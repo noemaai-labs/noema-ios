@@ -78,6 +78,10 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                     picked = candidates.first(where: { QuantExtractor.shortLabel(from: $0.label, format: .gguf).lowercased() == target }) ?? candidates.first
                 case .et, .ane, .afm:
                     picked = candidates.first
+                case .coreai:
+                    // Core AI repos publish one bundle per variant; the curated label
+                    // names the intended one (e.g. "ios-gpu/ios_hc0_int8v3").
+                    picked = candidates.first(where: { $0.label.caseInsensitiveCompare(extra.label) == .orderedSame }) ?? candidates.first
                 }
                 if let q = picked {
                     if !quants.contains(where: { $0.downloadURL == q.downloadURL }) {
@@ -213,7 +217,7 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
 
         if NetworkKillSwitch.isEnabled { throw URLError(.notConnectedToInternet) }
         NetworkKillSwitch.track(session: URLSession.shared)
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let (_, resp) = try await URLSession.shared.data(for: HFEndpoint.rewrite(req))
         guard let http = resp as? HTTPURLResponse else { return 0 }
 
         if let linked = http.value(forHTTPHeaderField: "X-Linked-Size"),
@@ -275,6 +279,14 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
     }
 
     static func recommendedStarterQuant(in details: ModelDetails) -> QuantInfo? {
+        if details.id.caseInsensitiveCompare("unsloth/Qwen3.5-2B-GGUF") == .orderedSame,
+           let q3 = details.quants.first(where: {
+               $0.format == .gguf &&
+               QuantExtractor.shortLabel(from: $0.label, format: $0.format).caseInsensitiveCompare("Q3_K_M") == .orderedSame
+           }) {
+            return q3
+        }
+
         let preferredPool = details.quants.filter { $0.format == .gguf && $0.isHighBitQuant }
         let fallbackPool = preferredPool.isEmpty ? details.quants.filter { $0.isHighBitQuant } : preferredPool
         let candidates = fallbackPool.isEmpty ? details.quants : fallbackPool
@@ -314,9 +326,9 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                     publisher: "Qwen",
                     summary: qwenSummary,
                     hasInstallableQuant: true,
-                    formats: [.gguf, .mlx],
+                    formats: [.gguf, .mlx, .coreai],
                     installed: false,
-                    tags: ["gguf", "mlx", "qwen3.5", "multimodal", "vision", "reasoning", "tool-use"],
+                    tags: ["gguf", "mlx", "coreai", "qwen3.5", "multimodal", "vision", "reasoning", "tool-use"],
                     pipeline_tag: "image-text-to-text",
                     minRAMBytes: nil,
                     recommendedETBackend: nil,
@@ -327,12 +339,12 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                     summary: qwenSummary,
                     quants: [
                         QuantInfo(
-                            label: "GGUF",
+                            label: "Q3_K_M",
                             format: .gguf,
-                            sizeBytes: 0,
-                            downloadURL: URL(string: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF")!,
+                            sizeBytes: 1_107_149_056,
+                            downloadURL: URL(string: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q3_K_M.gguf?download=1")!,
                             sha256: nil,
-                            configURL: nil
+                            configURL: URL(string: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/raw/main/config.json")
                         ),
                         QuantInfo(
                             label: "INT4",
@@ -347,6 +359,14 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                             format: .mlx,
                             sizeBytes: 0,
                             downloadURL: URL(string: "https://huggingface.co/mlx-community/Qwen3.5-2B-6bit")!,
+                            sha256: nil,
+                            configURL: nil
+                        ),
+                        QuantInfo(
+                            label: "ios-gpu/ios_hc0_int8v3",
+                            format: .coreai,
+                            sizeBytes: 0,
+                            downloadURL: URL(string: "https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreAI")!,
                             sha256: nil,
                             configURL: nil
                         )
@@ -406,9 +426,9 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                     publisher: "Google",
                     summary: gemmaSummary,
                     hasInstallableQuant: true,
-                    formats: [.gguf, .mlx, .et],
+                    formats: [.gguf, .mlx, .et, .ane],
                     installed: false,
-                    tags: ["gguf", "mlx", "et", "gemma", "gemma3", "multimodal", "vision"],
+                    tags: ["gguf", "mlx", "et", "cml", "gemma", "gemma3", "multimodal", "vision"],
                     pipeline_tag: "image-text-to-text",
                     minRAMBytes: nil,
                     recommendedETBackend: nil,
@@ -439,6 +459,14 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                             format: .mlx,
                             sizeBytes: 0,
                             downloadURL: URL(string: "https://huggingface.co/mlx-community/gemma-3-4b-it-8bit")!,
+                            sha256: nil,
+                            configURL: nil
+                        ),
+                        QuantInfo(
+                            label: "CML",
+                            format: .ane,
+                            sizeBytes: 0,
+                            downloadURL: URL(string: "https://huggingface.co/anemll/anemll-google-gemma-3-4b-it-qat-int4-ctx4096_0.3.5")!,
                             sha256: nil,
                             configURL: nil
                         ),
@@ -557,7 +585,7 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
             Entry(
                 record: ModelRecord(
                     id: "unsloth/gemma-4-E2B-it-GGUF",
-                    displayName: "Gemma 4 E2B",
+                    displayName: "Gemma 4 E2B it",
                     publisher: "Google",
                     summary: gemma4Summary,
                     hasInstallableQuant: true,
@@ -597,7 +625,7 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
 
             Entry(
                 record: ModelRecord(
-                    id: "unsloth/Qwen3-1.7B-GGUF",
+                    id: "Qwen/Qwen3-1.7B-GGUF",
                     displayName: "Qwen 3 1.7B",
                     publisher: "Qwen",
                     summary: qwen3Summary,
@@ -611,14 +639,14 @@ public final class ManualModelRegistry: ModelRegistry, @unchecked Sendable {
                     supportsVision: false
                 ),
                 details: ModelDetails(
-                    id: "unsloth/Qwen3-1.7B-GGUF",
+                    id: "Qwen/Qwen3-1.7B-GGUF",
                     summary: qwen3Summary,
                     quants: [
                         QuantInfo(
                             label: "GGUF",
                             format: .gguf,
                             sizeBytes: 0,
-                            downloadURL: URL(string: "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF")!,
+                            downloadURL: URL(string: "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF")!,
                             sha256: nil,
                             configURL: nil
                         ),

@@ -1,4 +1,3 @@
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -131,11 +130,6 @@ static inline __m512i mul_sum_us8_pairs_acc_int32x16(const __m512i acc, const __
 #endif
 }
 
-#endif
-
-#endif
-
-#if defined(__AVX512F__)
 // multiply int8_t, add results pairwise twice and return as 512 bit int vector，then add the accumulator
 static inline __m512i mul_sum_i8_pairs_acc_int32x16(const __m512i acc, const __m512i x, const __m512i y) {
     const __m512i zero = _mm512_setzero_si512();
@@ -148,7 +142,6 @@ static inline __m512i mul_sum_i8_pairs_acc_int32x16(const __m512i acc, const __m
 }
 #endif
 
-#if defined(__AVX2__) || defined(__AVX512F__)
 // add int16_t pairwise and return as 256 bit int vector, then add the accumulator
 static inline __m256i sum_i16_pairs_acc_int32x8(const __m256i acc, const __m256i x) {
     const __m256i ones = _mm256_set1_epi16(1);
@@ -6412,5 +6405,3 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
-
-#endif // defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)

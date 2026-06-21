@@ -11,7 +11,7 @@ import AppKit
 struct OnboardingView: View {
     @Binding var showOnboarding: Bool
     @State private var currentPage = 0
-    @StateObject private var embedInstaller = EmbedModelInstaller()
+    @StateObject private var embedInstaller = EmbedModelInstaller(recordID: EmbeddingModelCatalog.defaultModelID)
     @State private var animateElements = false
     @State private var logoScale: CGFloat = 0.5
     @State private var textOpacity: Double = 0
@@ -269,10 +269,14 @@ struct OnboardingView: View {
                     .font(.headline)
                     .foregroundColor(textPrimary)
                 
-                HStack(spacing: 16) {
-                    modelFormatCard(icon: "cube", title: "GGUF", description: "Good default · portable")
-                    modelFormatCard(icon: "bolt", title: "MLX", description: "Apple Silicon optimized")
-                    modelFormatCard(icon: "rectangle.stack", title: "LeapAI", description: "Optional small model backend")
+                LazyVGrid(columns: [
+                    GridItem(.flexible(), spacing: 12),
+                    GridItem(.flexible(), spacing: 12)
+                ], spacing: 12) {
+                    modelFormatCard(icon: "cube", title: "GGUF", description: "Portable llama.cpp")
+                    modelFormatCard(icon: "bolt", title: "MLX", description: "Apple Silicon speed")
+                    modelFormatCard(icon: "rectangle.stack", title: "ET", description: "ExecuTorch runtime")
+                    modelFormatCard(icon: "cpu", title: "CML", description: "Core ML runtime")
                 }
                 .padding(.horizontal, 30)
             }
@@ -299,7 +303,7 @@ struct OnboardingView: View {
         .animation(.easeOut(duration: 0.6), value: animateElements)
     }
     
-    private func modelFormatCard(icon: String, title: String, description: String) -> some View {
+    private func modelFormatCard(icon: String, title: LocalizedStringKey, description: LocalizedStringKey) -> some View {
         VStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 24))
@@ -409,12 +413,12 @@ struct OnboardingView: View {
                         .font(.headline)
                         .foregroundColor(textPrimary)
                     
-                    Text("Download a small embedding model so Noema can index and search your datasets")
+                    Text("Download Qwen3 Embedding 0.6B so Noema can index and search your datasets")
                         .font(.caption)
                         .foregroundColor(textSecondary)
                         .multilineTextAlignment(.center)
                     
-                    Text("320 MB • One-time download")
+                    Text("640 MB • One-time download")
                         .font(.caption2)
                         .foregroundColor(textSecondary.opacity(0.8))
                 }
@@ -492,7 +496,7 @@ struct OnboardingView: View {
         }
         .opacity(animateElements ? 1 : 0)
         .animation(.easeOut(duration: 0.6), value: animateElements)
-        .onReceive(downloadController.$items) { items in
+        .onReceive(downloadController.itemsPublisher) { items in
             guard let detail = recommendedDetail, let quant = recommendedQuant else { return }
             if let item = items.first(where: { $0.detail.id == detail.id && $0.quant.label == quant.label }) {
                 recommendedProgress = item.progress
@@ -611,6 +615,8 @@ struct OnboardingView: View {
                 isVision = false
             case .afm:
                 isVision = false
+            case .coreai:
+                isVision = false
             }
         }
 
@@ -623,7 +629,7 @@ struct OnboardingView: View {
         switch quant.format {
         case .gguf, .mlx:
             moeInfo = ModelScanner.moeInfo(for: url, format: quant.format)
-        case .et, .ane, .afm:
+        case .et, .ane, .afm, .coreai:
             moeInfo = nil
         }
         let architectureLabels = LocalModel.architectureLabels(for: url, format: quant.format, modelID: detail.id)
@@ -814,7 +820,8 @@ struct OnboardingView: View {
         if embedInstaller.state == .ready {
             return
         }
-        if FileManager.default.fileExists(atPath: EmbeddingModel.modelURL.path) {
+        EmbeddingModelCatalog.setActiveRecordID(EmbeddingModelCatalog.defaultModelID)
+        if FileManager.default.fileExists(atPath: onboardingEmbeddingModelURL.path) {
             embedInstaller.refreshStateFromDisk()
             return
         }
@@ -903,6 +910,10 @@ struct OnboardingView: View {
                     .frame(width: 60)
             }
         }
+    }
+
+    private var onboardingEmbeddingModelURL: URL {
+        EmbeddingModelCatalog.record(for: EmbeddingModelCatalog.defaultModelID)?.installedURL ?? EmbeddingModel.modelURL
     }
 }
 #Preview {

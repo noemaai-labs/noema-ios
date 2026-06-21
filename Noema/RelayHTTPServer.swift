@@ -314,6 +314,7 @@ private final class RelayHTTPConnection {
         case waiting
         case headers(Data)
         case body(HTTPRequest, Data)
+        case chunked(HTTPRequest, Data)
         case streaming
     }
 
@@ -325,6 +326,7 @@ private final class RelayHTTPConnection {
     private var buffer = Data()
     private var expectedBodyLength: Int = 0
     private var isClosed = false
+    private let closeLock = NSLock()
     private var currentOrigin: String?
     private let remoteDescription: String
     private let remoteHost: String?
@@ -388,8 +390,16 @@ private final class RelayHTTPConnection {
     }
 
     func cancel() {
-        guard !isClosed else { return }
+        // cancel() is reachable from the network queue (state handler) and from
+        // response Tasks (send completions). Make the close transition atomic so
+        // we never double-cancel or remove the connection from the delegate twice.
+        closeLock.lock()
+        if isClosed {
+            closeLock.unlock()
+            return
+        }
         isClosed = true
+        closeLock.unlock()
         connection.cancel()
         if let delegate {
             Task { await delegate.connectionDidFinish(self) }
@@ -432,10 +442,55 @@ private final class RelayHTTPConnection {
             }
             expectedBodyLength = request.contentLength
             if expectedBodyLength == 0 {
-                handle(request: request, body: Data())
+                let isChunked = request.header(named: "transfer-encoding")?
+                    .lowercased().contains("chunked") ?? false
+                if isChunked {
+                    state = .chunked(request, Data())
+                    processBuffer()
+                } else {
+                    handle(request: request, body: Data())
+                }
             } else {
                 state = .body(request, Data())
                 processBuffer()
+            }
+        case .chunked(let request, let initialBody):
+            // Decode HTTP/1.1 chunked transfer-encoding: <hex-size>CRLF<data>CRLF…,
+            // terminated by a zero-length chunk.
+            var body = initialBody
+            while true {
+                guard let lineEnd = buffer.range(of: Data("\r\n".utf8)) else {
+                    state = .chunked(request, body)
+                    return
+                }
+                let sizeLineData = buffer.subdata(in: 0..<lineEnd.lowerBound)
+                let sizeToken = String(data: sizeLineData, encoding: .utf8)?
+                    .split(separator: ";").first
+                    .map(String.init)?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                guard let chunkSize = Int(sizeToken, radix: 16) else {
+                    send(status: 400, json: ["error": "Malformed chunk size"])
+                    return
+                }
+                if chunkSize == 0 {
+                    // Consume the terminating chunk line and an optional final CRLF
+                    // (we ignore trailer headers).
+                    buffer.removeSubrange(0..<lineEnd.upperBound)
+                    if let trailerEnd = buffer.range(of: Data("\r\n".utf8)), trailerEnd.lowerBound == 0 {
+                        buffer.removeSubrange(0..<trailerEnd.upperBound)
+                    }
+                    state = .waiting
+                    handle(request: request, body: body)
+                    return
+                }
+                let dataStart = lineEnd.upperBound
+                let needed = dataStart + chunkSize + 2 // chunk bytes + trailing CRLF
+                if buffer.count < needed {
+                    state = .chunked(request, body)
+                    return
+                }
+                body.append(buffer.subdata(in: dataStart..<(dataStart + chunkSize)))
+                buffer.removeSubrange(0..<needed)
             }
         case .body(let request, var body):
             let needed = expectedBodyLength - body.count
@@ -522,6 +577,7 @@ private final class RelayHTTPConnection {
         }
         // Noema Relay does not support images/multimodal content via remote endpoints.
         let hasImageMarkers = payload.messages.contains { msg in
+            if msg.containsImage { return true }
             let t = msg.content.lowercased()
             return t.contains("<image>") || t.contains("image_url") || t.contains("![") || t.contains("data:image/")
         }
@@ -676,15 +732,27 @@ private final class RelayHTTPConnection {
         }
     }
 
+    /// Loopback clients (tools running on the host itself) are trusted without a
+    /// token. Any other origin — i.e. an actual LAN peer — must present the
+    /// bearer token, including on macOS, where the relay binds to 0.0.0.0 and is
+    /// Bonjour-advertised.
+    private var isLoopbackClient: Bool {
+        guard let host = remoteHost?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return host == "127.0.0.1"
+            || host == "::1"
+            || host == "localhost"
+            || host.hasPrefix("127.")
+            || host == "0:0:0:0:0:0:0:1"
+    }
+
     private func authorize(_ request: HTTPRequest) -> Bool {
-#if os(macOS)
-        return true
-#else
+        if isLoopbackClient { return true }
         guard configuration.requiresAuth(for: request.path) else { return true }
         guard let header = request.header(named: "Authorization") else { return false }
         let expected = "Bearer \(configuration.apiToken)"
         return header == expected
-#endif
     }
 
     private func sendStream(stream: AsyncThrowingStream<RelayServerEngine.StreamEvent, Error>, modelID: String) {
@@ -822,10 +890,64 @@ private struct HTTPRequest {
     }
 }
 
+/// Flattens an OpenAI message/`input` `content` field that may be a plain
+/// string, an array of typed content parts, or null. Text parts are joined;
+/// the presence of any image part is tracked so callers can reject multimodal
+/// requests (which Noema Relay does not serve remotely).
+private struct FlexibleContent: Decodable {
+    let text: String
+    let containsImage: Bool
+
+    private struct Part: Decodable {
+        let type: String?
+        let text: String?
+
+        var isImage: Bool {
+            guard let type = type?.lowercased() else { return false }
+            return type.contains("image")
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            text = ""
+            containsImage = false
+        } else if let string = try? container.decode(String.self) {
+            text = string
+            containsImage = false
+        } else if let parts = try? container.decode([Part].self) {
+            text = parts.compactMap { $0.text }.joined(separator: "\n")
+            containsImage = parts.contains { $0.isImage }
+        } else {
+            text = ""
+            containsImage = false
+        }
+    }
+}
+
 private struct OpenAIChatCompletionRequest: Decodable {
     struct Message: Decodable {
         var role: String
         var content: String
+        var containsImage: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case role
+            case content
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            role = try container.decode(String.self, forKey: .role)
+            if let flexible = try container.decodeIfPresent(FlexibleContent.self, forKey: .content) {
+                content = flexible.text
+                containsImage = flexible.containsImage
+            } else {
+                content = ""
+                containsImage = false
+            }
+        }
     }
 
     var model: String
@@ -868,7 +990,7 @@ private struct OpenAIChatCompletionRequest: Decodable {
         RelayServerEngine.NormalizedParameters(temperature: temperature,
                                                topP: top_p,
                                                topK: top_k,
-                                               maxTokens: nil,
+                                               maxTokens: max_tokens,
                                                stop: stop?.values ?? [],
                                                presencePenalty: presence_penalty,
                                                frequencyPenalty: frequency_penalty,
@@ -917,7 +1039,7 @@ private struct OpenAITextCompletionRequest: Decodable {
         RelayServerEngine.NormalizedParameters(temperature: temperature,
                                                topP: top_p,
                                                topK: top_k,
-                                               maxTokens: nil,
+                                               maxTokens: max_tokens,
                                                stop: stop?.values ?? [],
                                                presencePenalty: presence_penalty,
                                                frequencyPenalty: frequency_penalty,
@@ -929,6 +1051,17 @@ private struct OpenAIResponsesRequest: Decodable {
     struct Input: Decodable {
         var role: String
         var content: String
+
+        enum CodingKeys: String, CodingKey {
+            case role
+            case content
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            role = try container.decodeIfPresent(String.self, forKey: .role) ?? "user"
+            content = (try container.decodeIfPresent(FlexibleContent.self, forKey: .content))?.text ?? ""
+        }
     }
 
     var model: String
@@ -965,7 +1098,7 @@ private struct OpenAIResponsesRequest: Decodable {
         RelayServerEngine.NormalizedParameters(temperature: temperature,
                                                topP: top_p,
                                                topK: top_k,
-                                               maxTokens: nil,
+                                               maxTokens: max_tokens,
                                                stop: stop?.values ?? [],
                                                presencePenalty: presence_penalty,
                                                frequencyPenalty: frequency_penalty,

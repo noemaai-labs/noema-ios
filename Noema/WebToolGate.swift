@@ -4,6 +4,7 @@ import Foundation
 struct WebToolGate {
     // Background-safe gate that avoids MainActor by reading persisted defaults directly.
     static func isAvailable(currentFormat: ModelFormat? = nil) -> Bool {
+        guard EnterprisePolicyGate.allowsTool("noema.web.retrieve") else { return false }
         let d = UserDefaults.standard
         let enabled = d.object(forKey: "webSearchEnabled") as? Bool ?? true
         let offGrid = d.object(forKey: "offGrid") as? Bool ?? false

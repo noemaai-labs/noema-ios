@@ -639,6 +639,12 @@ struct StatefulCMLStateSpec: Sendable, Equatable {
     let dataType: MLMultiArrayDataType
     let bufferShape: [Int]
 
+    init(name: String, dataType: MLMultiArrayDataType, bufferShape: [Int]) {
+        self.name = name
+        self.dataType = dataType
+        self.bufferShape = bufferShape
+    }
+
     init(name: String, description: MLFeatureDescription) throws {
         guard let constraint = description.stateConstraint else {
             throw StatefulCMLCompatibilityError(reason: "`\(name)` does not expose a state constraint.")
@@ -837,9 +843,9 @@ struct StatefulCMLMaskLayout: Sendable, Equatable {
 @available(iOS 18.0, visionOS 2.0, *)
 struct StatefulCMLContract: Sendable, Equatable {
     let inputIDs: StatefulCMLTensorSpec
-    let causalMask: StatefulCMLTensorSpec
+    let causalMask: StatefulCMLTensorSpec?
     let logits: StatefulCMLTensorSpec
-    let maskLayout: StatefulCMLMaskLayout
+    let maskLayout: StatefulCMLMaskLayout?
     let contextLength: Int
     let generatedClassName: String?
     let keyCacheState: StatefulCMLStateSpec?
@@ -848,7 +854,7 @@ struct StatefulCMLContract: Sendable, Equatable {
 
     init(
         inputIDs: StatefulCMLTensorSpec,
-        causalMask: StatefulCMLTensorSpec,
+        causalMask: StatefulCMLTensorSpec?,
         logits: StatefulCMLTensorSpec,
         hasKeyCache: Bool,
         hasValueCache: Bool,
@@ -863,34 +869,56 @@ struct StatefulCMLContract: Sendable, Equatable {
             throw StatefulCMLCompatibilityError(reason: "Missing `value_cache` state.")
         }
         guard inputIDs.rank == 2 else {
-            throw StatefulCMLCompatibilityError(reason: "`input_ids` must be rank 2, found rank \(inputIDs.rank).")
+            throw StatefulCMLCompatibilityError(reason: "`\(inputIDs.name)` must be rank 2, found rank \(inputIDs.rank).")
         }
         guard inputIDs.dataType.isInteger else {
-            throw StatefulCMLCompatibilityError(reason: "`input_ids` must use an integer scalar type.")
+            throw StatefulCMLCompatibilityError(reason: "`\(inputIDs.name)` must use an integer scalar type.")
         }
         if logits.hasKnownShape, logits.rank != 3 {
-            throw StatefulCMLCompatibilityError(reason: "`logits` must be rank 3, found rank \(logits.rank).")
+            throw StatefulCMLCompatibilityError(reason: "`\(logits.name)` must be rank 3, found rank \(logits.rank).")
         }
         guard logits.dataType.isFloatingPoint else {
-            throw StatefulCMLCompatibilityError(reason: "`logits` must use a floating-point scalar type.")
-        }
-        guard causalMask.dataType.isFloatingPoint else {
-            throw StatefulCMLCompatibilityError(reason: "`causal_mask` must use a floating-point scalar type.")
+            throw StatefulCMLCompatibilityError(reason: "`\(logits.name)` must use a floating-point scalar type.")
         }
 
-        guard let minContextLength = inputIDs.minSequenceLength,
-              let maxContextLength = inputIDs.maxSequenceLength,
-              maxContextLength > minContextLength else {
-            throw StatefulCMLCompatibilityError(reason: "`input_ids` must expose a ranged sequence length.")
+        var maskLayout: StatefulCMLMaskLayout? = nil
+        if let causalMask {
+            guard causalMask.dataType.isFloatingPoint else {
+                throw StatefulCMLCompatibilityError(reason: "`\(causalMask.name)` must use a floating-point scalar type.")
+            }
+            maskLayout = try StatefulCMLMaskLayout(
+                dataType: causalMask.dataType,
+                dimensions: causalMask.dimensions
+            )
         }
 
-        let maskLayout = try StatefulCMLMaskLayout(
-            dataType: causalMask.dataType,
-            dimensions: causalMask.dimensions
-        )
-        if let maskMaxWidth = maskLayout.maxWidth, maskMaxWidth < maxContextLength {
+        let minSequenceLength = inputIDs.minSequenceLength
+        let maxSequenceLength = inputIDs.maxSequenceLength
+        let contextLength: Int
+        if let minSequenceLength, let maxSequenceLength, maxSequenceLength > minSequenceLength {
+            contextLength = maxSequenceLength
+        } else if let fixedSequenceLength = minSequenceLength, fixedSequenceLength == maxSequenceLength, fixedSequenceLength > 1 {
             throw StatefulCMLCompatibilityError(
-                reason: "`causal_mask` width \(maskMaxWidth) is smaller than the context length \(maxContextLength)."
+                reason: "`\(inputIDs.name)` has a fixed prompt-chunk length of \(fixedSequenceLength); Noema's stateful runtime feeds one token per call. Re-export with sequence length 1 or a ranged sequence length."
+            )
+        } else if let derived = Self.derivedContextLength(
+            maskLayout: maskLayout,
+            keyCacheState: keyCacheState,
+            metadata: metadata
+        ) {
+            // Fixed single-token (or unbounded) input shape: the sequence axis
+            // says nothing about the context window, so take it from metadata,
+            // the mask width, or the KV-cache buffer instead.
+            contextLength = derived
+        } else {
+            throw StatefulCMLCompatibilityError(
+                reason: "Could not determine the context length: `\(inputIDs.name)` shape is \(inputIDs.shapeSummary), no usable causal-mask width or KV-cache buffer shape was found. Re-export with a ranged sequence length or an explicit mask width."
+            )
+        }
+
+        if let maskMaxWidth = maskLayout?.maxWidth, maskMaxWidth < contextLength {
+            throw StatefulCMLCompatibilityError(
+                reason: "`\(causalMask?.name ?? "causal_mask")` width \(maskMaxWidth) is smaller than the context length \(contextLength)."
             )
         }
 
@@ -898,53 +926,117 @@ struct StatefulCMLContract: Sendable, Equatable {
         self.causalMask = causalMask
         self.logits = logits
         self.maskLayout = maskLayout
-        self.contextLength = maxContextLength
+        self.contextLength = contextLength
         self.generatedClassName = metadata.generatedClassName
         self.keyCacheState = keyCacheState
         self.valueCacheState = valueCacheState
         self.prefillMode = .compatibilitySingleQuery
     }
 
+    private static func derivedContextLength(
+        maskLayout: StatefulCMLMaskLayout?,
+        keyCacheState: StatefulCMLStateSpec?,
+        metadata: CoreMLArtifactMetadata
+    ) -> Int? {
+        let sanityRange = 8...1_048_576
+        for key in ["context_length", "max_context_length", "state_length"] {
+            if let value = metadata.intMetadataValue(for: key), sanityRange.contains(value) {
+                return value
+            }
+        }
+        if let width = maskLayout?.fixedWidth ?? maskLayout?.maxWidth, sanityRange.contains(width) {
+            return width
+        }
+        if let bufferShape = keyCacheState?.bufferShape, bufferShape.count >= 3 {
+            // Typical KV buffer layout is [... , heads, context, headDim].
+            let candidate = bufferShape[bufferShape.count - 2]
+            if sanityRange.contains(candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     init(modelDescription: MLModelDescription, metadata: CoreMLArtifactMetadata) throws {
-        guard let inputIDsDescription = modelDescription.inputDescriptionsByName["input_ids"] else {
-            throw StatefulCMLCompatibilityError(reason: "Missing `input_ids` input.")
+        let roles = CoreMLRoleResolver.resolve(
+            inputs: Self.artifactFeatures(from: modelDescription.inputDescriptionsByName),
+            outputs: Self.artifactFeatures(from: modelDescription.outputDescriptionsByName),
+            states: Self.artifactFeatures(from: modelDescription.stateDescriptionsByName)
+        )
+
+        func available(_ descriptions: [String: MLFeatureDescription]) -> String {
+            let names = descriptions.keys.sorted().joined(separator: ", ")
+            return names.isEmpty ? "<none>" : names
         }
-        guard let causalMaskDescription = modelDescription.inputDescriptionsByName["causal_mask"] else {
-            throw StatefulCMLCompatibilityError(reason: "Missing `causal_mask` input.")
+
+        guard let tokenName = roles.tokenInput,
+              let inputIDsDescription = modelDescription.inputDescriptionsByName[tokenName] else {
+            throw StatefulCMLCompatibilityError(
+                reason: "Missing token input (looked for `input_ids` and equivalents). Model inputs: [\(available(modelDescription.inputDescriptionsByName))]."
+            )
         }
-        guard let logitsDescription = modelDescription.outputDescriptionsByName["logits"] else {
-            throw StatefulCMLCompatibilityError(reason: "Missing `logits` output.")
+        guard let logitsName = roles.logitsOutput,
+              let logitsDescription = modelDescription.outputDescriptionsByName[logitsName] else {
+            throw StatefulCMLCompatibilityError(
+                reason: "Missing logits output (looked for `logits` and equivalents). Model outputs: [\(available(modelDescription.outputDescriptionsByName))]."
+            )
         }
-        guard let keyCacheDescription = modelDescription.stateDescriptionsByName["key_cache"] else {
-            throw StatefulCMLCompatibilityError(reason: "Missing `key_cache` state.")
+        guard let keyCacheName = roles.keyCacheState,
+              let keyCacheDescription = modelDescription.stateDescriptionsByName[keyCacheName] else {
+            throw StatefulCMLCompatibilityError(
+                reason: "Missing `key_cache` state (or equivalent). Model states: [\(available(modelDescription.stateDescriptionsByName))]."
+            )
         }
-        guard let valueCacheDescription = modelDescription.stateDescriptionsByName["value_cache"] else {
-            throw StatefulCMLCompatibilityError(reason: "Missing `value_cache` state.")
+        guard let valueCacheName = roles.valueCacheState,
+              let valueCacheDescription = modelDescription.stateDescriptionsByName[valueCacheName] else {
+            throw StatefulCMLCompatibilityError(
+                reason: "Missing `value_cache` state (or equivalent). Model states: [\(available(modelDescription.stateDescriptionsByName))]."
+            )
+        }
+
+        var causalMaskSpec: StatefulCMLTensorSpec? = nil
+        if let maskName = roles.maskInput,
+           let causalMaskDescription = modelDescription.inputDescriptionsByName[maskName] {
+            causalMaskSpec = try StatefulCMLTensorSpec(
+                name: maskName,
+                description: causalMaskDescription,
+                metadataFeature: metadata.inputSchema.first(where: { $0.name == maskName })
+            )
         }
 
         try self.init(
             inputIDs: StatefulCMLTensorSpec(
-                name: "input_ids",
+                name: tokenName,
                 description: inputIDsDescription,
-                metadataFeature: metadata.inputSchema.first(where: { $0.name == "input_ids" })
+                metadataFeature: metadata.inputSchema.first(where: { $0.name == tokenName })
             ),
-            causalMask: StatefulCMLTensorSpec(
-                name: "causal_mask",
-                description: causalMaskDescription,
-                metadataFeature: metadata.inputSchema.first(where: { $0.name == "causal_mask" })
-            ),
+            causalMask: causalMaskSpec,
             logits: StatefulCMLTensorSpec(
-                name: "logits",
+                name: logitsName,
                 description: logitsDescription,
-                metadataFeature: metadata.outputSchema.first(where: { $0.name == "logits" }),
+                metadataFeature: metadata.outputSchema.first(where: { $0.name == logitsName }),
                 allowUnspecifiedShape: true
             ),
             hasKeyCache: true,
             hasValueCache: true,
-            keyCacheState: try StatefulCMLStateSpec(name: "key_cache", description: keyCacheDescription),
-            valueCacheState: try StatefulCMLStateSpec(name: "value_cache", description: valueCacheDescription),
+            keyCacheState: try StatefulCMLStateSpec(name: keyCacheName, description: keyCacheDescription),
+            valueCacheState: try StatefulCMLStateSpec(name: valueCacheName, description: valueCacheDescription),
             metadata: metadata
         )
+    }
+
+    private static func artifactFeatures(from descriptions: [String: MLFeatureDescription]) -> [CoreMLArtifactFeature] {
+        descriptions.values.map { description in
+            let dataType: String?
+            if let constraint = description.multiArrayConstraint {
+                dataType = constraint.dataType.displayName
+            } else if let stateConstraint = description.stateConstraint {
+                dataType = stateConstraint.dataType.displayName
+            } else {
+                dataType = nil
+            }
+            return CoreMLArtifactFeature(name: description.name, dataType: dataType)
+        }
     }
 
     var summary: String {
@@ -954,7 +1046,7 @@ struct StatefulCMLContract: Sendable, Equatable {
             "effectivePromptLimit=\(effectivePromptTokenLimit)",
             prefillMode.maskWidthFormulaSummary,
             inputIDs.summary,
-            maskLayout.summary,
+            maskLayout?.summary ?? "causal_mask=<none>",
             logits.summary,
             keyCacheState?.summary,
             valueCacheState?.summary,
@@ -1009,7 +1101,10 @@ struct StatefulCMLContract: Sendable, Equatable {
     }
 
     func makeCausalMask(logicalWidth: Int, logicalQueryLength: Int) throws -> MLMultiArray {
-        try maskLayout.makeAdditiveCausalMask(logicalWidth: logicalWidth, logicalQueryLength: logicalQueryLength)
+        guard let maskLayout else {
+            throw StatefulCMLCompatibilityError(reason: "Model does not take a causal-mask input.")
+        }
+        return try maskLayout.makeAdditiveCausalMask(logicalWidth: logicalWidth, logicalQueryLength: logicalQueryLength)
     }
 
     func nextTokenScores(from logitsValue: MLMultiArray, tokenIndex: Int) throws -> MLTensor {
@@ -3732,7 +3827,7 @@ private final class StatefulCausalLanguageModel {
 
         if mode == .prefilling {
             // Process prompt tokens one at a time (compatibilitySingleQuery):
-            // each call feeds input_ids=[1,1] with a growing causal_mask width,
+            // each call feeds a [1,1] token with a growing causal-mask width,
             // letting the KV cache accumulate one entry per step via MLState.
             var lastLogitsValue: MLMultiArray?
             for i in 0..<tokenCount {
@@ -3740,15 +3835,15 @@ private final class StatefulCausalLanguageModel {
 
                 let singleInput = MLShapedArray<Int32>(scalars: [tokenScalars[i]], shape: [1, 1])
                 let logicalWidth = contract.maskWidth(for: i + 1)
-                let causalMask = try contract.makeCausalMask(
+                let causalMask = try makeCausalMaskIfNeeded(
                     logicalWidth: logicalWidth,
                     logicalQueryLength: 1
                 )
 
-                let provider = try MLDictionaryFeatureProvider(dictionary: [
-                    "input_ids": MLMultiArray(singleInput),
-                    "causal_mask": causalMask
-                ])
+                let provider = try makeFeatureProvider(
+                    tokens: MLMultiArray(singleInput),
+                    causalMask: causalMask
+                )
 
                 let prediction: any MLFeatureProvider
                 do {
@@ -3765,7 +3860,7 @@ private final class StatefulCausalLanguageModel {
                 }
 
                 if i == tokenCount - 1 {
-                    lastLogitsValue = prediction.featureValue(for: "logits")?.multiArrayValue
+                    lastLogitsValue = prediction.featureValue(for: contract.logits.name)?.multiArrayValue
                 }
             }
 
@@ -3779,7 +3874,7 @@ private final class StatefulCausalLanguageModel {
                     mode: .prefilling,
                     promptTokenCount: tokenCount,
                     logicalMaskWidth: contract.maskWidth(for: tokenCount),
-                    causalMask: try contract.makeCausalMask(
+                    causalMask: try makeCausalMaskIfNeeded(
                         logicalWidth: contract.maskWidth(for: tokenCount),
                         logicalQueryLength: 1
                     ),
@@ -3794,15 +3889,15 @@ private final class StatefulCausalLanguageModel {
             let inputIDs = MLShapedArray<Int32>(scalars: [lastToken], shape: [1, 1])
 
             let logicalWidth = contract.maskWidth(for: tokenCount)
-            let causalMask = try contract.makeCausalMask(
+            let causalMask = try makeCausalMaskIfNeeded(
                 logicalWidth: logicalWidth,
                 logicalQueryLength: 1
             )
 
-            let provider = try MLDictionaryFeatureProvider(dictionary: [
-                "input_ids": MLMultiArray(inputIDs),
-                "causal_mask": causalMask
-            ])
+            let provider = try makeFeatureProvider(
+                tokens: MLMultiArray(inputIDs),
+                causalMask: causalMask
+            )
 
             let prediction: any MLFeatureProvider
             do {
@@ -3818,7 +3913,7 @@ private final class StatefulCausalLanguageModel {
             }
             try CoreMLGenerationEngine.throwIfCancelled()
 
-            guard let logitsValue = prediction.featureValue(for: "logits")?.multiArrayValue else {
+            guard let logitsValue = prediction.featureValue(for: contract.logits.name)?.multiArrayValue else {
                 throw wrapPredictionFailure(
                     NSError(
                         domain: "Noema.CoreML",
@@ -3837,19 +3932,32 @@ private final class StatefulCausalLanguageModel {
         }
     }
 
+    private func makeCausalMaskIfNeeded(logicalWidth: Int, logicalQueryLength: Int) throws -> MLMultiArray? {
+        guard contract.causalMask != nil else { return nil }
+        return try contract.makeCausalMask(logicalWidth: logicalWidth, logicalQueryLength: logicalQueryLength)
+    }
+
+    private func makeFeatureProvider(tokens: MLMultiArray, causalMask: MLMultiArray?) throws -> MLDictionaryFeatureProvider {
+        var features: [String: Any] = [contract.inputIDs.name: tokens]
+        if let maskName = contract.causalMask?.name, let causalMask {
+            features[maskName] = causalMask
+        }
+        return try MLDictionaryFeatureProvider(dictionary: features)
+    }
+
     private func wrapPredictionFailure(
         _ error: Error,
         mode: Mode,
         promptTokenCount: Int,
         logicalMaskWidth: Int,
-        causalMask: MLMultiArray,
+        causalMask: MLMultiArray?,
         prefillStep: Int? = nil
     ) -> Error {
         guard !wrappedPredictionFailure else { return error }
         wrappedPredictionFailure = true
 
         let modeLabel = (mode == .prefilling) ? "prefill" : "extend"
-        let maskShape = causalMask.shape.map(\.intValue).map(String.init).joined(separator: "x")
+        let maskShape = causalMask.map { $0.shape.map(\.intValue).map(String.init).joined(separator: "x") } ?? "<none>"
         let description = [
             "CML prediction failed.",
             "mode=\(modeLabel)",

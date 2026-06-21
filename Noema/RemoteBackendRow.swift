@@ -34,7 +34,7 @@ struct RemoteBackendRow: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(backend.name)
                         .font(FontTheme.body)
@@ -56,40 +56,42 @@ struct RemoteBackendRow: View {
                     .foregroundStyle(AppTheme.secondaryText)
                     .lineLimit(1)
                 
-                if let indicator = connectionIndicator {
-                    HStack(spacing: 4) {
-                        Image(systemName: indicator.symbol)
-                        Text(indicator.text)
-                        if indicator.streaming {
-                            Text(LocalizedStringKey("Streaming"))
-                                .fontWeight(.semibold)
+                HStack(spacing: 6) {
+                    if let indicator = connectionIndicator {
+                        HStack(spacing: 4) {
+                            Circle().fill(indicator.color).frame(width: 6, height: 6)
+                            Text(indicator.text)
+                            if indicator.streaming {
+                                Text("·")
+                                Text(LocalizedStringKey("Streaming"))
+                            }
                         }
+                        .foregroundColor(indicator.color)
                     }
-                    .font(FontTheme.caption)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(indicator.color.opacity(0.18)))
-                    .foregroundColor(indicator.color)
+                    
+                    if let status {
+                        if connectionIndicator != nil {
+                            Text("·").foregroundColor(AppTheme.tertiaryText)
+                        }
+                        Text(status.text)
+                            .foregroundColor(status.color)
+                    }
                 }
-                
-                if let status {
-                    Text(status.text)
-                        .font(FontTheme.caption)
-                        .foregroundColor(status.color)
-                        .lineLimit(2)
-                }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .lineLimit(1)
+                .padding(.top, 2)
             }
             Spacer()
             
             if isOffline {
-                Label(String(localized: "Offline", locale: locale), systemImage: "wifi.slash")
-                    .font(FontTheme.caption)
+                Image(systemName: "wifi.slash")
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AppTheme.secondaryText)
             } else if isFetching {
                 ProgressView().scaleEffect(0.7)
             } else if backend.cachedModels.isEmpty {
                 Text(LocalizedStringKey("Tap to load"))
-                    .font(FontTheme.caption)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(AppTheme.secondaryText)
             } else {
                 Text(
@@ -98,24 +100,20 @@ struct RemoteBackendRow: View {
                         backend.cachedModels.count
                     )
                 )
-                    .font(FontTheme.caption.weight(.medium))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(Color.accentColor.opacity(0.2)))
-                    .foregroundStyle(Color.accentColor)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color.accentColor)
             }
         }
         .padding(.vertical, 8)
     }
 
     private func badge(text: String, color: Color) -> some View {
-        Text(text)
-            .font(FontTheme.caption)
-            .fontWeight(.medium)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Capsule().fill(color.opacity(0.15)))
-            .foregroundColor(color)
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(text)
+        }
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .foregroundColor(color)
     }
 
     private func badgeColor(for type: RemoteBackend.EndpointType) -> Color {

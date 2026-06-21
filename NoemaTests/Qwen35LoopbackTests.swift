@@ -129,6 +129,27 @@ final class Qwen35LoopbackTests: XCTestCase {
         XCTAssertNotNil(configuration.chatTemplateFile)
     }
 
+    func testLoopbackStartConfigurationIncludesMTPDraftOptions() throws {
+        let root = try makeTemporaryDirectory()
+        let weight = root.appendingPathComponent("Next2.5-Q4_K_M.gguf")
+        let mtp = root.appendingPathComponent("Next2.5-mtp-f16.gguf")
+        FileManager.default.createFile(atPath: weight.path, contents: Data("GGUF".utf8))
+        FileManager.default.createFile(atPath: mtp.path, contents: Data("GGUF".utf8))
+
+        let configuration = TemplateDrivenModelSupport.loopbackStartConfiguration(
+            modelURL: weight,
+            ggufPath: weight.path,
+            mmprojPath: nil,
+            mtpPath: mtp.path,
+            speculativeType: "draft-mtp",
+            specDraftNMax: 2
+        )
+
+        XCTAssertEqual(configuration.mtpPath, mtp.path)
+        XCTAssertEqual(configuration.speculativeType, "draft-mtp")
+        XCTAssertEqual(configuration.specDraftNMax, 2)
+    }
+
     func testStructuredMultimodalRequestPlanPreservesHistoryAndQwenFlags() throws {
         let root = try makeTemporaryDirectory()
         let weight = root.appendingPathComponent("Next2.5-Q4_K_M.gguf")
@@ -170,6 +191,57 @@ final class Qwen35LoopbackTests: XCTestCase {
         XCTAssertEqual(userPayload["role"] as? String, "user")
         XCTAssertEqual(content.first?["text"] as? String, "Describe this image")
         XCTAssertTrue(imagePayload["url"]?.hasPrefix("data:image/") == true)
+    }
+
+    func testStructuredExtractionRequestDisablesQwenThinkingAndConstrainsJSON() throws {
+        let root = try makeTemporaryDirectory()
+        let weight = root.appendingPathComponent("Next2.5-Q4_K_M.gguf")
+        let template = root.appendingPathComponent("chat_template.jinja")
+        let image = root.appendingPathComponent("photo.jpg")
+        FileManager.default.createFile(atPath: weight.path, contents: Data("GGUF".utf8))
+        FileManager.default.createFile(
+            atPath: template.path,
+            contents: Data(
+                """
+                <|im_start|>assistant
+                {% if enable_thinking %}<think>{% endif %}
+                <tool_call><function=name><parameter=name>
+                """.utf8
+            )
+        )
+        FileManager.default.createFile(atPath: image.path, contents: Data("not-a-real-image".utf8))
+
+        let client = NoemaLlamaClient(url: weight)
+        let input = LLMInput.multimodal(
+            text: "Return pass JSON",
+            imagePaths: [image.path],
+            generationOptions: LLMGenerationOptions(
+                reasoningEnabled: false,
+                maxOutputTokens: 1024,
+                thinkingBudgetTokens: 256,
+                responseFormat: .jsonSchema(name: "pass_extraction", schema: ["type": AnyCodable("object")])
+            )
+        )
+
+        let plan = client.buildLoopbackRequestPlan(for: input, forceNonStreaming: false)
+        let messages = try XCTUnwrap(plan.body["messages"] as? [[String: Any]])
+        let userPayload = try XCTUnwrap(messages.last)
+        let content = try XCTUnwrap(userPayload["content"] as? [[String: Any]])
+        let responseFormat = try XCTUnwrap(plan.body["response_format"] as? [String: Any])
+        let jsonSchema = try XCTUnwrap(responseFormat["json_schema"] as? [String: Any])
+        let schema = try XCTUnwrap(jsonSchema["schema"] as? [String: Any])
+
+        XCTAssertEqual(plan.body["add_generation_prompt"] as? Bool, true)
+        XCTAssertNil(plan.body["reasoning_format"])
+        XCTAssertEqual((plan.body["chat_template_kwargs"] as? [String: Bool])?["enable_thinking"], false)
+        XCTAssertEqual(plan.body["n_predict"] as? Int, 1024)
+        XCTAssertEqual(plan.body["max_tokens"] as? Int, 1024)
+        XCTAssertEqual(plan.body["thinking_budget_tokens"] as? Int, 256)
+        XCTAssertEqual(responseFormat["type"] as? String, "json_schema")
+        XCTAssertEqual(jsonSchema["name"] as? String, "pass_extraction")
+        XCTAssertEqual(schema["type"] as? String, "object")
+        XCTAssertEqual(content.first?["text"] as? String, "Return pass JSON")
+        XCTAssertNotNil(content.last?["image_url"] as? [String: String])
     }
 
     @MainActor

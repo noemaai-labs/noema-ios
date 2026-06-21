@@ -8,12 +8,26 @@ enum Runner {
 }
 
 enum RunnerFactory {
-    static func load(url: URL, format: ModelFormat) async throws -> Runner {
+    static func load(
+        url: URL,
+        format: ModelFormat,
+        isVision: Bool = false,
+        contextLength: Int? = nil,
+        preferContextOverEnvironment: Bool = false,
+        forceFreshLoopback: Bool = false
+    ) async throws -> Runner {
         switch format {
         case .gguf:
             // Prefer explicit projector if present next to the weights
             let mmproj = ProjectorLocator.projectorPath(alongside: url)
-            let param = LlamaParameter(options: LlamaOptions(), contextLength: nil, threadCount: nil, mmproj: mmproj)
+            let param = LlamaParameter(
+                options: LlamaOptions(),
+                contextLength: contextLength,
+                threadCount: nil,
+                mmproj: mmproj,
+                preferContextOverEnvironment: preferContextOverEnvironment,
+                forceFreshLoopback: forceFreshLoopback
+            )
             return .llm(try await AnyLLMClient(
                 NoemaLlamaClient.llama(url: url, parameter: param)
             ))
@@ -32,17 +46,12 @@ enum RunnerFactory {
                     userInfo: [NSLocalizedDescriptionKey: "ET models are not supported on this platform."]
                 )
             }
-            guard let pte = ETModelResolver.pteURL(for: url) else {
-                throw NSError(domain: "Noema", code: -2, userInfo: [NSLocalizedDescriptionKey: "Missing .pte file for ET model."])
-            }
-            guard let tokenizer = ETModelResolver.tokenizerURL(for: url) ?? ETModelResolver.tokenizerURL(for: pte.deletingLastPathComponent()) else {
-                throw NSError(domain: "Noema", code: -2, userInfo: [NSLocalizedDescriptionKey: "Missing tokenizer for ET model."])
-            }
+            let artifacts = try ETModelResolver.resolveLoadArtifacts(for: url)
             let settings = ModelSettings.default(for: .et)
             let client = ExecuTorchLLMClient(
-                modelPath: pte.path,
-                tokenizerPath: tokenizer.path,
-                isVision: false,
+                modelPath: artifacts.pteURL.path,
+                tokenizerPath: artifacts.tokenizerURL.path,
+                isVision: isVision,
                 settings: settings
             )
             try await client.load()
@@ -79,6 +88,26 @@ enum RunnerFactory {
                     unload: { afmClient.unload() },
                     syncSystemPrompt: { prompt in
                         await afmClient.syncSystemPrompt(prompt)
+                    }
+                )
+            )
+        case .coreai:
+            let resolved = try CoreAIModelResolver.resolve(modelURL: url)
+            var coreaiSettings = ModelSettings.default(for: .coreai)
+            if let contextLength {
+                coreaiSettings.contextLength = Double(contextLength)
+            }
+            let coreaiClient = CoreAILLMClient(resolved: resolved, settings: coreaiSettings)
+            try await coreaiClient.load()
+            return .llm(
+                AnyLLMClient(
+                    textStream: { input in
+                        try await coreaiClient.textStream(from: input)
+                    },
+                    cancel: nil,
+                    unload: { coreaiClient.unload() },
+                    syncSystemPrompt: { prompt in
+                        await coreaiClient.syncSystemPrompt(prompt)
                     }
                 )
             )

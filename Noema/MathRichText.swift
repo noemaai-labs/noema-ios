@@ -55,16 +55,29 @@ import AppKit
 struct MathRichText: View {
     let source: String
     var bodyFont: Font
+    /// Explicit point size/weight for the macOS AppKit renderer (SwiftUI `Font`
+    /// can't be converted to `NSFont`). Ignored on iOS/visionOS, which use
+    /// `bodyFont` directly.
+    var bodyPointSize: CGFloat
+    var bodyWeight: Font.Weight
     private let blockMathStyle: BlockMathStyle
 
-    init(source: String, bodyFont: Font = .body, blockMathStyle: BlockMathStyle? = nil) {
+#if os(macOS)
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.messageHoverCopySuppression) private var messageHoverCopySuppression
+#endif
+
+    init(source: String, bodyFont: Font = .body, bodyPointSize: CGFloat? = nil,
+         bodyWeight: Font.Weight = .regular, blockMathStyle: BlockMathStyle? = nil) {
         self.source = source
         self.bodyFont = bodyFont
+        self.bodyPointSize = bodyPointSize ?? preferredFontSize(.body)
+        self.bodyWeight = bodyWeight
         self.blockMathStyle = blockMathStyle ?? .standard(bodyFontSize: preferredFontSize(.body))
     }
 
     var body: some View {
-        RichMathTextLabel(source: source, bodyFont: bodyFont, blockMathStyle: blockMathStyle)
+        content
             // VoiceOver was focusing on every tiny fragment because the composed
             // view tree breaks text into many subviews. Combine/override so the
             // whole paragraph is a single readable element.
@@ -72,105 +85,109 @@ struct MathRichText: View {
             .accessibilityLabel(accessibilityString)
     }
 
+    @ViewBuilder
+    private var content: some View {
+#if os(macOS)
+        // One selectable NSTextView per block: continuous drag-selection and
+        // LaTeX-aware copy. EquatableView skips re-renders during ~30 Hz
+        // streaming when the source/style/appearance is unchanged.
+        MacSelectableMathText(
+            source: source,
+            bodyPointSize: bodyPointSize,
+            bodyWeight: macFontWeight(from: bodyWeight),
+            blockMathFontSize: blockMathStyle.fontSize,
+            isDark: colorScheme == .dark,
+            messageHoverCopySuppression: messageHoverCopySuppression
+        )
+        .equatable()
+#else
+        RichMathTextLabel(source: source, bodyFont: bodyFont, blockMathStyle: blockMathStyle)
+            // The streaming message re-renders its whole block list ~30 Hz; the
+            // tokenizer-heavy label only needs to re-run for the block whose text
+            // actually changed. EquatableView lets SwiftUI skip the rest.
+            .equatable()
+#endif
+    }
+
     private var accessibilityString: String {
         // Flatten excessive whitespace so the spoken output is natural.
-        source.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        // (Plain split/join — this runs on every body evaluation, so avoid
+        // spinning up NSRegularExpression per render.)
+        source.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 }
 
-private struct RichMathTextLabel: View {
+private struct RichMathTextLabel: View, Equatable {
     let source: String
     var bodyFont: Font
     let blockMathStyle: BlockMathStyle
 
+    /// Vertical gap between paragraphs/list items inside one rich-text block.
+    /// Gives the conversation a readable rhythm instead of stacked lines.
+    private var paragraphSpacing: CGFloat {
+#if os(macOS)
+        8
+#else
+        6
+#endif
+    }
+
+    /// Reconstruct the legacy `[MathToken]` inline list for the SwiftUI
+    /// `InlineLine` view tree from the shared segmenter tokens.
+    private func legacyTokens(from tokens: [MathRichInlineToken], headingLevel: Int?) -> [MathToken] {
+        var out: [MathToken] = tokens.map { token in
+            switch token {
+            case .text(let s): return .text(s)
+            case .inlineMath(let latex, _): return .inline(latex)
+            }
+        }
+        // Headings never reach this path in practice (the planner strips the
+        // "#"-prefix and renders headings as separate MathRichText views), but
+        // if a literal "# "-prefixed line ever leaks, render it byte-identically
+        // to the pre-segmenter behavior by restoring the marker text.
+        if let level = headingLevel {
+            let prefix = String(repeating: "#", count: level) + " "
+            if case .text(let first)? = out.first {
+                out[0] = .text(prefix + first)
+            } else {
+                out.insert(.text(prefix), at: 0)
+            }
+        }
+        return out
+    }
+
     var body: some View {
-        enum Segment { case inline([MathToken]); case block(String); case incomplete(String) }
-        let tokens = MathTokenizer.tokenize(source)
-        let segments: [Segment] = {
-            var out: [Segment] = []
-            var currentInline: [MathToken] = []
+        let segments = MathRichSegmenter.segments(from: source)
 
-            func flushInline() {
-                if !currentInline.isEmpty {
-                    out.append(.inline(currentInline))
-                    currentInline.removeAll(keepingCapacity: true)
-                }
-            }
-
-            for t in tokens {
-                switch t {
-                case .block(let latex):
-                    flushInline()
-                    out.append(.block(latex))
-
-                case .inline:
-                    currentInline.append(t)
-
-                case .incomplete(let s):
-                    // Flush any inline content first, then record incomplete LaTeX
-                    flushInline()
-                    out.append(.incomplete(s))
-
-                case .text(let s):
-                    if s.isEmpty { continue }
-                    // Treat single newlines as soft spaces so inline math does not
-                    // force awkward line breaks (e.g., when models add stray \n).
-                    // Preserve paragraph breaks only for 2+ consecutive newlines.
-                    let normalized = s.replacingOccurrences(of: "\r\n", with: "\n")
-                    let paragraphs = normalized.components(separatedBy: "\n\n")
-                    for (idx, para) in paragraphs.enumerated() {
-                        let inlinePara = para.replacingOccurrences(of: "\n", with: " ")
-                        if !inlinePara.isEmpty {
-                            let split = MathTokenizer.splitHeuristicInlineLatex(in: inlinePara)
-                            if split.isEmpty {
-                                currentInline.append(.text(inlinePara))
-                            } else {
-                                currentInline.append(contentsOf: split)
-                            }
-                        }
-                        if idx < paragraphs.count - 1 { flushInline() }
-                    }
-                }
-            }
-            flushInline()
-            return out
-        }()
-
-        let view = VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: paragraphSpacing) {
             ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                 switch seg {
-                case .inline(let inlineTokens):
-                    InlineLine(tokens: inlineTokens, bodyFont: bodyFont)
-                case .block(let latex):
-#if os(macOS)
-                    MacLatexHoverCopy(latex: latex) {
-                        BlockMathView(
-                            latex: latex,
-                            fontSize: blockMathStyle.fontSize,
-                            useCache: blockMathStyle.useCache,
-                            widthBehavior: blockMathStyle.widthBehavior
-                        )
+                case .paragraph(let marker, let headingLevel, let tokens):
+                    let inlineTokens = legacyTokens(from: tokens, headingLevel: headingLevel)
+                    if let marker {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(marker)
+                                .font(bodyFont)
+                                .foregroundStyle(.secondary)
+                            InlineLine(tokens: inlineTokens, bodyFont: bodyFont)
+                        }
+                        .padding(.leading, 8)
+                    } else {
+                        InlineLine(tokens: inlineTokens, bodyFont: bodyFont)
                     }
-#else
+                case .block(let latex):
                     BlockMathView(
                         latex: latex,
                         fontSize: blockMathStyle.fontSize,
                         useCache: blockMathStyle.useCache,
                         widthBehavior: blockMathStyle.widthBehavior
                     )
-#endif
                 case .incomplete(let raw):
                     Text(raw)
                         .foregroundStyle(Color.red)
                 }
             }
         }
-
-#if os(macOS)
-        return view.textSelection(.enabled)
-#else
-        return view
-#endif
     }
 }
 
@@ -217,64 +234,17 @@ private struct InlineLine: View {
     }
 }
 
-#if os(macOS)
-private struct MacLatexHoverCopy<Content: View>: View {
-    let latex: String
-    let content: () -> Content
-    @State private var isHovering = false
-    @State private var copied = false
-    @Environment(\.messageHoverCopySuppression) private var messageHoverCopySuppression
-
-    var body: some View {
-        content()
-            .overlay(alignment: .topTrailing) {
-                if isHovering {
-                    Button(action: copyLatexToPasteboard) {
-                        Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 12, weight: .semibold))
-                            .labelStyle(.titleAndIcon)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .foregroundStyle(Color.accentColor)
-                            .background(.thinMaterial, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .padding(6)
-                    .transition(.opacity.combined(with: .scale))
-                    .accessibilityLabel("Copy LaTeX")
-                }
-            }
-            .onHover { hovering in
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    isHovering = hovering
-                }
-                messageHoverCopySuppression?.wrappedValue = hovering
-                if !hovering {
-                    copied = false
-                }
-            }
-    }
-
-    private func copyLatexToPasteboard() {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(latex, forType: .string)
-        withAnimation(.easeInOut(duration: 0.16)) {
-            copied = true
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                copied = false
-            }
-        }
-    }
-}
-#endif
-
 private struct WrappedInline: View {
     let runs: [MathToken]
     let font: Font
     let fontSize: CGFloat
+
+    private enum DisplayRun: Equatable {
+        case text(AttributedString)
+        case inline(String)
+        case block(String)
+        case incomplete(String)
+    }
 
     // Split text into small fragments at whitespace and punctuation boundaries
     // so punctuation isn't glued to words (which can cause unwanted wrapping
@@ -335,31 +305,42 @@ private struct WrappedInline: View {
             lastKind = k
         }
         if !current.isEmpty { frags.append(current) }
-        return frags.flatMap { chunkLongFragment($0) }
+        let chunked = frags.flatMap { chunkLongFragment($0) }
+        var attachedWhitespace: [String] = []
+        for fragment in chunked {
+            if fragment.allSatisfy(\.isWhitespace), !attachedWhitespace.isEmpty {
+                attachedWhitespace[attachedWhitespace.count - 1] += fragment
+            } else {
+                attachedWhitespace.append(fragment)
+            }
+        }
+        return attachedWhitespace
     }
 
-    // Convert to inline-only Markdown attributed fragments while respecting the
-    // same wrapping boundaries as splitFragments.
-    private func splitMarkdownFragments(_ s: String) -> [AttributedString] {
-        guard !s.isEmpty else { return [] }
-        func normalizeInlineSpacing(_ s: String) -> String {
-            // Remove stray spaces before common punctuation the models often emit
-            // (" ," -> ",") so commas don't wrap onto their own lines.
-            var t = s
-            let punct = [",", ".", ";", ":", "!", "?", ")", "]", "}"]
-            // Remove stray spaces before punctuation (" ," -> ",")
-            for p in punct { t = t.replacingOccurrences(of: " " + p, with: p) }
-            // Balance opening brackets spacing: "( " -> "(" when it would start a line
-            t = t.replacingOccurrences(of: "( ", with: "(")
-            t = t.replacingOccurrences(of: "[ ", with: "[")
-            t = t.replacingOccurrences(of: "{ ", with: "{")
-            return t
-        }
+    private func normalizeInlineSpacing(_ s: String) -> String {
+        var t = s
+        let punct = [",", ".", ";", ":", "!", "?", ")", "]", "}"]
+        for p in punct { t = t.replacingOccurrences(of: " " + p, with: p) }
+        t = t.replacingOccurrences(of: "( ", with: "(")
+        t = t.replacingOccurrences(of: "[ ", with: "[")
+        t = t.replacingOccurrences(of: "{ ", with: "{")
+        return t
+    }
+
+    private func attributedMarkdown(_ s: String, isStrong: Bool) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace
         )
         let normalized = normalizeInlineSpacing(s)
-        let attributed = (try? AttributedString(markdown: normalized, options: options)) ?? AttributedString(normalized)
+        var attributed = (try? AttributedString(markdown: normalized, options: options)) ?? AttributedString(normalized)
+        if isStrong {
+            attributed.inlinePresentationIntent = .stronglyEmphasized
+        }
+        return attributed
+    }
+
+    private func splitAttributedFragments(_ attributed: AttributedString) -> [AttributedString] {
+        guard !attributed.characters.isEmpty else { return [] }
         let plain = String(attributed.characters)
         let parts = splitFragments(plain)
         var result: [AttributedString] = []
@@ -373,39 +354,84 @@ private struct WrappedInline: View {
         return result
     }
 
+    private func textDisplayRuns(from text: String, strong: inout Bool) -> [DisplayRun] {
+        guard !text.isEmpty else { return [] }
+        var result: [DisplayRun] = []
+        var buffer = ""
+        var cursor = text.startIndex
+
+        func flushBuffer() {
+            guard !buffer.isEmpty else { return }
+            let attributed = attributedMarkdown(buffer, isStrong: strong)
+            result.append(contentsOf: splitAttributedFragments(attributed).map(DisplayRun.text))
+            buffer.removeAll(keepingCapacity: true)
+        }
+
+        while cursor < text.endIndex {
+            if text[cursor...].hasPrefix("**") {
+                flushBuffer()
+                strong.toggle()
+                cursor = text.index(cursor, offsetBy: 2)
+            } else {
+                buffer.append(text[cursor])
+                cursor = text.index(after: cursor)
+            }
+        }
+        flushBuffer()
+        return result
+    }
+
+    private func displayRuns() -> [DisplayRun] {
+        var result: [DisplayRun] = []
+        var strong = false
+
+        for token in runs {
+            switch token {
+            case .text(let s):
+                result.append(contentsOf: textDisplayRuns(from: s, strong: &strong))
+            case .inline(let latex):
+                result.append(.inline(latex))
+            case .block(let latex):
+                result.append(.block(latex))
+            case .incomplete(let raw):
+                result.append(.incomplete(raw))
+            }
+        }
+
+        return result
+    }
+
     var body: some View {
         // Wrap inline elements so math spans don't force a single ultra-wide line.
-        // Zero spacing so inline math does not insert visual gaps between
-        // adjacent text segments.
-        InlineWrap(spacing: 0, lineSpacing: 0) {
-            ForEach(Array(runs.enumerated()), id: \.offset) { _, token in
-                switch token {
-                case .text(let s):
-                    if !s.isEmpty {
-                        let parts = splitMarkdownFragments(s)
-#if os(macOS)
-                        let combined = parts.reduce(into: AttributedString()) { $0 += $1 }
-                        if !combined.characters.isEmpty {
-                            Text(combined)
-                                .multilineTextAlignment(.leading)
-                        }
-#else
-                        ForEach(Array(parts.enumerated()), id: \.offset) { _, frag in
-                            Text(frag)
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: true)
-                        }
-#endif
+        // Zero horizontal spacing so inline math does not insert visual gaps
+        // between adjacent text segments; a few points of line spacing give
+        // wrapped paragraphs a comfortable reading rhythm.
+        let displayRuns = displayRuns()
+        InlineWrap(spacing: 0, lineSpacing: 3.5) {
+            ForEach(Array(displayRuns.enumerated()), id: \.offset) { _, run in
+                Group {
+                    switch run {
+                    case .text(let text):
+                        Text(text)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: true)
+                    case .inline(let latex):
+                        InlineMathView(latex: latex, fontSize: fontSize)
+                    case .block(let latex):
+                        // Should not appear here; render inline-sized just in case.
+                        InlineMathView(latex: latex, fontSize: fontSize)
+                    case .incomplete(let raw):
+                        Text(raw)
+                            .foregroundStyle(Color.red)
                     }
-                case .inline(let latex):
-                    InlineMathView(latex: latex, fontSize: fontSize)
-                case .block(let latex):
-                    // Should not appear here; render inline-sized just in case.
-                    InlineMathView(latex: latex, fontSize: fontSize)
-                case .incomplete(let raw):
-                    Text(raw)
-                        .foregroundStyle(Color.red)
                 }
+                // Streaming polish: appended fragments are *inserted* views
+                // (stable offsets for the prefix), so they fade in whenever the
+                // update runs inside an animated transaction — which only the
+                // live streaming bubble provides (see ActiveStreamingMessageView).
+                // Static messages render without a transaction: zero cost.
+                // Removal is identity so re-splits never leave fading ghosts.
+                .transition(.asymmetric(insertion: .opacity, removal: .identity))
             }
         }
         // Apply base font to the container so inline Markdown keeps its

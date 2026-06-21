@@ -1,3 +1,5 @@
 /* Auto-generated localization file for Info.plist */
+"NSMicrophoneUsageDescription" = "Noema को ऑडियो रिकॉर्ड करने की अनुमति दें ताकि उपलब्ध होने पर इसे स्थानीय रूप से ट्रांसक्राइब किया जा सके।";
+"NSSpeechRecognitionUsageDescription" = "Noema को ऑडियो और वीडियो अनुलग्नकों को पाठ में स्थानांतरित करने की अनुमति दें।";
 "NSBluetoothAlwaysUsageDescription" = "नोएमा आपके अन्य उपकरणों के साथ रिले सेटअप विवरण साझा करने के लिए ब्लूटूथ का उपयोग करता है।";
 "NSBluetoothPeripheralUsageDescription" = "नोएमा आपके अन्य उपकरणों के साथ रिले सेटअप विवरण साझा करने के लिए ब्लूटूथ का उपयोग करता है।";

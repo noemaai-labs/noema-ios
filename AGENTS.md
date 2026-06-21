@@ -45,6 +45,7 @@ RelayKit’s CloudKit bridge allows the app or companion services to write and p
 - All new UI strings (titles, headings, menus, buttons, alerts, tooltips, section labels) must be added to `Localizable.strings` for every supported language.
 - Use `LocalizedStringKey` (e.g., `Text("Some Key")`) instead of hard-coded literals so translations apply automatically.
 - Ensure new features honor the in-app language override in Settings and default to the system language on first launch.
+- Do not add sentence-style explanatory text under obvious settings. Keep inline explanations only for vague or risky controls, and put longer descriptions behind a question-mark help affordance.
 
 ## Additional assets
 - Xcode project files (`Noema.xcodeproj`, `Info.plist` variants) configure iOS, visionOS, and widget targets plus entitlements required for local networking, downloads, and potential relay services.

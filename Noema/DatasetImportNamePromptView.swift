@@ -5,6 +5,7 @@ struct DatasetImportNamePromptView: View {
     let onCancel: () -> Void
     let onImport: () async -> Void
 
+    @EnvironmentObject private var datasetManager: DatasetManager
     @FocusState private var isNameFocused: Bool
 
     var body: some View {
@@ -19,6 +20,28 @@ struct DatasetImportNamePromptView: View {
 #endif
                 } header: {
                     Text(LocalizedStringKey("Name your dataset"))
+                }
+                if !datasetManager.mediaImportProgressItems.isEmpty {
+                    Section {
+                        ForEach(datasetManager.mediaImportProgressItems) { item in
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: mediaImportIconName(for: item.state))
+                                    .foregroundStyle(mediaImportColor(for: item.state))
+                                    .frame(width: 18)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.filename)
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(nil)
+                                    Text(mediaImportStatusText(for: item.state))
+                                        .font(.caption2)
+                                        .foregroundStyle(mediaImportColor(for: item.state))
+                                        .lineLimit(nil)
+                                }
+                            }
+                        }
+                    } header: {
+                        Text(LocalizedStringKey("Media transcription progress"))
+                    }
                 }
             }
             .navigationTitle(LocalizedStringKey("Import Dataset"))
@@ -42,6 +65,33 @@ struct DatasetImportNamePromptView: View {
                     isNameFocused = true
                 }
             }
+        }
+    }
+
+    private func mediaImportIconName(for state: DatasetManager.MediaImportProgressState) -> String {
+        switch state {
+        case .pending: return "clock"
+        case .transcribing: return "waveform"
+        case .succeeded: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.circle.fill"
+        }
+    }
+
+    private func mediaImportColor(for state: DatasetManager.MediaImportProgressState) -> Color {
+        switch state {
+        case .pending: return .secondary
+        case .transcribing: return .accentColor
+        case .succeeded: return .green
+        case .failed: return .red
+        }
+    }
+
+    private func mediaImportStatusText(for state: DatasetManager.MediaImportProgressState) -> LocalizedStringKey {
+        switch state {
+        case .pending: return "Waiting"
+        case .transcribing: return "Transcribing"
+        case .succeeded: return "Imported"
+        case .failed: return "Failed"
         }
     }
 }

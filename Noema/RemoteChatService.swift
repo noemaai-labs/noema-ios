@@ -314,6 +314,12 @@ actor RemoteChatService {
         if let temperature = options.temperature {
             params["temperature"] = String(temperature)
         }
+        if let topP = options.topP {
+            params["top_p"] = String(topP)
+        }
+        if let topK = options.topK {
+            params["top_k"] = String(topK)
+        }
         if !options.stops.isEmpty {
             params["stop"] = options.stops.joined(separator: ",")
         }
@@ -515,16 +521,15 @@ actor RemoteChatService {
                     parameters["clientSSID"] = ssid
                 }
             }
-            let envelope = try await relayOutbox.sendAndAwaitReply(
+            _ = try await relayOutbox.sendAndStreamReply(
                 containerID: containerID,
                 conversationID: conversationID,
                 history: history,
-                parameters: parameters
+                parameters: parameters,
+                onDelta: { delta in
+                    _ = continuation.yield(delta)
+                }
             )
-            if let assistant = envelope.messages.last(where: { $0.role.lowercased() == "assistant" }) {
-                let output = assistant.fullText ?? assistant.text
-                _ = continuation.yield(output)
-            }
             continuation.finish()
         } catch {
             continuation.finish(throwing: error)

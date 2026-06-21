@@ -25,7 +25,7 @@ struct RelayServerApp: App {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, @preconcurrency NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { await startRelay() }
     }
@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String : Any]) {
-        Task { await CloudKitRelay.shared.handleRemoteNotification(userInfo) }
+        Task { await CloudKitRelay.shared.handleRemoteNotification() }
     }
 }
 #endif

@@ -29,6 +29,7 @@ enum DownloadPersistencePaths {
 
 enum DownloadJobState: String, Codable, CaseIterable, Sendable {
     case queued
+    case scheduled
     case preparing
     case downloading
     case paused
@@ -60,11 +61,14 @@ enum DownloadArtifactRole: String, Codable, CaseIterable, Sendable {
     case weightShard
     case projector
     case importanceMatrix
+    case mtp
+    case modelSidecar
     case leapBundle
     case leapManifest
     case leapManifestAsset
     case datasetFile
     case embeddingModel
+    case whisperModel
 }
 
 struct ModelDownloadOwner: Codable, Hashable, Sendable {
@@ -80,8 +84,78 @@ struct DatasetDownloadOwner: Codable, Hashable, Sendable {
     let detail: DatasetDetails
 }
 
-struct EmbeddingDownloadOwner: Codable, Hashable, Sendable {
+struct EmbeddingDownloadOwner: Hashable, Sendable {
+    let recordID: String?
+    let artifactID: String?
     let repoID: String
+    let filename: String?
+
+    init(repoID: String) {
+        self.recordID = nil
+        self.artifactID = nil
+        self.repoID = repoID
+        self.filename = nil
+    }
+
+    init(record: EmbeddingModelRecord, artifact: EmbeddingModelArtifact) {
+        self.recordID = record.id
+        self.artifactID = artifact.id
+        self.repoID = artifact.repoID
+        self.filename = artifact.filename
+    }
+}
+
+extension EmbeddingDownloadOwner: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case recordID
+        case artifactID
+        case repoID
+        case filename
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        recordID = try container.decodeIfPresent(String.self, forKey: .recordID)
+        artifactID = try container.decodeIfPresent(String.self, forKey: .artifactID)
+        repoID = try container.decode(String.self, forKey: .repoID)
+        filename = try container.decodeIfPresent(String.self, forKey: .filename)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(recordID, forKey: .recordID)
+        try container.encodeIfPresent(artifactID, forKey: .artifactID)
+        try container.encode(repoID, forKey: .repoID)
+        try container.encodeIfPresent(filename, forKey: .filename)
+    }
+
+    var externalID: String {
+        recordID ?? repoID
+    }
+}
+
+struct WhisperDownloadOwner: Codable, Hashable, Sendable {
+    let recordID: String
+    let artifactID: String
+    let runtimeRawValue: String
+    let repoID: String
+    let resourcePath: String
+
+    init(record: WhisperModelRecord, artifact: WhisperArtifact) {
+        self.recordID = record.id
+        self.artifactID = artifact.id
+        self.runtimeRawValue = artifact.runtime.rawValue
+        self.repoID = artifact.repoID
+        self.resourcePath = artifact.resourcePath
+    }
+
+    var runtime: WhisperRuntimeFormat {
+        WhisperRuntimeFormat(rawValue: runtimeRawValue) ?? .ggml
+    }
+
+    var externalID: String {
+        "whisper:\(runtimeRawValue):\(recordID)"
+    }
 }
 
 enum DownloadOwner: Hashable, Sendable {
@@ -89,6 +163,7 @@ enum DownloadOwner: Hashable, Sendable {
     case leap(LeapDownloadOwner)
     case dataset(DatasetDownloadOwner)
     case embedding(EmbeddingDownloadOwner)
+    case whisper(WhisperDownloadOwner)
 }
 
 extension DownloadOwner: Codable {
@@ -98,6 +173,7 @@ extension DownloadOwner: Codable {
         case leap
         case dataset
         case embedding
+        case whisper
     }
 
     private enum Kind: String, Codable {
@@ -105,6 +181,7 @@ extension DownloadOwner: Codable {
         case leap
         case dataset
         case embedding
+        case whisper
     }
 
     init(from decoder: Decoder) throws {
@@ -119,6 +196,8 @@ extension DownloadOwner: Codable {
             self = .dataset(try container.decode(DatasetDownloadOwner.self, forKey: .dataset))
         case .embedding:
             self = .embedding(try container.decode(EmbeddingDownloadOwner.self, forKey: .embedding))
+        case .whisper:
+            self = .whisper(try container.decode(WhisperDownloadOwner.self, forKey: .whisper))
         }
     }
 
@@ -137,6 +216,9 @@ extension DownloadOwner: Codable {
         case .embedding(let owner):
             try container.encode(Kind.embedding, forKey: .kind)
             try container.encode(owner, forKey: .embedding)
+        case .whisper(let owner):
+            try container.encode(Kind.whisper, forKey: .kind)
+            try container.encode(owner, forKey: .whisper)
         }
     }
 }
@@ -151,7 +233,9 @@ extension DownloadOwner {
         case .dataset(let owner):
             return owner.detail.id
         case .embedding(let owner):
-            return owner.repoID
+            return owner.externalID
+        case .whisper(let owner):
+            return owner.externalID
         }
     }
 }
@@ -315,12 +399,14 @@ struct DownloadJob: Identifiable, Codable, Hashable, Sendable {
     }
 
     var canPause: Bool {
+        if state == .scheduled { return false }
         if manualPause { return false }
         return artifacts.contains(where: \.canPause)
     }
 
     var canResume: Bool {
-        manualPause || artifacts.contains(where: \.canResume)
+        if state == .scheduled { return true }
+        return manualPause || artifacts.contains(where: \.canResume)
     }
 }
 
@@ -329,7 +415,7 @@ extension DownloadJobState {
         switch self {
         case .downloading, .waitingForConnectivity, .retrying, .verifying, .finalizing:
             return true
-        case .queued, .preparing, .paused, .completed, .failed, .cancelled:
+        case .queued, .scheduled, .preparing, .paused, .completed, .failed, .cancelled:
             return false
         }
     }
@@ -338,6 +424,8 @@ extension DownloadJobState {
         switch self {
         case .queued:
             return "Download Status Queued"
+        case .scheduled:
+            return "Download Status Scheduled"
         case .preparing:
             return "Download Status Preparing"
         case .downloading:
@@ -445,10 +533,24 @@ actor DownloadEngine {
                         manualPause: Bool? = nil,
                         errorMessage: String? = nil) async {
         guard var job = job(forExternalID: externalID) else { return }
+        // A cancelled job is awaiting removal; late pause/fail events from torn-down
+        // transfers must not revive it.
+        if job.state == .cancelled && state != .cancelled { return }
         job.state = state
         if let manualPause { job.manualPause = manualPause }
         if let errorMessage { job.lastErrorDescription = errorMessage }
         job.updatedAt = Date()
+        jobs[job.id] = job
+        persistQueue()
+        await notifyChanged()
+    }
+
+    func upsertArtifacts(externalID: String, artifacts incoming: [DownloadArtifact]) async {
+        guard var job = job(forExternalID: externalID), !incoming.isEmpty else { return }
+        if job.state == .cancelled { return }
+        job.artifacts = mergeArtifacts(existing: job.artifacts, incoming: incoming)
+        job.updatedAt = Date()
+        recalculateJobState(&job, preferredState: nil)
         jobs[job.id] = job
         persistQueue()
         await notifyChanged()
@@ -465,6 +567,7 @@ actor DownloadEngine {
                              manualPause: Bool? = nil) async {
         guard var job = job(forExternalID: externalID),
               let index = job.artifacts.firstIndex(where: { $0.id == artifactID }) else { return }
+        if job.state == .cancelled && state != .cancelled { return }
         if let downloadedBytes { job.artifacts[index].downloadedBytes = max(0, downloadedBytes) }
         if let expectedBytes, expectedBytes > 0 { job.artifacts[index].expectedBytes = expectedBytes }
         if let retryCount { job.artifacts[index].retryCount = retryCount }
@@ -498,6 +601,7 @@ actor DownloadEngine {
                                finalBytes: Int64? = nil) async {
         guard var job = job(forExternalID: externalID),
               let index = job.artifacts.firstIndex(where: { $0.id == artifactID }) else { return }
+        if job.state == .cancelled { return }
         if let finalBytes {
             job.artifacts[index].downloadedBytes = max(job.artifacts[index].downloadedBytes, finalBytes)
             job.artifacts[index].expectedBytes = max(job.artifacts[index].expectedBytes ?? 0, finalBytes)
@@ -508,6 +612,22 @@ actor DownloadEngine {
         job.artifacts[index].nextRetryAt = nil
         job.updatedAt = Date()
         recalculateJobState(&job, preferredState: nil)
+        jobs[job.id] = job
+        persistQueue()
+        await notifyChanged()
+    }
+
+    /// Resets an artifact's byte count downward after a transfer verifiably restarted from
+    /// scratch (the server rejected or ignored a resume). Progress updates are otherwise
+    /// monotonic, so without this the stale larger count freezes the visible progress
+    /// until the new transfer catches up.
+    func resetArtifactProgress(jobID: String, artifactID: String, downloadedBytes: Int64 = 0) async {
+        guard var job = jobs[jobID],
+              let index = job.artifacts.firstIndex(where: { $0.id == artifactID }) else { return }
+        if job.state == .cancelled { return }
+        if job.artifacts[index].state == .completed { return }
+        job.artifacts[index].downloadedBytes = max(0, downloadedBytes)
+        job.updatedAt = Date()
         jobs[job.id] = job
         persistQueue()
         await notifyChanged()
@@ -538,10 +658,23 @@ actor DownloadEngine {
         await notifyChanged()
     }
 
+    /// Removes the job only while it is still marked cancelled. A restart of the same
+    /// download re-upserts the job with a fresh state; teardown must not delete that.
+    func removeJobIfCancelled(externalID: String) async {
+        guard let job = job(forExternalID: externalID), job.state == .cancelled else { return }
+        await removeJob(externalID: externalID)
+    }
+
     func autoResumableJobs() -> [DownloadJob] {
         jobs.values
             .filter { !$0.manualPause && $0.state.autoResumeEligible }
             .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func scheduledJobs() -> [DownloadJob] {
+        jobs.values
+            .filter { $0.state == .scheduled }
+            .sorted { $0.updatedAt < $1.updatedAt }
     }
 
     private func mergeArtifacts(existing: [DownloadArtifact], incoming: [DownloadArtifact]) -> [DownloadArtifact] {
@@ -587,7 +720,10 @@ actor DownloadEngine {
             return
         }
         if job.manualPause || job.artifacts.contains(where: { $0.state == .paused }) {
-            job.state = .paused
+            // Scheduled jobs pause their live transfers; keep them visibly scheduled.
+            if job.state != .scheduled {
+                job.state = .paused
+            }
             return
         }
         if job.artifacts.contains(where: { $0.state == .failed }) {
@@ -646,15 +782,23 @@ actor DownloadEngine {
                                                 notify: Bool) async {
         guard var job = job(forExternalID: externalID),
               let index = job.artifacts.firstIndex(where: { $0.id == artifactID }) else { return }
+        if job.state == .cancelled { return }
         job.artifacts[index].downloadedBytes = max(job.artifacts[index].downloadedBytes, written)
         if let expected, expected > 0 {
             job.artifacts[index].expectedBytes = max(job.artifacts[index].expectedBytes ?? 0, expected)
         }
-        if job.artifacts[index].state != .completed {
-            job.artifacts[index].state = .downloading
+        // Trailing bytes from a transfer that is being paused must not undo the user's
+        // pause (or a scheduled hold): record the progress but keep the held state.
+        let holdState = job.manualPause || job.state == .scheduled
+        if !holdState {
+            if job.artifacts[index].state != .completed {
+                job.artifacts[index].state = .downloading
+            }
         }
         job.updatedAt = Date()
-        recalculateJobState(&job, preferredState: .downloading)
+        if !holdState {
+            recalculateJobState(&job, preferredState: .downloading)
+        }
         jobs[job.id] = job
         if persistNow {
             persistQueue()
@@ -681,21 +825,28 @@ actor DownloadEngine {
     }
 
     private func migrateRecoveredJobsIfNeeded() async {
-        let key = "download-engine-orphan-migration-v1"
+        let key = "download-engine-orphan-migration-v2"
         guard !UserDefaults.standard.bool(forKey: key) else { return }
         defer { UserDefaults.standard.set(true, forKey: key) }
 
-        let embedDownloadURL = EmbeddingModel.modelURL.appendingPathExtension("download")
-        let embedRepoID = "nomic-ai/nomic-embed-text-v1.5-GGUF"
-        if fm.fileExists(atPath: embedDownloadURL.path), job(forExternalID: embedRepoID) == nil {
-            let artifact = DownloadArtifact(
+        for record in EmbeddingModelCatalog.records where record.isInstallable {
+            guard let embeddingArtifact = record.primaryArtifact else { continue }
+            let stagedURL = embeddingArtifact.localURL(recordID: record.id).appendingPathExtension("download")
+            guard fm.fileExists(atPath: stagedURL.path),
+                  job(forExternalID: record.id) == nil,
+                  job(forExternalID: embeddingArtifact.repoID) == nil else {
+                continue
+            }
+
+            let existingBytes = downloadEngineFileSize(at: stagedURL)
+            let recoveredArtifact = DownloadArtifact(
                 id: "embedding",
                 role: .embeddingModel,
-                remoteURL: URL(string: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf?download=1"),
-                stagingURL: embedDownloadURL,
-                finalURL: EmbeddingModel.modelURL,
-                expectedBytes: downloadEngineFileSize(at: embedDownloadURL),
-                downloadedBytes: downloadEngineFileSize(at: embedDownloadURL) ?? 0,
+                remoteURL: embeddingArtifact.downloadURL,
+                stagingURL: stagedURL,
+                finalURL: embeddingArtifact.localURL(recordID: record.id),
+                expectedBytes: existingBytes,
+                downloadedBytes: existingBytes ?? 0,
                 checksum: nil,
                 state: .paused,
                 retryCount: 0,
@@ -704,11 +855,11 @@ actor DownloadEngine {
                 manualPause: true
             )
             _ = await upsertJob(
-                owner: .embedding(EmbeddingDownloadOwner(repoID: embedRepoID)),
-                artifacts: [artifact],
+                owner: .embedding(EmbeddingDownloadOwner(record: record, artifact: embeddingArtifact)),
+                artifacts: [recoveredArtifact],
                 state: .paused
             )
-            await logger.log("[DownloadEngine] recovered orphan embedding partial")
+            await logger.log("[DownloadEngine] recovered orphan embedding partial for \(record.id)")
         }
     }
 

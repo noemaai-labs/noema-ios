@@ -28,6 +28,21 @@ struct LocalModel: Identifiable, Hashable {
     var isFavourite: Bool = false
     var totalLayers: Int
     var moeInfo: MoEInfo? = nil
+    var alias: String? = nil
+}
+
+extension LocalModel {
+    var displayName: String {
+        if let alias = alias?.trimmingCharacters(in: .whitespacesAndNewlines), !alias.isEmpty {
+            return alias
+        }
+        if quant.isEmpty {
+            return name
+        }
+        return name
+            .replacingOccurrences(of: "-\(quant)", with: "")
+            .replacingOccurrences(of: ".\(quant)", with: "")
+    }
 }
 
 #if canImport(UIKit)
@@ -46,7 +61,7 @@ struct ModelSelectorView: View {
                 Group {
                     if let loaded = modelManager.loadedModel {
                         HStack {
-                            Text(loaded.name)
+                            Text(loaded.displayName)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(12)
                                 .background(Color(uiColor: .systemGray6))
@@ -427,6 +442,9 @@ struct ModelListView: View {
                 case .afm:
                     loadURL = InstalledModelsStore.baseDir(for: .afm, modelID: model.modelID)
                     try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
+                case .coreai:
+                    loadURL = InstalledModelsStore.baseDir(for: .coreai, modelID: model.modelID)
+                    try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
                 }
 
 #if DEBUG
@@ -529,7 +547,12 @@ struct ModelDetailView: View {
 extension LocalModel {
     static func loadInstalled(store: InstalledModelsStore) -> [LocalModel] {
         let favs = Set(UserDefaults.standard.array(forKey: "favouriteModels") as? [String] ?? [])
-        return store.all().map { item in
+        return store.all()
+            // Hide CoreAI installs from users below iOS/macOS/visionOS 27, where the
+            // runtime can't load them. This is the single source for Stored, every
+            // model selector, and App Intents.
+            .filter { ModelFormat.isCoreAIRuntimeAvailable || $0.format != .coreai }
+            .map { item in
             var layers = item.totalLayers
             if layers == 0 && item.format == .gguf {
                 layers = ModelScanner.layerCount(for: item.url, format: .gguf)
@@ -567,7 +590,8 @@ extension LocalModel {
                 lastUsedDate: item.lastUsed,
                 isFavourite: favs.contains(item.url.path),
                 totalLayers: layers,
-                moeInfo: item.moeInfo
+                moeInfo: item.moeInfo,
+                alias: item.alias
 
             )
         }
@@ -646,6 +670,11 @@ extension LocalModel {
             display = "Apple Foundation"
             scanSource = "afm-system"
             rawArchitecture = "afm"
+        case .coreai:
+            family = "coreai"
+            display = "Core AI"
+            scanSource = "coreai"
+            rawArchitecture = "coreai"
         case .et, .ane:
             break
         }

@@ -68,4 +68,27 @@ final class DatasetIndexingPresentationTests: XCTestCase {
         XCTAssertEqual(String(localized: "Checking embedding model…", locale: englishLocale), "Checking embedding model…")
         XCTAssertEqual(String(localized: "Ready for use", locale: englishLocale), "Ready for use")
     }
+
+    func testEnglishFirstEmbedWarmupLocalizationKeysResolve() {
+        XCTAssertEqual(String(localized: "Preparing Embedding Model", locale: englishLocale), "Preparing Embedding Model")
+        XCTAssertEqual(String(localized: "First-time download from HuggingFace", locale: englishLocale), "First-time download from HuggingFace")
+        XCTAssertEqual(String(localized: "Downloading embedding model…", locale: englishLocale), "Downloading embedding model…")
+        XCTAssertEqual(String(localized: "Warming up embedding model…", locale: englishLocale), "Warming up embedding model…")
+        XCTAssertEqual(String(localized: "Priming first embedding pass…", locale: englishLocale), "Priming first embedding pass…")
+        XCTAssertEqual(
+            String.localizedStringWithFormat(
+                String(localized: "Embedding chunk %d of %d…", locale: englishLocale),
+                2,
+                8
+            ),
+            "Embedding chunk 2 of 8…"
+        )
+        XCTAssertEqual(
+            String(
+                localized: "Ready to compute embeddings. Tap Confirm to start. For best performance, plug in your device.",
+                locale: englishLocale
+            ),
+            "Ready to compute embeddings. Tap Confirm to start. For best performance, plug in your device."
+        )
+    }
 }

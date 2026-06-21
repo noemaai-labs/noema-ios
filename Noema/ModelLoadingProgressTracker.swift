@@ -169,6 +169,9 @@ final class ModelLoadingProgressTracker: ObservableObject {
         case .afm:
             tau = 8.0
             cap = 0.35
+        case .coreai:
+            tau = 8.0
+            cap = 0.35
         }
         let t = max(0, elapsed)
         return min(cap, cap * (1 - exp(-t / tau)))

@@ -2,7 +2,7 @@
 import Foundation
 
 enum GGUFMetadata {
-    static func architectureInfo(at url: URL) -> (architecture: String, name: String?)? {
+    fileprivate static func computeArchitectureInfo(at url: URL) -> (architecture: String, name: String?)? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
 
@@ -146,7 +146,7 @@ enum GGUFMetadata {
         return (architecture, name)
     }
 
-    static func layerCount(at url: URL) -> Int? {
+    fileprivate static func computeLayerCount(at url: URL) -> Int? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
 
@@ -232,7 +232,7 @@ enum GGUFMetadata {
         return nil
     }
 
-    static func contextLength(at url: URL) -> Int? {
+    fileprivate static func computeContextLength(at url: URL) -> Int? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
         func readU32() -> UInt32? {
@@ -307,7 +307,7 @@ enum GGUFMetadata {
         return nil
     }
 
-    static func moeInfo(at url: URL) -> MoEInfo? {
+    fileprivate static func computeMoeInfo(at url: URL) -> MoEInfo? {
         var target = url
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: target.path, isDirectory: &isDir), isDir.boolValue {
@@ -675,7 +675,7 @@ enum GGUFMetadata {
         )
     }
 
-    static func chatTemplate(at url: URL) -> String? {
+    fileprivate static func computeChatTemplate(at url: URL) -> String? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
 
@@ -750,7 +750,7 @@ enum GGUFMetadata {
     }
 
     /// Scan GGUF header/kv for tool-related markers (chat_template hints or added tokens)
-    static func suggestsTools(at url: URL) -> Bool {
+    fileprivate static func computeSuggestsTools(at url: URL) -> Bool {
         // Attempt to read a limited header where GGUF metadata lives for speed
         let maxScanBytes = 8 * 1024 * 1024 // 8 MB
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
@@ -781,7 +781,7 @@ enum GGUFMetadata {
 
     /// Heuristic detection for vision-capable GGUF models.
     /// Scans the header/kv section for vision-related keys to avoid loading the entire file.
-    static func isVisionLikely(at url: URL) -> Bool {
+    fileprivate static func computeIsVisionLikely(at url: URL) -> Bool {
         // Attempt to read only the first few megabytes where GGUF metadata resides
         let maxScanBytes = 8 * 1024 * 1024 // 8 MB
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
@@ -804,7 +804,7 @@ enum GGUFMetadata {
     /// Stronger check for merged vision models: verify projector-related metadata/tensors exist.
     /// Returns true only when the GGUF contains definitive projector indicators such as
     /// keys like `llava.projector_type`, or tensor/kv names containing `mmproj`, `mm_projector`, or `vision_tower`.
-    static func hasMultimodalProjector(at url: URL) -> Bool {
+    fileprivate static func computeHasMultimodalProjector(at url: URL) -> Bool {
         // Read the first chunk where GGUF header + kvs live
         let maxScanBytes = 16 * 1024 * 1024 // 16 MB
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
@@ -907,5 +907,304 @@ enum GGUFMetadata {
             }
         }
         return false
+    }
+
+    fileprivate static func computeHasMTP(at url: URL) -> Bool {
+        let maxScanBytes = 16 * 1024 * 1024
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: maxScanBytes), head.count > 0 else { return false }
+
+        var data = head
+        var offset = 0
+
+        func ensureCapacity(_ length: Int) -> Bool {
+            if length < 0 { return false }
+            return offset <= data.count - length
+        }
+
+        func skipBytes(_ length: Int) -> Bool {
+            guard ensureCapacity(length) else { return false }
+            offset += length
+            return true
+        }
+
+        func readU32() -> UInt32? {
+            guard ensureCapacity(4) else { return nil }
+            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            offset += 4
+            return UInt32(littleEndian: value)
+        }
+
+        func readU64() -> UInt64? {
+            guard ensureCapacity(8) else { return nil }
+            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            offset += 8
+            return UInt64(littleEndian: value)
+        }
+
+        func readI32() -> Int32? {
+            guard let raw = readU32() else { return nil }
+            return Int32(bitPattern: raw)
+        }
+
+        func readI64() -> Int64? {
+            guard let raw = readU64() else { return nil }
+            return Int64(bitPattern: raw)
+        }
+
+        func readString(len: Int) -> String? {
+            guard ensureCapacity(len) else { return nil }
+            let sub = data.subdata(in: offset..<offset+len)
+            offset += len
+            return String(data: sub, encoding: .utf8)
+        }
+
+        func readScalarInteger(ofType type: UInt32) -> Int64? {
+            switch type {
+            case 0: // uint8
+                guard ensureCapacity(1) else { return nil }
+                let value = Int64(data[offset])
+                offset += 1
+                return value
+            case 1: // int8
+                guard ensureCapacity(1) else { return nil }
+                let value = Int64(Int8(bitPattern: data[offset]))
+                offset += 1
+                return value
+            case 2: // uint16
+                guard ensureCapacity(2) else { return nil }
+                let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
+                offset += 2
+                return Int64(UInt16(littleEndian: value))
+            case 3: // int16
+                guard ensureCapacity(2) else { return nil }
+                let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
+                offset += 2
+                return Int64(Int16(bitPattern: UInt16(littleEndian: value)))
+            case 4: // uint32
+                return readU32().map(Int64.init)
+            case 5: // int32
+                return readI32().map(Int64.init)
+            case 10: // uint64
+                guard let value = readU64(), value <= UInt64(Int64.max) else { return nil }
+                return Int64(value)
+            case 11: // int64
+                return readI64()
+            default:
+                return nil
+            }
+        }
+
+        func skipScalar(ofType type: UInt32) -> Bool {
+            let size: Int
+            switch type {
+            case 0, 1, 7: size = 1
+            case 2, 3: size = 2
+            case 4, 5, 6: size = 4
+            case 10, 11, 12: size = 8
+            default: size = 0
+            }
+            guard size > 0 else { return false }
+            return skipBytes(size)
+        }
+
+        func skipArray(elementType: UInt32, count: UInt64) -> Bool {
+            if elementType == 8 {
+                guard count <= UInt64(Int.max) else { return false }
+                for _ in 0..<Int(count) {
+                    guard let len = readU64().map(Int.init), skipBytes(len) else { return false }
+                }
+                return true
+            }
+
+            let elementSize: Int
+            switch elementType {
+            case 0, 1, 7: elementSize = 1
+            case 2, 3: elementSize = 2
+            case 4, 5, 6: elementSize = 4
+            case 10, 11, 12: elementSize = 8
+            default: elementSize = 0
+            }
+            guard elementSize > 0 else { return false }
+            let maxElements = UInt64(Int.max) / UInt64(elementSize)
+            guard count <= maxElements else { return false }
+            return skipBytes(Int(count) * elementSize)
+        }
+
+        func skipValue(ofType type: UInt32) -> Bool {
+            switch type {
+            case 8:
+                guard let len = readU64().map(Int.init) else { return false }
+                return skipBytes(len)
+            case 9:
+                guard let elemType = readU32(), let count = readU64() else { return false }
+                return skipArray(elementType: elemType, count: count)
+            default:
+                return skipScalar(ofType: type)
+            }
+        }
+
+        func isMTPMetadataKey(_ key: String) -> Bool {
+            let lower = key.lowercased()
+            return lower == "nextn_predict_layers" || lower.hasSuffix(".nextn_predict_layers")
+        }
+
+        func isMTPTensorName(_ name: String) -> Bool {
+            let lower = name.lowercased()
+            return lower.contains(".nextn.")
+                || lower.contains("nextn.eh_proj")
+                || lower.contains("nextn.enorm")
+                || lower.contains("nextn.hnorm")
+                || lower.contains("nextn.embed_tokens")
+                || lower.contains("nextn.shared_head")
+        }
+
+        guard let magic = readString(len: 4), magic == "GGUF" else { return false }
+        guard readU32() != nil else { return false }
+        guard let tensorCount = readU64(), let kvCount = readU64() else { return false }
+
+        for _ in 0..<kvCount {
+            guard let keyLen = readU64().map(Int.init),
+                  let key = readString(len: keyLen),
+                  let type = readU32() else {
+                return false
+            }
+
+            if isMTPMetadataKey(key) {
+                if let value = readScalarInteger(ofType: type) {
+                    if value > 0 { return true }
+                    continue
+                }
+                guard skipValue(ofType: type) else { return false }
+                continue
+            }
+
+            guard skipValue(ofType: type) else { return false }
+        }
+
+        guard tensorCount <= UInt64(Int.max) else { return false }
+        for _ in 0..<Int(tensorCount) {
+            guard let nameLen = readU64().map(Int.init),
+                  let name = readString(len: nameLen),
+                  let dimensions = readU32() else {
+                return false
+            }
+            if isMTPTensorName(name) {
+                return true
+            }
+            guard dimensions <= 4 else { return false }
+            for _ in 0..<dimensions {
+                guard readU64() != nil else { return false }
+            }
+            guard readU32() != nil, readU64() != nil else { return false }
+        }
+
+        return false
+    }
+}
+
+// MARK: - Per-file memoization
+//
+// GGUF metadata is immutable for a given file, so the (relatively expensive)
+// parse results are cached by (path, size, modification date). This avoids
+// re-mmapping multi-GB model files on every call — e.g. when the Settings
+// summary cards recompute their counts. Safe to call off the main thread.
+extension GGUFMetadata {
+    private final class Box<T> {
+        let value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    private struct CacheKey: Hashable {
+        let fn: String
+        let path: String
+        let size: Int64
+        let mtime: Double
+    }
+
+    private final class MetadataCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [CacheKey: AnyObject] = [:]
+
+        func value<T>(for key: CacheKey) -> T? {
+            lock.lock(); defer { lock.unlock() }
+            return (storage[key] as? Box<T>)?.value
+        }
+
+        func store<T>(_ value: T, for key: CacheKey) {
+            lock.lock(); defer { lock.unlock() }
+            storage[key] = Box(value)
+        }
+    }
+
+    private static let metadataCache = MetadataCache()
+
+    private static func fileStamp(_ url: URL) -> (size: Int64, mtime: Double) {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        return (size, mtime)
+    }
+
+    private static func memoized<T>(_ fn: String, _ url: URL, compute: () -> T) -> T {
+        let stamp = fileStamp(url)
+        let key = CacheKey(fn: fn, path: url.path, size: stamp.size, mtime: stamp.mtime)
+        if let cached: T = metadataCache.value(for: key) {
+            return cached
+        }
+        let value = compute()
+        metadataCache.store(value, for: key)
+        return value
+    }
+
+    static func architectureInfo(at url: URL) -> (architecture: String, name: String?)? {
+        // Not memoized: the labeled-tuple return type is not worth boxing and
+        // this is only used by detail views, not the hot summary-card path.
+        computeArchitectureInfo(at: url)
+    }
+
+    static func layerCount(at url: URL) -> Int? {
+        memoized("layerCount", url) { computeLayerCount(at: url) }
+    }
+
+    static func contextLength(at url: URL) -> Int? {
+        memoized("contextLength", url) { computeContextLength(at: url) }
+    }
+
+    static func moeInfo(at url: URL) -> MoEInfo? {
+        memoized("moeInfo", url) { computeMoeInfo(at: url) }
+    }
+
+    static func chatTemplate(at url: URL) -> String? {
+        memoized("chatTemplate", url) { computeChatTemplate(at: url) }
+    }
+
+    static func suggestsTools(at url: URL) -> Bool {
+        memoized("suggestsTools", url) { computeSuggestsTools(at: url) }
+    }
+
+    static func isVisionLikely(at url: URL) -> Bool {
+        memoized("isVisionLikely", url) { computeIsVisionLikely(at: url) }
+    }
+
+    static func hasMultimodalProjector(at url: URL) -> Bool {
+        memoized("hasMultimodalProjector", url) { computeHasMultimodalProjector(at: url) }
+    }
+
+    static func hasMTP(at url: URL) -> Bool {
+        memoized("hasMTP", url) { computeHasMTP(at: url) }
+    }
+
+    /// Populate the metadata cache for a GGUF file. Safe to call off the main
+    /// thread (e.g. from a detached task) so that subsequent main-thread reads
+    /// are served from cache and never block on disk I/O.
+    static func prewarm(at url: URL) {
+        _ = layerCount(at: url)
+        _ = contextLength(at: url)
+        _ = moeInfo(at: url)
+        _ = hasMTP(at: url)
+        _ = hasMultimodalProjector(at: url)
+        _ = chatTemplate(at: url)
     }
 }

@@ -41,6 +41,8 @@ static std::atomic<int> g_last_ready_status{-1};
 static std::atomic<int> g_last_ready_elapsed_ms{0};
 static std::mutex g_server_mutex;
 static std::mutex g_diagnostics_mutex;
+static std::mutex g_start_options_mutex;
+static std::string g_last_start_options_json;
 // Keep loopback HTTP read/write timeouts effectively unbounded for very long
 // generations and large multimodal prompts.
 static constexpr int kNoemaLoopbackServerTimeoutSeconds = 315360000; // ~10 years
@@ -324,6 +326,53 @@ static void record_start_failure(noema_start_failure_code code) {
   if (g_last_start_diagnostics.message.empty()) {
     g_last_start_diagnostics.message = fallback_message_for_code(code);
   }
+}
+
+static std::string json_string_array(const std::vector<std::string> &values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += "\"";
+    out += json_escape(values[i]);
+    out += "\"";
+  }
+  out += "]";
+  return out;
+}
+
+static void record_start_options(const std::vector<std::string> &args, int port,
+                                 const char *gguf_path, const char *mmproj_path,
+                                 const char *mtp_path, const char *spec_type,
+                                 int spec_draft_n_max, int spec_draft_n_min,
+                                 float spec_draft_p_min) {
+  std::string json = "{";
+  json += "\"port\":" + std::to_string(port);
+  json += ",\"ggufPath\":\"" + json_escape(gguf_path ? gguf_path : "") + "\"";
+  json += ",\"mmprojPath\":\"" + json_escape(mmproj_path ? mmproj_path : "") + "\"";
+  json += ",\"mtpPath\":\"" + json_escape(mtp_path ? mtp_path : "") + "\"";
+  json += ",\"speculativeType\":\"" + json_escape(spec_type ? spec_type : "") + "\"";
+  if (spec_draft_n_max == INT32_MIN) {
+    json += ",\"specDraftNMax\":null";
+  } else {
+    json += ",\"specDraftNMax\":" + std::to_string(spec_draft_n_max);
+  }
+  if (spec_draft_n_min == INT32_MIN) {
+    json += ",\"specDraftNMin\":null";
+  } else {
+    json += ",\"specDraftNMin\":" + std::to_string(spec_draft_n_min);
+  }
+  if (spec_draft_p_min < 0.0f) {
+    json += ",\"specDraftPMin\":null";
+  } else {
+    json += ",\"specDraftPMin\":" + std::to_string(spec_draft_p_min);
+  }
+  json += ",\"argv\":" + json_string_array(args);
+  json += "}";
+
+  std::lock_guard<std::mutex> lock(g_start_options_mutex);
+  g_last_start_options_json = std::move(json);
 }
 
 extern "C" void noema_llama_server_report_load_progress(float progress) {
@@ -639,7 +688,12 @@ int noema_llama_server_start_with_options(const char *host, int preferred_port,
                                           int reasoning_budget,
                                           int use_jinja,
                                           int cache_ram_mib,
-                                          int ctx_checkpoints) {
+                                          int ctx_checkpoints,
+                                          const char *mtp_path,
+                                          const char *spec_type,
+                                          int spec_draft_n_max,
+                                          int spec_draft_n_min,
+                                          float spec_draft_p_min) {
   std::lock_guard<std::mutex> lock(g_server_mutex);
 
   const char *bind_host = (host && host[0]) ? host : "127.0.0.1";
@@ -697,6 +751,26 @@ int noema_llama_server_start_with_options(const char *host, int preferred_port,
   if (mmproj_path && mmproj_path[0]) {
     args.emplace_back("--mmproj");
     args.emplace_back(mmproj_path);
+  }
+  if (spec_type && spec_type[0]) {
+    args.emplace_back("--spec-type");
+    args.emplace_back(spec_type);
+    if (mtp_path && mtp_path[0]) {
+      args.emplace_back("--spec-draft-model");
+      args.emplace_back(mtp_path);
+    }
+    if (spec_draft_n_max != INT32_MIN) {
+      args.emplace_back("--spec-draft-n-max");
+      args.emplace_back(std::to_string(spec_draft_n_max));
+    }
+    if (spec_draft_n_min != INT32_MIN) {
+      args.emplace_back("--spec-draft-n-min");
+      args.emplace_back(std::to_string(spec_draft_n_min));
+    }
+    if (spec_draft_p_min >= 0.0f) {
+      args.emplace_back("--spec-draft-p-min");
+      args.emplace_back(std::to_string(spec_draft_p_min));
+    }
   }
   if (use_jinja) {
     args.emplace_back("--jinja");
@@ -792,6 +866,11 @@ int noema_llama_server_start_with_options(const char *host, int preferred_port,
   } else {
     args.emplace_back("--context-shift");
   }
+
+  record_start_options(args, port, gguf_path, mmproj_path, mtp_path, spec_type,
+                       spec_draft_n_max, spec_draft_n_min, spec_draft_p_min);
+  fprintf(stderr, "[NoemaLLamaServer] start options: %s\n",
+          g_last_start_options_json.c_str());
 
   g_running.store(true);
   g_port.store(port);
@@ -891,9 +970,9 @@ int noema_llama_server_start_with_options(const char *host, int preferred_port,
 int noema_llama_server_start(const char *host, int preferred_port,
                              const char *gguf_path,
                              const char *mmproj_path) {
-  return noema_llama_server_start_with_options(host, preferred_port, gguf_path,
-                                               mmproj_path, nullptr, INT32_MIN,
-                                               0, INT32_MIN, INT32_MIN);
+  return noema_llama_server_start_with_options(
+      host, preferred_port, gguf_path, mmproj_path, nullptr, INT32_MIN, 0,
+      INT32_MIN, INT32_MIN, nullptr, nullptr, INT32_MIN, INT32_MIN, -1.0f);
 }
 
 void noema_llama_server_stop(void) {
@@ -960,5 +1039,12 @@ const char *noema_llama_server_last_start_diagnostics_json(void) {
   json += ",\"httpReady\":";
   json += g_http_ready.load() ? "true" : "false";
   json += "}";
+  return json.c_str();
+}
+
+const char *noema_llama_server_last_start_options_json(void) {
+  static thread_local std::string json;
+  std::lock_guard<std::mutex> lock(g_start_options_mutex);
+  json = g_last_start_options_json;
   return json.c_str();
 }

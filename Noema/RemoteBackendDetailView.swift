@@ -89,11 +89,11 @@ struct RemoteBackendDetailView: View {
     var body: some View {
         Group {
             if let backend {
-                detailContent(for: backend)
+                AnyView(detailContent(for: backend))
+            } else if #available(iOS 17.0, macOS 14.0, visionOS 1.0, *) {
+                AnyView(ContentUnavailableView("Backend not found", systemImage: "exclamationmark.triangle"))
             } else {
-                if #available(iOS 17.0, macOS 14.0, visionOS 1.0, *) {
-                    ContentUnavailableView("Backend not found", systemImage: "exclamationmark.triangle")
-                } else {
+                AnyView(
                     VStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle")
                             .font(.largeTitle)
@@ -103,7 +103,7 @@ struct RemoteBackendDetailView: View {
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+                )
             }
         }
         .alert(item: $actionMessage) { message in
@@ -296,14 +296,16 @@ struct RemoteBackendDetailView: View {
                 .platformAutocapitalization(.words)
                 .focused($focusedField, equals: .name)
         }
-        editableRow(
-            title: backend.isCloudRelay ? LocalizedStringKey("Container") : LocalizedStringKey("Base URL"),
-            systemImage: backend.isCloudRelay ? "icloud" : "link",
-            value: backend.baseURLString,
-            field: .baseURL,
-            backend: backend
-        ) { binding in
-            baseURLEditingField(binding: binding, backend: backend)
+        if !backend.isCloudRelay {
+            editableRow(
+                title: LocalizedStringKey("Base URL"),
+                systemImage: "link",
+                value: backend.baseURLString,
+                field: .baseURL,
+                backend: backend
+            ) { binding in
+                baseURLEditingField(binding: binding, backend: backend)
+            }
         }
         if backend.isCloudRelay {
             editableRow(
@@ -431,19 +433,21 @@ struct RemoteBackendDetailView: View {
 
     @ViewBuilder
     private func endpointRow(for item: EndpointItem) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             Image(systemName: item.icon)
-                .font(.caption.weight(.semibold))
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(item.value)
-                    .font(.system(.caption2, design: .monospaced))
-                    .textSelection(.enabled)
-                    .foregroundStyle(.primary)
-            }
+                .frame(width: 14)
+            Text(item.title.uppercased())
+                .font(.system(.caption2, design: .monospaced, weight: .bold))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(item.value)
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 
@@ -1163,22 +1167,20 @@ struct RemoteBackendDetailView: View {
         }
 
         var body: some View {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text(title)
-                    .font(FontTheme.subheadline)
+                    .font(.system(.caption, design: .monospaced, weight: .bold))
                     .foregroundStyle(AppTheme.secondaryText)
                     .textCase(.uppercase)
-                    .padding(.leading, 4)
+                    .padding(.leading, 2)
                 content
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(AppTheme.cardFill)
-                    )
+                    .padding(16)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.3))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(AppTheme.cardStroke, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
                     )
             }
         }
@@ -1795,23 +1797,25 @@ struct RemoteBackendDetailView: View {
         emptyPlaceholder: String? = nil,
         @ViewBuilder content: (Binding<String>) -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(alignment: .center, spacing: 8) {
             Label(title, systemImage: systemImage)
-                .font(.footnote.weight(.medium))
+                .font(.system(.caption2, design: .monospaced, weight: .bold))
                 .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .labelStyle(.titleAndIcon)
+            Spacer(minLength: 8)
             if isEditing, let binding = draftBinding(for: keyPath(for: field), backend: backend) {
                 editingFieldContainer {
                     content(binding)
                 }
             } else {
                 if value.isEmpty {
-                    Text(emptyPlaceholder ?? "None")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .italic()
+                    Text(emptyPlaceholder ?? "NONE")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
                 } else {
                     Text(value)
-                        .font(.callout)
+                        .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.primary)
                         .textSelection(.enabled)
                 }
@@ -1845,21 +1849,12 @@ struct RemoteBackendDetailView: View {
     @ViewBuilder
     private func baseURLEditingField(binding: Binding<String>, backend: RemoteBackend) -> some View {
         HStack(spacing: 8) {
-            Group {
-                if backend.isCloudRelay {
-                    TextField("iCloud.arminproducts.Noema", text: binding)
-                        .platformAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                        .focused($focusedField, equals: .baseURL)
-                } else {
-                    TextField("https://example.com", text: binding)
-                        .platformKeyboardType(.url)
-                        .platformAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                        .focused($focusedField, equals: .baseURL)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            TextField("https://example.com", text: binding)
+                .platformKeyboardType(.url)
+                .platformAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .focused($focusedField, equals: .baseURL)
+                .frame(maxWidth: .infinity, alignment: .leading)
             Button(binding.wrappedValue.isEmpty ? "Paste" : "Clear & Paste") {
                 pasteBaseURL(into: binding, clearExisting: !binding.wrappedValue.isEmpty)
             }
@@ -2626,95 +2621,58 @@ struct RemoteModelRow: View {
 
     private var standardBody: some View {
         HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(model.name)
-                        .font(.headline)
-                        .fontWeight(.semibold)
                     if supportsFavorite {
                         Image(systemName: isFavorite ? "star.fill" : "star")
-                            .font(.caption)
-                            .foregroundStyle(.yellow)
+                            .font(.system(size: 12))
+                            .foregroundStyle(isFavorite ? Color.yellow : Color.secondary.opacity(0.5))
+                            .onTapGesture { favoriteAction?() }
                     }
+                    Text(model.name)
+                        .font(FontTheme.body)
+                        .fontWeight(.medium)
+                        .foregroundStyle(AppTheme.text)
+                    
                     if model.isCustom {
-                        chip(text: "Custom", color: .gray)
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.blue)
                     }
                 }
-                if isBackendLoaded {
-                    Label("Loaded on server", systemImage: "bolt.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.green)
-                }
-                if shouldShowAuthor, let author = sanitizedAuthor {
-                    Text(author)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Text(model.id)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                if endpointType == .openRouter, let description = model.trimmedDescriptionText {
-                    Text(description)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                badgesRow
-                if let parent = model.parentModel, !parent.isEmpty {
-                    Label("Parent: \(parent)", systemImage: "arrow.merge")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                        .textSelection(.enabled)
-                }
-                if shouldShowDigest, let digest = model.digest, !digest.isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "number")
-                        Text("Digest:")
-                        Text(digest)
-                            .font(.caption2.monospaced())
-                            .textSelection(.enabled)
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                
+                Text(model.id.split(separator: "/").first.map(String.init) ?? model.id)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-                }
-                if let updated = model.modifiedAtDisplayString {
-                    Label("Updated \(updated)", systemImage: "clock.arrow.circlepath")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if let state = model.state, !state.isEmpty {
-                    Label("State: \(state)", systemImage: "bolt.circle")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if let ctx = model.maxContextLength {
-                    Label("Max context: \(ctx)", systemImage: "text.alignleft")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if endpointType == .openRouter {
-                    if let providerContextLength = model.providerContextLength, providerContextLength > 0 {
-                        Label("Provider context: \(providerContextLength)", systemImage: "rectangle.and.text.magnifyingglass")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+
+                HStack(spacing: 6) {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(isBackendLoaded ? Color.green : Color.gray)
+                            .frame(width: 6, height: 6)
+                        Text(isBackendLoaded ? "Loaded" : "Available")
                     }
-                    if let maxCompletionTokens = model.maxCompletionTokens, maxCompletionTokens > 0 {
-                        Label("Max output: \(maxCompletionTokens)", systemImage: "arrow.up.forward")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+
+                    if shouldShowAuthor, let author = sanitizedAuthor {
+                        Text("·")
+                        Text(author)
+                    }
+                    
+                    if let ctx = model.maxContextLength {
+                        Text("·")
+                        Text("\(ctx) ctx")
                     }
                 }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .padding(.top, 2)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                if supportsSettings {
-                    settingsAction?()
-                }
+                if supportsSettings { settingsAction?() }
             }
             Spacer(minLength: 8)
             trailingControl
@@ -2723,63 +2681,63 @@ struct RemoteModelRow: View {
     }
 
     private var openRouterBody: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(model.name)
-                            .font(.headline.weight(.semibold))
-                            .foregroundStyle(.primary)
-
-                        if let author = sanitizedAuthor {
-                            Text(author)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Text(model.id)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .lineLimit(2)
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    if supportsFavorite {
+                        Image(systemName: isFavorite ? "star.fill" : "star")
+                            .font(.system(size: 12))
+                            .foregroundStyle(isFavorite ? Color.yellow : Color.secondary.opacity(0.5))
+                            .onTapGesture { favoriteAction?() }
                     }
-
-                    Spacer(minLength: 8)
-
-                    if isBackendLoaded {
-                        openRouterMetaChip(text: "Loaded", color: .green)
-                    }
+                    Text(model.name)
+                        .font(FontTheme.body)
+                        .fontWeight(.medium)
+                        .foregroundStyle(AppTheme.text)
                 }
+                
+                Text(model.id)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
 
                 if let description = model.trimmedDescriptionText {
                     Text(description)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(2)
                 }
 
-                RemoteModelChipWrapLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+                HStack(spacing: 6) {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(isBackendLoaded ? Color.green : Color.gray)
+                            .frame(width: 6, height: 6)
+                        Text(isBackendLoaded ? "Loaded" : "Available")
+                    }
+
+                    Text("·")
+                    Text("OpenRouter")
+
                     if let providerContextLength = model.providerContextLength, providerContextLength > 0 {
-                        openRouterMetaChip(text: "Context \(providerContextLength.formatted())", color: .accentColor)
-                    }
-                    ForEach(familyBadges, id: \.self) { family in
-                        openRouterMetaChip(text: family, color: .secondary, muted: true)
+                        Text("·")
+                        Text("\(providerContextLength.formatted()) ctx")
                     }
                 }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .padding(.top, 2)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             }
-
-            openRouterActions
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if supportsSettings { settingsAction?() }
+            }
+            Spacer(minLength: 8)
+            trailingControl
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.primary.opacity(0.035))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-        )
+        .padding(.vertical, 8)
     }
 
     @ViewBuilder
@@ -2919,16 +2877,8 @@ struct RemoteModelRow: View {
                 .controlSize(.small)
                 .accessibilityLabel(LocalizedStringKey("Open Settings"))
             }
-            if supportsFavorite {
-                Button(action: { favoriteAction?() }) {
-                    Image(systemName: isFavorite ? "star.fill" : "star")
-                        .foregroundStyle(isFavorite ? .yellow : .secondary)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityLabel(isFavorite ? LocalizedStringKey("Remove Favorite") : LocalizedStringKey("Add Favorite"))
-            }
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     @ViewBuilder
@@ -2959,15 +2909,18 @@ struct RemoteModelRow: View {
                 Label("Offline", systemImage: "wifi.slash")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
             case .unreachable:
                 Label("Unavailable", systemImage: "exclamationmark.triangle")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
             case .available:
                 if isActive {
                     Label("Using", systemImage: "checkmark.circle.fill")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.green)
+                        .fixedSize(horizontal: true, vertical: false)
                 } else {
                     Button(action: useAction) {
                         if isActivating {
@@ -2981,6 +2934,7 @@ struct RemoteModelRow: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(isActivating)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
             }
         }
@@ -3210,7 +3164,9 @@ private struct RemoteModelSettingsSheet: View {
                 }
             }
             .navigationTitle(LocalizedStringKey("Settings"))
-#if !os(macOS)
+#if os(macOS)
+            .formStyle(.grouped)
+#else
             .navigationBarTitleDisplayMode(.inline)
 #endif
             .toolbar {

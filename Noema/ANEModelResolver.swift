@@ -244,6 +244,122 @@ struct CoreMLArtifactMetadata: Codable, Equatable, Sendable {
     }
 }
 
+/// Feature names resolved to runtime roles. Exports name the same tensors
+/// differently (coremltools auto-names, camelCase vs snake_case conventions),
+/// so the runtimes must not assume exact names.
+@available(iOS 18.0, visionOS 2.0, *)
+struct CoreMLResolvedRoles: Sendable, Equatable {
+    var tokenInput: String?
+    var maskInput: String?
+    var logitsOutput: String?
+    var keyCacheState: String?
+    var valueCacheState: String?
+
+    var summary: String {
+        "tokenInput=\(tokenInput ?? "<none>")"
+            + " mask=\(maskInput ?? "<none>")"
+            + " logits=\(logitsOutput ?? "<none>")"
+            + " keyCache=\(keyCacheState ?? "<none>")"
+            + " valueCache=\(valueCacheState ?? "<none>")"
+    }
+}
+
+@available(iOS 18.0, visionOS 2.0, *)
+enum CoreMLRoleResolver {
+    private static let tokenAliases: Set<String> = ["inputids", "inputtokens", "tokens", "tokenids"]
+    private static let maskAliases: Set<String> = ["causalmask", "attentionmask", "mask"]
+    private static let logitsAliases: Set<String> = ["logits", "outputlogits", "logit", "lmlogits"]
+    private static let keyCacheAliases: Set<String> = ["keycache", "kcache"]
+    private static let valueCacheAliases: Set<String> = ["valuecache", "vcache"]
+
+    static func normalized(_ name: String) -> String {
+        name.lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+    }
+
+    private static func isIntegerType(_ dataType: String?) -> Bool {
+        dataType?.lowercased().contains("int") == true
+    }
+
+    private static func isFloatingPointType(_ dataType: String?) -> Bool {
+        guard let lowered = dataType?.lowercased() else { return false }
+        return lowered.contains("float") || lowered.contains("double") || lowered.contains("fp16") || lowered.contains("fp32")
+    }
+
+    private static func match(_ features: [CoreMLArtifactFeature], aliases: Set<String>) -> String? {
+        features.first { aliases.contains(normalized($0.name)) }?.name
+    }
+
+    static func resolve(metadata: CoreMLArtifactMetadata) -> CoreMLResolvedRoles {
+        resolve(inputs: metadata.inputSchema, outputs: metadata.outputSchema, states: metadata.stateSchema)
+    }
+
+    static func resolve(
+        inputs: [CoreMLArtifactFeature],
+        outputs: [CoreMLArtifactFeature],
+        states: [CoreMLArtifactFeature]
+    ) -> CoreMLResolvedRoles {
+        var roles = CoreMLResolvedRoles()
+
+        roles.tokenInput = match(inputs, aliases: tokenAliases)
+        if roles.tokenInput == nil {
+            let integerInputs = inputs.filter { isIntegerType($0.dataType) }
+            if integerInputs.count == 1 {
+                roles.tokenInput = integerInputs[0].name
+            }
+        }
+
+        roles.maskInput = match(inputs, aliases: maskAliases)
+        if roles.maskInput == nil,
+           inputs.count == 2,
+           let tokenInput = roles.tokenInput,
+           let other = inputs.first(where: { $0.name != tokenInput }),
+           isFloatingPointType(other.dataType) {
+            roles.maskInput = other.name
+        }
+
+        roles.logitsOutput = match(outputs, aliases: logitsAliases)
+        if roles.logitsOutput == nil {
+            if outputs.count == 1 {
+                roles.logitsOutput = outputs[0].name
+            } else {
+                let floatOutputs = outputs.filter { isFloatingPointType($0.dataType) }
+                if floatOutputs.count == 1 {
+                    roles.logitsOutput = floatOutputs[0].name
+                }
+            }
+        }
+
+        roles.keyCacheState = match(states, aliases: keyCacheAliases)
+        roles.valueCacheState = match(states, aliases: valueCacheAliases)
+        for state in states where roles.keyCacheState == nil || roles.valueCacheState == nil {
+            let normalizedName = normalized(state.name)
+            if roles.keyCacheState == nil, state.name != roles.valueCacheState, normalizedName.contains("key") {
+                roles.keyCacheState = state.name
+            } else if roles.valueCacheState == nil, state.name != roles.keyCacheState, normalizedName.contains("val") {
+                roles.valueCacheState = state.name
+            }
+        }
+        // A two-state model with one role identified gives the other state the
+        // remaining role (covers exports like "k"/"v" with no recognizable text).
+        if states.count == 2 {
+            if let key = roles.keyCacheState, roles.valueCacheState == nil,
+               let other = states.first(where: { $0.name != key }) {
+                roles.valueCacheState = other.name
+            } else if let value = roles.valueCacheState, roles.keyCacheState == nil,
+                      let other = states.first(where: { $0.name != value }) {
+                roles.keyCacheState = other.name
+            }
+        }
+        if let key = roles.keyCacheState, key == roles.valueCacheState {
+            roles.valueCacheState = nil
+        }
+
+        return roles
+    }
+}
+
 @available(iOS 18.0, visionOS 2.0, *)
 struct ANEMLLRecommendedSampling: Sendable, Equatable {
     let doSample: Bool
@@ -328,7 +444,7 @@ enum ANEModelResolver {
         case missingTokenizer
         case missingMetadata
         case invalidANEMLLPipeline(reason: String)
-        case unsupportedCoreMLLayout(inputs: [String], outputs: [String], states: [String])
+        case unsupportedCoreMLLayout(inputs: [String], outputs: [String], states: [String], resolvedRoles: String?)
 
         var errorDescription: String? {
             switch self {
@@ -340,11 +456,12 @@ enum ANEModelResolver {
                 return "The compiled CML model is missing metadata.json, so Noema cannot determine the runtime layout."
             case .invalidANEMLLPipeline(let reason):
                 return "Invalid ANEMLL pipeline manifest. \(reason)"
-            case .unsupportedCoreMLLayout(let inputs, let outputs, let states):
+            case .unsupportedCoreMLLayout(let inputs, let outputs, let states, let resolvedRoles):
                 let inputSummary = inputs.isEmpty ? "<none>" : inputs.joined(separator: ", ")
                 let outputSummary = outputs.isEmpty ? "<none>" : outputs.joined(separator: ", ")
                 let stateSummary = states.isEmpty ? "<none>" : states.joined(separator: ", ")
-                return "Unsupported CML model layout. inputs=[\(inputSummary)] outputs=[\(outputSummary)] states=[\(stateSummary)]"
+                let rolesSummary = resolvedRoles.map { " resolved: \($0)" } ?? ""
+                return "Unsupported CML model layout. inputs=[\(inputSummary)] outputs=[\(outputSummary)] states=[\(stateSummary)]\(rolesSummary)"
             }
         }
     }
@@ -388,7 +505,8 @@ enum ANEModelResolver {
             throw ResolveError.unsupportedCoreMLLayout(
                 inputs: metadata.inputNames.sorted(),
                 outputs: metadata.outputNames.sorted(),
-                states: metadata.stateNames.sorted()
+                states: metadata.stateNames.sorted(),
+                resolvedRoles: CoreMLRoleResolver.resolve(metadata: metadata).summary
             )
         }
 
@@ -497,25 +615,19 @@ enum ANEModelResolver {
     }
 
     static func classify(metadata: CoreMLArtifactMetadata) -> CoreMLModelFlavor {
-        let inputs = metadata.inputNames
-        let outputs = metadata.outputNames
-        let states = metadata.stateNames
+        // swift-transformers' LanguageModel force-unwraps the exact feature names
+        // "inputIds" and "logits", so this route must stay exact-match. It covers
+        // both stateless exports and camelCase keyCache/valueCache stateful ones.
+        if metadata.inputNames.contains("inputIds"), metadata.outputNames.contains("logits") {
+            return .transformersLanguageModel
+        }
 
-        guard outputs.contains("logits") else { return .unknown }
-
-        if inputs.contains("input_ids"),
-           inputs.contains("causal_mask"),
-           states.contains("key_cache"),
-           states.contains("value_cache") {
+        let roles = CoreMLRoleResolver.resolve(metadata: metadata)
+        if roles.tokenInput != nil,
+           roles.logitsOutput != nil,
+           roles.keyCacheState != nil,
+           roles.valueCacheState != nil {
             return .statefulCausalLM
-        }
-
-        if inputs.contains("inputIds") {
-            return .transformersLanguageModel
-        }
-
-        if states.contains("keyCache"), states.contains("valueCache") {
-            return .transformersLanguageModel
         }
 
         return .unknown

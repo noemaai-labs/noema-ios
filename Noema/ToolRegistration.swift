@@ -26,6 +26,10 @@ public final class ToolRegistrar {
 
         // Register persistent memory tool
         await registerMemoryTool()
+
+        // Register deterministic local tools
+        await registerCalculatorTool()
+        await registerUnitConverterTool()
         
         isInitialized = true
         await logger.log("[ToolRegistrar] Tool initialization complete. Registered tools: \(ToolRegistry.shared.registeredToolNames)")
@@ -48,6 +52,18 @@ public final class ToolRegistrar {
         ToolRegistry.shared.register(memoryTool)
         await logger.log("[ToolRegistrar] Registered MemoryTool")
     }
+
+    private func registerCalculatorTool() async {
+        let calculatorTool = CalculatorTool()
+        ToolRegistry.shared.register(calculatorTool)
+        await logger.log("[ToolRegistrar] Registered CalculatorTool")
+    }
+
+    private func registerUnitConverterTool() async {
+        let unitConverterTool = UnitConverterTool()
+        ToolRegistry.shared.register(unitConverterTool)
+        await logger.log("[ToolRegistrar] Registered UnitConverterTool")
+    }
 }
 
 // MARK: - Tool Factory
@@ -64,6 +80,14 @@ public struct ToolFactory {
 
     public static func createMemoryTool() -> MemoryTool {
         return MemoryTool()
+    }
+
+    public static func createCalculatorTool() -> CalculatorTool {
+        return CalculatorTool()
+    }
+
+    public static func createUnitConverterTool() -> UnitConverterTool {
+        return UnitConverterTool()
     }
 }
 
@@ -164,6 +188,8 @@ public final class ToolManager {
     }
     
     public func isToolAvailable(_ toolName: String) async -> Bool {
+        // Noema Teams policy gates every tool, before any local toggle is considered.
+        guard EnterprisePolicyGate.allowsTool(toolName) else { return false }
         let configuration = resolvedConfiguration()
         switch toolName {
         case "noema.web.retrieve":
@@ -175,6 +201,9 @@ public final class ToolManager {
             return configuration.pythonEnabled && PythonToolGate.isAvailable(currentFormat: nil)
         case "noema.memory":
             return configuration.memoryEnabled && MemoryToolGate.isAvailable(currentFormat: nil)
+        case "noema.math.calculate", "noema.units.convert":
+            let registry = await ToolRegistry.shared
+            return registry.tool(named: toolName) != nil
         default:
             guard !configuration.offlineMode else { return false }
             let registry = await ToolRegistry.shared

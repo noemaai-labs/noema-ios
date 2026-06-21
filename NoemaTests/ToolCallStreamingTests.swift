@@ -193,6 +193,76 @@ final class ToolCallStreamingTests: XCTestCase {
     }
 
     @MainActor
+    func testToolCallSimulatorMatrixExecutesSupportedPythonPayloadShapes() async throws {
+        enum Scanner {
+            case prefixed
+            case embedded
+        }
+
+        struct Scenario {
+            let name: String
+            let payload: String
+            let scanner: Scanner
+            let expectedCode: String
+            let expectedOutput: String
+        }
+
+        let scenarios = [
+            Scenario(
+                name: "openai-ready",
+                payload: #"TOOL_CALL: {"tool":"noema.python.execute","tool_call_id":"sim-openai","args":{"code":"print(6 * 7)"},"request_status":"ready"}"#,
+                scanner: .prefixed,
+                expectedCode: "print(6 * 7)",
+                expectedOutput: "42"
+            ),
+            Scenario(
+                name: "xml-mlx",
+                payload: #"<tool_call>{"name":"noema.python.execute","arguments":{"code":"print(7 * 7)"}}</tool_call>"#,
+                scanner: .embedded,
+                expectedCode: "print(7 * 7)",
+                expectedOutput: "49"
+            ),
+            Scenario(
+                name: "arguments-json-string",
+                payload: #"TOOL_CALL: {"tool":"noema.python.execute","tool_call_id":"sim-string-args","args":"{\"code\":\"print(9 * 9)\"}","request_status":"ready"}"#,
+                scanner: .prefixed,
+                expectedCode: "print(9 * 9)",
+                expectedOutput: "81"
+            )
+        ]
+
+        for scenario in scenarios {
+            let vm = makeChatVM(userText: "Run \(scenario.name)")
+            let didHandle: Bool
+            switch scenario.scanner {
+            case .prefixed:
+                didHandle = await interceptToolCallIfPresent(
+                    scenario.payload,
+                    messageIndex: 1,
+                    chatVM: vm
+                ) != nil
+            case .embedded:
+                didHandle = await interceptEmbeddedToolCallIfPresent(
+                    in: scenario.payload,
+                    messageIndex: 1,
+                    chatVM: vm
+                ) != nil
+            }
+
+            XCTAssertTrue(didHandle, scenario.name)
+            let completedCall = try XCTUnwrap(vm.streamMsgs[1].toolCalls?.onlyElement, scenario.name)
+            XCTAssertEqual(completedCall.toolName, "noema.python.execute", scenario.name)
+            XCTAssertEqual(completedCall.phase, .completed, scenario.name)
+            XCTAssertEqual(completedCall.requestParams["code"]?.value as? String, scenario.expectedCode, scenario.name)
+            XCTAssertEqual(
+                ToolCallViewSupport.parsePythonResult(from: completedCall.result ?? "")?.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
+                scenario.expectedOutput,
+                scenario.name
+            )
+        }
+    }
+
+    @MainActor
     func testRequestingWebToolTokenCreatesImmediatePendingCard() async throws {
         let vm = makeChatVM(userText: "Latest AI news")
 

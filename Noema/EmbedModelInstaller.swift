@@ -16,27 +16,44 @@ final class EmbedModelInstaller: ObservableObject {
     @Published var progress: Double = 0
     @Published var state: State = .idle
 
-    // Updated to the stable v1.5 embedding model recommended in RAG_FIX_INSTRUCTIONS.md
-    private let remoteURL = URL(string: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf?download=1")!
+    private let recordID: String?
 
-    init() {
+    init(recordID: String? = nil) {
+        self.recordID = recordID
         refreshStateFromDisk()
+    }
+
+    private var record: EmbeddingModelRecord {
+        if let recordID, let record = EmbeddingModelCatalog.record(for: recordID) {
+            return record
+        }
+        return EmbeddingModelCatalog.activeRecord()
     }
 
     func installIfNeeded() async {
         progress = 0
         state = .idle
-        if FileManager.default.fileExists(atPath: EmbeddingModel.modelURL.path) {
+        let record = self.record
+        guard record.isInstallable,
+              let artifact = record.primaryArtifact,
+              let remoteURL = artifact.downloadURL else {
+            state = .failed(record.gatingReason ?? "Embedding model is not available for download")
+            notifyAvailabilityChanged(record.isInstalled)
+            return
+        }
+
+        let destinationURL = artifact.localURL(recordID: record.id)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
             state = .ready
             progress = 1
-            notifyAvailabilityChanged(true)
+            notifyAvailabilityChanged(record.id == EmbeddingModelCatalog.activeRecord().id)
             return
         }
         state = .downloading
         do {
             // Ensure destination directory exists first
-            try FileManager.default.createDirectory(at: EmbeddingModel.modelDir, withIntermediateDirectories: true)
-            let dest = EmbeddingModel.modelURL
+            try FileManager.default.createDirectory(at: artifact.directoryURL(recordID: record.id), withIntermediateDirectories: true)
+            let dest = destinationURL
             try await BackgroundDownloadManager.shared.download(from: remoteURL, to: dest, expectedSize: nil) { [weak self] p in
                 // Progress callback may be non-async; hop to main safely.
                 Task { @MainActor in self?.progress = p }
@@ -46,12 +63,12 @@ final class EmbedModelInstaller: ObservableObject {
             state = .installing
             // File is already at destination, nothing to move
             // Log the successful download + install so we can trace this in the console / log file.
-            Task.detached { await logger.log("[EmbedInstaller] ✅ Embedding model downloaded and installed at: \(EmbeddingModel.modelURL.path)") }
-            UserDefaults.standard.set(true, forKey: "hasInstalledEmbedModel:\(EmbeddingModel.modelURL.path)")
+            Task.detached { await logger.log("[EmbedInstaller] ✅ Embedding model downloaded and installed at: \(dest.path)") }
+            UserDefaults.standard.set(true, forKey: "hasInstalledEmbedModel:\(dest.path)")
             state = .ready
             progress = 1
             Haptics.success()
-            notifyAvailabilityChanged(true)
+            notifyAvailabilityChanged(record.id == EmbeddingModelCatalog.activeRecord().id)
         } catch {
             state = .failed(error.localizedDescription)
             notifyAvailabilityChanged(false)
@@ -61,10 +78,11 @@ final class EmbedModelInstaller: ObservableObject {
     /// Refresh the installer state based on whether the model file exists on disk.
     /// This does not initiate any downloads; it purely reflects current disk state.
     func refreshStateFromDisk() {
-        if FileManager.default.fileExists(atPath: EmbeddingModel.modelURL.path) {
+        let record = self.record
+        if FileManager.default.fileExists(atPath: record.installedURL.path) {
             state = .ready
             progress = 1
-            notifyAvailabilityChanged(true)
+            notifyAvailabilityChanged(record.id == EmbeddingModelCatalog.activeRecord().id)
         } else {
             state = .idle
             progress = 0
@@ -86,7 +104,7 @@ final class EmbedModelInstaller: ObservableObject {
     }
 
     private func atomicMove(from: URL, to: URL) throws {
-        try FileManager.default.createDirectory(at: EmbeddingModel.modelDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
         if FileManager.default.fileExists(atPath: to.path) {
             try FileManager.default.removeItem(at: to)
         }
@@ -94,6 +112,10 @@ final class EmbedModelInstaller: ObservableObject {
     }
 
     private func notifyAvailabilityChanged(_ available: Bool) {
-        NotificationCenter.default.post(name: .embeddingModelAvailabilityChanged, object: nil, userInfo: ["available": available])
+        NotificationCenter.default.post(
+            name: .embeddingModelAvailabilityChanged,
+            object: nil,
+            userInfo: ["available": available, "recordID": record.id]
+        )
     }
 }

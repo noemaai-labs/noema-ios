@@ -44,9 +44,7 @@ struct NoemaApp: App {
     @StateObject private var walkthroughManager: GuidedWalkthroughManager
     @StateObject private var localizationManager: LocalizationManager
 
-#if canImport(FBSDKCoreKit) && os(iOS)
     @Environment(\.scenePhase) private var scenePhase
-#endif
 
     private var colorScheme: ColorScheme? {
         switch appearance {
@@ -67,6 +65,12 @@ struct NoemaApp: App {
         let localizationManager = LocalizationManager()
 
         UITestLaunchConfiguration.applyIfNeeded(modelManager: modelManager, chatVM: chatVM)
+
+        AppIntentDriver.shared.bind(chatVM: chatVM,
+                                    modelManager: modelManager,
+                                    datasetManager: datasetManager,
+                                    tabRouter: tabRouter,
+                                    downloadController: downloadController)
 
         _tabRouter = StateObject(wrappedValue: tabRouter)
         _chatVM = StateObject(wrappedValue: chatVM)
@@ -98,13 +102,66 @@ struct NoemaApp: App {
                 .environmentObject(localizationManager)
                 .environment(\.locale, localizationManager.locale)
         }
-#if canImport(FBSDKCoreKit) && os(iOS)
         .onChange(of: scenePhase) { newPhase in
             if newPhase == .active {
+#if canImport(FBSDKCoreKit) && os(iOS)
                 AppEvents.shared.activateApp()
+#endif
+                EnterprisePolicyManager.shared.refreshIfEnrolled()
             }
         }
-#endif
+        .commands {
+            NoemaKeyboardCommands(tabRouter: tabRouter, chatVM: chatVM)
+        }
+    }
+}
+
+private struct NoemaKeyboardCommands: Commands {
+    @ObservedObject var tabRouter: TabRouter
+    @ObservedObject var chatVM: ChatVM
+
+    var body: some Commands {
+        CommandMenu(LocalizedStringKey("Navigate")) {
+            Button(LocalizedStringKey("Chat")) {
+                tabRouter.selection = .chat
+            }
+            .keyboardShortcut("1", modifiers: [.command])
+
+            Button(LocalizedStringKey("Stored")) {
+                tabRouter.selection = .stored
+            }
+            .keyboardShortcut("2", modifiers: [.command])
+
+            Button(LocalizedStringKey("Explore")) {
+                tabRouter.selection = .explore
+            }
+            .keyboardShortcut("3", modifiers: [.command])
+
+            Button(LocalizedStringKey("Settings")) {
+                tabRouter.selection = .settings
+            }
+            .keyboardShortcut("4", modifiers: [.command])
+
+            Divider()
+
+            Button(LocalizedStringKey("New Chat")) {
+                tabRouter.selection = .chat
+                chatVM.startNewSession()
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+
+            Button(LocalizedStringKey("Stop")) {
+                chatVM.stop()
+            }
+            .keyboardShortcut(".", modifiers: [.command])
+            .disabled(!chatVM.isStreaming)
+
+            Button(LocalizedStringKey("Stop After Paragraph")) {
+                chatVM.requestStopAfterParagraph()
+            }
+            .keyboardShortcut(".", modifiers: [.command, .shift])
+            .disabled(!chatVM.isStreaming)
+        }
     }
 }
 
@@ -114,13 +171,13 @@ struct NoemaApp: App {
 struct NoemaMacApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     @AppStorage("appearance") private var appearance = "system"
-    @StateObject private var tabRouter = TabRouter()
-    @StateObject private var chatVM = ChatVM()
-    @StateObject private var modelManager = AppModelManager()
-    @StateObject private var datasetManager = DatasetManager()
-    @StateObject private var downloadController = DownloadController()
-    @StateObject private var walkthroughManager = GuidedWalkthroughManager()
-    @StateObject private var localizationManager = LocalizationManager()
+    @StateObject private var tabRouter: TabRouter
+    @StateObject private var chatVM: ChatVM
+    @StateObject private var modelManager: AppModelManager
+    @StateObject private var datasetManager: DatasetManager
+    @StateObject private var downloadController: DownloadController
+    @StateObject private var walkthroughManager: GuidedWalkthroughManager
+    @StateObject private var localizationManager: LocalizationManager
 
     private var colorScheme: ColorScheme? {
         switch appearance {
@@ -132,6 +189,25 @@ struct NoemaMacApp: App {
 
     init() {
         configureSharedApplicationEnvironment()
+        let tabRouter = TabRouter()
+        let chatVM = ChatVM()
+        let modelManager = AppModelManager()
+        let datasetManager = DatasetManager()
+        let downloadController = DownloadController()
+
+        AppIntentDriver.shared.bind(chatVM: chatVM,
+                                    modelManager: modelManager,
+                                    datasetManager: datasetManager,
+                                    tabRouter: tabRouter,
+                                    downloadController: downloadController)
+
+        _tabRouter = StateObject(wrappedValue: tabRouter)
+        _chatVM = StateObject(wrappedValue: chatVM)
+        _modelManager = StateObject(wrappedValue: modelManager)
+        _datasetManager = StateObject(wrappedValue: datasetManager)
+        _downloadController = StateObject(wrappedValue: downloadController)
+        _walkthroughManager = StateObject(wrappedValue: GuidedWalkthroughManager())
+        _localizationManager = StateObject(wrappedValue: LocalizationManager())
     }
 
     var body: some Scene {
@@ -218,7 +294,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String : Any]) {
-        Task { await CloudKitRelay.shared.handleRemoteNotification(userInfo) }
+        Task { await CloudKitRelay.shared.handleRemoteNotification() }
     }
 }
 

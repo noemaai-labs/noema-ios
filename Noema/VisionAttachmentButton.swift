@@ -1,5 +1,9 @@
 #if os(iOS) || os(macOS) || os(visionOS)
 import SwiftUI
+import UniformTypeIdentifiers
+#if canImport(CoreTransferable)
+import CoreTransferable
+#endif
 #if os(iOS)
 import UIKit
 #endif
@@ -23,12 +27,18 @@ struct VisionAttachmentButton: View {
     @ObservedObject private var settings = SettingsStore.shared
 #if os(macOS)
     @State private var isProcessingImport = false
+    @State private var isProcessingMediaImport = false
 #else
     @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var videoPickerItems: [PhotosPickerItem] = []
     @State private var showPicker = false
+    @State private var showVideoPicker = false
+    @State private var showMediaImporter = false
 #if os(iOS)
     @State private var showAttachmentTray = false
+    @State private var showMediaSourceDialog = false
     @State private var showCameraCapture = false
+    @State private var showPassScanner = false
     @State private var recentAssets: [PHAsset] = []
     @State private var thumbnailCache: [String: UIImage] = [:]
     @State private var recentAssetAttachmentURLs: [String: URL] = [:]
@@ -97,7 +107,10 @@ struct VisionAttachmentButton: View {
                     pythonArmed: settings.pythonArmed,
                     pythonDisabled: pythonDisabled,
                     pythonDisabledReason: pythonDisabledReason,
+                    isRecordingAudio: vm.isRecordingAudio,
                     onPhotos: selectPhotosFromMacMenu,
+                    onRecordAudio: selectRecordAudioFromMacMenu,
+                    onAttachMedia: selectAttachMediaFromMacMenu,
                     onWebSearch: selectWebSearchFromMacMenu,
                     onPython: selectPythonFromMacMenu
                 )
@@ -112,9 +125,19 @@ struct VisionAttachmentButton: View {
                 maxSelectionCount: max(0, remainingSlots),
                 matching: .images
             )
+            .photosPicker(
+                isPresented: $showVideoPicker,
+                selection: $videoPickerItems,
+                maxSelectionCount: 1,
+                matching: .videos
+            )
             .onChangeCompat(of: pickerItems) { _, items in
                 guard !items.isEmpty else { return }
                 Task { await loadPickedItems(items) }
+            }
+            .onChangeCompat(of: videoPickerItems) { _, items in
+                guard !items.isEmpty else { return }
+                Task { await loadPickedVideos(items) }
             }
 #if os(iOS)
             .sheet(isPresented: $showAttachmentTray) {
@@ -134,6 +157,7 @@ struct VisionAttachmentButton: View {
                     pythonArmed: settings.pythonArmed,
                     pythonDisabled: pythonDisabled,
                     pythonDisabledReason: pythonDisabledReason,
+                    isRecordingAudio: vm.isRecordingAudio,
                     onCamera: {
                         showAttachmentTray = false
                         openCamera()
@@ -141,6 +165,18 @@ struct VisionAttachmentButton: View {
                     onAllPhotos: {
                         showAttachmentTray = false
                         showPicker = true
+                    },
+                    onRecordAudio: {
+                        showAttachmentTray = false
+                        Task { await vm.toggleAudioRecording() }
+                    },
+                    onAttachMedia: {
+                        showAttachmentTray = false
+                        showMediaSourceDialog = true
+                    },
+                    onScanPass: {
+                        showAttachmentTray = false
+                        showPassScanner = true
                     },
                     onWebSearchTap: {
                         showAttachmentTray = false
@@ -170,6 +206,18 @@ struct VisionAttachmentButton: View {
                 )
                 .ignoresSafeArea()
             }
+            .sheet(isPresented: $showPassScanner) {
+                PassScannerFlowView()
+            }
+            .confirmationDialog("Attach Audio/Video", isPresented: $showMediaSourceDialog, titleVisibility: .visible) {
+                Button("Photos") {
+                    showVideoPicker = true
+                }
+                Button("Files") {
+                    showMediaImporter = true
+                }
+                Button("Cancel", role: .cancel) { }
+            }
 #endif
 #endif
         }
@@ -180,6 +228,16 @@ struct VisionAttachmentButton: View {
                     showPicker = true
                 }
                 .disabled(attachmentsDisabled)
+            }
+            Button {
+                Task { await vm.toggleAudioRecording() }
+            } label: {
+                Text(LocalizedStringKey(vm.isRecordingAudio ? "Stop Recording" : "Record Audio"))
+            }
+            Button {
+                showMediaImporter = true
+            } label: {
+                Text(LocalizedStringKey("Attach Audio/Video"))
             }
             if showWebSearchOption {
                 if settings.webSearchArmed {
@@ -200,6 +258,15 @@ struct VisionAttachmentButton: View {
                 }
             }
             Button("Cancel", role: .cancel) { }
+        }
+#endif
+#if !os(macOS)
+        .fileImporter(
+            isPresented: $showMediaImporter,
+            allowedContentTypes: TranscriptionMediaSupport.allowedContentTypes,
+            allowsMultipleSelection: true
+        ) { result in
+            Task { await handleMediaImportResult(result) }
         }
 #endif
         .buttonStyle(.plain)
@@ -317,10 +384,11 @@ struct VisionAttachmentButton: View {
     private var attachmentTrayHeight: CGFloat {
         let hasPhotos = UIConstants.showMultimodalUI && vm.supportsImageInput
         let toolRowCount = (showWebSearchOption ? 1 : 0) + (showPythonOption ? 1 : 0)
+        let mediaRows = 3
         if hasPhotos {
-            return 200 + CGFloat(toolRowCount * 80)
+            return 200 + CGFloat((toolRowCount + mediaRows) * 80)
         } else {
-            return CGFloat(max(100, toolRowCount * 90 + 30))
+            return CGFloat(max(100, (toolRowCount + mediaRows) * 90 + 30))
         }
     }
 #endif
@@ -341,6 +409,9 @@ struct VisionAttachmentButton: View {
 
     private var isDisabled: Bool {
         if showWebSearchOption || showPythonOption {
+#if os(iOS)
+            if showPlusIcon { return false }
+#endif
             return attachmentsDisabled && webSearchDisabled && pythonDisabled
         }
         return attachmentsDisabled
@@ -384,6 +455,8 @@ struct VisionAttachmentButton: View {
 
     private var hasActiveState: Bool {
         !vm.pendingImageURLs.isEmpty
+            || !vm.pendingMediaAttachments.isEmpty
+            || vm.isRecordingAudio
             || (showWebSearchOption && settings.webSearchArmed)
             || (showPythonOption && settings.pythonArmed)
     }
@@ -703,6 +776,18 @@ struct VisionAttachmentButton: View {
         Task { await presentOpenPanel() }
     }
 
+    private func selectRecordAudioFromMacMenu() {
+        showActionMenu = false
+        Task { await vm.toggleAudioRecording() }
+    }
+
+    private func selectAttachMediaFromMacMenu() {
+        showActionMenu = false
+        guard !isProcessingMediaImport else { return }
+        isProcessingMediaImport = true
+        Task { await presentMediaOpenPanel() }
+    }
+
     private func selectWebSearchFromMacMenu() {
         showActionMenu = false
         toggleWebSearch()
@@ -732,6 +817,22 @@ struct VisionAttachmentButton: View {
             if let image = UIImage(contentsOfFile: url.path) {
                 await vm.savePendingImage(image)
             }
+        }
+    }
+
+    @MainActor
+    private func presentMediaOpenPanel() async {
+        defer { isProcessingMediaImport = false }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = TranscriptionMediaSupport.allowedContentTypes
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.prompt = String(localized: "Attach")
+
+        let response = panel.runModal()
+        guard response == .OK else { return }
+        for url in panel.urls where TranscriptionMediaSupport.isSupported(url) {
+            await vm.savePendingMediaFile(from: url)
         }
     }
 #else
@@ -866,8 +967,47 @@ struct VisionAttachmentButton: View {
         }
         await MainActor.run { pickerItems.removeAll() }
     }
+
+    private func loadPickedVideos(_ items: [PhotosPickerItem]) async {
+        for item in items.prefix(1) {
+            guard let video = try? await item.loadTransferable(type: PickedVideoFile.self) else { continue }
+            await vm.savePendingMediaFile(from: video.url, originalFilename: video.originalFilename)
+            try? FileManager.default.removeItem(at: video.url)
+        }
+        await MainActor.run { videoPickerItems.removeAll() }
+    }
+
+    private func handleMediaImportResult(_ result: Result<[URL], Error>) async {
+        guard case .success(let urls) = result else { return }
+        for url in urls where TranscriptionMediaSupport.isSupported(url) {
+            await vm.savePendingMediaFile(from: url)
+        }
+    }
 #endif
 }
+
+#if canImport(PhotosUI) && canImport(CoreTransferable) && !os(macOS)
+private struct PickedVideoFile: Transferable {
+    let url: URL
+    let originalFilename: String?
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { video in
+            SentTransferredFile(video.url)
+        } importing: { received in
+            let sourceURL = received.file
+            let ext = sourceURL.pathExtension.isEmpty ? "mov" : sourceURL.pathExtension
+            let destination = FileManager.default.temporaryDirectory
+                .appendingPathComponent("noema-photo-video-\(UUID().uuidString).\(ext)")
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.copyItem(at: sourceURL, to: destination)
+            return PickedVideoFile(url: destination, originalFilename: sourceURL.lastPathComponent)
+        }
+    }
+}
+#endif
 
 private struct BadgeView: View {
     let count: Int
@@ -899,7 +1039,10 @@ private struct MacQuickActionPopover: View {
     let pythonArmed: Bool
     let pythonDisabled: Bool
     let pythonDisabledReason: String
+    let isRecordingAudio: Bool
     let onPhotos: () -> Void
+    let onRecordAudio: () -> Void
+    let onAttachMedia: () -> Void
     let onWebSearch: () -> Void
     let onPython: () -> Void
 
@@ -916,6 +1059,26 @@ private struct MacQuickActionPopover: View {
                     action: onPhotos
                 )
             }
+
+            MacQuickActionRow(
+                icon: isRecordingAudio ? "stop.circle.fill" : "mic",
+                title: isRecordingAudio ? String(localized: "Stop Recording") : String(localized: "Record Audio"),
+                stateText: isRecordingAudio ? String(localized: "Recording") : nil,
+                isArmed: isRecordingAudio,
+                isUnavailable: false,
+                unavailableReason: "",
+                action: onRecordAudio
+            )
+
+            MacQuickActionRow(
+                icon: "waveform.badge.plus",
+                title: String(localized: "Attach Audio/Video"),
+                stateText: nil,
+                isArmed: false,
+                isUnavailable: false,
+                unavailableReason: "",
+                action: onAttachMedia
+            )
 
             if showsWebSearchAction {
                 MacQuickActionRow(
@@ -1025,8 +1188,12 @@ private struct AttachmentTray: View {
     let pythonArmed: Bool
     let pythonDisabled: Bool
     let pythonDisabledReason: String
+    let isRecordingAudio: Bool
     let onCamera: () -> Void
     let onAllPhotos: () -> Void
+    let onRecordAudio: () -> Void
+    let onAttachMedia: () -> Void
+    let onScanPass: () -> Void
     let onWebSearchTap: () -> Void
     let onPythonTap: () -> Void
     let onAssetTap: (PHAsset) -> Void
@@ -1084,8 +1251,40 @@ private struct AttachmentTray: View {
                 }
             }
 
+            if showsPhotoSection { Divider().padding(.top, 2) }
+
+            toolRow(
+                icon: isRecordingAudio ? "stop.circle.fill" : "mic",
+                title: isRecordingAudio ? String(localized: "Stop Recording") : String(localized: "Record Audio"),
+                subtitle: isRecordingAudio ? String(localized: "Recording") : String(localized: "Record a voice note for transcription."),
+                isArmed: isRecordingAudio,
+                isDisabled: false,
+                identifier: "chat-tool-record-audio",
+                action: onRecordAudio
+            )
+
+            toolRow(
+                icon: "waveform.badge.plus",
+                title: String(localized: "Attach Audio/Video"),
+                subtitle: String(localized: "Import media and transcribe it locally when available."),
+                isArmed: false,
+                isDisabled: false,
+                identifier: "chat-tool-attach-media",
+                action: onAttachMedia
+            )
+
+            toolRow(
+                icon: "wallet.pass",
+                title: String(localized: "Scan Pass"),
+                subtitle: String(localized: "Extract trip details and add a confirmed pass to Wallet."),
+                isArmed: false,
+                isDisabled: false,
+                identifier: "chat-tool-scan-pass",
+                action: onScanPass
+            )
+
             if showsWebSearchAction {
-                if showsPhotoSection { Divider().padding(.top, 2) }
+                Divider().padding(.top, 2)
 
                 toolRow(
                     icon: "globe",

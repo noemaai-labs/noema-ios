@@ -95,7 +95,7 @@ final class GuidedWalkthroughManager: ObservableObject {
             .sink { [weak self] _ in self?.handleDownloadedModelsChanged() }
             .store(in: &cancellables)
 
-        downloadController.$items
+        downloadController.itemsPublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] items in
                 self?.updateRecommendedDownloadProgress(with: items)
@@ -358,6 +358,8 @@ final class GuidedWalkthroughManager: ObservableObject {
                 isVision = false
             case .afm:
                 isVision = false
+            case .coreai:
+                isVision = false
             }
         }
 
@@ -370,7 +372,7 @@ final class GuidedWalkthroughManager: ObservableObject {
         switch quant.format {
         case .gguf, .mlx:
             moeInfo = ModelScanner.moeInfo(for: url, format: quant.format)
-        case .et, .ane, .afm:
+        case .et, .ane, .afm, .coreai:
             moeInfo = nil
         }
         let architectureLabels = LocalModel.architectureLabels(for: url, format: quant.format, modelID: detail.id)
@@ -557,5 +559,18 @@ struct GuidedHighlightModifier: ViewModifier {
 extension View {
     func guideHighlight(_ id: GuidedWalkthroughManager.HighlightID) -> some View {
         modifier(GuidedHighlightModifier(id: id))
+    }
+
+    /// Attaches the guided-highlight anchor preference **only** when the walkthrough is
+    /// active. The `anchorPreference`/`overlayPreferenceValue` machinery re-propagates on
+    /// every geometry change, so leaving it attached makes scrolling a `Form`/`ScrollView`
+    /// that contains a highlighted control janky even when no walkthrough is running.
+    @ViewBuilder
+    func guideHighlightIfActive(_ active: Bool, _ id: GuidedWalkthroughManager.HighlightID) -> some View {
+        if active {
+            self.guideHighlight(id)
+        } else {
+            self
+        }
     }
 }

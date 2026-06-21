@@ -53,8 +53,8 @@ enum ModelBenchmarkError: LocalizedError {
     }
 }
 
-struct ModelBenchmarkResult: Identifiable {
-    let id = UUID()
+struct ModelBenchmarkResult: Identifiable, Codable, Equatable {
+    let id: UUID
     let format: ModelFormat
     let settings: ModelSettings
     let kvCacheOffloadActive: Bool
@@ -68,6 +68,41 @@ struct ModelBenchmarkResult: Identifiable {
     let memoryDeltaBytes: Int64
     let outputPreview: String
     let completedAt: Date
+    let speculativeTimings: LoopbackSpeculativeTimings?
+
+    init(
+        id: UUID = UUID(),
+        format: ModelFormat,
+        settings: ModelSettings,
+        kvCacheOffloadActive: Bool,
+        promptTokens: Int,
+        promptRate: Double,
+        generationTokens: Int,
+        generationRate: Double,
+        totalDuration: TimeInterval,
+        timeToFirstToken: TimeInterval,
+        peakMemoryBytes: Int64,
+        memoryDeltaBytes: Int64,
+        outputPreview: String,
+        completedAt: Date,
+        speculativeTimings: LoopbackSpeculativeTimings?
+    ) {
+        self.id = id
+        self.format = format
+        self.settings = settings
+        self.kvCacheOffloadActive = kvCacheOffloadActive
+        self.promptTokens = promptTokens
+        self.promptRate = promptRate
+        self.generationTokens = generationTokens
+        self.generationRate = generationRate
+        self.totalDuration = totalDuration
+        self.timeToFirstToken = timeToFirstToken
+        self.peakMemoryBytes = peakMemoryBytes
+        self.memoryDeltaBytes = memoryDeltaBytes
+        self.outputPreview = outputPreview
+        self.completedAt = completedAt
+        self.speculativeTimings = speculativeTimings
+    }
 }
 
 struct ModelBenchmarkProgress {
@@ -95,6 +130,14 @@ enum ModelBenchmarkService {
         if settings.cpuThreads > 0 { pieces.append("threads=\(settings.cpuThreads)") }
         pieces.append("kvOffload=\(settings.kvCacheOffload)")
         pieces.append("flash=\(settings.flashAttention)")
+        if settings.speculativeDecoding.mtpEnabled {
+            pieces.append("mtp=on")
+            pieces.append("mtpDraftNMax=\(settings.speculativeDecoding.resolvedMTPDraftNMax)")
+            pieces.append("mtpDraftNMin=\(settings.speculativeDecoding.resolvedMTPDraftNMin)")
+            pieces.append("mtpDraftPMin=\(String(format: "%.2f", settings.speculativeDecoding.resolvedMTPDraftPMin))")
+        } else {
+            pieces.append("mtp=off")
+        }
         if let seed = settings.seed { pieces.append("seed=\(seed)") }
         pieces.append(String(format: "temp=%.2f", settings.temperature))
         pieces.append(String(format: "topP=%.2f", settings.topP))
@@ -175,9 +218,10 @@ enum ModelBenchmarkService {
             throw ModelBenchmarkError.loadFailed(error.localizedDescription)
         }
 
-        let input = await MainActor.run {
+        let rawInput = await MainActor.run {
             vmRef.value.makeBenchmarkInput(from: prompt)
         }
+        let input = inputWithBenchmarkOptions(rawInput, maxOutputTokens: 512)
 
         return try await executeBenchmark(
             with: client,
@@ -196,6 +240,7 @@ enum ModelBenchmarkService {
         progress: (@MainActor (ModelBenchmarkProgress) -> Void)?
     ) async throws -> ModelBenchmarkResult {
         log("Benchmark run starting – promptTokens≈\(estimateTokens(for: prompt))")
+        await LoopbackRuntimeDiagnostics.shared.resetLatestResponse()
         let startFootprint = Int64(c_app_memory_footprint())
         var peakFootprint = startFootprint
         let start = Date()
@@ -248,11 +293,9 @@ enum ModelBenchmarkService {
                     lastUIUpdate = now
                 }
                 let estTokens = estimateTokens(for: aggregate)
-                if estTokens >= generationCap {
-                    log("Benchmark token limit reached (est=\(estTokens), cap=\(generationCap)) – cancelling stream")
+                if estTokens >= generationCap, !hitTokenLimit {
+                    log("Benchmark token cap reached (est=\(estTokens), cap=\(generationCap)) – waiting for server final timings")
                     hitTokenLimit = true
-                    client.cancelActive()
-                    break
                 }
                 if now.timeIntervalSince(start) >= maxDuration {
                     log("Benchmark duration limit reached (\(maxDuration)s) – cancelling stream")
@@ -286,21 +329,30 @@ enum ModelBenchmarkService {
         let totalDuration = end.timeIntervalSince(start)
         let timeToFirst = firstTokenDate?.timeIntervalSince(start) ?? totalDuration
         let generationDuration = max(0, totalDuration - timeToFirst)
+        let loopbackDiagnostics = await LoopbackRuntimeDiagnostics.shared.latestResponseSnapshot()
+        let speculativeTimings = loopbackDiagnostics?.timings
 
-        let promptTokens = estimateTokens(for: prompt)
-        let generationTokens = estimateTokens(for: aggregate)
-        let promptRate = timeToFirst > 0 ? Double(promptTokens) / timeToFirst : 0
-        let generationRate = generationDuration > 0 ? Double(generationTokens) / generationDuration : 0
+        let promptTokens = positiveOrNil(speculativeTimings?.promptN) ?? estimateTokens(for: prompt)
+        let generationTokens = positiveOrNil(speculativeTimings?.predictedN) ?? estimateTokens(for: aggregate)
+        let promptRate = positiveOrNil(speculativeTimings?.promptPerSecond) ?? (timeToFirst > 0 ? Double(promptTokens) / timeToFirst : 0)
+        let generationRate = positiveOrNil(speculativeTimings?.predictedPerSecond) ?? (generationDuration > 0 ? Double(generationTokens) / generationDuration : 0)
 
         let finalFootprint = Int64(c_app_memory_footprint())
         peakFootprint = max(peakFootprint, finalFootprint)
         let delta = max(Int64(0), peakFootprint - startFootprint)
 
         log(String(format: "Durations: total=%.2fs ttf=%.2fs gen=%.2fs", totalDuration, timeToFirst, generationDuration))
-        log("Token estimates: prompt=\(promptTokens) (~\(String(format: "%.2f", promptRate)) t/s) generation=\(generationTokens) (~\(String(format: "%.2f", generationRate)) t/s)")
+        log("Tokens: prompt=\(promptTokens) (\(String(format: "%.2f", promptRate)) t/s) generation=\(generationTokens) (\(String(format: "%.2f", generationRate)) t/s)")
         log("Memory: start=\(startFootprint)B peak=\(peakFootprint)B delta=\(delta)B")
+        if let timings = speculativeTimings, let draftN = timings.draftN, draftN > 0 {
+            let accepted = timings.draftNAccepted ?? 0
+            let acceptance = timings.acceptanceRate.map { String(format: "%.1f%%", $0 * 100) } ?? "-"
+            log("Speculative draft: accepted=\(accepted) generated=\(draftN) acceptance=\(acceptance)")
+        } else if settings.speculativeDecoding.hasSelection {
+            log("Speculative draft: no accepted/generated draft counters were reported by the server")
+        }
         if hitTokenLimit {
-            log("Benchmark ended after hitting the token cap")
+            log("Benchmark crossed the estimated token cap before server completion")
         }
         if hitDurationLimit {
             log("Benchmark ended after hitting the time limit")
@@ -319,8 +371,30 @@ enum ModelBenchmarkService {
             peakMemoryBytes: peakFootprint,
             memoryDeltaBytes: delta,
             outputPreview: String(aggregate.prefix(400)),
-            completedAt: Date()
+            completedAt: Date(),
+            speculativeTimings: speculativeTimings
         )
+    }
+
+    private static func inputWithBenchmarkOptions(_ input: LLMInput, maxOutputTokens: Int) -> LLMInput {
+        let current = input.generationOptions
+        let options = LLMGenerationOptions(
+            reasoningEnabled: current.reasoningEnabled,
+            maxOutputTokens: maxOutputTokens,
+            thinkingBudgetTokens: current.thinkingBudgetTokens,
+            responseFormat: current.responseFormat
+        )
+        return LLMInput(input.content, generationOptions: options)
+    }
+
+    private static func positiveOrNil(_ value: Int?) -> Int? {
+        guard let value, value > 0 else { return nil }
+        return value
+    }
+
+    private static func positiveOrNil(_ value: Double?) -> Double? {
+        guard let value, value > 0 else { return nil }
+        return value
     }
 
     private static func estimateTokens(for text: String) -> Int {

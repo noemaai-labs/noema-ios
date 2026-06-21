@@ -102,6 +102,7 @@ enum ModelRAMAdvisor {
         case .et:  return 1.1   // slightly more conservative
         case .ane: return 1.0
         case .afm: return 1.0
+        case .coreai: return 1.0
         }
     }
 
@@ -117,7 +118,7 @@ enum ModelRAMAdvisor {
             if gb < 12.0 { return 5120 }    // 13B class
             if gb < 24.0 { return 6656 }    // 30B class
             return 8192                      // 70B class and above
-        case .mlx, .ane, .et, .afm:
+        case .mlx, .ane, .et, .afm, .coreai:
             // MLX/Apple/ET models vary widely; use a modest default
             if gb < 3.0 { return 3072 }
             if gb < 6.0 { return 4096 }
@@ -131,7 +132,7 @@ enum ModelRAMAdvisor {
         switch format {
         case .gguf:
             return kvCacheEstimate.combinedBytesPerElement
-        case .mlx, .ane, .et, .afm:
+        case .mlx, .ane, .et, .afm, .coreai:
             return 4.0
         }
     }
@@ -155,7 +156,7 @@ enum ModelRAMAdvisor {
         let gqaFactor: Double = {
             switch format {
             case .gguf: return 0.45 // more conservative KV estimate
-            case .mlx, .ane, .et, .afm: return 0.6
+            case .mlx, .ane, .et, .afm, .coreai: return 0.6
             }
         }()
         let kv = Double(layers) * Double(max(1, contextLength)) * Double(hidden) * combinedBytesPerElement

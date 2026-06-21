@@ -1,3 +1,5 @@
 /* Auto-generated localization file for Info.plist */
+"NSMicrophoneUsageDescription" = "Mümkün olduğunda yerel olarak metne dönüştürülebilmesi için Noema’nın ses kaydetmesine izin verin.";
+"NSSpeechRecognitionUsageDescription" = "Noema’nın ses ve video eklerini metne dönüştürmesine izin verin.";
 "NSBluetoothAlwaysUsageDescription" = "Noema, röle kurulum ayrıntılarını diğer cihazlarınızla paylaşmak için Bluetooth'u kullanır.";
 "NSBluetoothPeripheralUsageDescription" = "Noema, röle kurulum ayrıntılarını diğer cihazlarınızla paylaşmak için Bluetooth'u kullanır.";

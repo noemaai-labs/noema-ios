@@ -1806,11 +1806,21 @@ final class RelayManagementViewModel: ObservableObject {
         loadedModelsMonitorTask?.cancel()
         loadedModelsMonitorTask = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
+            var lastSignature: [String]? = nil
             while !Task.isCancelled {
                 let snapshots = await self.serverEngine.modelSnapshots()
-                await MainActor.run {
-                    self.relaySnapshots = snapshots
-                    self.recomputeLoadedModels()
+                // Only hop to the main actor (and invalidate SwiftUI) when
+                // something the UI cares about actually changed. Otherwise this
+                // 1 Hz poll re-rendered the whole Relay view every second.
+                let signature = snapshots.map {
+                    "\($0.id)|\($0.isLoaded)|\($0.contextLength ?? -1)|\($0.displayName)"
+                }
+                if signature != lastSignature {
+                    lastSignature = signature
+                    await MainActor.run {
+                        self.relaySnapshots = snapshots
+                        self.recomputeLoadedModels()
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s poll
             }
@@ -1987,6 +1997,15 @@ private struct RelayDynamicProvider: InferenceProvider {
     func generateReply(for envelope: RelayEnvelope) async throws -> String {
         try await service.generateReply(for: envelope)
     }
+
+    func generateReplyStreaming(
+        for envelope: RelayEnvelope,
+        onPartial: @Sendable @escaping (String) async -> Void
+    ) async throws -> String {
+        try await service.streamReply(for: envelope) { partial in
+            Task { await onPartial(partial) }
+        }
+    }
 }
 
 @MainActor
@@ -2016,15 +2035,15 @@ struct RelayManagementView: View {
                 onRestart: { viewModel.restartRelay() }
             )
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    card { serverOverviewSection }
-                    card { connectionsAndModelsSection }
+                VStack(alignment: .leading, spacing: 16) {
+                    industrialPane { serverOverviewSection }
+                    industrialPane { connectionsAndModelsSection }
                     settingsAndBluetoothRow
-                    card { sourcesSection }
-                    card { cloudKitSection }
+                    industrialPane { sourcesSection }
+                    industrialPane { cloudKitSection }
                 }
-                .padding(.horizontal, 32)
-                .padding(.vertical, 36)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 24)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
@@ -2058,31 +2077,30 @@ struct RelayManagementView: View {
     }
 
     @ViewBuilder
-    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private func industrialPane<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         content()
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(AppTheme.padding)
-            .glassifyIfAvailable(in: RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-            .background(AppTheme.cardFill)
+            .padding(16)
+            .background(Color.secondary.opacity(0.03))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
             )
-            .shadow(color: Color.black.opacity(0.02), radius: 10, x: 0, y: 4)
     }
 
     // Place Server Settings and Bluetooth panels side-by-side on wide screens
     private var settingsAndBluetoothRow: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 24) {
-                card { serverSettingsSection }
+            HStack(alignment: .top, spacing: 16) {
+                industrialPane { serverSettingsSection }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                card { bluetoothSection }
+                industrialPane { bluetoothSection }
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            VStack(alignment: .leading, spacing: 24) {
-                card { serverSettingsSection }
-                card { bluetoothSection }
+            VStack(alignment: .leading, spacing: 16) {
+                industrialPane { serverSettingsSection }
+                industrialPane { bluetoothSection }
             }
         }
     }
@@ -2111,31 +2129,31 @@ struct RelayManagementView: View {
     }
 
     private var serverOverviewHeader: some View {
-        HStack(alignment: .center, spacing: 20) {
+        HStack(alignment: .center, spacing: 16) {
             RelayGlyph()
-                .frame(width: 54, height: 54)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(LocalizedStringKey("Noema Server"))
-                    .font(FontTheme.heading)
+                .frame(width: 44, height: 44)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(LocalizedStringKey("NOEMA SERVER"))
+                    .font(.caption)
+                    .fontWeight(.bold)
                     .foregroundStyle(AppTheme.text)
                 Text(viewModel.statusMessage)
-                    .font(FontTheme.body)
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(AppTheme.secondaryText)
                 if viewModel.isLANServerStarting {
                     Label(LocalizedStringKey("Bringing LAN server online…"), systemImage: "clock.arrow.2.circlepath")
-                        .font(FontTheme.caption)
+                        .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(AppTheme.tertiaryText)
                 } else if let activity = viewModel.lastActivity {
                     Label(String.localizedStringWithFormat(String(localized: "Last activity %@"), activity.formatted(date: .numeric, time: .shortened)), systemImage: "clock.arrow.circlepath")
-                        .font(FontTheme.caption)
+                        .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(AppTheme.tertiaryText)
                 }
             }
             Spacer(minLength: 0)
             Toggle(isOn: serverRunningBinding) {
-                Text(viewModel.serverState == .running ? String(localized: "Running") : String(localized: "Stopped"))
-                    .font(FontTheme.body)
-                    .fontWeight(.medium)
+                Text(viewModel.serverState == .running ? String(localized: "RUNNING") : String(localized: "STOPPED"))
+                    .font(.system(.caption, design: .monospaced, weight: .bold))
             }
             .toggleStyle(ModernToggleStyle())
             .disabled(viewModel.serverState == .starting || viewModel.isLANServerStarting)
@@ -2143,66 +2161,77 @@ struct RelayManagementView: View {
     }
 
     private var serverOverviewDetails: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(LocalizedStringKey("Reachable at"))
-                .font(FontTheme.subheadline)
-                .foregroundStyle(AppTheme.secondaryText)
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(LocalizedStringKey("IP"))
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundStyle(AppTheme.secondaryText)
                 Text(lanAddressDisplay)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(AppTheme.text)
                     .textSelection(.enabled)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.secondary.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 Button {
                     copyToPasteboard(lanAddressDisplay)
                 } label: {
                     Image(systemName: "doc.on.doc")
+                        .font(.caption2)
                         .foregroundStyle(AppTheme.secondaryText)
                 }
                 .buttonStyle(.borderless)
                 .help(String(localized: "Copy local URL"))
                 .disabled(viewModel.lanReachableAddress == nil)
             }
+            
             Divider()
-                .padding(.vertical, 4)
-            VStack(alignment: .leading, spacing: 8) {
-                Text(LocalizedStringKey("Connection Modes"))
-                    .font(FontTheme.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .textCase(.uppercase)
+                .padding(.vertical, 2)
+
+            HStack(alignment: .top, spacing: 24) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Label {
-                        Text(LocalizedStringKey("Cloud Relay via CloudKit (auto-discovery and Bluetooth pairing)"))
-                            .font(FontTheme.caption)
-                            .foregroundStyle(AppTheme.text)
-                    } icon: {
-                        Image(systemName: "icloud")
-                            .foregroundStyle(Color.accentColor)
-                    }
-                    Label {
-                        Text(LocalizedStringKey("Local Network HTTP server for LAN clients (OpenAI-compatible)"))
-                            .font(FontTheme.caption)
-                            .foregroundStyle(AppTheme.text)
-                    } icon: {
-                        Image(systemName: "wifi.router")
-                            .foregroundStyle(Color.accentColor)
+                    Text(LocalizedStringKey("CONNECTION MODES"))
+                        .font(.caption2)
+                        .fontWeight(.bold)
+                        .foregroundStyle(AppTheme.secondaryText)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label {
+                            Text(LocalizedStringKey("CloudKit Relay"))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(AppTheme.text)
+                        } icon: {
+                            Image(systemName: "icloud")
+                                .font(.caption2)
+                                .foregroundStyle(Color.accentColor)
+                        }
+                        Label {
+                            Text(LocalizedStringKey("Local LAN (OpenAI)"))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(AppTheme.text)
+                        } icon: {
+                            Image(systemName: "wifi.router")
+                                .font(.caption2)
+                                .foregroundStyle(Color.accentColor)
+                        }
                     }
                 }
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                Text(LocalizedStringKey("Supported Endpoints"))
-                    .font(FontTheme.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .textCase(.uppercase)
                 VStack(alignment: .leading, spacing: 6) {
-                    Label {
-                        Text(LocalizedStringKey("OpenAI-style API — /v1/chat/completions, /v1/completions, /v1/models"))
-                            .font(FontTheme.caption)
-                            .foregroundStyle(AppTheme.text)
-                    } icon: {
-                        Image(systemName: "chevron.left.slash.chevron.right")
-                            .foregroundStyle(Color.accentColor)
+                    Text(LocalizedStringKey("ENDPOINTS"))
+                        .font(.caption2)
+                        .fontWeight(.bold)
+                        .foregroundStyle(AppTheme.secondaryText)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label {
+                            Text(LocalizedStringKey("v1/chat, v1/models"))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(AppTheme.text)
+                        } icon: {
+                            Image(systemName: "chevron.left.slash.chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(Color.accentColor)
+                        }
                     }
                 }
             }
@@ -2280,45 +2309,39 @@ struct RelayManagementView: View {
         }
 
         var body: some View {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(title)
-                    .font(FontTheme.subheadline)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(AppTheme.secondaryText)
+                    .font(.caption)
+                    .fontWeight(.bold)
                     .textCase(.uppercase)
-                    .padding(.leading, 4)
+                    .foregroundStyle(AppTheme.secondaryText)
                 content
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(AppTheme.cardFill)
-                    )
             }
         }
     }
 
     private func connectedDeviceRow(for client: RelayServerEngine.ConnectedClient) -> some View {
         let descriptor = connectedDeviceDescriptor(for: client)
-        return HStack(alignment: .top, spacing: 12) {
+        return HStack(alignment: .center, spacing: 12) {
             Image(systemName: descriptor.icon)
-                .font(.system(size: 20))
+                .font(.caption)
                 .foregroundStyle(descriptor.tint)
-            VStack(alignment: .leading, spacing: 4) {
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
                 Text(descriptor.title)
-                    .font(FontTheme.body)
-                    .fontWeight(.medium)
+                    .font(.system(.caption, design: .monospaced, weight: .bold))
                     .foregroundStyle(AppTheme.text)
                 if let detail = descriptor.detail {
                     Text(detail)
-                        .font(FontTheme.caption)
+                        .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(AppTheme.secondaryText)
                 }
-                Text(descriptor.lastSeen)
-                    .font(FontTheme.caption)
-                    .foregroundStyle(AppTheme.tertiaryText)
             }
             Spacer(minLength: 0)
+            Text(descriptor.lastSeen)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
         }
     }
 
@@ -2374,23 +2397,33 @@ struct RelayManagementView: View {
     @ViewBuilder
     private func loadedModelRow(for snapshot: RelayServerEngine.ModelSnapshot) -> some View {
         let isActive = viewModel.activeModelID == snapshot.descriptor.id
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(snapshot.displayName)
-                    .font(FontTheme.body)
-                    .fontWeight(.medium)
+                    .font(.system(.caption, design: .monospaced, weight: .bold))
                     .foregroundStyle(AppTheme.text)
                 if isActive {
-                    Text(LocalizedStringKey("Active"))
-                        .font(FontTheme.caption)
-                        .fontWeight(.semibold)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                    Text(LocalizedStringKey("ACTIVE"))
+                        .font(.system(.caption2, design: .monospaced, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                         .foregroundStyle(Color.accentColor)
                 }
+                Spacer(minLength: 0)
+                if case .local = snapshot.descriptor.kind {
+                    HStack(spacing: 8) {
+                        Button(String(localized: "Settings")) { presentModelSettings(for: snapshot) }
+                            .buttonStyle(GlassButtonStyle())
+                            .controlSize(.small)
+                        Button(String(localized: "Unload")) { viewModel.unloadModel(snapshot.descriptor.id) }
+                            .buttonStyle(GlassButtonStyle())
+                            .controlSize(.small)
+                    }
+                }
             }
-            HStack(spacing: 16) {
+            HStack(spacing: 8) {
                 metadataLabel(snapshot.provider.displayName, systemImage: "antenna.radiowaves.left.and.right")
                 if let quant = snapshot.quant, !quant.isEmpty {
                     metadataLabel(quant, systemImage: "cube")
@@ -2401,35 +2434,27 @@ struct RelayManagementView: View {
                 if let size = snapshot.sizeBytes {
                     metadataLabel(ByteCountFormatter.string(fromByteCount: size, countStyle: .memory), systemImage: "externaldrive")
                 }
-            }
-            Text(String.localizedStringWithFormat(String(localized: "Last refreshed %@"), Self.relativeFormatter.localizedString(for: snapshot.created, relativeTo: Date())))
-                .font(FontTheme.caption)
-                .foregroundStyle(AppTheme.tertiaryText)
-            if case .local = snapshot.descriptor.kind {
-                HStack(spacing: 12) {
-                    Button(String(localized: "Model Settings")) { presentModelSettings(for: snapshot) }
-                        .buttonStyle(GlassButtonStyle())
-                    Button(String(localized: "Unload")) { viewModel.unloadModel(snapshot.descriptor.id) }
-                        .buttonStyle(GlassButtonStyle())
-                    Spacer(minLength: 0)
-                }
+                Spacer(minLength: 0)
+                Text(String.localizedStringWithFormat(String(localized: "Refreshed %@"), Self.relativeFormatter.localizedString(for: snapshot.created, relativeTo: Date())))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(AppTheme.tertiaryText)
             }
         }
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(AppTheme.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.cardStroke, lineWidth: 1)
-        )
+        .padding(.vertical, 4)
     }
 
     private func metadataLabel(_ text: String, systemImage: String) -> some View {
         Label(text, systemImage: systemImage)
-            .font(FontTheme.caption)
+            .font(.system(.caption2, design: .monospaced, weight: .bold))
             .foregroundStyle(AppTheme.secondaryText)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.secondary.opacity(0.1))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+            )
     }
 
     private func presentModelSettings(for snapshot: RelayServerEngine.ModelSnapshot) {
@@ -2440,88 +2465,93 @@ struct RelayManagementView: View {
     private var serverSettingsSection: some View {
         let config = viewModel.serverConfiguration
         return DisclosureGroup(isExpanded: $serverSettingsExpanded) {
-            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 16) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Server Port"))
+                    settingsLabel(LocalizedStringKey("PORT"))
                     HStack(spacing: 8) {
                         TextField(String(localized: "Port"), text: $portText)
-                            .frame(width: 80)
+                            .frame(width: 60)
                             .textFieldStyle(.roundedBorder)
+                            .font(.system(.caption, design: .monospaced))
                             .onSubmit { applyPortText() }
                         Button(String(localized: "Apply")) { applyPortText() }
-                            .buttonStyle(GlassButtonStyle())
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
                     }
                 }
 
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Serve on Local Network"))
+                    settingsLabel(LocalizedStringKey("LAN SERVE"))
                     Toggle("", isOn: Binding(
                         get: { config.serveOnLocalNetwork },
                         set: { viewModel.toggleServeOnLocalNetwork($0) }
                     ))
                     .toggleStyle(ModernToggleStyle())
+                    .labelsHidden()
                 }
 
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Just-in-Time Model Loading"))
+                    settingsLabel(LocalizedStringKey("JIT LOAD"))
                     Toggle("", isOn: Binding(
                         get: { config.justInTimeLoading },
                         set: { viewModel.toggleJustInTimeLoading($0) }
                     ))
                     .toggleStyle(ModernToggleStyle())
+                    .labelsHidden()
                 }
 
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Auto unload unused JIT models"))
+                    settingsLabel(LocalizedStringKey("AUTO UNLOAD"))
                     Toggle("", isOn: Binding(
                         get: { config.autoUnloadJIT },
                         set: { viewModel.toggleAutoUnloadJIT($0) }
                     ))
                     .toggleStyle(ModernToggleStyle())
+                    .labelsHidden()
                 }
 
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Max idle TTL"))
+                    settingsLabel(LocalizedStringKey("IDLE TTL"))
                     HStack(spacing: 8) {
-                        TextField(String(localized: "Minutes"), text: $idleTTLText)
-                            .frame(width: 80)
+                        TextField(String(localized: "Mins"), text: $idleTTLText)
+                            .frame(width: 60)
                             .textFieldStyle(.roundedBorder)
+                            .font(.system(.caption, design: .monospaced))
                             .onSubmit { applyIdleTTLText() }
                         Button(String(localized: "Apply")) { applyIdleTTLText() }
-                            .buttonStyle(GlassButtonStyle())
-                        Text(LocalizedStringKey("minutes"))
-                            .font(FontTheme.subheadline)
-                            .foregroundStyle(AppTheme.secondaryText)
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
                     }
                 }
 
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Only keep last JIT model"))
+                    settingsLabel(LocalizedStringKey("KEEP LAST"))
                     Toggle("", isOn: Binding(
                         get: { config.onlyKeepLastJITModel },
                         set: { viewModel.toggleKeepLastJITModel($0) }
                     ))
                     .toggleStyle(ModernToggleStyle())
+                    .labelsHidden()
                 }
 
                 GridRow {
-                    settingsLabel(LocalizedStringKey("Request logging"))
+                    settingsLabel(LocalizedStringKey("REQ LOGGING"))
                     Toggle("", isOn: Binding(
                         get: { config.requestLoggingEnabled },
                         set: { viewModel.toggleRequestLogging($0) }
                     ))
                     .toggleStyle(ModernToggleStyle())
+                    .labelsHidden()
                 }
-
-                // Cloud Relay worker/log tuning removed for simplicity
             }
+            .padding(.top, 8)
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "gearshape")
-                    .font(.title3.weight(.semibold))
-                Text(LocalizedStringKey("Server Settings"))
-                    .font(FontTheme.heading)
-                    .fontWeight(.semibold)
+                    .font(.caption)
+                Text(LocalizedStringKey("SERVER SETTINGS"))
+                    .font(.caption)
+                    .fontWeight(.bold)
                     .foregroundStyle(AppTheme.text)
             }
         }
@@ -2530,7 +2560,7 @@ struct RelayManagementView: View {
 
     private func settingsLabel(_ text: LocalizedStringKey) -> some View {
         Text(text)
-            .font(FontTheme.subheadline)
+            .font(.system(.caption2, design: .monospaced, weight: .bold))
             .foregroundStyle(AppTheme.secondaryText)
     }
 
@@ -2589,24 +2619,27 @@ struct RelayManagementView: View {
     }
 
     private var sourcesSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(LocalizedStringKey("Relay Sources"))
-                .font(FontTheme.heading)
-                .fontWeight(.semibold)
-                .foregroundStyle(AppTheme.text)
-            Text(LocalizedStringKey("Expose any downloaded models or connected remote endpoints from the Stored tab to your paired devices. Select which one should answer conversations when the relay is running."))
-                .font(FontTheme.subheadline)
-                .foregroundStyle(AppTheme.secondaryText)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(LocalizedStringKey("RELAY SOURCES"))
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundStyle(AppTheme.text)
+                Spacer()
+                exposureBulkControls
+            }
             if viewModel.availableModels.isEmpty {
                 Text(LocalizedStringKey("No models available. Add downloads or remote connections in Stored to configure the relay."))
-                    .font(FontTheme.caption)
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(AppTheme.secondaryText)
                     .padding(.vertical, 8)
             } else {
-                exposureBulkControls
-                VStack(spacing: 12) {
-                    ForEach(viewModel.availableModels) { descriptor in
+                VStack(spacing: 8) {
+                    ForEach(Array(viewModel.availableModels.enumerated()), id: \.element.id) { index, descriptor in
                         modelRow(for: descriptor)
+                        if index < viewModel.availableModels.count - 1 {
+                            Divider()
+                        }
                     }
                 }
             }
@@ -2615,9 +2648,7 @@ struct RelayManagementView: View {
 
             Toggle(LocalizedStringKey("Eject button unloads relay model"), isOn: $viewModel.ejectsModelOnDisconnect)
                 .toggleStyle(ModernToggleStyle())
-            Text(LocalizedStringKey("When enabled, pressing eject on iOS tells this Mac to unload the active relay model."))
-                .font(FontTheme.caption)
-                .foregroundStyle(AppTheme.secondaryText)
+                .font(.system(.caption, design: .monospaced))
         }
     }
 
@@ -2629,88 +2660,79 @@ struct RelayManagementView: View {
         let isUnavailable = entry?.health == .error
         let isLoaded = viewModel.isModelLoaded(descriptor.id)
 
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
                 providerBadge(for: descriptor.provider)
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text(descriptor.displayName)
-                            .font(FontTheme.body)
-                            .fontWeight(.medium)
-                            .foregroundStyle(AppTheme.text)
-                        if isActive {
-                            Text(LocalizedStringKey("Active"))
-                                .font(FontTheme.caption)
-                                .fontWeight(.semibold)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.accentColor.opacity(0.15), in: Capsule())
-                                .foregroundStyle(Color.accentColor)
-                        }
-                    }
-                    Text(modelSubtitle(for: descriptor))
-                        .font(FontTheme.subheadline)
-                        .foregroundStyle(AppTheme.secondaryText)
-                    if let entry, entry.health == .missing {
-                        Text(LocalizedStringKey("Source unavailable. Check storage or network settings."))
-                            .font(FontTheme.caption)
-                            .foregroundColor(.red)
-                    }
-                    if isUnavailable {
-                        Text(LocalizedStringKey("Remote endpoint is offline. This model can't be found at this time."))
-                            .font(FontTheme.caption)
-                            .foregroundColor(.orange)
-                    }
+                Text(descriptor.displayName)
+                    .font(.system(.caption, design: .monospaced, weight: .bold))
+                    .foregroundStyle(AppTheme.text)
+                if isActive {
+                    Text(LocalizedStringKey("ACTIVE"))
+                        .font(.system(.caption2, design: .monospaced, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .foregroundStyle(Color.accentColor)
                 }
                 Spacer(minLength: 0)
+                if let entryIndex = entryIndex {
+                    Text(LocalizedStringKey("EXPOSE"))
+                        .font(.system(.caption2, design: .monospaced, weight: .bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                    Toggle("", isOn: $viewModel.catalogEntries[entryIndex].exposed)
+                        .labelsHidden()
+                        .toggleStyle(ModernToggleStyle())
+                        .disabled(isUnavailable)
+                }
             }
 
-            HStack(alignment: .center, spacing: 16) {
-                if let entryIndex = entryIndex {
-                    Toggle(isOn: $viewModel.catalogEntries[entryIndex].exposed) {
-                        Text(LocalizedStringKey("Expose to iOS"))
-                            .font(FontTheme.subheadline)
-                            .foregroundStyle(AppTheme.text)
-                    }
-                    .toggleStyle(ModernToggleStyle())
-                    .disabled(isUnavailable)
+            HStack(alignment: .center, spacing: 8) {
+                Text(modelSubtitle(for: descriptor))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(AppTheme.secondaryText)
+                if let entry {
+                    Text("•")
+                        .font(.system(.caption2))
+                        .foregroundStyle(AppTheme.tertiaryText)
+                    Text(exposureSummary(for: descriptor, entry: entry))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(AppTheme.secondaryText)
                 }
                 Spacer()
-                // Load/Unload controls to allow multiple models concurrently
                 if !isUnavailable {
                     if isLoaded {
                         Button(LocalizedStringKey("Unload")) { viewModel.unloadModel(descriptor.id) }
-                            .buttonStyle(GlassButtonStyle())
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
                     } else {
                         if viewModel.loadingModelIDs.contains(descriptor.id) {
-                            HStack(spacing: 8) {
-                                ProgressView().controlSize(.small)
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.mini)
                                 Text(LocalizedStringKey("Loading…"))
                             }
-                            .font(FontTheme.subheadline)
+                            .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(AppTheme.secondaryText)
                         } else {
                             Button(LocalizedStringKey("Load")) { viewModel.loadModel(descriptor.id) }
-                                .buttonStyle(GlassButtonStyle())
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
                         }
                     }
                 }
-                if let entry {
-                    Text(exposureSummary(for: descriptor, entry: entry))
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
+            }
+            if let entry, entry.health == .missing {
+                Text(LocalizedStringKey("Source unavailable. Check storage or network settings."))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.red)
+            }
+            if isUnavailable {
+                Text(LocalizedStringKey("Remote endpoint is offline. This model can't be found at this time."))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.orange)
             }
         }
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(isActive ? Color.accentColor.opacity(0.08) : AppTheme.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(isActive ? Color.accentColor.opacity(0.4) : AppTheme.cardStroke, lineWidth: isActive ? 2 : 1)
-        )
+        .padding(.vertical, 4)
         .opacity(isUnavailable ? 0.45 : 1)
     }
 
@@ -2752,14 +2774,10 @@ struct RelayManagementView: View {
         case .http:
             symbol = "network"
         }
-        return Circle()
-            .fill(Color.accentColor.opacity(0.12))
-            .frame(width: 42, height: 42)
-            .overlay(
-                Image(systemName: symbol)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-            )
+        return Image(systemName: symbol)
+            .font(.caption2)
+            .foregroundStyle(Color.accentColor)
+            .frame(width: 16)
     }
 
     private func modelSubtitle(for descriptor: RelayModelDescriptor) -> String {
@@ -2807,55 +2825,47 @@ struct RelayManagementView: View {
     }
 
     private var bluetoothSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(LocalizedStringKey("Bluetooth Pairing"))
-                .font(FontTheme.heading)
-                .fontWeight(.semibold)
-                .foregroundStyle(AppTheme.text)
-            HStack(alignment: .center, spacing: 20) {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.caption)
+                    .foregroundStyle(Color.blue)
+                Text(LocalizedStringKey("BLUETOOTH PAIRING"))
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundStyle(AppTheme.text)
+            }
+            HStack(alignment: .center, spacing: 12) {
                 AnimatedBluetoothBadge(state: viewModel.bluetoothState)
-                VStack(alignment: .leading, spacing: 8) {
+                    .frame(width: 32, height: 32)
+                VStack(alignment: .leading, spacing: 2) {
                     Text(bluetoothStatusTitle)
-                        .font(FontTheme.body)
-                        .fontWeight(.medium)
+                        .font(.system(.caption, design: .monospaced, weight: .bold))
                         .foregroundStyle(AppTheme.text)
-                    Text(LocalizedStringKey("Nearby iPhone and iPad devices discover your Mac relay instantly and sync pairing codes over the air."))
-                        .font(FontTheme.subheadline)
-                        .foregroundStyle(AppTheme.secondaryText)
+                    bluetoothStatusDetail
                 }
             }
-            bluetoothStatusDetail
             if let payload = viewModel.payload {
-                Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                     GridRow {
-                        Text(LocalizedStringKey("Device"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.semibold)
+                        Text(LocalizedStringKey("DEVICE"))
+                            .font(.system(.caption2, design: .monospaced, weight: .bold))
                             .foregroundStyle(AppTheme.secondaryText)
                         Text(payload.deviceName)
-                            .font(FontTheme.body)
+                            .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(AppTheme.text)
                     }
                     GridRow {
-                        Text(LocalizedStringKey("Relay ID"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.semibold)
+                        Text(LocalizedStringKey("RELAY ID"))
+                            .font(.system(.caption2, design: .monospaced, weight: .bold))
                             .foregroundStyle(AppTheme.secondaryText)
                         Text(payload.id.uuidString)
-                            .font(FontTheme.body)
+                            .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(AppTheme.text)
                             .textSelection(.enabled)
                     }
                 }
-                .padding(16)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.accentColor.opacity(colorScheme == .dark ? 0.2 : 0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.accentColor.opacity(colorScheme == .dark ? 0.3 : 0.15))
-                )
+                .padding(.vertical, 4)
                 .animation(.easeInOut(duration: 0.35), value: payload.id)
             }
         }
@@ -2906,118 +2916,65 @@ struct RelayManagementView: View {
     }
 
     private var cloudKitSection: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text(LocalizedStringKey("CloudKit"))
-                .font(FontTheme.heading)
-                .fontWeight(.semibold)
-                .foregroundStyle(AppTheme.text)
-            let containerID = RelayConfiguration.containerIdentifier
-            Text(
-                String.localizedStringWithFormat(
-                    String(
-                        localized: "The relay listens to the %@ container for new conversations and responds with your selected provider.",
-                        locale: LocalizationManager.preferredLocale()
-                    ),
-                    containerID
-                )
-            )
-                .font(FontTheme.subheadline)
-                .foregroundStyle(AppTheme.secondaryText)
-
-            HStack(alignment: .top, spacing: 16) {
-                Circle()
-                    .fill(cloudKitStatusColor.opacity(0.12))
-                    .frame(width: 56, height: 56)
-                    .overlay(
-                        Image(systemName: cloudKitStatusSymbol)
-                            .font(.system(size: 24, weight: .semibold))
-                            .foregroundStyle(cloudKitStatusColor)
-                    )
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(cloudKitStatusTitle)
-                        .font(FontTheme.body)
-                        .fontWeight(.medium)
-                        .foregroundStyle(cloudKitStatusColor)
-
-                    if let detail = cloudKitPrimaryDetail {
-                        Text(detail)
-                            .font(FontTheme.caption)
-                            .foregroundStyle(cloudKitPrimaryDetailColor)
-                    }
-
-                    if shouldShowCloudKitProgress {
-                        ProgressView()
-                            .progressViewStyle(.linear)
-                            .tint(cloudKitStatusColor)
-                    }
-
-                    if let substatus = cloudKitSubstatus {
-                        Text(substatus)
-                            .font(FontTheme.caption)
-                            .foregroundStyle(AppTheme.secondaryText)
-                    }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: cloudKitStatusSymbol)
+                    .font(.caption)
+                    .foregroundStyle(cloudKitStatusColor)
+                Text(LocalizedStringKey("CLOUDKIT RELAY"))
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundStyle(AppTheme.text)
+                Spacer()
+                if shouldShowCloudKitProgress {
+                    ProgressView()
+                        .controlSize(.mini)
                 }
             }
 
-            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                 GridRow {
-                    Text(LocalizedStringKey("Container"))
-                        .font(FontTheme.caption)
-                        .fontWeight(.semibold)
+                    Text(LocalizedStringKey("STATUS"))
+                        .font(.system(.caption2, design: .monospaced, weight: .bold))
                         .foregroundStyle(AppTheme.secondaryText)
-                    Text(RelayConfiguration.containerIdentifier)
-                        .font(FontTheme.body)
-                        .foregroundStyle(AppTheme.text)
-                        .textSelection(.enabled)
+                    Text(cloudKitStatusTitle)
+                        .font(.system(.caption, design: .monospaced, weight: .bold))
+                        .foregroundStyle(cloudKitStatusColor)
                 }
+                
+                if let detail = cloudKitPrimaryDetail {
+                    GridRow {
+                        Text(LocalizedStringKey("INFO"))
+                            .font(.system(.caption2, design: .monospaced, weight: .bold))
+                            .foregroundStyle(AppTheme.secondaryText)
+                        Text(detail)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(cloudKitPrimaryDetailColor)
+                    }
+                }
+                
                 if viewModel.catalogVersion > 0 {
                     GridRow {
-                        Text(LocalizedStringKey("Catalog"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.semibold)
+                        Text(LocalizedStringKey("CATALOG"))
+                            .font(.system(.caption2, design: .monospaced, weight: .bold))
                             .foregroundStyle(AppTheme.secondaryText)
-                        Text(
-                            String.localizedStringWithFormat(
-                                String(
-                                    localized: "Version %@",
-                                    locale: LocalizationManager.preferredLocale()
-                                ),
-                                "\(viewModel.catalogVersion)"
-                            )
-                        )
-                        .font(FontTheme.body)
-                        .foregroundStyle(AppTheme.text)
+                        Text("v\(viewModel.catalogVersion)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(AppTheme.text)
                     }
                 }
                 if let lastSync = cloudKitLastSyncText {
                     GridRow {
-                        Text(LocalizedStringKey("Last Sync"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.semibold)
+                        Text(LocalizedStringKey("LAST SYNC"))
+                            .font(.system(.caption2, design: .monospaced, weight: .bold))
                             .foregroundStyle(AppTheme.secondaryText)
                         Text(lastSync)
-                            .font(FontTheme.body)
+                            .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(AppTheme.text)
                     }
                 }
             }
-
-            if let payload = viewModel.payload {
-                let refreshed = payload.updatedAt.formatted(date: .numeric, time: .shortened)
-                Label(
-                    String.localizedStringWithFormat(
-                        String(
-                            localized: "Pairing refreshed %@",
-                            locale: LocalizationManager.preferredLocale()
-                        ),
-                        refreshed
-                    ),
-                    systemImage: "icloud"
-                )
-                    .font(FontTheme.caption)
-                    .foregroundStyle(AppTheme.tertiaryText)
-            }
+            .padding(.vertical, 4)
         }
     }
 
@@ -3473,19 +3430,19 @@ private struct AnimatedBluetoothBadge: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.accentColor.opacity(shouldAnimate ? 0.4 : 0.2), lineWidth: 2)
-                .frame(width: ripple ? 140 : 90, height: ripple ? 140 : 90)
+                .stroke(Color.accentColor.opacity(shouldAnimate ? 0.4 : 0.2), lineWidth: 1.5)
+                .scaleEffect(ripple ? 1.6 : 1.0)
                 .opacity(shouldAnimate ? (ripple ? 0.0 : 0.5) : 0)
             Circle()
                 .fill(Color.accentColor.opacity(0.15))
-                .frame(width: 80, height: 80)
                 .overlay {
                     Image(systemName: "wave.3.right")
-                        .font(.system(size: 30, weight: .semibold))
+                        .resizable()
+                        .scaledToFit()
+                        .padding(8)
                         .foregroundStyle(Color.accentColor)
                 }
         }
-        .frame(width: 140, height: 140)
         .onAppear(perform: restartAnimation)
         .onChange(of: state) { _ in restartAnimation() }
         .animation(
@@ -3511,15 +3468,16 @@ private struct AnimatedBluetoothBadge: View {
 private struct RelayGlyph: View {
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color.accentColor.opacity(0.15))
-                .frame(width: 80, height: 80)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .stroke(Color.accentColor.opacity(0.3), lineWidth: 1)
                 )
             Image(systemName: "bolt.horizontal.fill")
-                .font(.system(size: 32, weight: .semibold))
+                .resizable()
+                .scaledToFit()
+                .padding(10)
                 .foregroundStyle(Color.accentColor)
         }
     }

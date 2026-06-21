@@ -190,8 +190,25 @@ enum AFMToolExecutionMapper {
             let isWebSearch = call.toolName == "noema.web.retrieve"
             let isPython = call.toolName == "noema.python.execute"
             let isMemory = call.toolName == "noema.memory"
-            let displayName = isWebSearch ? "Web Search" : (isPython ? "Python" : (isMemory ? "Memory" : "Tool"))
-            let iconName = isWebSearch ? "globe" : (isPython ? "chevron.left.forwardslash.chevron.right" : (isMemory ? "bookmark" : "wrench.and.screwdriver"))
+            // Legacy only: the escalation tool was removed in favor of the
+            // Dynamic Profile baton-pass (AFMDynamicProfileRouting.swift),
+            // which is never recorded. This mapping keeps any old recorded
+            // summaries rendering correctly.
+            let isPCC = call.toolName == "noema.afm.escalateToPrivateCloudCompute"
+            let displayName: String = {
+                if isWebSearch { return "Web Search" }
+                if isPython { return "Python" }
+                if isMemory { return "Memory" }
+                if isPCC { return "Private Cloud Compute" }
+                return "Tool"
+            }()
+            let iconName: String = {
+                if isWebSearch { return "globe" }
+                if isPython { return "chevron.left.forwardslash.chevron.right" }
+                if isMemory { return "bookmark" }
+                if isPCC { return "cloud" }
+                return "wrench.and.screwdriver"
+            }()
 
             resolvedCalls.append(
                 AFMResolvedToolCall(
@@ -451,4 +468,5 @@ final class AFMMemoryTool: FoundationModels.Tool {
         return payloadString
     }
 }
+
 #endif

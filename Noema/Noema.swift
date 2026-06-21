@@ -6,6 +6,13 @@ import Foundation
 import RelayKit
 import Combine
 import ImageIO
+#if canImport(CoreSpotlight) && canImport(UniformTypeIdentifiers)
+import CoreSpotlight
+import UniformTypeIdentifiers
+#endif
+#if canImport(AVFoundation)
+import AVFoundation
+#endif
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -25,6 +32,123 @@ import NoemaPackages
 #if canImport(MLX)
 import MLX
 #endif
+
+struct NoemaSpotlightIndexRecord: Sendable, Hashable {
+    let uniqueIdentifier: String
+    let title: String
+    let contentDescription: String
+    let keywords: [String]
+}
+
+@MainActor
+final class NoemaSpotlightIndexingService {
+    static let shared = NoemaSpotlightIndexingService()
+
+    private let chatDomain = "noema.chats"
+    private let datasetDomain = "noema.datasets"
+    private var chatTask: Task<Void, Never>?
+    private var datasetTask: Task<Void, Never>?
+    // Last successfully donated content per domain. Re-donating identical
+    // records churns the OS-side donation translator (repeated
+    // LNSpotlightCascadeTranslator failures in the log) for no gain.
+    private var lastChatDigest: Int?
+    private var lastDatasetDigest: Int?
+
+    private init() {}
+
+    func scheduleChatTitleIndex(records: [NoemaSpotlightIndexRecord]) {
+        let digest = Self.digest(records)
+        guard digest != lastChatDigest else { return }
+        chatTask?.cancel()
+        chatTask = Task { [chatDomain] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            await Self.replaceDomain(chatDomain, records: records)
+            await MainActor.run { Self.shared.lastChatDigest = digest }
+        }
+    }
+
+    func scheduleDatasetNameIndex(records: [NoemaSpotlightIndexRecord]) {
+        let digest = Self.digest(records)
+        guard digest != lastDatasetDigest else { return }
+        datasetTask?.cancel()
+        datasetTask = Task { [datasetDomain] in
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            guard !Task.isCancelled else { return }
+            await Self.replaceDomain(datasetDomain, records: records)
+            await MainActor.run { Self.shared.lastDatasetDigest = digest }
+        }
+    }
+
+    private static func digest(_ records: [NoemaSpotlightIndexRecord]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(records)
+        return hasher.finalize()
+    }
+
+    func removeDatasetRecord(datasetID: String) {
+        let identifier = Self.datasetIdentifier(for: datasetID)
+        Task {
+            await Self.deleteItems(identifiers: [identifier])
+        }
+    }
+
+    static func chatIdentifier(for sessionID: UUID) -> String {
+        "noema.chat.\(sessionID.uuidString)"
+    }
+
+    static func datasetIdentifier(for datasetID: String) -> String {
+        "noema.dataset.\(datasetID)"
+    }
+
+    nonisolated private static func replaceDomain(_ domain: String, records: [NoemaSpotlightIndexRecord]) async {
+#if canImport(CoreSpotlight) && canImport(UniformTypeIdentifiers)
+        guard CSSearchableIndex.isIndexingAvailable() else { return }
+        await withCheckedContinuation { continuation in
+            CSSearchableIndex.default().deleteSearchableItems(withDomainIdentifiers: [domain]) { _ in
+                let items = records.map { searchableItem(for: $0, domain: domain) }
+                guard !items.isEmpty else {
+                    continuation.resume()
+                    return
+                }
+                CSSearchableIndex.default().indexSearchableItems(items) { _ in
+                    continuation.resume()
+                }
+            }
+        }
+#else
+        _ = domain
+        _ = records
+#endif
+    }
+
+    nonisolated private static func deleteItems(identifiers: [String]) async {
+#if canImport(CoreSpotlight)
+        guard CSSearchableIndex.isIndexingAvailable(), !identifiers.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            CSSearchableIndex.default().deleteSearchableItems(withIdentifiers: identifiers) { _ in
+                continuation.resume()
+            }
+        }
+#else
+        _ = identifiers
+#endif
+    }
+
+#if canImport(CoreSpotlight) && canImport(UniformTypeIdentifiers)
+    nonisolated private static func searchableItem(for record: NoemaSpotlightIndexRecord, domain: String) -> CSSearchableItem {
+        let attributes = CSSearchableItemAttributeSet(contentType: .text)
+        attributes.title = record.title
+        attributes.contentDescription = record.contentDescription
+        attributes.keywords = record.keywords
+        return CSSearchableItem(
+            uniqueIdentifier: record.uniqueIdentifier,
+            domainIdentifier: domain,
+            attributeSet: attributes
+        )
+    }
+#endif
+}
 
 #if canImport(UIKit)
 private extension UIImage {
@@ -266,6 +390,7 @@ private enum ToolContinuationOutcome {
 
 enum ChatMarkdownPlannerEntry: Equatable {
     case blank
+    case thematicBreak
     case heading(level: Int, content: String)
     case bullet(marker: String, content: String)
     case mathBlock(String)
@@ -287,10 +412,14 @@ enum ChatMarkdownRenderPlanner {
         while index < entries.count {
             if isMacOS {
                 switch entries[index] {
-                case .heading, .table:
+                case .table, .thematicBreak:
                     units.append(.entryIndex(index))
                     index += 1
-                case .blank, .bullet, .mathBlock, .text:
+                case .blank, .bullet, .mathBlock, .text, .heading:
+                    // Headings fold into the same selectable block as the
+                    // surrounding prose (rendered as "#"-prefixed paragraphs by
+                    // MacSelectableMathText) so a drag-selection can sweep across
+                    // them. Only tables and rules stay as standalone units.
                     var lines: [String] = []
 
                     macOSBlock: while index < entries.count {
@@ -303,7 +432,14 @@ enum ChatMarkdownRenderPlanner {
                             lines.append(source)
                         case .text(let line):
                             lines.append(line)
-                        case .heading, .table:
+                        case .heading(let level, let content):
+                            // Surround with blank lines so the heading becomes
+                            // its own paragraph (single newlines collapse to
+                            // spaces in the renderer).
+                            if !lines.isEmpty, lines.last != "" { lines.append("") }
+                            lines.append(String(repeating: "#", count: level) + " " + content)
+                            lines.append("")
+                        case .table, .thematicBreak:
                             break macOSBlock
                         }
                         index += 1
@@ -324,14 +460,14 @@ enum ChatMarkdownRenderPlanner {
                             lines.append(source)
                         case .blank:
                             lines.append("")
-                        case .heading, .table, .bullet:
+                        case .heading, .table, .bullet, .thematicBreak:
                             break textBlock
                         }
                         index += 1
                     }
 
                     units.append(.textMathBlock(lines.joined(separator: "\n")))
-                case .heading, .table:
+                case .heading, .table, .thematicBreak:
                     units.append(.entryIndex(index))
                     index += 1
                 case .bullet:
@@ -1145,10 +1281,10 @@ enum RunPurpose { case chat, title }
 // MARK: –– Model metadata ----------------------------------------------------
 #if canImport(UIKit) || canImport(AppKit)
 private enum ModelInfo {
-    static let repoID   = "ggml-org/Qwen3-1.7B-GGUF"
-    static let fileName = "Qwen3-1.7B-Q4_K_M.gguf"
+    static let repoID   = "unsloth/Qwen3.5-2B-GGUF"
+    static let fileName = "Qwen3.5-2B-Q3_K_M.gguf"
 
-    /// Returns <Documents>/LocalLLMModels/qwen/Qwen3-1.7B-GGUF/…/Qwen3‑1.7B‑Q4_K_M.gguf
+    /// Returns <Documents>/LocalLLMModels/qwen/Qwen3.5-2B-GGUF/.../Qwen3.5-2B-Q3_K_M.gguf
     static func sandboxURL() -> URL {
         var url = FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -1279,7 +1415,7 @@ struct DownloadView: View {
 
     var body: some View {
         VStack(spacing: 20) {
-            Text(LocalizedStringKey("First‑time setup: download the Qwen‑1.7B model and embeddings.\nWi‑Fi recommended."))
+            Text(LocalizedStringKey("First‑time setup: download the Qwen 3.5 2B Q3_K_M model and embeddings.\nWi‑Fi recommended."))
                 .multilineTextAlignment(.center)
 
             switch vm.state {
@@ -1339,7 +1475,7 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
         req.setValue(accept, forHTTPHeaderField: "Accept")
         if let t = token, !t.isEmpty { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
         NetworkKillSwitch.track(session: URLSession.shared)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: HFEndpoint.rewrite(req))
         if let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) { return data }
         return nil
     }
@@ -1819,49 +1955,36 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
         refresh()
     }
 
+    func installedModel(matching model: LocalModel) -> InstalledModel? {
+        store.all().first { installed in
+            installed.modelID == model.modelID
+            && installed.quantLabel == model.quant
+            && InstalledModelsStore.canonicalURL(for: installed.url, format: installed.format).path == InstalledModelsStore.canonicalURL(for: model.url, format: model.format).path
+        } ?? store.all().first { installed in
+            installed.modelID == model.modelID
+            && installed.quantLabel == model.quant
+            && installed.format == model.format
+        }
+    }
+
     func delete(_ model: LocalModel) {
         if model.format == .afm {
             return
         }
-        let fm = FileManager.default
+        let canonicalURL = InstalledModelsStore.canonicalURL(for: model.url, format: model.format)
 #if canImport(CoreML) && (os(iOS) || os(visionOS))
         if model.format == .ane {
             try? ANEModelResolver.removeCompiledCache(for: model.url)
         }
 #endif
-        switch model.format {
-        case .gguf:
-            let dir = model.url.deletingLastPathComponent()
-            var removedWeights = false
-            let artifactsURL = dir.appendingPathComponent("artifacts.json")
-            if let data = try? Data(contentsOf: artifactsURL),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let shards = obj["weightShards"] as? [String],
-               !shards.isEmpty {
-                for name in Set(shards) {
-                    let shardURL = dir.appendingPathComponent(name)
-                    if fm.fileExists(atPath: shardURL.path) {
-                        try? fm.removeItem(at: shardURL)
-                        removedWeights = true
-                    }
-                }
-            }
-            if !removedWeights || fm.fileExists(atPath: model.url.path) {
-                try? fm.removeItem(at: model.url)
-            }
-            // Remove DeepSeek marker cache sidecar if present to keep directory tidy
-            let dsCache = dir.appendingPathComponent("ds_markers.cache.json")
-            if fm.fileExists(atPath: dsCache.path) {
-                try? fm.removeItem(at: dsCache)
-            }
-            if let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil),
-               !items.contains(where: { $0.pathExtension.lowercased() == "gguf" }) {
-                try? fm.removeItem(at: dir)
-            }
-        default:
-            try? fm.removeItem(at: model.url)
-        }
+        let installedBeforeDelete = store.all()
+        _ = ModelStorageCleanup.deleteModelFiles(for: model, installedModels: installedBeforeDelete)
         store.remove(modelID: model.modelID, quantLabel: model.quant)
+        ModelSettingsStore.remove(modelID: model.modelID, quantLabel: model.quant, canonicalPath: canonicalURL.path)
+        modelSettings.removeValue(forKey: canonicalURL.path)
+        modelSettings.removeValue(forKey: model.url.path)
+        HiddenModelsStore.unhide(modelID: model.modelID, quantLabel: model.quant)
+        ModelStorageCleanup.clearPassExtractionSelectionIfNeeded(deletedModel: model)
         Task {
             await MoEDetectionStore.shared.remove(modelID: model.modelID, quantLabel: model.quant)
         }
@@ -1869,6 +1992,7 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
         if loadedModel?.id == model.id { loadedModel = nil }
         if lastUsedModel?.id == model.id { lastUsedModel = nil }
         StartupPreferencesStore.clearLocalPath(model.url.path)
+        StartupPreferencesStore.clearLocalPath(canonicalURL.path)
     }
 
     private func resolvedSettings(for model: LocalModel,
@@ -1958,6 +2082,25 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
         ModelSettingsStore.save(settings: normalized, for: model)
         if model.format == .et {
             store.updateETBackend(modelID: model.modelID, quantLabel: model.quant, backend: normalized.etBackend)
+        }
+    }
+
+    func updateAlias(_ alias: String?, for model: LocalModel) {
+        store.updateAlias(modelID: model.modelID, quantLabel: model.quant, alias: alias)
+        let trimmed = alias?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedAlias = trimmed?.isEmpty == false ? trimmed : nil
+
+        if let idx = downloadedModels.firstIndex(where: { $0.id == model.id }) {
+            downloadedModels[idx].alias = normalizedAlias
+        }
+        if let idx = hiddenModels.firstIndex(where: { $0.id == model.id }) {
+            hiddenModels[idx].alias = normalizedAlias
+        }
+        if loadedModel?.id == model.id {
+            loadedModel?.alias = normalizedAlias
+        }
+        if lastUsedModel?.id == model.id {
+            lastUsedModel?.alias = normalizedAlias
         }
     }
 
@@ -2071,7 +2214,7 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
                     return true
                 }
                 return false
-            case .et, .ane, .afm:
+            case .et, .ane, .afm, .coreai:
                 return false
             }
         }
@@ -2156,6 +2299,10 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
                 case .afm:
                     isVision = false
                     toolCap = true
+                case .coreai:
+                    isVision = false
+                    let coreaiDir = InstalledModelsStore.baseDir(for: .coreai, modelID: modelID)
+                    toolCap = ToolCapabilityDetector.isToolCapableLocal(url: coreaiDir, format: .coreai)
                 }
                 await MainActor.run { [weak self] in
                     guard let self else { return }
@@ -2254,7 +2401,47 @@ private func fetchTokenizer(into dir: URL, repoID: String) async {
 
 extension AppModelManager: ModelLoadingManaging {}
 
+/// Holds the live text of the message currently being generated.
+///
+/// During streaming the model can emit tokens faster than 60 Hz. Writing every token
+/// into `ChatVM.sessions` (which is `@Published` and observed by every tab via
+/// `.environmentObject`) makes the *whole* app re-evaluate view bodies per token, which
+/// is the main source of UI stutter during inference. Instead, high-frequency token
+/// updates flow into this small, separate observable: only the streaming chat bubble and
+/// the auto-scroll observer subscribe to it, so unrelated tabs are not disturbed.
+///
+/// `ChatVM` holds this as a plain `let` (not `@Published`), so mutating it does **not**
+/// trip `ChatVM.objectWillChange`.
+@MainActor final class StreamingMessageStore: ObservableObject {
+    /// The id of the message currently streaming, or `nil` when idle.
+    @Published private(set) var activeID: UUID?
+    /// The latest visible assistant text for `activeID`.
+    @Published private(set) var visibleText: String = ""
+
+    func begin(id: UUID, initialText: String = "") {
+        activeID = id
+        visibleText = initialText
+    }
+
+    func update(_ text: String) {
+        guard activeID != nil else { return }
+        visibleText = text
+    }
+
+    func finish() {
+        activeID = nil
+        visibleText = ""
+    }
+}
+
     @MainActor final class ChatVM: ObservableObject {
+    struct ETRepairCandidate: Equatable {
+        let modelID: String
+        let quantLabel: String
+        let modelURL: URL
+        let sourceRepoID: String?
+    }
+
     // Progress tracker for model loading
     @Published var loadingProgressTracker = ModelLoadingProgressTracker()
     struct Msg: Identifiable, Equatable, Codable {
@@ -2262,6 +2449,42 @@ extension AppModelManager: ModelLoadingManaging {}
             var tokenCount: Int
             var avgTokPerSec: Double
             var timeToFirst: Double
+            /// Wall-clock seconds from the request being sent to the final token,
+            /// i.e. time-to-first-token plus generation time. Surfaced as the
+            /// "total" generation duration in the diagnostics footer.
+            var totalDuration: Double
+            var latencySamplesMs: [Double]
+
+            init(
+                tokenCount: Int,
+                avgTokPerSec: Double,
+                timeToFirst: Double,
+                totalDuration: Double = 0,
+                latencySamplesMs: [Double] = []
+            ) {
+                self.tokenCount = tokenCount
+                self.avgTokPerSec = avgTokPerSec
+                self.timeToFirst = timeToFirst
+                self.totalDuration = totalDuration
+                self.latencySamplesMs = latencySamplesMs
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case tokenCount
+                case avgTokPerSec
+                case timeToFirst
+                case totalDuration
+                case latencySamplesMs
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                tokenCount = try container.decode(Int.self, forKey: .tokenCount)
+                avgTokPerSec = try container.decode(Double.self, forKey: .avgTokPerSec)
+                timeToFirst = try container.decode(Double.self, forKey: .timeToFirst)
+                totalDuration = try container.decodeIfPresent(Double.self, forKey: .totalDuration) ?? 0
+                latencySamplesMs = try container.decodeIfPresent([Double].self, forKey: .latencySamplesMs) ?? []
+            }
         }
 
         struct PromptProcessingState: Equatable, Codable {
@@ -2271,6 +2494,13 @@ extension AppModelManager: ModelLoadingManaging {}
         struct Citation: Equatable, Codable {
             let text: String
             let source: String?
+            let score: Float?
+
+            init(text: String, source: String?, score: Float? = nil) {
+                self.text = text
+                self.source = source
+                self.score = score
+            }
         }
 
         struct RAGInjectionInfo: Equatable, Codable {
@@ -2511,10 +2741,18 @@ extension AppModelManager: ModelLoadingManaging {}
         var citations: [Citation]?
         var ragInjectionInfo: RAGInjectionInfo?
         var usedWebSearch: Bool?
+        var usedRemoteBackend: Bool?
+        var remoteBackendName: String?
+        var remoteModelName: String?
+        /// True when this reply was produced (fully or via mid-turn handoff)
+        /// by Apple's Private Cloud Compute rather than on-device AFM.
+        var ranOnPrivateCloudCompute: Bool?
         var webHits: [WebHit]?
         var webError: String?
         var imagePaths: [String]?
+        var mediaAttachments: [ChatMediaAttachment]?
         var toolCalls: [ToolCall]?
+        var isBookmarked: Bool = false
 
         var trimmedVisibleAssistantText: String {
             visibleAssistantText(from: text).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2544,7 +2782,11 @@ extension AppModelManager: ModelLoadingManaging {}
              datasetName: String? = nil,
              perf: Perf? = nil,
              streaming: Bool = false,
-             promptProcessing: PromptProcessingState? = nil) {
+             promptProcessing: PromptProcessingState? = nil,
+             usedRemoteBackend: Bool? = nil,
+             remoteBackendName: String? = nil,
+             remoteModelName: String? = nil,
+             isBookmarked: Bool = false) {
             self.id = id
             self.role = role
             self.text = text
@@ -2554,9 +2796,13 @@ extension AppModelManager: ModelLoadingManaging {}
             self.perf = perf
             self.streaming = streaming
             self.promptProcessing = promptProcessing
+            self.usedRemoteBackend = usedRemoteBackend
+            self.remoteBackendName = remoteBackendName
+            self.remoteModelName = remoteModelName
+            self.isBookmarked = isBookmarked
         }
 
-        enum CodingKeys: String, CodingKey { case id, role, text, timestamp, datasetID, datasetName, perf, promptProcessing, retrievedContext, citations, ragInjectionInfo, usedWebSearch, webHits, webError, imagePaths, toolCalls }
+        enum CodingKeys: String, CodingKey { case id, role, text, timestamp, datasetID, datasetName, perf, promptProcessing, retrievedContext, citations, ragInjectionInfo, usedWebSearch, usedRemoteBackend, remoteBackendName, remoteModelName, ranOnPrivateCloudCompute, webHits, webError, imagePaths, mediaAttachments, toolCalls, isBookmarked }
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -2572,10 +2818,16 @@ extension AppModelManager: ModelLoadingManaging {}
             citations = try? c.decode([Citation].self, forKey: .citations)
             ragInjectionInfo = try? c.decode(RAGInjectionInfo.self, forKey: .ragInjectionInfo)
             usedWebSearch = try? c.decode(Bool.self, forKey: .usedWebSearch)
+            usedRemoteBackend = try? c.decode(Bool.self, forKey: .usedRemoteBackend)
+            remoteBackendName = try? c.decode(String.self, forKey: .remoteBackendName)
+            remoteModelName = try? c.decode(String.self, forKey: .remoteModelName)
+            ranOnPrivateCloudCompute = try? c.decode(Bool.self, forKey: .ranOnPrivateCloudCompute)
             webHits = try? c.decode([WebHit].self, forKey: .webHits)
             webError = try? c.decode(String.self, forKey: .webError)
             imagePaths = try? c.decode([String].self, forKey: .imagePaths)
+            mediaAttachments = try? c.decode([ChatMediaAttachment].self, forKey: .mediaAttachments)
             toolCalls = try? c.decode([ToolCall].self, forKey: .toolCalls)
+            isBookmarked = (try? c.decode(Bool.self, forKey: .isBookmarked)) ?? false
         }
 
         func encode(to encoder: Encoder) throws {
@@ -2592,15 +2844,197 @@ extension AppModelManager: ModelLoadingManaging {}
             try c.encode(citations, forKey: .citations)
             try c.encodeIfPresent(ragInjectionInfo, forKey: .ragInjectionInfo)
             try c.encodeIfPresent(usedWebSearch, forKey: .usedWebSearch)
+            try c.encodeIfPresent(usedRemoteBackend, forKey: .usedRemoteBackend)
+            try c.encodeIfPresent(remoteBackendName, forKey: .remoteBackendName)
+            try c.encodeIfPresent(remoteModelName, forKey: .remoteModelName)
+            try c.encodeIfPresent(ranOnPrivateCloudCompute, forKey: .ranOnPrivateCloudCompute)
             try c.encodeIfPresent(webHits, forKey: .webHits)
             try c.encodeIfPresent(webError, forKey: .webError)
             try c.encodeIfPresent(imagePaths, forKey: .imagePaths)
+            try c.encodeIfPresent(mediaAttachments, forKey: .mediaAttachments)
             try c.encodeIfPresent(toolCalls, forKey: .toolCalls)
+            if isBookmarked {
+                try c.encode(isBookmarked, forKey: .isBookmarked)
+            }
         }
     }
 
     // Expose Msg.ToolCall as ChatVM.ToolCall for convenience
     typealias ToolCall = Msg.ToolCall
+
+    struct ChatToolPermissions: Equatable, Codable {
+        var webSearch: Bool
+        var python: Bool
+        var memory: Bool
+        var datasetRetrieval: Bool
+
+        static let allEnabled = ChatToolPermissions(webSearch: true, python: true, memory: true, datasetRetrieval: true)
+        static let allDisabled = ChatToolPermissions(webSearch: false, python: false, memory: false, datasetRetrieval: false)
+
+        init(webSearch: Bool, python: Bool, memory: Bool, datasetRetrieval: Bool = true) {
+            self.webSearch = webSearch
+            self.python = python
+            self.memory = memory
+            self.datasetRetrieval = datasetRetrieval
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case webSearch
+            case python
+            case memory
+            case datasetRetrieval
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            webSearch = try container.decodeIfPresent(Bool.self, forKey: .webSearch) ?? true
+            python = try container.decodeIfPresent(Bool.self, forKey: .python) ?? true
+            memory = try container.decodeIfPresent(Bool.self, forKey: .memory) ?? true
+            datasetRetrieval = try container.decodeIfPresent(Bool.self, forKey: .datasetRetrieval) ?? true
+        }
+
+        var enabledCount: Int {
+            [webSearch, python, memory, datasetRetrieval].filter { $0 }.count
+        }
+
+        func filtered(_ availability: ToolAvailability) -> ToolAvailability {
+            ToolAvailability(
+                webSearch: availability.webSearch && webSearch,
+                python: availability.python && python,
+                memory: availability.memory && memory,
+                calculator: availability.calculator,
+                unitConverter: availability.unitConverter
+            )
+        }
+
+        func allows(toolName: String) -> Bool {
+            switch toolName {
+            case "noema.web.retrieve":
+                return webSearch
+            case "noema.python.execute":
+                return python
+            case "noema.memory":
+                return memory
+            default:
+                return true
+            }
+        }
+    }
+
+    enum ChatToolPermissionKind {
+        case webSearch
+        case python
+        case memory
+        case datasetRetrieval
+    }
+
+    enum ChatMode: String, CaseIterable, Identifiable, Codable {
+        case general
+        case research
+        case study
+        case code
+        case meetingPrep
+        case travel
+        case medicalNotes
+        case legalReading
+        case creativeDrafting
+
+        var id: String { rawValue }
+
+        var titleKey: String {
+            switch self {
+            case .general: return "General Chat"
+            case .research: return "Research Mode"
+            case .study: return "Study Mode"
+            case .code: return "Code Mode"
+            case .meetingPrep: return "Meeting Prep Mode"
+            case .travel: return "Travel Mode"
+            case .medicalNotes: return "Medical Notes Mode"
+            case .legalReading: return "Legal Reading Mode"
+            case .creativeDrafting: return "Creative Drafting Mode"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .general: return "bubble.left.and.bubble.right"
+            case .research: return "doc.text.magnifyingglass"
+            case .study: return "book"
+            case .code: return "chevron.left.forwardslash.chevron.right"
+            case .meetingPrep: return "calendar.badge.clock"
+            case .travel: return "airplane"
+            case .medicalNotes: return "cross.case"
+            case .legalReading: return "scroll"
+            case .creativeDrafting: return "paintbrush"
+            }
+        }
+
+        var promptGuidance: String? {
+            switch self {
+            case .general:
+                return nil
+            case .research:
+                return "Chat mode: Research. Prioritize source-grounded synthesis, call out uncertainty, separate findings from assumptions, and preserve citations when retrieval or tools provide evidence."
+            case .study:
+                return "Chat mode: Study. Teach step by step, check understanding, create short examples, and prefer quizzes or summaries when they help the user learn."
+            case .code:
+                return "Chat mode: Code. Be precise about files, APIs, edge cases, and tests. Prefer minimal patches, explain tradeoffs, and avoid speculative implementation details."
+            case .meetingPrep:
+                return "Chat mode: Meeting Prep. Extract goals, decisions needed, risks, agenda items, and concrete follow-ups. Keep the result scannable."
+            case .travel:
+                return "Chat mode: Travel. Organize by time, place, constraints, confirmations, and contingencies. Highlight missing details and offline-relevant information."
+            case .medicalNotes:
+                return "Chat mode: Medical Notes. Summarize clearly, distinguish user-provided facts from interpretation, avoid diagnosis certainty, and recommend professional care for urgent or risky symptoms."
+            case .legalReading:
+                return "Chat mode: Legal Reading. Identify facts, issues, rules, analysis, caveats, and cited text. Avoid presenting legal conclusions as professional legal advice."
+            case .creativeDrafting:
+                return "Chat mode: Creative Drafting. Offer strong options, preserve the user's voice, make intentional style choices, and keep iterations easy to compare."
+            }
+        }
+    }
+
+    enum AnswerStyle: String, CaseIterable, Identifiable, Codable {
+        case natural
+        case terse
+        case cited
+        case stepByStep
+        case socratic
+        case executiveBrief
+        case tableFirst
+
+        var id: String { rawValue }
+
+        var titleKey: String {
+            switch self {
+            case .natural: return "Natural Style"
+            case .terse: return "Terse"
+            case .cited: return "Cited"
+            case .stepByStep: return "Step-by-step"
+            case .socratic: return "Socratic"
+            case .executiveBrief: return "Executive Brief"
+            case .tableFirst: return "Table-first"
+            }
+        }
+
+        var promptGuidance: String? {
+            switch self {
+            case .natural:
+                return nil
+            case .terse:
+                return "Answer style: Terse. Prefer concise direct answers, remove filler, and use bullets only when they improve clarity."
+            case .cited:
+                return "Answer style: Cited. Preserve citations and source labels when available; clearly separate uncited model knowledge from cited evidence."
+            case .stepByStep:
+                return "Answer style: Step-by-step. Explain the reasoning path as user-visible steps without exposing hidden chain-of-thought; summarize before details when useful."
+            case .socratic:
+                return "Answer style: Socratic. Ask one focused question at a time when teaching or debugging; guide the user toward the answer instead of dumping everything at once."
+            case .executiveBrief:
+                return "Answer style: Executive Brief. Lead with the decision, risks, and next actions; keep sections short and scan-friendly."
+            case .tableFirst:
+                return "Answer style: Table-first. Use a compact table for comparisons, options, or extracted facts before any prose summary."
+            }
+        }
+    }
 
     struct Session: Identifiable, Equatable, Codable {
         let id: UUID
@@ -2609,14 +3043,24 @@ extension AppModelManager: ModelLoadingManaging {}
         var isFavorite: Bool = false
         var date: Date
         var datasetID: String?
+        var toolPermissions: ChatToolPermissions?
+        var scratchpad: String?
+        var chatMode: ChatMode?
+        var answerStyle: AnswerStyle?
+        var chatInstructions: String?
 
-        init(id: UUID = UUID(), title: String, messages: [Msg], isFavorite: Bool = false, date: Date, datasetID: String? = nil) {
+        init(id: UUID = UUID(), title: String, messages: [Msg], isFavorite: Bool = false, date: Date, datasetID: String? = nil, toolPermissions: ChatToolPermissions? = .allEnabled, scratchpad: String? = nil, chatMode: ChatMode? = nil, answerStyle: AnswerStyle? = nil, chatInstructions: String? = nil) {
             self.id = id
             self.title = title
             self.messages = messages
             self.isFavorite = isFavorite
             self.date = date
             self.datasetID = datasetID
+            self.toolPermissions = toolPermissions
+            self.scratchpad = scratchpad
+            self.chatMode = chatMode
+            self.answerStyle = answerStyle
+            self.chatInstructions = chatInstructions
         }
     }
     
@@ -2672,7 +3116,11 @@ extension AppModelManager: ModelLoadingManaging {}
     }
     @Published var stillLoading = false
     @Published var loadError: String?
+    @Published var pendingETRepairCandidate: ETRepairCandidate?
     @Published private(set) var modelLoaded = false
+    @Published private(set) var lastUnloadVerification: ModelUnloadMemoryVerificationResult?
+    @Published private(set) var lastGenerationPowerPolicy: GenerationPowerPolicyDecision?
+    @Published var stopAfterParagraphRequested = false
     var canAcceptChatInput: Bool {
         (modelLoaded && client != nil && !loading && !stillLoading)
             || modelManager?.activeRemoteSession != nil
@@ -2687,6 +3135,11 @@ extension AppModelManager: ModelLoadingManaging {}
     @Published var injectionMethod: InjectionMethod?
     @Published var supportsImageInput: Bool = false
     @Published var pendingImageURLs: [URL] = []
+    @Published var pendingMediaAttachments: [ChatMediaAttachment] = []
+    @Published var isRecordingAudio: Bool = false
+    @Published var audioRecordingError: String?
+    @Published var audioRecordingStartedAt: Date?
+    @Published var audioRecordingLevel: Float = 0
     // In-memory thumbnails for pending attachments to avoid re-decoding on each keystroke.
     @Published private(set) var pendingThumbnails: [URL: UIImage] = [:]
     @Published var crossSessionSendBlocked: Bool = false
@@ -2805,16 +3258,25 @@ extension AppModelManager: ModelLoadingManaging {}
     }
 
     private struct PendingPerfAccumulator {
+        static let maxLatencySamples = 32
+
         var start: Date
         var firstToken: Date?
         var lastToken: Date?
         var tokenCount: Int
+        var latencySamplesMs: [Double]
     }
 
     private var pendingPerfAccumulators: [UUID: PendingPerfAccumulator] = [:]
 
     private func beginPerfTracking(messageID: UUID, start: Date) {
-        pendingPerfAccumulators[messageID] = PendingPerfAccumulator(start: start, firstToken: nil, lastToken: nil, tokenCount: 0)
+        pendingPerfAccumulators[messageID] = PendingPerfAccumulator(
+            start: start,
+            firstToken: nil,
+            lastToken: nil,
+            tokenCount: 0,
+            latencySamplesMs: []
+        )
     }
 
     private func recordToken(messageID: UUID, timestamp: Date = Date()) {
@@ -2822,6 +3284,15 @@ extension AppModelManager: ModelLoadingManaging {}
         acc.tokenCount += 1
         if acc.firstToken == nil {
             acc.firstToken = timestamp
+        }
+        if let previous = acc.lastToken {
+            let latencyMs = timestamp.timeIntervalSince(previous) * 1000
+            if latencyMs.isFinite, latencyMs >= 0 {
+                if acc.latencySamplesMs.count >= PendingPerfAccumulator.maxLatencySamples {
+                    acc.latencySamplesMs.removeFirst(acc.latencySamplesMs.count - PendingPerfAccumulator.maxLatencySamples + 1)
+                }
+                acc.latencySamplesMs.append(latencyMs)
+            }
         }
         acc.lastToken = timestamp
         pendingPerfAccumulators[messageID] = acc
@@ -2835,7 +3306,14 @@ extension AppModelManager: ModelLoadingManaging {}
         let rate = duration > 0 ? Double(acc.tokenCount) / duration : 0
         let totalTokens = acc.tokenCount + max(0, injectionOverhead)
         let timeToFirst = first.timeIntervalSince(acc.start)
-        return Msg.Perf(tokenCount: totalTokens, avgTokPerSec: rate, timeToFirst: timeToFirst)
+        let totalDuration = last.timeIntervalSince(acc.start)
+        return Msg.Perf(
+            tokenCount: totalTokens,
+            avgTokPerSec: rate,
+            timeToFirst: timeToFirst,
+            totalDuration: totalDuration,
+            latencySamplesMs: acc.latencySamplesMs
+        )
     }
 
     private func cancelPerfTracking(messageID: UUID) {
@@ -2963,7 +3441,7 @@ extension AppModelManager: ModelLoadingManaging {}
     }
 
     nonisolated static func packRAGContext(
-        chunks: [(text: String, source: String?)],
+        chunks: [(text: String, source: String?, score: Float?)],
         requestedMaxChunks: Int,
         usablePromptTokens: Int,
         promptTokenCounter: @escaping @Sendable (String) async -> Int,
@@ -2994,7 +3472,7 @@ extension AppModelManager: ModelLoadingManaging {}
             let tokenCount = await promptTokenCounter(promptBuilder(candidate))
             if tokenCount <= contextBudgetTokens {
                 injectedBlocks.append(formatted)
-                injectedCitations.append(Msg.Citation(text: chunk.text, source: chunk.source))
+                injectedCitations.append(Msg.Citation(text: chunk.text, source: chunk.source, score: chunk.score))
             } else {
                 break
             }
@@ -3028,7 +3506,7 @@ extension AppModelManager: ModelLoadingManaging {}
 
                 if !bestText.isEmpty {
                     injectedBlocks = [formattedRAGChunk(index: 1, text: bestText, source: firstChunk.source)]
-                    injectedCitations = [Msg.Citation(text: bestText, source: firstChunk.source)]
+                    injectedCitations = [Msg.Citation(text: bestText, source: firstChunk.source, score: firstChunk.score)]
                     partialChunkInjected = bestText != firstText
                 }
             }
@@ -3076,8 +3554,26 @@ extension AppModelManager: ModelLoadingManaging {}
         return Array(messages.dropLast())
     }
 
+    /// True when the active remote session is currently routing over Cloud
+    /// Relay (CloudKit). In that mode the host does not forward incremental
+    /// prompt-prefill progress to us, so the prompt-processing card would just
+    /// sit at 0% — we show a plain spinner instead.
+    var isCloudRelayTransportActive: Bool {
+        guard let session = modelManager?.activeRemoteSession else { return false }
+        if case .cloudRelay = session.transport { return true }
+        return false
+    }
+
+    /// Whether the prompt-processing progress card should be used for the
+    /// active run. Only on-device gguf/CoreAI runs report incremental
+    /// prompt-prefill progress; Cloud Relay (CloudKit) sends none, so we fall
+    /// back to the generic spinner there.
+    var supportsPromptProcessingCard: Bool {
+        (loadedFormat == .gguf || loadedFormat == .coreai) && !isCloudRelayTransportActive
+    }
+
     func startPromptProcessing(for messageIndex: Int) {
-        guard loadedFormat == .gguf else { return }
+        guard loadedFormat == .gguf, !isCloudRelayTransportActive else { return }
         updateStreamMessage(at: messageIndex) { message in
             message.promptProcessing = .init(progress: 0)
         }
@@ -3132,6 +3628,10 @@ extension AppModelManager: ModelLoadingManaging {}
         streamMsgs[messageIndex].text = displayText
         streamMsgs[messageIndex].streaming = false
         streamMsgs[messageIndex].promptProcessing = nil
+        // Streaming finished for this segment: stop rendering the bubble from the store so
+        // it falls back to the committed `sessions` text. (A tool continuation re-begins it.)
+        streamingStore.finish()
+        clearStopAfterParagraphRequest()
         if let perfResult {
             streamMsgs[messageIndex].perf = perfResult
         }
@@ -3264,20 +3764,6 @@ extension AppModelManager: ModelLoadingManaging {}
     
     /// Rolling thought view models for active thinking boxes
     @Published var rollingThoughtViewModels: [String: RollingThoughtViewModel] = [:]
-    
-    /// Token stream adapter for rolling thoughts
-    private struct ChatTokenStream: TokenStream {
-        typealias AsyncTokenSequence = AsyncStream<String>
-        let stream: AsyncTokenSequence
-
-        func tokens() -> AsyncTokenSequence {
-            return stream
-        }
-
-        init(tokens: AsyncTokenSequence) {
-            self.stream = tokens
-        }
-    }
 
     @AppStorage("systemPreset") private var systemPresetRaw = SystemPreset.general.rawValue
 
@@ -3288,6 +3774,24 @@ extension AppModelManager: ModelLoadingManaging {}
         UserDefaults.standard.object(forKey: "currentModelSupportsFunctionCalling") as? Bool ?? false
     }
     private var pendingAFMToolSummary: AFMToolExecutionSummary?
+    private var pendingAFMRouteInfo: AFMTurnRouteInfo?
+    /// Live AFM client while an `.afm` model is loaded; consulted by the
+    /// context preflight so PCC's larger window lifts the local 4K/8K limit.
+    private var activeAFMClient: AFMLLMClient?
+    private var activeTurnScratchpadSnapshot: String?
+
+    private func applyPendingAFMRouteInfo(to messageIndex: Int) {
+        guard let info = pendingAFMRouteInfo else { return }
+        pendingAFMRouteInfo = nil
+        guard streamMsgs.indices.contains(messageIndex) else { return }
+        if info.route == .privateCloudCompute {
+            streamMsgs[messageIndex].ranOnPrivateCloudCompute = true
+        } else if info.fellBackToOnDevice {
+            // Stayed (or finished) on-device; the accurate Local Only badge
+            // already applies. Just leave a trace for diagnostics.
+            print("[AFM][Route] PCC requested but turn fell back on-device (escalated=\(info.escalatedMidTurn))")
+        }
+    }
 
     private func applyPendingAFMToolSummary(to messageIndex: Int) {
         guard streamMsgs.indices.contains(messageIndex) else {
@@ -3386,6 +3890,11 @@ extension AppModelManager: ModelLoadingManaging {}
         return ds
     }
 
+    private var activeSessionRetrievalDataset: LocalDataset? {
+        guard activeToolPermissions.datasetRetrieval else { return nil }
+        return activeSessionIndexedDataset
+    }
+
     private var effectiveEditableSystemPromptIntro: String? {
         let globalIntro = SystemPreset.resolvedEditableIntro(from: customSystemPromptIntro)
         guard let loadedSettings else { return globalIntro }
@@ -3405,6 +3914,7 @@ extension AppModelManager: ModelLoadingManaging {}
         toolAvailability: ToolAvailability,
         includeThinkRestriction: Bool,
         memorySnapshot: String?,
+        scratchpadSnapshot: String?,
         editableIntro: String?
     ) -> String {
         // If a dataset is active (RAG), prefer the RAG preset and exclude tool guidance.
@@ -3434,11 +3944,13 @@ extension AppModelManager: ModelLoadingManaging {}
                 includeThinkRestriction: includeThinkRestriction,
                 memorySnapshot: memorySnapshot
             )
+            appendChatBehaviorGuidance(to: &base)
+            appendScratchpadGuidance(to: &base, scratchpadSnapshot: scratchpadSnapshot)
             return base
         }
         let attachedCount = supportsImageInput ? pendingImageURLs.count : 0
         let hasAttachedImages = supportsImageInput && attachedCount > 0
-        return SystemPromptResolver.general(
+        var base = SystemPromptResolver.general(
             currentFormat: loadedFormat,
             isVisionCapable: supportsImageInput,
             hasAttachedImages: hasAttachedImages,
@@ -3448,6 +3960,52 @@ extension AppModelManager: ModelLoadingManaging {}
             memorySnapshot: memorySnapshot,
             editableIntro: editableIntro
         )
+        appendChatBehaviorGuidance(to: &base)
+        appendScratchpadGuidance(to: &base, scratchpadSnapshot: scratchpadSnapshot)
+        return base
+    }
+
+    private func appendChatBehaviorGuidance(to prompt: inout String) {
+        if let guidance = activeChatMode.promptGuidance {
+            prompt += "\n\n\(guidance)"
+        }
+        if let guidance = activeAnswerStyle.promptGuidance {
+            prompt += "\n\n\(guidance)"
+        }
+        let instructions = activeChatInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !instructions.isEmpty {
+            prompt += "\n\nPer-chat instructions: \(instructions)"
+        }
+    }
+
+    private func appendScratchpadGuidance(to prompt: inout String, scratchpadSnapshot: String?) {
+        guard let scratchpadSnapshot = scratchpadSnapshot?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !scratchpadSnapshot.isEmpty else { return }
+        prompt += """
+
+        Referenced private scratchpad and pinned results:
+        The user explicitly referenced saved, pinned, bookmarked, or scratchpad context for this turn. Use the following local chat notes as context. Do not mention this section unless it helps answer the user.
+
+        \(scratchpadSnapshot)
+        """
+    }
+
+    private func referencedScratchpadSnapshot(for userInput: String) -> String? {
+        let snapshot = activeScratchpad.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !snapshot.isEmpty else { return nil }
+        let normalized = userInput.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let referenceTerms = [
+            "scratchpad",
+            "pinned",
+            "saved note",
+            "saved result",
+            "bookmark",
+            "bookmarked",
+            "that result",
+            "the result you saved"
+        ]
+        guard referenceTerms.contains(where: { normalized.contains($0) }) else { return nil }
+        return snapshot
     }
 
     private func resolveMemoryPromptBudget(
@@ -3466,6 +4024,7 @@ extension AppModelManager: ModelLoadingManaging {}
             toolAvailability: toolAvailability,
             includeThinkRestriction: includeThinkRestriction,
             memorySnapshot: nil,
+            scratchpadSnapshot: activeTurnScratchpadSnapshot,
             editableIntro: effectiveEditableSystemPromptIntro
         )
         let basePromptTokens = estimatedPromptTokens(
@@ -3486,6 +4045,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 toolAvailability: toolAvailability,
                 includeThinkRestriction: includeThinkRestriction,
                 memorySnapshot: snapshot,
+                scratchpadSnapshot: activeTurnScratchpadSnapshot,
                 editableIntro: effectiveEditableSystemPromptIntro
             )
             return estimatedPromptTokens(for: effectiveHistory, systemPrompt: prompt)
@@ -3496,7 +4056,8 @@ extension AppModelManager: ModelLoadingManaging {}
         using dataset: LocalDataset?,
         history: [Msg]? = nil
     ) -> (text: String, memoryPlan: MemoryPromptBudgetPlan) {
-        let toolAvailability = systemPromptToolAvailabilityOverride ?? ToolAvailability.current(currentFormat: loadedFormat)
+        let rawToolAvailability = systemPromptToolAvailabilityOverride ?? ToolAvailability.current(currentFormat: loadedFormat)
+        let toolAvailability = activeToolPermissions.filtered(rawToolAvailability)
         let includeThinkRestriction = activeRemoteBackendID == nil
         let memoryPlan = resolveMemoryPromptBudget(
             using: dataset,
@@ -3509,6 +4070,7 @@ extension AppModelManager: ModelLoadingManaging {}
             toolAvailability: toolAvailability,
             includeThinkRestriction: includeThinkRestriction,
             memorySnapshot: memoryPlan.snapshot,
+            scratchpadSnapshot: activeTurnScratchpadSnapshot,
             editableIntro: effectiveEditableSystemPromptIntro
         )
         return (text: text, memoryPlan: memoryPlan)
@@ -3520,7 +4082,7 @@ extension AppModelManager: ModelLoadingManaging {}
 
     /// Returns the active system prompt text based on user settings.
     var systemPromptText: String {
-        makeSystemPromptText(using: activeSessionIndexedDataset)
+        makeSystemPromptText(using: activeSessionRetrievalDataset)
     }
 
     private var baselineSystemPromptText: String {
@@ -3558,6 +4120,7 @@ extension AppModelManager: ModelLoadingManaging {}
     private var currentContextTask: Task<ResolvedRAGContext?, Never>?
     private var titleTask: Task<Void, Never>?
     private var currentContinuationTask: Task<Void, Never>?
+    private var stopAfterParagraphBaselineCharacterCount: Int?
     private var lastTitledMessageID: UUID?
     private var lastTitledHash: Int?
     private var loadedURL: URL?
@@ -3677,10 +4240,18 @@ extension AppModelManager: ModelLoadingManaging {}
     private var toolSpecsCache: [ToolSpec] = []
     private var systemPromptToolAvailabilityOverride: ToolAvailability?
     private var promptRefreshCancellables: Set<AnyCancellable> = []
+#if canImport(AVFoundation)
+    private var audioRecorder: AVAudioRecorder?
+    private var audioRecordingURL: URL?
+    private var audioRecordingFriendlyName: String?
+    private var audioRecordingMeterTask: Task<Void, Never>?
+#endif
+    private var mediaTranscriptionTasks: [ChatMediaAttachment.ID: Task<Void, Never>] = [:]
     
     @AppStorage("verboseLogging") private var verboseLogging = false
     @AppStorage("ragMaxChunks") private var ragMaxChunks = 5
     @AppStorage("ragMinScore") private var ragMinScore = 0.5
+    @AppStorage("ragRetrievalMode") private var ragRetrievalModeRaw = DatasetRetrievalMode.defaultValue.rawValue
     @AppStorage("contextOverflowStrategy") private var contextOverflowStrategyRaw = ContextOverflowStrategy.defaultValue.rawValue
     @AppStorage(ChatAttachmentCleanupPolicy.storageKey) private var attachmentCleanupPolicyRaw = ChatAttachmentCleanupPolicy.defaultValue.rawValue
     @AppStorage(SystemPreset.customSystemPromptIntroKey) private var customSystemPromptIntro = SystemPreset.defaultEditableIntro
@@ -3708,6 +4279,7 @@ extension AppModelManager: ModelLoadingManaging {}
         recreateRollingThoughtViewModels()
         syncModelManagerDatasetForActiveSession()
         refreshSystemPromptForActiveSession()
+        scheduleSpotlightChatTitleIndex()
         // Ensure tools are registered early so calls are executable during the first run
         initializeToolSystem()
         NotificationCenter.default.publisher(for: .memoryStoreDidChange)
@@ -3849,9 +4421,14 @@ extension AppModelManager: ModelLoadingManaging {}
         for session in sessions {
             if let excludingSessionID, session.id == excludingSessionID { continue }
             for message in session.messages {
-                guard let paths = message.imagePaths else { continue }
-                for path in paths {
+                for path in message.imagePaths ?? [] {
                     refs.insert(Self.normalizedAttachmentPath(path))
+                }
+                for attachment in message.mediaAttachments ?? [] {
+                    refs.insert(Self.normalizedAttachmentPath(attachment.storedPath))
+                    if let sidecar = attachment.transcriptSidecarPath {
+                        refs.insert(Self.normalizedAttachmentPath(sidecar))
+                    }
                 }
             }
         }
@@ -3871,6 +4448,10 @@ extension AppModelManager: ModelLoadingManaging {}
             do {
                 try fm.removeItem(at: url)
                 pendingImageURLs.removeAll { Self.normalizedAttachmentPath($0.path) == path }
+                pendingMediaAttachments.removeAll { attachment in
+                    Self.normalizedAttachmentPath(attachment.storedPath) == path
+                        || attachment.transcriptSidecarPath.map { Self.normalizedAttachmentPath($0) == path } == true
+                }
                 pendingThumbnails = pendingThumbnails.filter { Self.normalizedAttachmentPath($0.key.path) != path }
                 ImageThumbnailCache.shared.clear(for: path)
                 removed += 1
@@ -3945,6 +4526,21 @@ extension AppModelManager: ModelLoadingManaging {}
         if let data = try? JSONEncoder().encode(sessions) {
             try? data.write(to: Self.sessionsURL())
         }
+        scheduleSpotlightChatTitleIndex()
+    }
+
+    private func scheduleSpotlightChatTitleIndex() {
+        let records = sessions.map { session in
+            let trimmedTitle = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = trimmedTitle.isEmpty ? String(localized: "New chat") : trimmedTitle
+            return NoemaSpotlightIndexRecord(
+                uniqueIdentifier: NoemaSpotlightIndexingService.chatIdentifier(for: session.id),
+                title: title,
+                contentDescription: String(localized: "Noema chat"),
+                keywords: ["Noema", "chat"]
+            )
+        }
+        NoemaSpotlightIndexingService.shared.scheduleChatTitleIndex(records: records)
     }
 
     private func syncModelManagerDatasetForActiveSession() {
@@ -3960,7 +4556,7 @@ extension AppModelManager: ModelLoadingManaging {}
             return
         }
         let context = resolvedSystemPromptContext(
-            using: activeSessionIndexedDataset,
+            using: activeSessionRetrievalDataset,
             history: historyOverride ?? sessions[idx].messages
         )
         memoryPromptBudgetStatus = context.memoryPlan.status
@@ -3993,7 +4589,197 @@ extension AppModelManager: ModelLoadingManaging {}
         return sessions.firstIndex { $0.id == id }
     }
 
+    var activeToolPermissions: ChatToolPermissions {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else {
+            return .allEnabled
+        }
+        return sessions[idx].toolPermissions ?? .allEnabled
+    }
+
+    var activeScratchpad: String {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return "" }
+        return sessions[idx].scratchpad ?? ""
+    }
+
+    var activeChatInstructions: String {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return "" }
+        return sessions[idx].chatInstructions ?? ""
+    }
+
+    var activeChatMode: ChatMode {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return .general }
+        return sessions[idx].chatMode ?? .general
+    }
+
+    var activeAnswerStyle: AnswerStyle {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return .natural }
+        return sessions[idx].answerStyle ?? .natural
+    }
+
+    func setScratchpadForActiveSession(_ text: String) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessions[idx].scratchpad = trimmed.isEmpty ? nil : text
+    }
+
+    func pinMessageTextToActiveScratchpad(_ text: String, role: String, timestamp: Date) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let roleTitle: String
+        if role == "🧑‍💻" || role.lowercased() == "user" {
+            roleTitle = String(localized: "User")
+        } else if role == "🤖" || role.lowercased() == "assistant" {
+            roleTitle = String(localized: "Assistant")
+        } else {
+            roleTitle = String(localized: "Message")
+        }
+        let title = String.localizedStringWithFormat(String(localized: "Pinned %@ message"), roleTitle)
+        let date = DateFormatter.localizedString(from: timestamp, dateStyle: .medium, timeStyle: .short)
+        let block = "### \(title) - \(date)\n\(trimmed)"
+        let existing = (sessions[idx].scratchpad ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        sessions[idx].scratchpad = existing.isEmpty ? block : existing + "\n\n" + block
+    }
+
+    func pinToolCallToActiveScratchpad(_ toolCall: Msg.ToolCall) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+
+        let resultText = toolCall.result?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let errorText = toolCall.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard resultText?.isEmpty == false || errorText?.isEmpty == false else { return }
+
+        let title = String.localizedStringWithFormat(String(localized: "Pinned %@ result"), toolCall.displayName)
+        let date = DateFormatter.localizedString(from: toolCall.timestamp, dateStyle: .medium, timeStyle: .short)
+        var sections = [
+            "### \(title) - \(date)",
+            "\(String(localized: "Tool")): \(toolCall.toolName)"
+        ]
+        if let resultText, !resultText.isEmpty {
+            sections.append("\(String(localized: "Result")):\n\(ToolCallViewSupport.formatRawResult(resultText))")
+        }
+        if let errorText, !errorText.isEmpty {
+            sections.append("\(String(localized: "Error")):\n\(errorText)")
+        }
+        let block = sections.joined(separator: "\n\n")
+        let existing = (sessions[idx].scratchpad ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        sessions[idx].scratchpad = existing.isEmpty ? block : existing + "\n\n" + block
+    }
+
+    func requestToolCallRepair(_ toolCall: Msg.ToolCall) async {
+        guard canAcceptChatInput else { return }
+        guard !isStreamingInAnotherSession else {
+            crossSessionSendBlocked = true
+            return
+        }
+
+        var details = [
+            "\(String(localized: "Tool")): \(toolCall.toolName)"
+        ]
+        if !toolCall.requestParams.isEmpty {
+            let params = toolCall.requestParams.keys.sorted().map { key in
+                "\(key): \(ToolCallViewSupport.formatParameterValue(toolCall.requestParams[key]?.value))"
+            }.joined(separator: "\n")
+            details.append("\(String(localized: "Request Parameters")):\n\(params)")
+        }
+        if let error = toolCall.error?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty {
+            details.append("\(String(localized: "Error")):\n\(error)")
+        }
+        if let result = toolCall.result?.trimmingCharacters(in: .whitespacesAndNewlines), !result.isEmpty {
+            details.append("\(String(localized: "Raw Response")):\n\(ToolCallViewSupport.formatRawResult(result))")
+        }
+
+        let prompt = String.localizedStringWithFormat(
+            String(localized: "Repair this failed tool call. Explain what likely went wrong, propose corrected arguments, and rerun the tool only if it is safe and useful.\n\n%@"),
+            details.joined(separator: "\n\n")
+        )
+        await sendMessage(prompt)
+    }
+
+    func setChatInstructionsForActiveSession(_ text: String) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessions[idx].chatInstructions = trimmed.isEmpty ? nil : text
+        refreshSystemPromptForActiveSession()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let client = self.client, self.modelLoaded {
+                await client.syncSystemPrompt(self.systemPromptText)
+            }
+        }
+    }
+
+    func setChatModeForActiveSession(_ mode: ChatMode) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        sessions[idx].chatMode = mode == .general ? nil : mode
+        refreshSystemPromptForActiveSession()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let client = self.client, self.modelLoaded {
+                await client.syncSystemPrompt(self.systemPromptText)
+            }
+        }
+    }
+
+    func setAnswerStyleForActiveSession(_ style: AnswerStyle) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        sessions[idx].answerStyle = style == .natural ? nil : style
+        refreshSystemPromptForActiveSession()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let client = self.client, self.modelLoaded {
+                await client.syncSystemPrompt(self.systemPromptText)
+            }
+        }
+    }
+
+    func setToolPermissionForActiveSession(_ kind: ChatToolPermissionKind, enabled: Bool) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        var permissions = sessions[idx].toolPermissions ?? .allEnabled
+        switch kind {
+        case .webSearch:
+            permissions.webSearch = enabled
+        case .python:
+            permissions.python = enabled
+        case .memory:
+            permissions.memory = enabled
+        case .datasetRetrieval:
+            permissions.datasetRetrieval = enabled
+        }
+        applyToolPermissionsToActiveSession(permissions)
+    }
+
+    func setAllToolPermissionsForActiveSession(enabled: Bool) {
+        applyToolPermissionsToActiveSession(enabled ? .allEnabled : .allDisabled)
+    }
+
+    private func applyToolPermissionsToActiveSession(_ permissions: ChatToolPermissions) {
+        guard let idx = activeIndex, sessions.indices.contains(idx) else { return }
+        sessions[idx].toolPermissions = permissions
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.toolSpecsCache = []
+            self.systemPromptToolAvailabilityOverride = nil
+            if let remoteService = self.remoteService {
+                let specs = await self.fetchEnabledToolSpecs()
+                await remoteService.updateToolSpecs(specs)
+                let availability = self.toolAvailability(from: specs)
+                self.systemPromptToolAvailabilityOverride = availability.any ? availability : nil
+            }
+            self.refreshSystemPromptForActiveSession()
+            if let client = self.client,
+               self.loadedFormat == .et || self.loadedFormat == .ane || self.loadedFormat == .afm {
+                await client.syncSystemPrompt(self.systemPromptText)
+            }
+        }
+    }
+
     private var streamSessionIndex: Int?
+
+    /// Live text of the in-flight assistant message. Token updates flow here instead of
+    /// into `sessions` so they don't force every observer of `ChatVM` to re-render.
+    /// Held as a plain `let` so updates don't trip `ChatVM.objectWillChange`.
+    let streamingStore = StreamingMessageStore()
 
     var streamMsgs: [Msg] {
         get {
@@ -4016,6 +4802,96 @@ extension AppModelManager: ModelLoadingManaging {}
         set {
             if let idx = activeIndex { sessions[idx].messages = newValue }
         }
+    }
+
+    func toggleBookmark(messageID: UUID) {
+        guard let sessionIndex = sessions.firstIndex(where: { session in
+            session.messages.contains(where: { $0.id == messageID })
+        }),
+        let messageIndex = sessions[sessionIndex].messages.firstIndex(where: { $0.id == messageID }) else {
+            return
+        }
+        sessions[sessionIndex].messages[messageIndex].isBookmarked.toggle()
+    }
+
+    func regenerateAssistantResponse(messageID: UUID) async {
+        guard !isStreamingInAnotherSession else {
+            crossSessionSendBlocked = true
+            return
+        }
+        guard let sessionIndex = activeIndex,
+              sessions.indices.contains(sessionIndex),
+              let assistantIndex = sessions[sessionIndex].messages.firstIndex(where: { $0.id == messageID }) else {
+            return
+        }
+
+        let message = sessions[sessionIndex].messages[assistantIndex]
+        guard message.role == "🤖" || message.role.lowercased() == "assistant" else { return }
+        guard let userIndex = sessions[sessionIndex].messages[..<assistantIndex].lastIndex(where: { candidate in
+            candidate.role == "🧑‍💻" || candidate.role.lowercased() == "user"
+        }) else { return }
+
+        let userMessage = sessions[sessionIndex].messages[userIndex]
+        let text = userMessage.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+
+        currentStreamTask?.cancel()
+        currentContinuationTask?.cancel()
+        streamSessionIndex = nil
+        sessions[sessionIndex].messages = Array(sessions[sessionIndex].messages.prefix(userIndex))
+        refreshSystemPromptForActiveSession()
+        await sendMessage(text)
+    }
+
+    @discardableResult
+    func prepareAskSamePromptWithAnotherModel(messageID: UUID) -> Bool {
+        guard let sourceIndex = activeIndex,
+              sessions.indices.contains(sourceIndex),
+              let assistantIndex = sessions[sourceIndex].messages.firstIndex(where: { $0.id == messageID }) else {
+            return false
+        }
+
+        let message = sessions[sourceIndex].messages[assistantIndex]
+        guard message.role == "🤖" || message.role.lowercased() == "assistant" else { return false }
+        guard let userIndex = sessions[sourceIndex].messages[..<assistantIndex].lastIndex(where: { candidate in
+            candidate.role == "🧑‍💻" || candidate.role.lowercased() == "user"
+        }) else { return false }
+
+        let userMessage = sessions[sourceIndex].messages[userIndex]
+        let text = userMessage.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+
+        let source = sessions[sourceIndex]
+        var branchedMessages = Array(source.messages.prefix(userIndex))
+        if !branchedMessages.contains(where: { $0.role.lowercased() == "system" }) {
+            branchedMessages.insert(Msg(role: "system", text: baselineSystemPromptText, timestamp: Date()), at: 0)
+        }
+
+        let sourceTitle = source.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackTitle = Self.defaultTitle()
+        let branchTitle = String.localizedStringWithFormat(
+            String(localized: "Compare: %@"),
+            sourceTitle.isEmpty ? fallbackTitle : sourceTitle
+        )
+        let branch = Session(
+            title: branchTitle,
+            messages: branchedMessages,
+            date: Date(),
+            datasetID: source.datasetID,
+            toolPermissions: source.toolPermissions,
+            scratchpad: source.scratchpad,
+            chatMode: source.chatMode,
+            answerStyle: source.answerStyle,
+            chatInstructions: source.chatInstructions
+        )
+
+        sessions.insert(branch, at: 0)
+        activeSessionID = branch.id
+        prompt = text
+        injectionStage = .none
+        injectionMethod = nil
+        refreshSystemPromptForActiveSession()
+        return true
     }
 
     var isStreaming: Bool { msgs.last?.streaming == true }
@@ -4136,14 +5012,15 @@ extension AppModelManager: ModelLoadingManaging {}
         registerContextOverflow(strategy: strategy, details: details)
     }
 
+    private var currentStreamOrActiveSessionID: Session.ID? {
+        if let streamSessionIndex, sessions.indices.contains(streamSessionIndex) {
+            return sessions[streamSessionIndex].id
+        }
+        return activeSessionID
+    }
+
     private func registerContextOverflow(strategy: ContextOverflowStrategy, details: ContextOverflowDetails?) {
-        let sessionID: Session.ID? = {
-            if let streamSessionIndex, sessions.indices.contains(streamSessionIndex) {
-                return sessions[streamSessionIndex].id
-            }
-            return activeSessionID
-        }()
-        guard let sessionID else { return }
+        guard let sessionID = currentStreamOrActiveSessionID else { return }
         let fallbackContext = currentPromptBudget().usablePromptTokens
         var banners = contextOverflowBanners
         banners[sessionID] = ContextOverflowBannerState(
@@ -4152,6 +5029,25 @@ extension AppModelManager: ModelLoadingManaging {}
             contextTokens: details?.contextTokens ?? fallbackContext,
             timestamp: Date()
         )
+        contextOverflowBanners = banners
+    }
+
+    /// Drop the overflow pill once a turn fits within the budget again, so it
+    /// always reflects the most recent send rather than sticking forever.
+    private func clearContextOverflowForCurrentStream() {
+        guard let sessionID = currentStreamOrActiveSessionID,
+              contextOverflowBanners[sessionID] != nil else { return }
+        var banners = contextOverflowBanners
+        banners.removeValue(forKey: sessionID)
+        contextOverflowBanners = banners
+    }
+
+    /// User-initiated dismissal from the status pill.
+    func dismissActiveContextOverflowBanner() {
+        guard let sessionID = activeSessionID,
+              contextOverflowBanners[sessionID] != nil else { return }
+        var banners = contextOverflowBanners
+        banners.removeValue(forKey: sessionID)
         contextOverflowBanners = banners
     }
 
@@ -4194,11 +5090,14 @@ extension AppModelManager: ModelLoadingManaging {}
         let looksLikeOverflow = lower.contains("exceed_context_size_error")
             || (lower.contains("context") && lower.contains("exceed"))
             || lower.contains("available context size")
+            // Multimodal prompt overflow: "input (N tokens) is larger than the max context size (M tokens)"
+            || lower.contains("larger than the max context size")
         guard looksLikeOverflow else { return nil }
 
         let promptTokens =
             extractFirstInt(in: message, pattern: #""n_prompt_tokens"\s*:\s*(\d+)"#)
             ?? extractFirstInt(in: message, pattern: #"request\s*\((\d+)\s*tokens\)"#)
+            ?? extractFirstInt(in: message, pattern: #"input\s*\((\d+)\s*tokens\)"#)
         let contextTokens =
             extractFirstInt(in: message, pattern: #""n_ctx"\s*:\s*(\d+)"#)
             ?? extractFirstInt(in: message, pattern: #"context size\s*\((\d+)\s*tokens\)"#)
@@ -4215,7 +5114,12 @@ extension AppModelManager: ModelLoadingManaging {}
             return systemPrompt + "\n" + latestUser
         }
 
-        let rendered = prepareForGeneration(messages: history, system: systemPrompt)
+        // Match the reconstructed tool messages used when actually building the
+        // request so the token estimate doesn't undercount the replayed results.
+        let rendered = prepareForGeneration(
+            messages: historyWithReconstructedToolMessages(history),
+            system: systemPrompt
+        )
         switch rendered {
         case .plain(let prompt):
             return prompt
@@ -4271,6 +5175,45 @@ extension AppModelManager: ModelLoadingManaging {}
         }
     }
 
+    /// Last-resort trim when no whole message can be removed (e.g. a single
+    /// pasted document larger than the context window): shrink the largest
+    /// trimmable message body in place, honoring the strategy — rolling window
+    /// keeps the tail, truncate-middle keeps head + tail. Returns false when
+    /// nothing useful can be shrunk further.
+    private func shrinkOversizedMessageForContext(
+        _ history: inout [Msg],
+        strategy: ContextOverflowStrategy,
+        promptTokens: Int,
+        tokenLimit: Int
+    ) -> Bool {
+        guard promptTokens > tokenLimit else { return false }
+        let shrinkableIndices = history.indices.filter { idx in
+            let role = history[idx].role.lowercased()
+            if role == "system" { return false }
+            if history[idx].role == "🤖" && history[idx].streaming { return false }
+            return !history[idx].text.isEmpty
+        }
+        guard let idx = shrinkableIndices.max(by: { history[$0].text.count < history[$1].text.count }) else {
+            return false
+        }
+        let text = history[idx].text
+        // Scale the text down proportionally to the overage, with a safety margin.
+        let ratio = max(0.05, min(0.85, (Double(tokenLimit) / Double(promptTokens)) * 0.85))
+        let targetCount = Int(Double(text.count) * ratio)
+        // Below this size shrinking just destroys the message without fixing anything.
+        guard targetCount >= 160, targetCount < text.count else { return false }
+        let marker = "\n[… trimmed to fit the context window …]\n"
+        switch strategy {
+        case .rollingWindow:
+            history[idx].text = marker + String(text.suffix(targetCount))
+        case .truncateMiddle, .stopAtLimit:
+            let head = targetCount / 2
+            let tail = targetCount - head
+            history[idx].text = String(text.prefix(head)) + marker + String(text.suffix(tail))
+        }
+        return true
+    }
+
     private func planHistoryForContextOverflow(history: [Msg]) -> ContextHistoryPlan {
         let limit = contextSoftLimitTokens()
         let strategy = contextOverflowStrategy
@@ -4302,17 +5245,25 @@ extension AppModelManager: ModelLoadingManaging {}
         var iterations = 0
         while finalEstimate > limit, iterations < 256 {
             let candidates = removableHistoryIndices(for: working)
-            guard !candidates.isEmpty else { break }
-            let removalIndex: Int
-            switch strategy {
-            case .truncateMiddle:
-                removalIndex = candidates[candidates.count / 2]
-            case .rollingWindow:
-                removalIndex = candidates[0]
-            case .stopAtLimit:
-                removalIndex = candidates[0]
+            if !candidates.isEmpty {
+                let removalIndex: Int
+                switch strategy {
+                case .truncateMiddle:
+                    removalIndex = candidates[candidates.count / 2]
+                case .rollingWindow:
+                    removalIndex = candidates[0]
+                case .stopAtLimit:
+                    removalIndex = candidates[0]
+                }
+                working.remove(at: removalIndex)
+            } else if !shrinkOversizedMessageForContext(
+                &working,
+                strategy: strategy,
+                promptTokens: finalEstimate,
+                tokenLimit: limit
+            ) {
+                break
             }
-            working.remove(at: removalIndex)
             trimmed = true
             finalEstimate = estimatedPromptTokens(for: working)
             iterations += 1
@@ -4333,6 +5284,54 @@ extension AppModelManager: ModelLoadingManaging {}
 
     func focus(onMessageWithID id: UUID) {
         spotlightMessageID = id
+    }
+
+    @discardableResult
+    func branchSession(fromMessageID messageID: UUID) -> Session? {
+        guard let sourceIndex = activeIndex,
+              sessions.indices.contains(sourceIndex),
+              let messageIndex = sessions[sourceIndex].messages.firstIndex(where: { $0.id == messageID }) else {
+            return nil
+        }
+
+        currentStreamTask?.cancel()
+        gemmaAutoTemplated = false
+
+        let source = sessions[sourceIndex]
+        var branchedMessages = Array(source.messages.prefix(messageIndex + 1))
+        if !branchedMessages.contains(where: { $0.role.lowercased() == "system" }) {
+            branchedMessages.insert(Msg(role: "system", text: baselineSystemPromptText, timestamp: Date()), at: 0)
+        }
+        for index in branchedMessages.indices {
+            branchedMessages[index].streaming = false
+            branchedMessages[index].promptProcessing = nil
+            branchedMessages[index].postToolWaiting = false
+        }
+
+        let sourceTitle = source.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackTitle = Self.defaultTitle()
+        let branchTitle = String.localizedStringWithFormat(
+            String(localized: "Branch: %@"),
+            sourceTitle.isEmpty ? fallbackTitle : sourceTitle
+        )
+        let branch = Session(
+            title: branchTitle,
+            messages: branchedMessages,
+            date: Date(),
+            datasetID: source.datasetID,
+            toolPermissions: source.toolPermissions,
+            scratchpad: source.scratchpad,
+            chatMode: source.chatMode,
+            answerStyle: source.answerStyle,
+            chatInstructions: source.chatInstructions
+        )
+
+        sessions.insert(branch, at: 0)
+        activeSessionID = branch.id
+        injectionStage = .none
+        injectionMethod = nil
+        refreshSystemPromptForActiveSession()
+        return branch
     }
 
     func startNewSession() {
@@ -4425,6 +5424,8 @@ extension AppModelManager: ModelLoadingManaging {}
                 return InstalledModelsStore.canonicalURL(for: resolved.url, format: .ane)
             case .afm:
                 return InstalledModelsStore.canonicalURL(for: resolved.url, format: .afm)
+            case .coreai:
+                return InstalledModelsStore.canonicalURL(for: resolved.url, format: .coreai)
             }
         }()
 
@@ -4685,7 +5686,7 @@ extension AppModelManager: ModelLoadingManaging {}
                     }
                     finalSettings = s
                 }
-            case .et, .ane, .afm:
+            case .et, .ane, .afm, .coreai:
                 break
             }
         }
@@ -4702,42 +5703,105 @@ extension AppModelManager: ModelLoadingManaging {}
         )
     }
 
-    @MainActor
-    private func resolveETTokenizerURL(pteURL: URL, settings: ModelSettings?) async -> URL? {
-        if let explicit = settings?.tokenizerPath, !explicit.isEmpty {
-            let explicitURL = URL(fileURLWithPath: explicit)
-            if FileManager.default.fileExists(atPath: explicitURL.path) {
-                return explicitURL
-            }
+    private func resolveETLoadArtifacts(url: URL, settings: ModelSettings?) throws -> ETModelResolver.LoadArtifacts {
+        try ETModelResolver.resolveLoadArtifacts(for: url, settings: settings)
+    }
+
+    private func etRepairCandidate(for attemptedURL: URL, diagnostic: ETModelResolver.ArtifactDiagnostic) -> ETRepairCandidate? {
+        guard diagnostic.isRepairable else { return nil }
+        let modelDirectory = diagnostic.modelDirectory
+        let model = modelManager?.downloadedModels.first(where: { candidate in
+            candidate.format == .et && (
+                candidate.url == attemptedURL
+                || candidate.url == modelDirectory
+                || candidate.url.deletingLastPathComponent() == modelDirectory
+                || ETModelResolver.modelDirectory(for: candidate.url) == modelDirectory
+            )
+        })
+
+        return ETRepairCandidate(
+            modelID: model?.modelID ?? inferRepoID(from: modelDirectory) ?? "",
+            quantLabel: model?.quant ?? "",
+            modelURL: model?.url ?? modelDirectory,
+            sourceRepoID: diagnostic.sourceRepoID
+        )
+    }
+
+    private func catalogETSourceRepoID(modelID: String, quantLabel: String) async -> String? {
+        guard !modelID.isEmpty else { return nil }
+        guard let details = try? await ManualModelRegistry().details(for: modelID) else { return nil }
+        let matching = details.quants.first { quant in
+            quant.format == .et && (
+                quant.label.caseInsensitiveCompare(quantLabel) == .orderedSame
+                || quantLabel.isEmpty
+            )
+        } ?? details.quants.first(where: { $0.format == .et })
+        guard let url = matching?.downloadURL else { return nil }
+        return huggingFaceRepoID(from: url)
+    }
+
+    private func huggingFaceRepoID(from url: URL) -> String? {
+        guard let host = url.host, host.contains("huggingface.co") else { return nil }
+        var parts = url.path.split(separator: "/").filter { !$0.isEmpty }.map(String.init)
+        let prefixes: Set<String> = ["repos", "api", "models"]
+        while parts.count > 2, let first = parts.first, prefixes.contains(first) {
+            parts.removeFirst()
+        }
+        guard parts.count >= 2 else { return nil }
+        return "\(parts[0])/\(parts[1])"
+    }
+
+    func repairPendingETArtifacts() async {
+        guard let candidate = pendingETRepairCandidate else { return }
+        let sourceRepo: String?
+        if let existing = candidate.sourceRepoID {
+            sourceRepo = existing
+        } else {
+            sourceRepo = await catalogETSourceRepoID(modelID: candidate.modelID, quantLabel: candidate.quantLabel)
+        }
+        guard sourceRepo != nil || !candidate.modelID.isEmpty else {
+            loadError = String(localized: "Repair is unavailable for this ET model. Reinstall it from Explore.")
+            return
         }
 
-        let modelDir = pteURL.deletingLastPathComponent()
-        if let local = ETModelResolver.tokenizerURL(for: modelDir) ?? ETModelResolver.tokenizerURL(for: pteURL) {
-            return local
-        }
+        loading = true
+        stillLoading = false
+        defer { loading = false; stillLoading = false }
 
-        let repoHint = modelManager?.downloadedModels.first(where: { model in
-            model.url == pteURL || model.url == modelDir || model.url.deletingLastPathComponent() == modelDir
-        })?.modelID
-        let repoID = repoHint ?? inferRepoID(from: modelDir)
-        guard let repoID else { return nil }
-
-        if verboseLogging {
-            print("[ChatVM] ET tokenizer missing locally, attempting fetch for repo: \(repoID)")
+        do {
+            try await ModelDownloadManager().repairETArtifacts(
+                modelID: candidate.modelID,
+                modelURL: candidate.modelURL,
+                sourceRepoID: sourceRepo
+            )
+            modelManager?.refresh()
+            pendingETRepairCandidate = nil
+            loadError = String(localized: "Repair finished. Load the ET model again.")
+        } catch let diagnostic as ETModelResolver.ArtifactDiagnostic {
+            pendingETRepairCandidate = etRepairCandidate(for: candidate.modelURL, diagnostic: diagnostic)
+            loadError = diagnostic.userFacingMessage
+        } catch {
+            loadError = error.localizedDescription
         }
-        await fetchTokenizer(into: modelDir, repoID: repoID)
-        return ETModelResolver.tokenizerURL(for: modelDir) ?? ETModelResolver.tokenizerURL(for: pteURL)
     }
 
     private func startGGUFLoopbackServer(
         modelURL: URL,
         settings: ModelSettings,
         explicitMMProj: String?
-    ) async throws -> (port: Int32, effectiveSettings: ModelSettings, recovered: Bool, diagnostics: LlamaServerBridge.StartDiagnostics?) {
+    ) async throws -> (port: Int32, effectiveSettings: ModelSettings) {
+        let mtpPath = settings.speculativeDecoding.mtpEnabled ? MtpLocator.mtpPath(alongside: modelURL) : nil
+        let hasMTP = mtpPath != nil || GGUFMetadata.hasMTP(at: modelURL)
+        let mtpEnabled = settings.speculativeDecoding.mtpEnabled && hasMTP
         let primaryConfiguration = TemplateDrivenModelSupport.loopbackStartConfiguration(
             modelURL: modelURL,
             ggufPath: modelURL.path,
-            mmprojPath: explicitMMProj
+            mmprojPath: explicitMMProj,
+            mtpPath: mtpPath,
+            speculativeType: mtpEnabled ? "draft-mtp" : nil,
+            specDraftNMax: mtpEnabled ? Int32(settings.speculativeDecoding.resolvedMTPDraftNMax) : nil,
+            specDraftNMin: mtpEnabled ? Int32(settings.speculativeDecoding.resolvedMTPDraftNMin) : nil,
+            specDraftPMin: mtpEnabled ? settings.speculativeDecoding.resolvedMTPDraftPMin : nil
         )
 
         func start(_ configuration: LlamaServerBridge.StartConfiguration) async -> Int32 {
@@ -4749,45 +5813,17 @@ extension AppModelManager: ModelLoadingManaging {}
 
         let primaryPort = await start(primaryConfiguration)
         if primaryPort > 0 {
-            return (primaryPort, settings, false, nil)
+            logLastLoopbackStartOptions(prefix: "[Loopback][StartOptions][Load]")
+            return (primaryPort, settings)
         }
 
-        let initialDiagnostics = LlamaServerBridge.lastStartDiagnostics()
-        let retryPlan = LoopbackStartupPlanner.makeRetryPlan(
-            modelURL: modelURL,
-            requestedSettings: settings,
-            mmprojPath: explicitMMProj,
-            diagnostics: initialDiagnostics
-        )
-        applyEnvironmentVariables(from: retryPlan.settings)
-
-        let initialReason = initialDiagnostics?.message.isEmpty == false
-            ? initialDiagnostics!.message
-            : (initialDiagnostics?.code ?? "startup_failed")
+        let diagnostics = LlamaServerBridge.lastStartDiagnostics()
+        let reason = diagnostics?.message.isEmpty == false
+            ? diagnostics!.message
+            : (diagnostics?.code ?? "startup_failed")
         Task {
             await logger.log(
-                "[Loopback][Recovery] phase=retry.start reason=\(retryPlan.reason) initial_reason=\(initialReason) original={\(LoopbackStartupPlanner.summary(for: settings))} recovered={\(LoopbackStartupPlanner.summary(for: retryPlan.settings))}"
-            )
-        }
-
-        let retryPort = await start(retryPlan.configuration)
-        let retryDiagnostics = LlamaServerBridge.lastStartDiagnostics()
-        if retryPort > 0 {
-            Task {
-                await logger.log(
-                    "[Loopback][Recovery] phase=retry.success reason=\(retryPlan.reason) dropped_template=\(retryPlan.droppedTemplateOverride)"
-                )
-            }
-            return (retryPort, retryPlan.settings, true, retryDiagnostics ?? initialDiagnostics)
-        }
-
-        let finalDiagnostics = retryDiagnostics ?? initialDiagnostics
-        let finalReason = finalDiagnostics?.message.isEmpty == false
-            ? finalDiagnostics!.message
-            : (finalDiagnostics?.code ?? "startup_failed")
-        Task {
-            await logger.log(
-                "[Loopback][Recovery] phase=retry.failed reason=\(retryPlan.reason) dropped_template=\(retryPlan.droppedTemplateOverride) final_reason=\(finalReason)"
+                "[Loopback] start.failed reason=\(reason) settings_unchanged=true"
             )
         }
 
@@ -4795,7 +5831,7 @@ extension AppModelManager: ModelLoadingManaging {}
             domain: "Noema",
             code: 2001,
             userInfo: [
-                NSLocalizedDescriptionKey: LoopbackStartupPlanner.formatFailureMessage(finalDiagnostics, retryAttempted: true)
+                NSLocalizedDescriptionKey: LoopbackStartupPlanner.formatFailureMessage(diagnostics)
             ]
         )
     }
@@ -4823,6 +5859,7 @@ extension AppModelManager: ModelLoadingManaging {}
         loading = true
         stillLoading = false
         loadError = nil
+        pendingETRepairCandidate = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             if self?.loading == true { self?.stillLoading = true }
         }
@@ -4832,6 +5869,20 @@ extension AppModelManager: ModelLoadingManaging {}
         var loadURL = prepared.url
         let detectedFmt = prepared.format
         var finalSettings = prepared.settings
+        if let settings = finalSettings {
+            let powerDecision = GenerationPowerPolicy.adjustedSettings(settings, format: detectedFmt)
+            finalSettings = powerDecision.settings
+            lastGenerationPowerPolicy = powerDecision
+            if powerDecision.adapted {
+                Task {
+                    await logger.log(
+                        "[GenerationPower] adapted=true format=\(detectedFmt.rawValue) threads=\(powerDecision.originalThreadCount)->\(powerDecision.appliedThreadCount) context=\(powerDecision.originalContextLength)->\(powerDecision.appliedContextLength) reasons=\(powerDecision.reasons.map(\.rawValue).joined(separator: ","))"
+                    )
+                }
+            }
+        } else {
+            lastGenerationPowerPolicy = nil
+        }
         let preparedPromptTemplateSource = prepared.promptTemplateSource ?? PromptTemplateSource.defaultTemplate.rawValue
         inferenceBackendSummary = nil
         loadingProgressTracker.reportBackendProgress(0.08)
@@ -4856,6 +5907,7 @@ extension AppModelManager: ModelLoadingManaging {}
                     case .et: return "ET"
                     case .ane: return ModelFormat.ane.displayName
                     case .afm: return "AFM"
+                    case .coreai: return "Core AI"
                     }
                 }()
                 print("[ChatVM] loading \(kind) from \(loadURL.lastPathComponent)…")
@@ -4892,21 +5944,9 @@ extension AppModelManager: ModelLoadingManaging {}
                 // "loopback enabled" (UI image support is gated separately).
                 LoopbackVisionState.setEnabled(true)
                 let projName = explicitMMProj.map { URL(fileURLWithPath: $0).lastPathComponent } ?? (hasMergedProjector ? "merged" : "none")
-                let templateLabel: String = {
-                    if outcome.recovered, LoopbackStartupPlanner.shouldDropTemplateOverride(outcome.diagnostics) {
-                        return "recovery-default"
-                    }
-                    return TemplateDrivenModelSupport.templateLabel(modelURL: loadURL)
-                }()
+                let templateLabel = TemplateDrivenModelSupport.templateLabel(modelURL: loadURL)
                 if verboseLogging { print("[ChatVM] Started loopback llama.cpp server on 127.0.0.1:\(p) mmproj=\(projName)") }
                 Task { await logger.log("[Loopback] start host=127.0.0.1 port=\(p) gguf=\(loadURL.lastPathComponent) mmproj=\(projName) template=\(templateLabel)") }
-                if outcome.recovered {
-                    Task {
-                        await logger.log(
-                            "[Loopback][Recovery] phase=load.applied settings={\(LoopbackStartupPlanner.summary(for: outcome.effectiveSettings))}"
-                        )
-                    }
-                }
                 loadingProgressTracker.reportBackendProgress(0.96)
             }
         }
@@ -4915,8 +5955,9 @@ extension AppModelManager: ModelLoadingManaging {}
             return Int(clamped)
         }
         let threadOverride = finalSettings.map { settings -> Int in
-            let requested = settings.cpuThreads > 0 ? settings.cpuThreads : ProcessInfo.processInfo.activeProcessorCount
-            return max(1, requested)
+            let requested = settings.cpuThreads > 0 ? settings.cpuThreads : ModelSettings.recommendedInferenceThreadCount
+            // Hard-clamp so inference always leaves a core free for the UI.
+            return min(max(1, requested), ModelSettings.maxInferenceThreadCount)
         }
         let llamaParameter = LlamaParameter(
             options: llamaOptions,
@@ -4934,7 +5975,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 // Choose VLM vs Text based on model contents
                 if MLXBridge.isVLMModel(at: loadURL) {
                     loadingProgressTracker.reportBackendProgress(0.34)
-                    client = try await MLXBridge.makeVLMClient(url: loadURL)
+                    client = try await MLXBridge.makeVLMClient(url: loadURL, settings: finalSettings)
                 } else {
                     loadingProgressTracker.reportBackendProgress(0.34)
                     client = try await MLXBridge.makeTextClient(url: loadURL, settings: finalSettings)
@@ -4965,31 +6006,15 @@ extension AppModelManager: ModelLoadingManaging {}
                     )
                 }
                 loadingProgressTracker.reportBackendProgress(0.12)
-                guard let pteURL = ETModelResolver.pteURL(for: loadURL) else {
-                    throw NSError(domain: "Noema", code: -2, userInfo: [
-                        NSLocalizedDescriptionKey: String(
-                            localized: "No .pte program found for ET model.",
-                            locale: LocalizationManager.preferredLocale()
-                        )
-                    ])
-                }
-                loadURL = pteURL
-                let tokenizerURL = await resolveETTokenizerURL(pteURL: pteURL, settings: finalSettings)
-                guard let tokenizerURL else {
-                    throw NSError(domain: "Noema", code: -2, userInfo: [
-                        NSLocalizedDescriptionKey: String(
-                            localized: "Tokenizer file not found for ET model.",
-                            locale: LocalizationManager.preferredLocale()
-                        )
-                    ])
-                }
+                let artifacts = try resolveETLoadArtifacts(url: loadURL, settings: finalSettings)
+                loadURL = artifacts.pteURL
                 var etSettings = finalSettings ?? ModelSettings.default(for: .et)
                 etSettings.etBackend = ETBackendDetector.effectiveBackend(userSelected: etSettings.etBackend, detected: nil)
-                let likelyVision = pteURL.lastPathComponent.lowercased().contains("vision")
-                    || pteURL.deletingLastPathComponent().lastPathComponent.lowercased().contains("vision")
+                let likelyVision = artifacts.pteURL.lastPathComponent.lowercased().contains("vision")
+                    || artifacts.pteURL.deletingLastPathComponent().lastPathComponent.lowercased().contains("vision")
                 let etClient = ExecuTorchLLMClient(
-                    modelPath: pteURL.path,
-                    tokenizerPath: tokenizerURL.path,
+                    modelPath: artifacts.pteURL.path,
+                    tokenizerPath: artifacts.tokenizerURL.path,
                     isVision: likelyVision,
                     settings: etSettings
                 )
@@ -5041,12 +6066,21 @@ extension AppModelManager: ModelLoadingManaging {}
                 )
                 #endif
             case .afm:
-                let afmSettings = finalSettings ?? ModelSettings.default(for: .afm)
-                let afmClient = AFMLLMClient(guardrailsMode: afmSettings.afmGuardrails) { [weak self] summary in
-                    await MainActor.run {
-                        self?.pendingAFMToolSummary = summary
+                let afmClient = AFMLLMClient(
+                    guardrailsMode: AFMLLMClient.resolvedGuardrailsMode(from: finalSettings),
+                    privateCloudComputeMode: AFMLLMClient.resolvedPrivateCloudComputeMode(from: finalSettings),
+                    onToolSummary: { [weak self] summary in
+                        await MainActor.run {
+                            self?.pendingAFMToolSummary = summary
+                        }
+                    },
+                    onRouteInfo: { [weak self] info in
+                        await MainActor.run {
+                            self?.pendingAFMRouteInfo = info
+                        }
                     }
-                }
+                )
+                activeAFMClient = afmClient
                 await afmClient.syncSystemPrompt(systemPromptText)
                 try await afmClient.load()
                 client = AnyLLMClient(
@@ -5061,6 +6095,30 @@ extension AppModelManager: ModelLoadingManaging {}
                 )
                 loadingProgressTracker.reportBackendProgress(0.95)
                 loadedFormat = .afm
+            case .coreai:
+                loadingProgressTracker.reportBackendProgress(0.14)
+                let resolved = try CoreAIModelResolver.resolve(modelURL: loadURL)
+                let coreaiClient = CoreAILLMClient(
+                    resolved: resolved,
+                    settings: finalSettings ?? .default(for: .coreai)
+                )
+                await coreaiClient.syncSystemPrompt(systemPromptText)
+                try await coreaiClient.load()
+                client = AnyLLMClient(
+                    textStream: { input in
+                        try await coreaiClient.textStream(from: input)
+                    },
+                    textStreamWithProgress: { input, onPromptProgress in
+                        try await coreaiClient.textStream(from: input, onPromptProgress: onPromptProgress)
+                    },
+                    cancel: nil,
+                    unload: { coreaiClient.unload() },
+                    syncSystemPrompt: { prompt in
+                        await coreaiClient.syncSystemPrompt(prompt)
+                    }
+                )
+                loadingProgressTracker.reportBackendProgress(0.95)
+                loadedFormat = .coreai
             }
         } else {
             // Auto-detect format and load via appropriate client
@@ -5072,7 +6130,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 loadingProgressTracker.reportBackendProgress(0.2)
                 if MLXBridge.isVLMModel(at: loadURL) {
                     loadingProgressTracker.reportBackendProgress(0.34)
-                    client = try await MLXBridge.makeVLMClient(url: loadURL)
+                    client = try await MLXBridge.makeVLMClient(url: loadURL, settings: finalSettings)
                 } else {
                     loadingProgressTracker.reportBackendProgress(0.34)
                     client = try await MLXBridge.makeTextClient(url: loadURL, settings: finalSettings)
@@ -5103,31 +6161,15 @@ extension AppModelManager: ModelLoadingManaging {}
                     )
                 }
                 loadingProgressTracker.reportBackendProgress(0.12)
-                guard let pteURL = ETModelResolver.pteURL(for: loadURL) else {
-                    throw NSError(domain: "Noema", code: -2, userInfo: [
-                        NSLocalizedDescriptionKey: String(
-                            localized: "No .pte program found for ET model.",
-                            locale: LocalizationManager.preferredLocale()
-                        )
-                    ])
-                }
-                loadURL = pteURL
-                let tokenizerURL = await resolveETTokenizerURL(pteURL: pteURL, settings: finalSettings)
-                guard let tokenizerURL else {
-                    throw NSError(domain: "Noema", code: -2, userInfo: [
-                        NSLocalizedDescriptionKey: String(
-                            localized: "Tokenizer file not found for ET model.",
-                            locale: LocalizationManager.preferredLocale()
-                        )
-                    ])
-                }
+                let artifacts = try resolveETLoadArtifacts(url: loadURL, settings: finalSettings)
+                loadURL = artifacts.pteURL
                 var etSettings = finalSettings ?? ModelSettings.default(for: .et)
                 etSettings.etBackend = ETBackendDetector.effectiveBackend(userSelected: etSettings.etBackend, detected: nil)
-                let likelyVision = pteURL.lastPathComponent.lowercased().contains("vision")
-                    || pteURL.deletingLastPathComponent().lastPathComponent.lowercased().contains("vision")
+                let likelyVision = artifacts.pteURL.lastPathComponent.lowercased().contains("vision")
+                    || artifacts.pteURL.deletingLastPathComponent().lastPathComponent.lowercased().contains("vision")
                 let etClient = ExecuTorchLLMClient(
-                    modelPath: pteURL.path,
-                    tokenizerPath: tokenizerURL.path,
+                    modelPath: artifacts.pteURL.path,
+                    tokenizerPath: artifacts.tokenizerURL.path,
                     isVision: likelyVision,
                     settings: etSettings
                 )
@@ -5179,12 +6221,21 @@ extension AppModelManager: ModelLoadingManaging {}
                 )
                 #endif
             case .afm:
-                let afmSettings = finalSettings ?? ModelSettings.default(for: .afm)
-                let afmClient = AFMLLMClient(guardrailsMode: afmSettings.afmGuardrails) { [weak self] summary in
-                    await MainActor.run {
-                        self?.pendingAFMToolSummary = summary
+                let afmClient = AFMLLMClient(
+                    guardrailsMode: AFMLLMClient.resolvedGuardrailsMode(from: finalSettings),
+                    privateCloudComputeMode: AFMLLMClient.resolvedPrivateCloudComputeMode(from: finalSettings),
+                    onToolSummary: { [weak self] summary in
+                        await MainActor.run {
+                            self?.pendingAFMToolSummary = summary
+                        }
+                    },
+                    onRouteInfo: { [weak self] info in
+                        await MainActor.run {
+                            self?.pendingAFMRouteInfo = info
+                        }
                     }
-                }
+                )
+                activeAFMClient = afmClient
                 await afmClient.syncSystemPrompt(systemPromptText)
                 try await afmClient.load()
                 client = AnyLLMClient(
@@ -5199,6 +6250,30 @@ extension AppModelManager: ModelLoadingManaging {}
                 )
                 loadingProgressTracker.reportBackendProgress(0.95)
                 loadedFormat = .afm
+            case .coreai:
+                loadingProgressTracker.reportBackendProgress(0.14)
+                let resolved = try CoreAIModelResolver.resolve(modelURL: loadURL)
+                let coreaiClient = CoreAILLMClient(
+                    resolved: resolved,
+                    settings: finalSettings ?? .default(for: .coreai)
+                )
+                await coreaiClient.syncSystemPrompt(systemPromptText)
+                try await coreaiClient.load()
+                client = AnyLLMClient(
+                    textStream: { input in
+                        try await coreaiClient.textStream(from: input)
+                    },
+                    textStreamWithProgress: { input, onPromptProgress in
+                        try await coreaiClient.textStream(from: input, onPromptProgress: onPromptProgress)
+                    },
+                    cancel: nil,
+                    unload: { coreaiClient.unload() },
+                    syncSystemPrompt: { prompt in
+                        await coreaiClient.syncSystemPrompt(prompt)
+                    }
+                )
+                loadingProgressTracker.reportBackendProgress(0.95)
+                loadedFormat = .coreai
             }
         }
 
@@ -5253,6 +6328,21 @@ extension AppModelManager: ModelLoadingManaging {}
                 imageDetectNotes.append("store.missing")
             }
         }
+        // Apple Foundation Model gained on-device multimodal prompting on iOS 27.
+        if loadedFormat == .afm {
+            #if NOEMA_ENABLE_XCODE27_APIS
+            if #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) {
+                supportsImageInput = true
+                imageDetectNotes.append("afm.vision=ios27")
+            } else {
+                supportsImageInput = false
+                imageDetectNotes.append("afm.vision=unavailable")
+            }
+            #else
+            supportsImageInput = false
+            imageDetectNotes.append("afm.vision=sdk<27")
+            #endif
+        }
         Task { await logger.log("[Images][Capability] format=\(String(describing: loadedFormat)) supports=\(supportsImageInput) notes=\(imageDetectNotes.joined(separator: ","))") }
 
         // Persist current model format and function-calling capability for tool gating (e.g., web search)
@@ -5276,13 +6366,16 @@ extension AppModelManager: ModelLoadingManaging {}
         if verboseLogging { print("[ChatVM] client ready ✅") }
         if loadedFormat == .mlx { print("[ChatVM] MLX client ready ✅") }
 
-        // Do not persist runtime-recovered load settings here. Explicit Save/Load
-        // actions own durable settings changes; startup crash recovery should not
-        // rewrite the user's saved context length.
+        // Explicit Save/Load actions own durable settings changes; failed startup
+        // handling must not rewrite the user's saved model settings.
     }
 
     func applyEnvironmentVariables(from s: ModelSettings) {
         setenv("LLAMA_CONTEXT_SIZE", String(Int(s.contextLength)), 1)
+        // Mid-generation overflow behavior (read at server start): trimming
+        // strategies let the server shift the KV cache and keep generating;
+        // Stop at Limit disables shifting so generation halts at n_ctx.
+        setenv("LLAMA_CONTEXT_SHIFT", contextOverflowStrategy == .stopAtLimit ? "0" : "1", 1)
         let supportsOffload = DeviceGPUInfo.supportsGPUOffload
         // If sentinel (-1): request all available GPU layers by using a large value (clamped by backend)
         let resolvedGpuLayers: Int = {
@@ -5291,8 +6384,9 @@ extension AppModelManager: ModelLoadingManaging {}
             return max(0, s.gpuLayers)
         }()
         setenv("LLAMA_N_GPU_LAYERS", String(resolvedGpuLayers), 1)
-        let threadCount = s.cpuThreads > 0 ? s.cpuThreads : ProcessInfo.processInfo.activeProcessorCount
-        let clampedThreads = max(1, threadCount)
+        let threadCount = s.cpuThreads > 0 ? s.cpuThreads : ModelSettings.recommendedInferenceThreadCount
+        // Hard-clamp so inference always leaves a core free for the UI.
+        let clampedThreads = min(max(1, threadCount), ModelSettings.maxInferenceThreadCount)
         setenv("LLAMA_THREADS", String(clampedThreads), 1)
         setenv("LLAMA_THREADS_BATCH", String(clampedThreads), 1)
         // Some llama/ggml builds still honor GGML_* env names – set both for safety
@@ -5367,9 +6461,22 @@ extension AppModelManager: ModelLoadingManaging {}
         } else {
             unsetenv("NOEMA_OVERRIDE_TENSOR")
         }
+        if s.speculativeDecoding.mtpEnabled {
+            setenv("NOEMA_MTP_ENABLED", "1", 1)
+            setenv("NOEMA_MTP_DRAFT_N_MAX", String(s.speculativeDecoding.resolvedMTPDraftNMax), 1)
+            setenv("NOEMA_MTP_DRAFT_N_MIN", String(s.speculativeDecoding.resolvedMTPDraftNMin), 1)
+            setenv("NOEMA_MTP_DRAFT_P_MIN", String(s.speculativeDecoding.resolvedMTPDraftPMin), 1)
+        } else {
+            unsetenv("NOEMA_MTP_ENABLED")
+            unsetenv("NOEMA_MTP_DRAFT_N_MAX")
+            unsetenv("NOEMA_MTP_DRAFT_N_MIN")
+            unsetenv("NOEMA_MTP_DRAFT_P_MIN")
+        }
         // Speculative decoding environment variables are not applied on macOS.
         #if !os(macOS)
-        if let helper = s.speculativeDecoding.helperModelID, !helper.isEmpty {
+        if s.speculativeDecoding.selection == .helperDraftModel,
+           let helper = s.speculativeDecoding.helperModelID,
+           !helper.isEmpty {
             setenv("NOEMA_DRAFT_MODEL", helper, 1)
             let mode = s.speculativeDecoding.mode == .tokens ? "tokens" : "max"
             setenv("NOEMA_DRAFT_MODE", mode, 1)
@@ -5421,11 +6528,35 @@ extension AppModelManager: ModelLoadingManaging {}
         if fmt == .et, ETModelResolver.pteURL(for: url) == nil, url.pathExtension.lowercased() == "gguf" {
             fmt = .gguf
         }
-        
+
+        // Noema Teams policy: block disallowed formats and disallowed specific models
+        // here, at the single local-model load choke point.
+        if EnterprisePolicyGate.isActive {
+            let policyMessage = String(
+                localized: "Blocked by your organization's policy.",
+                locale: LocalizationManager.preferredLocale()
+            )
+            if let fmt, !EnterprisePolicyGate.allowsModelFormat(fmt) {
+                loadError = policyMessage
+                Task { await logger.log("[ChatVM][Load] blocked_by_policy format=\(fmt.rawValue)") }
+                return false
+            }
+            let resolvedModelID = modelManager?.downloadedModels.first(where: {
+                $0.url == url || url.path.hasPrefix($0.url.path)
+            })?.modelID
+            if !EnterprisePolicyGate.allowsModel(modelID: resolvedModelID) {
+                loadError = policyMessage
+                Task { await logger.log("[ChatVM][Load] blocked_by_policy modelID=\(resolvedModelID ?? "<unknown>")") }
+                return false
+            }
+        }
+
         // Set the loading model name for the notification
         let modelName = displayLoadName(for: url, format: fmt)
         await MainActor.run {
             modelManager?.loadingModelName = modelName
+            lastUnloadVerification = nil
+            lastGenerationPowerPolicy = nil
         }
         Task {
             await logger.log("[ChatVM][Load] begin model=\(modelName) format=\(fmt?.displayName ?? "<auto>") forceReload=\(forceReload)")
@@ -5460,7 +6591,13 @@ extension AppModelManager: ModelLoadingManaging {}
             return true
         } catch {
             // Surface the error to the UI so the user knows what failed.
-            loadError = error.localizedDescription
+            if let diagnostic = error as? ETModelResolver.ArtifactDiagnostic {
+                pendingETRepairCandidate = etRepairCandidate(for: url, diagnostic: diagnostic)
+                loadError = diagnostic.userFacingMessage
+            } else {
+                pendingETRepairCandidate = nil
+                loadError = error.localizedDescription
+            }
             if verboseLogging { print("[ChatVM] ❌ \(error.localizedDescription)") }
             Task {
                 await logger.log("[ChatVM][Load] failed model=\(modelName) error=\(error.localizedDescription)")
@@ -5609,7 +6746,11 @@ extension AppModelManager: ModelLoadingManaging {}
     private func fetchEnabledToolSpecs() async -> [ToolSpec] {
         let specs = await fetchToolSpecs()
         let availableNames = Set(await ToolManager.shared.availableTools)
-        return specs.filter { availableNames.contains($0.function.name) }
+        let permissions = activeToolPermissions
+        return specs.filter {
+            availableNames.contains($0.function.name)
+                && permissions.allows(toolName: $0.function.name)
+        }
     }
 
     private func toolAvailability(from specs: [ToolSpec]) -> ToolAvailability {
@@ -5617,16 +6758,28 @@ extension AppModelManager: ModelLoadingManaging {}
         return ToolAvailability(
             webSearch: names.contains("noema.web.retrieve"),
             python: names.contains("noema.python.execute"),
-            memory: names.contains("noema.memory")
+            memory: names.contains("noema.memory"),
+            calculator: names.contains("noema.math.calculate"),
+            unitConverter: names.contains("noema.units.convert")
         )
     }
 
     nonisolated func unload() async {
+        let before = LiveMemoryPressureSnapshot.current()
         // Capture the current client so we can await a full teardown off the main actor.
         let clientToUnload: AnyLLMClient? = await MainActor.run { () -> AnyLLMClient? in
             self.detachClientAndUnloadResources()
         }
         await Self.unloadDetachedClient(clientToUnload)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        let after = LiveMemoryPressureSnapshot.current()
+        let result = ModelUnloadVerifier.evaluate(before: before, after: after)
+        await MainActor.run {
+            self.lastUnloadVerification = result
+        }
+        Task {
+            await logger.log("[ModelUnloadVerification] \(result.logSummary)")
+        }
     }
 
     #if canImport(LeapSDK)
@@ -5700,6 +6853,20 @@ extension AppModelManager: ModelLoadingManaging {}
 #endif
 
     func activateRemoteSession(backend: RemoteBackend, model: RemoteModel, settings: ModelSettings? = nil) async throws {
+        // Noema Teams policy: every remote chat session is created here, so this is the
+        // single choke point for remote-inference and backend allowlists.
+        guard EnterprisePolicyGate.remoteInferenceAllowed else {
+            throw RemoteBackendError.validationFailed(String(
+                localized: "Remote inference is disabled by your organization's policy.",
+                locale: LocalizationManager.preferredLocale()
+            ))
+        }
+        guard EnterprisePolicyGate.allowsRemoteBackend(id: backend.id, endpointType: backend.endpointType) else {
+            throw RemoteBackendError.validationFailed(String(
+                localized: "This remote backend is not allowed by your organization's policy.",
+                locale: LocalizationManager.preferredLocale()
+            ))
+        }
         if !backend.isCloudRelay {
             guard backend.chatEndpointURL != nil else {
                 throw RemoteBackendError.invalidEndpoint
@@ -5724,6 +6891,7 @@ extension AppModelManager: ModelLoadingManaging {}
         }()
 
         systemPromptToolAvailabilityOverride = nil
+        lastGenerationPowerPolicy = nil
 
         await Self.unloadDetachedClient(detachClientAndUnloadResources())
 
@@ -6016,6 +7184,8 @@ extension AppModelManager: ModelLoadingManaging {}
 
     func stop() {
         // Proactively cancel backend generation (llama.cpp) and any in-flight tool calls
+        stopAfterParagraphRequested = false
+        stopAfterParagraphBaselineCharacterCount = nil
         client?.cancelActive()
         currentContextTask?.cancel()
         currentContextTask = nil
@@ -6066,6 +7236,26 @@ extension AppModelManager: ModelLoadingManaging {}
         streamSessionIndex = nil
     }
 
+    func requestStopAfterParagraph() {
+        guard isStreaming else { return }
+        stopAfterParagraphRequested = true
+        let visibleText = msgs.last?.text ?? ""
+        stopAfterParagraphBaselineCharacterCount = visibleText.count
+    }
+
+    private func clearStopAfterParagraphRequest() {
+        stopAfterParagraphRequested = false
+        stopAfterParagraphBaselineCharacterCount = nil
+    }
+
+    private func shouldStopAtRequestedParagraphBoundary(in visibleText: String) -> Bool {
+        guard stopAfterParagraphRequested else { return false }
+        let baseline = min(stopAfterParagraphBaselineCharacterCount ?? 0, visibleText.count)
+        let suffix = String(visibleText.dropFirst(baseline))
+        guard suffix.trimmingCharacters(in: .whitespacesAndNewlines).count >= 24 else { return false }
+        return suffix.range(of: #"\n\s*\n"#, options: .regularExpression) != nil
+    }
+
     private func markRollingThoughtsInterrupted(forMessageAt index: Int) {
         guard streamMsgs.indices.contains(index) else { return }
         let messageID = streamMsgs[index].id.uuidString
@@ -6095,7 +7285,7 @@ extension AppModelManager: ModelLoadingManaging {}
         precondition(purpose == .chat, "appendUser used for non-chat run")
         var m = msgs
         let datasetSnapshot: (id: String, name: String)? = {
-            guard let ds = activeSessionIndexedDataset else { return nil }
+            guard let ds = activeSessionRetrievalDataset else { return nil }
             return (ds.datasetID, ds.name)
         }()
         m.append(.init(role: "🧑‍💻",
@@ -6109,13 +7299,17 @@ extension AppModelManager: ModelLoadingManaging {}
     private func appendAssistantPlaceholder(purpose: RunPurpose) -> Int {
         precondition(purpose == .chat, "appendAssistant used for non-chat run")
         var m = msgs
+        let remoteSession = modelManager?.activeRemoteSession
         m.append(
             .init(
                 role: "🤖",
                 text: "",
                 timestamp: Date(),
                 streaming: true,
-                promptProcessing: self.loadedFormat == .gguf ? .init(progress: 0) : nil
+                promptProcessing: self.supportsPromptProcessingCard ? .init(progress: 0) : nil,
+                usedRemoteBackend: remoteSession != nil,
+                remoteBackendName: remoteSession?.backendName,
+                remoteModelName: remoteSession?.modelName
             )
         )
         msgs = m
@@ -6129,10 +7323,17 @@ extension AppModelManager: ModelLoadingManaging {}
 
     /// New send variant that avoids races with UI clearing the prompt by accepting the text explicitly.
     func sendMessage(_ rawInput: String) async {
-        let input = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !input.isEmpty else { return }
+        clearStopAfterParagraphRequest()
+        let visibleInput = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let completedMediaAttachments = pendingMediaAttachments.filter(\.hasCompletedTranscript)
+        guard !visibleInput.isEmpty || !completedMediaAttachments.isEmpty else { return }
+        let input = visibleInput.isEmpty ? String(localized: "Transcribed media attached.") : visibleInput
+        let modelInput = Self.promptText(
+            userText: visibleInput,
+            mediaAttachments: completedMediaAttachments
+        )
 
-        await logger.log("[ChatVM][SendAttempt] \(input)")
+        await logger.log("[ChatVM][SendAttempt] \(modelInput)")
 
         if isStreamingInAnotherSession {
             if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -6152,9 +7353,10 @@ extension AppModelManager: ModelLoadingManaging {}
         }
 
         prompt = ""
+        activeTurnScratchpadSnapshot = referencedScratchpadSnapshot(for: input)
 
         let datasetSnapshot: (id: String, name: String)? = {
-            guard let ds = activeSessionIndexedDataset else { return nil }
+            guard let ds = activeSessionRetrievalDataset else { return nil }
             return (ds.datasetID, ds.name)
         }()
 
@@ -6207,29 +7409,47 @@ extension AppModelManager: ModelLoadingManaging {}
                 pendingThumbnails.removeValue(forKey: url)
             }
         }
+        if !completedMediaAttachments.isEmpty {
+            m = self.streamMsgs
+            let idx = m.index(before: m.endIndex)
+            m[idx].mediaAttachments = completedMediaAttachments
+            self.streamMsgs = m
+            let sentIDs = Set(completedMediaAttachments.map(\.id))
+            pendingMediaAttachments.removeAll { sentIDs.contains($0.id) }
+        }
         m = self.streamMsgs
+        let remoteSession = modelManager?.activeRemoteSession
         m.append(
             .init(
                 role: "🤖",
                 text: "",
                 timestamp: Date(),
                 streaming: true,
-                promptProcessing: self.loadedFormat == .gguf ? .init(progress: 0) : nil
+                promptProcessing: self.supportsPromptProcessingCard ? .init(progress: 0) : nil,
+                usedRemoteBackend: remoteSession != nil,
+                remoteBackendName: remoteSession?.backendName,
+                remoteModelName: remoteSession?.modelName
             )
         )
         self.streamMsgs = m
         let outIdx = self.streamMsgs.index(before: self.streamMsgs.endIndex)
         self.pendingAFMToolSummary = nil
+        self.pendingAFMRouteInfo = nil
         let fullHistory = self.streamMsgs
+        let modelHistory = Self.modelFacingHistory(visibleHistory: fullHistory, modelInput: modelInput)
         let messageID = self.streamMsgs[outIdx].id
-        var history = fullHistory
+        // Begin streaming into the narrow store; the live bubble renders from it so token
+        // updates don't republish ChatVM (and thus every tab) on every token.
+        self.streamingStore.begin(id: messageID)
+        var history = modelHistory
         refreshSystemPromptForActiveSession(historyOverride: fullHistory)
         if loadedFormat == .afm {
             let afmPreflight = Self.afmPreflight(
-                history: fullHistory,
+                history: modelHistory,
                 estimateTokens: { [weak self] history in
                     self?.estimatedPromptTokens(for: history) ?? 0
-                }
+                },
+                contextLimit: activeAFMClient?.effectiveContextLimit() ?? 4096
             )
             if let stopMessage = afmPreflight.stopMessage {
                 await MainActor.run {
@@ -6237,13 +7457,14 @@ extension AppModelManager: ModelLoadingManaging {}
                     self.streamMsgs[outIdx].text = "⚠️ " + stopMessage
                     self.streamMsgs[outIdx].streaming = false
                     self.streamMsgs[outIdx].promptProcessing = nil
+                    self.streamingStore.finish()
                     self.injectionStage = .none
                     self.injectionMethod = nil
                 }
                 return
             }
         } else {
-            let contextPlan = planHistoryForContextOverflow(history: fullHistory)
+            let contextPlan = planHistoryForContextOverflow(history: modelHistory)
             history = contextPlan.history
             // Context overflow handling:
             // - stopAtLimit: show error and return (intentional user choice)
@@ -6256,12 +7477,14 @@ extension AppModelManager: ModelLoadingManaging {}
                     contextTokens: currentPromptBudget().usablePromptTokens,
                     rawMessage: "preflight-stop"
                 )
+                registerContextOverflow(strategy: contextOverflowStrategy, details: details)
                 let message = contextStopMessage(details: details)
                 await MainActor.run {
                     guard self.streamMsgs.indices.contains(outIdx) else { return }
                     self.streamMsgs[outIdx].text = "⚠️ " + message
                     self.streamMsgs[outIdx].streaming = false
                     self.streamMsgs[outIdx].promptProcessing = nil
+                    self.streamingStore.finish()
                     self.injectionStage = .none
                     self.injectionMethod = nil
                 }
@@ -6274,6 +7497,10 @@ extension AppModelManager: ModelLoadingManaging {}
                     rawMessage: contextPlan.requiresStop ? "preflight-overflow" : "preflight-trimmed"
                 )
                 registerContextOverflow(strategy: contextOverflowStrategy, details: details)
+            } else {
+                // This turn fits again — retire any stale overflow pill so it
+                // always describes the most recent send.
+                clearContextOverflowForCurrentStream()
             }
         }
 
@@ -6288,7 +7515,7 @@ extension AppModelManager: ModelLoadingManaging {}
         refreshSystemPromptForActiveSession(historyOverride: history)
 
         // Use local backends only.
-        if (loadedFormat == .et || loadedFormat == .ane || loadedFormat == .afm), let client = self.client {
+        if (loadedFormat == .et || loadedFormat == .ane || loadedFormat == .afm || loadedFormat == .coreai), let client = self.client {
             await client.syncSystemPrompt(systemPromptText)
         }
 
@@ -6297,9 +7524,9 @@ extension AppModelManager: ModelLoadingManaging {}
         var llmInput: LLMInput
         
         if loadedFormat == .et {
-            promptStr = input
+            promptStr = modelInput
             stops = loadedSettings?.stopSequences ?? []
-            let userMessage = ChatMessage(role: "user", content: input)
+            let userMessage = ChatMessage(role: "user", content: modelInput)
             llmInput = LLMInput(.messages([userMessage]))
         } else {
             let (basePrompt, s, _) = self.buildPrompt(kind: currentKind, history: history)
@@ -6333,7 +7560,7 @@ extension AppModelManager: ModelLoadingManaging {}
         // If a dataset is active decide whether to inject the full content or
         // fall back to RAG lookups and prepend the resulting context to the
         // prompt before sending it to the model.
-        if let ds = activeSessionIndexedDataset {
+        if let ds = activeSessionRetrievalDataset {
             let requestedMaxChunks = max(1, ragMaxChunks)
             let datasetDisplayName = ds.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? ds.datasetID : ds.name
             let promptBudget = Self.promptBudget(for: contextLimit)
@@ -6360,8 +7587,9 @@ extension AppModelManager: ModelLoadingManaging {}
             )
             updateRAGInjectionInfo(messageIndex: outIdx, decidingInfo)
             logRAGInjectionInfo(decidingInfo)
-            currentContextTask = Task { [weak self, requestedMaxChunks, datasetDisplayName, promptBudget, promptTemplateKind, currentKind, promptStr, verboseLogging = self.verboseLogging, ragMinScore = self.ragMinScore] in
+            currentContextTask = Task { [weak self, requestedMaxChunks, datasetDisplayName, promptBudget, promptTemplateKind, currentKind, promptStr, verboseLogging = self.verboseLogging, ragMinScore = self.ragMinScore, ragRetrievalModeRaw = self.ragRetrievalModeRaw] in
                 guard let self else { return nil }
+                let ragRetrievalMode = DatasetRetrievalMode.from(ragRetrievalModeRaw)
 
                 func makeInfo(
                     stage: Msg.RAGInjectionInfo.Stage,
@@ -6415,7 +7643,7 @@ extension AppModelManager: ModelLoadingManaging {}
                     )
                 }
 
-                func fetchDetailedContext() async -> [(text: String, source: String?)] {
+                func fetchDetailedContext() async -> [(text: String, source: String?, score: Float?)] {
                     await EmbeddingModel.shared.ensureModel()
                     if !(await EmbeddingModel.shared.isReady()) {
                         await EmbeddingModel.shared.warmUp()
@@ -6427,7 +7655,8 @@ extension AppModelManager: ModelLoadingManaging {}
                         for: input,
                         dataset: ds,
                         maxChunks: requestedMaxChunks,
-                        minScore: Float(ragMinScore)
+                        minScore: Float(ragMinScore),
+                        mode: ragRetrievalMode
                     ) { status in
                         Task { @MainActor in
                             self.datasetManager?.processingStatus[ds.datasetID] = status
@@ -6439,7 +7668,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 }
 
                 func resolvePackedRAGContext(
-                    from detailed: [(text: String, source: String?)],
+                    from detailed: [(text: String, source: String?, score: Float?)],
                     fullContentEstimateTokens: Int?,
                     baseReason: String
                 ) async -> ResolvedRAGContext {
@@ -6637,18 +7866,31 @@ extension AppModelManager: ModelLoadingManaging {}
         // history until the prompt fits within the shared usable prompt budget.
         if loadedFormat == .gguf, contextOverflowStrategy != .stopAtLimit {
             let tokenLimit = currentPromptBudget().usablePromptTokens
-            for trimIteration in 0..<10 {
+            var firstOverflowTokens: Int? = nil
+            var lastVerifiedTokens: Int? = nil
+            var trimIteration = 0
+            while trimIteration < 64 {
                 guard let tokenCount = await tokenCountViaServer(promptStr) else { break }
+                lastVerifiedTokens = tokenCount
                 guard tokenCount >= tokenLimit else { break }
+                if firstOverflowTokens == nil { firstOverflowTokens = tokenCount }
 
                 let candidates = removableHistoryIndices(for: history)
-                guard !candidates.isEmpty else { break }
-                let removalIndex: Int
-                switch contextOverflowStrategy {
-                case .truncateMiddle: removalIndex = candidates[candidates.count / 2]
-                case .rollingWindow, .stopAtLimit: removalIndex = candidates[0]
+                if !candidates.isEmpty {
+                    let removalIndex: Int
+                    switch contextOverflowStrategy {
+                    case .truncateMiddle: removalIndex = candidates[candidates.count / 2]
+                    case .rollingWindow, .stopAtLimit: removalIndex = candidates[0]
+                    }
+                    history.remove(at: removalIndex)
+                } else if !shrinkOversizedMessageForContext(
+                    &history,
+                    strategy: contextOverflowStrategy,
+                    promptTokens: tokenCount,
+                    tokenLimit: tokenLimit
+                ) {
+                    break
                 }
-                history.remove(at: removalIndex)
 
                 let (newPrompt, newStops, _) = buildPrompt(kind: currentKind, history: history)
                 promptStr = newPrompt
@@ -6659,6 +7901,37 @@ extension AppModelManager: ModelLoadingManaging {}
                 }
 
                 Task { await logger.log("[ContextTrim] iteration=\(trimIteration) tokens=\(tokenCount) limit=\(tokenLimit) remaining_turns=\(history.count)") }
+                trimIteration += 1
+            }
+
+            if let firstOverflowTokens {
+                // The prompt genuinely overflowed; surface the pill even when the
+                // cheap preflight estimate thought it would fit.
+                registerContextOverflow(
+                    strategy: contextOverflowStrategy,
+                    details: ContextOverflowDetails(
+                        promptTokens: firstOverflowTokens,
+                        contextTokens: tokenLimit,
+                        rawMessage: "verified-trim"
+                    )
+                )
+            }
+            if let lastVerifiedTokens, lastVerifiedTokens >= tokenLimit,
+               ((await tokenCountViaServer(promptStr)) ?? lastVerifiedTokens) >= tokenLimit {
+                // Even after exhausting every trim the prompt cannot fit; the server
+                // would reject it with a 400, so stop here with a clear message.
+                let message = contextFallbackMessage(for: contextOverflowStrategy)
+                Task { await logger.log("[ContextTrim] giving up tokens=\(lastVerifiedTokens) limit=\(tokenLimit)") }
+                await MainActor.run {
+                    guard self.streamMsgs.indices.contains(outIdx) else { return }
+                    self.streamMsgs[outIdx].text = "⚠️ " + message
+                    self.streamMsgs[outIdx].streaming = false
+                    self.streamMsgs[outIdx].promptProcessing = nil
+                    self.streamingStore.finish()
+                    self.injectionStage = .none
+                    self.injectionMethod = nil
+                }
+                return
             }
         }
 
@@ -6746,6 +8019,7 @@ extension AppModelManager: ModelLoadingManaging {}
                         self.streamMsgs[outIdx].streaming = false
                         self.streamMsgs[outIdx].promptProcessing = nil
                         self.streamMsgs[outIdx].text = "⚠️ " + error.localizedDescription
+                        self.streamingStore.finish()
                     }
                     await self.cancelPerfTracking(messageID: messageID)
                     return
@@ -6758,6 +8032,7 @@ extension AppModelManager: ModelLoadingManaging {}
                     self.streamMsgs[outIdx].streaming = false
                     self.streamMsgs[outIdx].promptProcessing = nil
                     self.streamMsgs[outIdx].text = "⚠️ Model is not ready. Please wait for loading to complete, then try again."
+                    self.streamingStore.finish()
                 }
                 await self.cancelPerfTracking(messageID: messageID)
                 return
@@ -6773,11 +8048,20 @@ extension AppModelManager: ModelLoadingManaging {}
             var pendingToolJSON: String? = nil
             var pendingAssistantText: String? = nil
             var didTriggerFinalAnswerStartHaptic = false
+            // Coalesce UI updates: push the live bubble text into the narrow store at ~30 Hz,
+            // and checkpoint into `sessions` (which republishes ChatVM) only ~10 Hz. This keeps
+            // the whole app fluid during fast token generation while leaving the streamed text
+            // current enough for copy/readbacks/finalize.
+            var lastStoreFlush: ContinuousClock.Instant?
+            var lastSessionFlush: ContinuousClock.Instant?
+            let storeFlushInterval: Duration = .milliseconds(33)
+            let sessionCheckpointInterval: Duration = .milliseconds(100)
             // Seed a visible <think> box for DeepSeek prompts that open a think section in the prompt
             if self.currentKind == .deepseek && promptStr.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("<think>") {
                 raw = "<think>"
                 await MainActor.run {
                     if self.streamMsgs.indices.contains(outIdx) {
+                        self.streamingStore.update(visibleAssistantText(from: raw))
                         self.streamMsgs[outIdx].text = visibleAssistantText(from: raw)
                     }
                 }
@@ -6791,7 +8075,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 let isCotTemplate = (self.promptTemplate?.contains("<think>") == true)
                 let defaultStopsBase = ["</s>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<eos>", "<｜User｜>", "<|User|>"]
                 let defaultStops: [String] = {
-                    if isCotTemplate || self.loadedFormat == .et || (self.activeSessionIndexedDataset != nil) { return defaultStopsBase }
+                    if isCotTemplate || self.loadedFormat == .et || (self.activeSessionRetrievalDataset != nil) { return defaultStopsBase }
                     return defaultStopsBase + ["Step 1:", "Step 2:"]
                 }()
                 let stopSeqs = stops.isEmpty ? defaultStops : stops
@@ -6855,6 +8139,22 @@ extension AppModelManager: ModelLoadingManaging {}
                     }
                 }
                 if let remoteService = self.remoteService {
+                    let redactionResult = SensitiveDataDetector.redactedForRemote(
+                        finalPrompt,
+                        enabled: UserDefaults.standard.bool(forKey: "redactSensitiveDataForRemoteBackends")
+                    )
+                    let sensitiveSummary = redactionResult.summary
+                    if !sensitiveSummary.isEmpty {
+                        await logger.log(
+                            "[Privacy][RemoteSensitivity] findings=\(sensitiveSummary.logSummary) total=\(sensitiveSummary.totalCount)"
+                        )
+                    }
+                    if redactionResult.redacted {
+                        await logger.log("[Privacy][RemoteRedaction] applied=true findings=\(sensitiveSummary.logSummary)")
+                        llmInput = useImages
+                            ? LLMInput.multimodal(text: redactionResult.text, imagePaths: imagePaths)
+                            : LLMInput(.plain(redactionResult.text))
+                    }
                     let allowTools = remoteToolsAllowedOverride.any
                     let activeRemoteSession = self.modelManager?.activeRemoteSession
                     let activeRemoteBackend = activeRemoteSession.flatMap { session in
@@ -6908,7 +8208,7 @@ extension AppModelManager: ModelLoadingManaging {}
                     }
                 }
                 let promptProgressHandler: (@Sendable (Double) -> Void)?
-                if self.loadedFormat == .gguf {
+                if self.supportsPromptProcessingCard {
                     promptProgressHandler = { progress in
                         Task { @MainActor [weak self] in
                             guard let self,
@@ -6950,6 +8250,7 @@ extension AppModelManager: ModelLoadingManaging {}
                                 raw += trailing
                                 await MainActor.run {
                                     if self.streamMsgs.indices.contains(outIdx) {
+                                        self.streamingStore.update(visibleAssistantText(from: raw))
                                         self.streamMsgs[outIdx].text = visibleAssistantText(from: raw)
                                     }
                                 }
@@ -7078,6 +8379,7 @@ extension AppModelManager: ModelLoadingManaging {}
                             await MainActor.run {
                                 if self.streamMsgs.indices.contains(outIdx) {
                                     self.streamMsgs[outIdx].usedWebSearch = true
+                                    self.streamingStore.update(visibleAssistantText(from: anchoredCleaned))
                                     self.streamMsgs[outIdx].text = visibleAssistantText(from: anchoredCleaned)
                                 }
                             }
@@ -7114,15 +8416,39 @@ extension AppModelManager: ModelLoadingManaging {}
                             break
                         }
                     }
-                    let shouldTriggerFinalAnswerHaptic = await MainActor.run { () -> Bool in
-                        guard myID == self.activeRunID,
-                              self.streamMsgs.indices.contains(outIdx),
-                              self.streamMsgs[outIdx].streaming else { return false }
-                        self.streamMsgs[outIdx].text = visibleAssistantText(from: raw)
-                        if didTriggerFinalAnswerStartHaptic { return false }
-                        return self.strictFinalAnswerText(for: self.streamMsgs[outIdx]) != nil
+                    let now = ContinuousClock().now
+                    let shouldFlushStore = lastStoreFlush.map { now - $0 >= storeFlushInterval } ?? true
+                    let shouldCheckpointSession = lastSessionFlush.map { now - $0 >= sessionCheckpointInterval } ?? true
+                    if shouldFlushStore { lastStoreFlush = now }
+                    if shouldFlushStore, shouldCheckpointSession { lastSessionFlush = now }
+                    let streamUpdate: (triggerHaptic: Bool, stopAfterParagraph: Bool) = shouldFlushStore
+                        ? await MainActor.run { () -> (triggerHaptic: Bool, stopAfterParagraph: Bool) in
+                            guard myID == self.activeRunID,
+                                  self.streamMsgs.indices.contains(outIdx),
+                                  self.streamMsgs[outIdx].streaming else { return (false, false) }
+                            let visibleText = visibleAssistantText(from: raw)
+                            // High-frequency: live bubble + auto-scroll (narrow observable).
+                            self.streamingStore.update(visibleText)
+                            // Low-frequency: checkpoint into sessions for copy/readbacks/finalize.
+                            if shouldCheckpointSession {
+                                self.streamMsgs[outIdx].text = visibleText
+                            }
+                            let shouldStopAfterParagraph = self.shouldStopAtRequestedParagraphBoundary(in: visibleText)
+                            if didTriggerFinalAnswerStartHaptic {
+                                return (false, shouldStopAfterParagraph)
+                            }
+                            return (self.strictFinalAnswerText(forText: visibleText, toolCalls: self.streamMsgs[outIdx].toolCalls) != nil, shouldStopAfterParagraph)
+                        }
+                        : (false, false)
+                    if streamUpdate.stopAfterParagraph {
+                        await logger.log("[ChatVM] Stop-after-paragraph boundary reached")
+                        await MainActor.run {
+                            self.clearStopAfterParagraphRequest()
+                        }
+                        c.cancelActive()
+                        break
                     }
-                    if shouldTriggerFinalAnswerHaptic {
+                    if streamUpdate.triggerHaptic {
 #if os(iOS)
                         Haptics.impact(.medium)
 #endif
@@ -7141,6 +8467,10 @@ extension AppModelManager: ModelLoadingManaging {}
                     guard myID == self.activeRunID,
                           self.streamMsgs.indices.contains(outIdx) else { return }
                     if !intentionalToolRestartCancellation {
+                        // Commit any partial streamed text (loop only checkpointed periodically)
+                        // and stop rendering the bubble from the store.
+                        self.streamMsgs[outIdx].text = visibleAssistantText(from: raw)
+                        self.streamingStore.finish()
                         self.streamMsgs[outIdx].streaming = false
                     }
                     self.clearPromptProcessing(for: outIdx)
@@ -7155,7 +8485,7 @@ extension AppModelManager: ModelLoadingManaging {}
                             } else {
                                 let promptStr = overflow.promptTokens.map { "\($0)" } ?? "?"
                                 let ctxStr = overflow.contextTokens.map { "\($0)" } ?? "?"
-                                self.streamMsgs[outIdx].text = "⚠️ Context limit reached (\(promptStr)/\(ctxStr) tokens). Start a new chat or increase context length in Settings."
+                                self.streamMsgs[outIdx].text = "⚠️ " + self.contextFallbackMessage(for: self.contextOverflowStrategy) + " (\(promptStr)/\(ctxStr) tokens)"
                             }
                         } else {
                             let lower = message.lowercased()
@@ -7170,6 +8500,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 }
                 if self.loadedFormat == .afm && !intentionalToolRestartCancellation {
                     self.applyPendingAFMToolSummary(to: outIdx)
+                    self.applyPendingAFMRouteInfo(to: outIdx)
                 }
                 if self.remoteLoadingPending {
                     await MainActor.run {
@@ -7263,6 +8594,7 @@ extension AppModelManager: ModelLoadingManaging {}
                                 raw += trailing
                                 await MainActor.run {
                                     if self.streamMsgs.indices.contains(outIdx) {
+                                            self.streamingStore.update(visibleAssistantText(from: raw))
                                             self.streamMsgs[outIdx].text = visibleAssistantText(from: raw)
                                     }
                                 }
@@ -7294,6 +8626,7 @@ extension AppModelManager: ModelLoadingManaging {}
                     await MainActor.run {
                         if self.streamMsgs.indices.contains(outIdx) {
                             self.streamMsgs[outIdx].usedWebSearch = true
+                            self.streamingStore.update(visibleAssistantText(from: anchoredCleaned))
                             self.streamMsgs[outIdx].text = visibleAssistantText(from: anchoredCleaned)
                         }
                     }
@@ -7324,6 +8657,17 @@ extension AppModelManager: ModelLoadingManaging {}
                     preferredText: cleaned
                 ) ?? cleaned
             }
+            // Trailing flush: commit the final visible text into `sessions` so finalize sees
+            // the complete output (the per-token loop only checkpointed periodically).
+            if pendingToolJSON == nil {
+                await MainActor.run {
+                    if myID == self.activeRunID,
+                       self.streamMsgs.indices.contains(outIdx),
+                       self.streamMsgs[outIdx].streaming {
+                        self.streamMsgs[outIdx].text = visibleAssistantText(from: raw)
+                    }
+                }
+            }
             let injectionOverhead = (self.injectionMethod == .full && self.currentInjectedTokenOverhead > 0) ? self.currentInjectedTokenOverhead : 0
             let perfResult: Msg.Perf? = shouldRestartWithToolResult ? nil : await self.finalizePerf(messageID: messageID, injectionOverhead: injectionOverhead)
             await self.finalizeAssistantStream(
@@ -7339,6 +8683,7 @@ extension AppModelManager: ModelLoadingManaging {}
             )
             if self.loadedFormat == .afm {
                 self.applyPendingAFMToolSummary(to: outIdx)
+                self.applyPendingAFMRouteInfo(to: outIdx)
             }
             // Set session title from first user query with a sensible word cap
             if let sIdx = self.streamSessionIndex,
@@ -7438,11 +8783,19 @@ extension AppModelManager: ModelLoadingManaging {}
         var localHistory = continuationHistory
         var continuationChunkMerger = StreamChunkMerger(mode: streamChunkMergeMode)
         var didTriggerFinalAnswerStartHaptic = false
+        // Same coalescing policy as the initial stream loop (see notes there).
+        var lastStoreFlush: ContinuousClock.Instant?
+        var lastSessionFlush: ContinuousClock.Instant?
+        let storeFlushInterval: Duration = .milliseconds(33)
+        let sessionCheckpointInterval: Duration = .milliseconds(100)
 
         await MainActor.run {
             if self.streamMsgs.indices.contains(outIdx) {
                 self.streamMsgs[outIdx].streaming = true
-                if self.loadedFormat == .gguf {
+                // Re-arm the narrow store for the post-tool continuation, seeding it with the
+                // text already on screen so the bubble doesn't flash empty.
+                self.streamingStore.begin(id: self.streamMsgs[outIdx].id, initialText: self.streamMsgs[outIdx].text)
+                if self.supportsPromptProcessingCard {
                     self.startPromptProcessing(for: outIdx)
                     self.streamMsgs[outIdx].postToolWaiting = false
                 } else {
@@ -7460,7 +8813,7 @@ extension AppModelManager: ModelLoadingManaging {}
             var postToolInput: LLMInput? = nil
             await MainActor.run {
                 if self.streamMsgs.indices.contains(outIdx) {
-                    if self.loadedFormat == .gguf {
+                    if self.supportsPromptProcessingCard {
                         self.startPromptProcessing(for: outIdx)
                         self.streamMsgs[outIdx].postToolWaiting = false
                     } else {
@@ -7487,7 +8840,7 @@ extension AppModelManager: ModelLoadingManaging {}
                 }
                 localHistory[outIdx].text = latestAssistantText
             }
-            let promptHistory: [ChatVM.Msg] = {
+            var promptHistory: [ChatVM.Msg] = {
                 guard self.loadedFormat != .et else { return localHistory }
                 let latestToolName = self.streamMsgs.indices.contains(outIdx)
                     ? self.streamMsgs[outIdx].toolCalls?.last?.toolName
@@ -7505,6 +8858,38 @@ extension AppModelManager: ModelLoadingManaging {}
                 )
                 return enrichedHistory
             }()
+            // Tool results (web pages, search dumps) can blow past the context
+            // budget mid-conversation; apply the same overflow plan as the
+            // initial send so the continuation doesn't 400 with a raw error.
+            if self.loadedFormat != .et {
+                let continuationPlan = self.planHistoryForContextOverflow(history: promptHistory)
+                if continuationPlan.initialEstimate > self.contextSoftLimitTokens() {
+                    self.registerContextOverflow(
+                        strategy: self.contextOverflowStrategy,
+                        details: ContextOverflowDetails(
+                            promptTokens: continuationPlan.initialEstimate,
+                            contextTokens: self.currentPromptBudget().usablePromptTokens,
+                            rawMessage: "continuation-overflow"
+                        )
+                    )
+                }
+                if continuationPlan.requiresStop && self.contextOverflowStrategy == .stopAtLimit {
+                    await MainActor.run {
+                        if self.streamMsgs.indices.contains(outIdx) {
+                            self.clearPromptProcessing(for: outIdx)
+                            let stopNote = self.contextStopMessage(details: nil)
+                            let partialText = localHistory.indices.contains(outIdx)
+                                ? visibleAssistantText(from: localHistory[outIdx].text)
+                                : ""
+                            self.streamMsgs[outIdx].text = partialText + "\n⚠️ " + stopNote
+                            self.streamMsgs[outIdx].postToolWaiting = false
+                            self.streamingStore.finish()
+                        }
+                    }
+                    break continuationLoop
+                }
+                promptHistory = continuationPlan.history
+            }
             let (_, continuationStops, _) = self.buildPrompt(kind: self.currentKind, history: promptHistory)
             if self.loadedFormat == .et {
                 let previousUser = history.last(where: { $0.role.lowercased() == "user" || $0.role == "🧑‍💻" })?.text ?? ""
@@ -7553,7 +8938,7 @@ extension AppModelManager: ModelLoadingManaging {}
             do {
                 guard let input = postToolInput else { break }
                 let continuationPromptProgressHandler: (@Sendable (Double) -> Void)?
-                if self.loadedFormat == .gguf {
+                if self.supportsPromptProcessingCard {
                     continuationPromptProgressHandler = { progress in
                         Task { @MainActor [weak self] in
                             guard let self,
@@ -7589,17 +8974,12 @@ extension AppModelManager: ModelLoadingManaging {}
                             pendingAssistantText = continuation
                             if let trailing, !trailing.isEmpty {
                                 continuation += trailing
-                                await MainActor.run {
-                                    if self.streamMsgs.indices.contains(outIdx) {
-                                        self.streamMsgs[outIdx].text = baseVisibleAssistantText + visibleAssistantText(from: continuation)
-                                    }
-                                }
                             }
-                            let continuationText: String = await MainActor.run {
+                            let continuationText = baseVisibleAssistantText + visibleAssistantText(from: continuation)
+                            await MainActor.run {
                                 if self.streamMsgs.indices.contains(outIdx) {
-                                    return self.streamMsgs[outIdx].text
-                                } else {
-                                    return continuation
+                                    self.streamingStore.update(continuationText)
+                                    self.streamMsgs[outIdx].text = continuationText
                                 }
                             }
                             await self.handleRollingThoughts(raw: continuationText, messageIndex: outIdx)
@@ -7634,24 +9014,32 @@ extension AppModelManager: ModelLoadingManaging {}
                         }
                     }
 
-                    let shouldTriggerFinalAnswerHaptic = await MainActor.run { () -> Bool in
-                        guard self.streamMsgs.indices.contains(outIdx) else { return false }
-                        let visibleContinuation = baseVisibleAssistantText + visibleAssistantText(from: continuation)
-                        self.streamMsgs[outIdx].text = visibleContinuation
-                        if didTriggerFinalAnswerStartHaptic { return false }
-                        return self.strictFinalAnswerText(for: self.streamMsgs[outIdx]) != nil
-                    }
-                    if shouldTriggerFinalAnswerHaptic {
+                    let visibleContinuation = baseVisibleAssistantText + visibleAssistantText(from: continuation)
+                    let now = ContinuousClock().now
+                    let shouldFlushStore = lastStoreFlush.map { now - $0 >= storeFlushInterval } ?? true
+                    let shouldCheckpointSession = lastSessionFlush.map { now - $0 >= sessionCheckpointInterval } ?? true
+                    if shouldFlushStore { lastStoreFlush = now }
+                    if shouldFlushStore, shouldCheckpointSession { lastSessionFlush = now }
+                    if shouldFlushStore {
+                        let shouldTriggerFinalAnswerHaptic = await MainActor.run { () -> Bool in
+                            guard self.streamMsgs.indices.contains(outIdx) else { return false }
+                            // High-frequency: live bubble + auto-scroll (narrow observable).
+                            self.streamingStore.update(visibleContinuation)
+                            // Low-frequency: checkpoint into sessions for copy/readbacks/finalize.
+                            if shouldCheckpointSession {
+                                self.streamMsgs[outIdx].text = visibleContinuation
+                            }
+                            if didTriggerFinalAnswerStartHaptic { return false }
+                            return self.strictFinalAnswerText(forText: visibleContinuation, toolCalls: self.streamMsgs[outIdx].toolCalls) != nil
+                        }
+                        if shouldTriggerFinalAnswerHaptic {
 #if os(iOS)
-                        Haptics.impact(.medium)
+                            Haptics.impact(.medium)
 #endif
-                        didTriggerFinalAnswerStartHaptic = true
+                            didTriggerFinalAnswerStartHaptic = true
+                        }
                     }
-                    let fullText: String = await MainActor.run {
-                        if self.streamMsgs.indices.contains(outIdx) {
-                            return self.streamMsgs[outIdx].text
-                        } else { return continuation }
-                    }
+                    let fullText = visibleContinuation
                     await self.handleRollingThoughts(raw: fullText, messageIndex: outIdx)
 
                     if let sfx = continuationStops.first(where: { continuation.hasSuffix($0) }) {
@@ -7670,6 +9058,15 @@ extension AppModelManager: ModelLoadingManaging {}
                         }
                     }
                     if contTokCount >= maxContTokens { break }
+                }
+                // Trailing flush on successful completion: commit the final visible text
+                // (the loop only checkpointed periodically) into both the store and sessions.
+                await MainActor.run {
+                    if self.streamMsgs.indices.contains(outIdx) {
+                        let finalVisible = baseVisibleAssistantText + visibleAssistantText(from: continuation)
+                        self.streamingStore.update(finalVisible)
+                        self.streamMsgs[outIdx].text = finalVisible
+                    }
                 }
             } catch {
                 let wasCancellation = (error as? CancellationError) != nil
@@ -7693,10 +9090,19 @@ extension AppModelManager: ModelLoadingManaging {}
                     }
                 }
                 if !intentionalContinuationCancellation {
+                    let overflow = self.parseContextOverflowDetails(from: error.localizedDescription)
+                    if let overflow {
+                        self.registerContextOverflow(strategy: self.contextOverflowStrategy, details: overflow)
+                    }
+                    let displayedError = overflow != nil
+                        ? self.contextFallbackMessage(for: self.contextOverflowStrategy)
+                        : error.localizedDescription
                     await MainActor.run {
                         if self.streamMsgs.indices.contains(outIdx) {
                             self.clearPromptProcessing(for: outIdx)
-                            self.streamMsgs[outIdx].text.append("\n⚠️ " + error.localizedDescription)
+                            // Commit the full partial continuation (the loop only checkpointed
+                            // periodically) before appending the error.
+                            self.streamMsgs[outIdx].text = baseVisibleAssistantText + visibleAssistantText(from: continuation) + "\n⚠️ " + displayedError
                             self.streamMsgs[outIdx].postToolWaiting = false
                         }
                     }
@@ -7734,6 +9140,7 @@ extension AppModelManager: ModelLoadingManaging {}
 
                     await MainActor.run {
                         if self.streamMsgs.indices.contains(outIdx) {
+                            self.streamingStore.update(visibleAssistantText(from: updatedText))
                             self.streamMsgs[outIdx].text = visibleAssistantText(from: updatedText)
                             if let toolName = self.streamMsgs[outIdx].toolCalls?.last?.toolName,
                                toolName == "noema.web.retrieve" {
@@ -7782,6 +9189,9 @@ extension AppModelManager: ModelLoadingManaging {}
             case .finishWithVisibleText(_):
                 await MainActor.run {
                     if self.streamMsgs.indices.contains(outIdx) {
+                        // Final text was already committed (success: end of stream `do`;
+                        // error: in the catch). Just stop rendering the bubble from the store.
+                        self.streamingStore.finish()
                         self.clearPromptProcessing(for: outIdx)
                         self.streamMsgs[outIdx].postToolWaiting = false
                     }
@@ -8153,6 +9563,19 @@ extension AppModelManager: ModelLoadingManaging {}
         return TemplateDrivenModelSupport.usesTemplateDrivenMessages(modelURL: url)
     }
 
+    /// Formats whose client applies the model's own chat template to structured
+    /// messages, so ChatVM must send history as messages rather than a
+    /// pre-templated prompt string (which would be templated a second time).
+    private var usesStructuredChatMessages: Bool {
+        if loadedFormat == .mlx { return true }
+        // CoreAILLMClient re-templates `.plain` input as a single user turn, so a
+        // pre-templated prompt string would be wrapped a second time. Sending
+        // structured messages lets the client apply its template exactly once and
+        // keeps tool calls + results paired in replayed history.
+        if loadedFormat == .coreai { return true }
+        return usesTemplateDrivenLoopbackMessages
+    }
+
     private func injectContextIntoMessages(_ messages: [ChatMessage], context: String) -> [ChatMessage] {
         let note = """
         Use the following information to answer the question. If passages are prefixed with bracketed numbers like [1], [2], cite those numbers. Otherwise cite the source names shown in the context. In <think>...</think>, reason about how each cited passage answers the question before writing the final response.
@@ -8206,10 +9629,56 @@ extension AppModelManager: ModelLoadingManaging {}
         }
     }
 
-    func loopbackChatMessages(from history: [Msg], retrievedContext: String? = nil) -> [ChatMessage]? {
-        guard usesTemplateDrivenLoopbackMessages else { return nil }
+    /// Re-materializes the `tool` role messages that carry tool results so a tool
+    /// call *and* its result are replayed into the model context on later turns.
+    ///
+    /// The saved transcript keeps tool results only inside `Msg.toolCalls[].result`
+    /// (the visible assistant text is scrubbed of all tool markers by
+    /// `visibleAssistantText`). Without this step, history rebuilt for a new turn
+    /// would serialize the assistant's `tool_calls` (the arguments) but never emit
+    /// the matching `tool` result messages, so the model would only ever see its own
+    /// final answers and "forget" what the tools returned. Inserting a `tool` message
+    /// per call lets the existing `pendingToolCallIDs` pairing in `loopbackChatMessages`
+    /// attach the results, and also preserves the `tool_calls`⇄`tool` invariant the
+    /// chat-completions format expects.
+    private func historyWithReconstructedToolMessages(_ history: [Msg]) -> [Msg] {
+        var result: [Msg] = []
+        result.reserveCapacity(history.count)
 
-        let sanitizedHistory = sanitizedHistoryForTemplateDrivenLoopback(history)
+        for index in history.indices {
+            let message = history[index]
+            result.append(message)
+
+            guard normalizedLoopbackRole(message.role) == "assistant",
+                  let calls = message.toolCalls,
+                  !calls.isEmpty else { continue }
+
+            // In-turn continuation already appends an explicit `tool` message right
+            // after the assistant; don't duplicate it. This also keeps the function
+            // idempotent if applied to an already-reconstructed history.
+            let nextIsToolMessage: Bool = {
+                let nextIndex = index + 1
+                guard history.indices.contains(nextIndex) else { return false }
+                return normalizedLoopbackRole(history[nextIndex].role) == "tool"
+            }()
+            if nextIsToolMessage { continue }
+
+            for call in calls {
+                let payload = call.result
+                    ?? call.error.map { "Error: \($0)" }
+                    ?? "(no tool result was recorded)"
+                result.append(Msg(role: "tool", text: payload, timestamp: call.timestamp))
+            }
+        }
+
+        return result
+    }
+
+    func loopbackChatMessages(from history: [Msg], retrievedContext: String? = nil) -> [ChatMessage]? {
+        guard usesStructuredChatMessages else { return nil }
+
+        let toolAwareHistory = historyWithReconstructedToolMessages(history)
+        let sanitizedHistory = sanitizedHistoryForTemplateDrivenLoopback(toolAwareHistory)
         let rendered = prepareForGeneration(messages: sanitizedHistory, system: systemPromptText)
         guard case .messages(let renderedMessages) = rendered else { return nil }
 
@@ -8428,7 +9897,12 @@ extension ChatVM {
         Task {
             await logger.log(Self.systemPromptMetadataSummary(systemPrompt))
         }
-        let rendered = prepareForGeneration(messages: history, system: systemPrompt)
+        // Replay tool results from history so completion-style prompts keep the
+        // tool call + result in context (mirrors the structured loopback path).
+        let rendered = prepareForGeneration(
+            messages: historyWithReconstructedToolMessages(history),
+            system: systemPrompt
+        )
         switch rendered {
         case .messages(let arr):
             // Convert back to ChatVM.Msg for our renderer
@@ -8609,6 +10083,451 @@ extension ChatVM {
         return pieces
     }
 
+    // Build the model-facing prompt without changing the visible chat bubble text.
+    nonisolated static func promptText(userText: String, mediaAttachments: [ChatMediaAttachment]) -> String {
+        let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let includeTimestamps = TranscriptionSettings.includesTimestampsInPrompt
+        let transcriptBlocks = mediaAttachments.compactMap { $0.promptBlock(includeTimestamps: includeTimestamps) }
+        guard !transcriptBlocks.isEmpty else { return trimmed }
+
+        var parts: [String] = []
+        if !trimmed.isEmpty {
+            parts.append(trimmed)
+        } else {
+            parts.append(String(localized: "Use the attached transcript to answer."))
+        }
+        parts.append(transcriptBlocks.joined(separator: "\n\n"))
+        return parts.joined(separator: "\n\n")
+    }
+
+    nonisolated static func modelFacingHistory(visibleHistory: [Msg], modelInput: String) -> [Msg] {
+        var history = visibleHistory
+        if let userIndex = history.indices.dropLast().last(where: { history[$0].role == "🧑‍💻" }) {
+            history[userIndex].text = modelInput
+        }
+        return history
+    }
+
+    @MainActor
+    func savePendingMediaFile(from sourceURL: URL, originalFilename overrideFilename: String? = nil) async {
+        guard let kind = TranscriptionMediaSupport.kind(for: sourceURL) else {
+            audioRecordingError = String(localized: "This media format is not supported for transcription.")
+            return
+        }
+
+        let fm = FileManager.default
+        let scoped = sourceURL.startAccessingSecurityScopedResource()
+        defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let ext = sourceURL.pathExtension.isEmpty ? (kind == .audio ? "m4a" : "mov") : sourceURL.pathExtension
+        let filename = UUID().uuidString + "." + ext
+        let destination = Self.attachmentStorageDirectory().appendingPathComponent(filename)
+
+        do {
+            if fm.fileExists(atPath: destination.path) {
+                try fm.removeItem(at: destination)
+            }
+            if Self.isPath(sourceURL.path, inside: Self.attachmentStorageDirectory()) {
+                if sourceURL.path != destination.path {
+                    try fm.copyItem(at: sourceURL, to: destination)
+                }
+            } else {
+                try fm.copyItem(at: sourceURL, to: destination)
+            }
+            let bytes = (try? fm.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value
+            let duration = await mediaDurationSeconds(for: destination)
+            let attachment = ChatMediaAttachment(
+                kind: kind,
+                originalFilename: overrideFilename?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? overrideFilename!
+                    : sourceURL.lastPathComponent,
+                storedPath: destination.path,
+                fileSizeBytes: bytes,
+                durationSeconds: duration
+            )
+            pendingMediaAttachments.append(
+                attachment
+            )
+            Task { await logger.log("[ASR][Attach] kind=\(kind.rawValue) name=\(attachment.originalFilename) path=\(destination.path)") }
+            if TranscriptionSettings.autoTranscribesAttachments {
+                if TranscriptionSettings.selectedEngineID == .audioLanguageModel,
+                   !TranscriptionSettings.hasConfirmedRemoteUpload {
+                    audioRecordingError = String(localized: "Confirm remote ASR upload before transcribing this media.")
+                } else {
+                    beginTranscribingPendingMediaAttachment(id: attachment.id)
+                }
+            }
+        } catch {
+            audioRecordingError = error.localizedDescription
+            Task { await logger.log("[ASR][Attach] failed=\(error.localizedDescription)") }
+        }
+    }
+
+    private func mediaDurationSeconds(for url: URL) async -> TimeInterval? {
+#if canImport(AVFoundation)
+        let asset = AVURLAsset(url: url)
+        guard let duration = try? await asset.load(.duration) else { return nil }
+        let seconds = CMTimeGetSeconds(duration)
+        return seconds.isFinite && seconds > 0 ? seconds : nil
+#else
+        return nil
+#endif
+    }
+
+    @MainActor
+    func removePendingMediaAttachment(id: ChatMediaAttachment.ID) {
+        mediaTranscriptionTasks[id]?.cancel()
+        mediaTranscriptionTasks[id] = nil
+        guard let index = pendingMediaAttachments.firstIndex(where: { $0.id == id }) else { return }
+        let attachment = pendingMediaAttachments.remove(at: index)
+        let referencedByMessage = sessions.contains { session in
+            session.messages.contains { msg in
+                msg.mediaAttachments?.contains(where: { $0.id == id }) == true
+            }
+        }
+        guard !referencedByMessage else { return }
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: attachment.storedPath))
+        if let sidecar = attachment.transcriptSidecarPath {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: sidecar))
+        }
+    }
+
+    @MainActor
+    func beginTranscribingPendingMediaAttachment(id: ChatMediaAttachment.ID) {
+        guard mediaTranscriptionTasks[id] == nil else { return }
+        let task = Task { [weak self] in
+            await self?.transcribePendingMediaAttachment(id: id)
+            await MainActor.run {
+                self?.mediaTranscriptionTasks[id] = nil
+            }
+        }
+        mediaTranscriptionTasks[id] = task
+    }
+
+    @MainActor
+    func cancelPendingMediaTranscription(id: ChatMediaAttachment.ID) {
+        mediaTranscriptionTasks[id]?.cancel()
+        mediaTranscriptionTasks[id] = nil
+        guard let index = pendingMediaAttachments.firstIndex(where: { $0.id == id }) else { return }
+        pendingMediaAttachments[index].status = .notStarted
+        pendingMediaAttachments[index].partialTranscript = nil
+        pendingMediaAttachments[index].errorMessage = nil
+    }
+
+    @MainActor
+    func transcribePendingMediaAttachment(id: ChatMediaAttachment.ID) async {
+        guard let index = pendingMediaAttachments.firstIndex(where: { $0.id == id }) else { return }
+        var attachment = pendingMediaAttachments[index]
+        attachment.status = .transcribing
+        attachment.errorMessage = nil
+        pendingMediaAttachments[index] = attachment
+
+        let offGrid = UserDefaults.standard.object(forKey: "offGrid") as? Bool ?? false
+        let options = TranscriptionSettings.requestOptions(offGrid: offGrid)
+        let mediaURL = URL(fileURLWithPath: attachment.storedPath)
+        let selectedEngineID = TranscriptionSettings.selectedEngineID
+        // Capture the Sendable filename so the @Sendable onEvent closure doesn't
+        // capture the non-Sendable `attachment` across isolation.
+        let originalFilename = attachment.originalFilename
+        Task {
+            await logger.log("[ASR][Transcribe] start name=\(attachment.originalFilename) engine=\(selectedEngineID.rawValue) locale=\(options.localeIdentifier) off_grid=\(offGrid) bytes=\(attachment.fileSizeBytes ?? -1) duration=\(attachment.durationSeconds.map { String(format: "%.2f", $0) } ?? "unknown")")
+        }
+
+        do {
+            let backend: any TranscriptionBackend = try TranscriptionBackendFactory.makeBackend(for: selectedEngineID)
+            Task { await logger.log("[ASR][Transcribe] backend.ready requested=\(selectedEngineID.rawValue) actual=\(backend.engineID.rawValue)") }
+            let rawArtifact = try await backend.transcribe(
+                mediaURL: mediaURL,
+                originalFilename: attachment.originalFilename,
+                options: options,
+                onEvent: { [weak self] event in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        guard let currentIndex = self.pendingMediaAttachments.firstIndex(where: { $0.id == id }) else { return }
+                        switch event {
+                        case .partial(let text):
+                            self.pendingMediaAttachments[currentIndex].partialTranscript = text
+                            Task { await logger.log("[ASR][Transcribe] partial name=\(originalFilename) chars=\(text.count)") }
+                        case .completed:
+                            break
+                        }
+                    }
+                }
+            )
+            let artifact = rawArtifact.withProvenance(engineID: selectedEngineID, options: options)
+
+            guard let currentIndex = pendingMediaAttachments.firstIndex(where: { $0.id == id }) else { return }
+            let sidecar = try writeTranscriptSidecar(artifact)
+            pendingMediaAttachments[currentIndex].status = .completed
+            pendingMediaAttachments[currentIndex].partialTranscript = nil
+            pendingMediaAttachments[currentIndex].transcript = artifact
+            pendingMediaAttachments[currentIndex].transcriptSidecarPath = sidecar.path
+            Haptics.successLight()
+            AccessibilityAnnouncer.announceLocalized("Transcription complete")
+            Task { await logger.log("[ASR][Transcribe] completed name=\(attachment.originalFilename) chars=\(artifact.transcriptText.count)") }
+        } catch {
+            if Task.isCancelled { return }
+            guard let currentIndex = pendingMediaAttachments.firstIndex(where: { $0.id == id }) else { return }
+            pendingMediaAttachments[currentIndex].status = .failed
+            pendingMediaAttachments[currentIndex].errorMessage = error.localizedDescription
+            Haptics.error()
+            AccessibilityAnnouncer.announce(error.localizedDescription)
+            Task { await logger.log("[ASR][Transcribe] failed name=\(attachment.originalFilename) engine=\(selectedEngineID.rawValue) error_type=\(String(describing: type(of: error))) error=\(error.localizedDescription)") }
+        }
+    }
+
+    @MainActor
+    func updatePendingMediaTranscript(id: ChatMediaAttachment.ID, title: String, transcriptText: String) {
+        guard let index = pendingMediaAttachments.firstIndex(where: { $0.id == id }),
+              let artifact = pendingMediaAttachments[index].transcript else { return }
+        let updated = artifact.updatingReview(title: title, transcriptText: transcriptText)
+        pendingMediaAttachments[index].transcript = updated
+        if let sidecarURL = try? writeTranscriptSidecar(updated) {
+            pendingMediaAttachments[index].transcriptSidecarPath = sidecarURL.path
+        }
+    }
+
+    @MainActor
+    func updateMessageMediaTranscript(messageID: Msg.ID, attachmentID: ChatMediaAttachment.ID, title: String, transcriptText: String) {
+        var messages = msgs
+        guard let messageIndex = messages.firstIndex(where: { $0.id == messageID }),
+              var attachments = messages[messageIndex].mediaAttachments,
+              let attachmentIndex = attachments.firstIndex(where: { $0.id == attachmentID }),
+              let artifact = attachments[attachmentIndex].transcript else { return }
+        let updated = artifact.updatingReview(title: title, transcriptText: transcriptText)
+        attachments[attachmentIndex].transcript = updated
+        if let sidecarURL = try? writeTranscriptSidecar(updated) {
+            attachments[attachmentIndex].transcriptSidecarPath = sidecarURL.path
+        }
+        messages[messageIndex].mediaAttachments = attachments
+        msgs = messages
+        saveSessions()
+    }
+
+    @MainActor
+    func saveTranscriptAttachmentAsDataset(_ attachment: ChatMediaAttachment) async -> Result<LocalDataset, Error> {
+        guard let artifact = attachment.transcript else {
+            return .failure(Self.transcriptSaveError(String(localized: "No transcript was saved.")))
+        }
+        guard let datasetManager else {
+            return .failure(Self.transcriptSaveError(String(localized: "Stored is unavailable.")))
+        }
+        let dir = Self.attachmentStorageDirectory()
+            .appendingPathComponent("TranscriptExports", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let base = attachment.originalFilename
+            .replacingOccurrences(of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+        let textURL = dir.appendingPathComponent((base.isEmpty ? artifact.id.uuidString : base) + ".transcript.txt")
+        let body = artifact.exportText.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try body.data(using: .utf8)?.write(to: textURL, options: [.atomic])
+            if let dataset = await datasetManager.importDocuments(
+                from: [textURL],
+                suggestedName: String.localizedStringWithFormat(String(localized: "%@ Transcript"), attachment.originalFilename)
+            ) {
+                let metadataDir = DatasetIndexIO.transcriptMetadataDirectoryURL(for: dataset.url)
+                try? FileManager.default.createDirectory(at: metadataDir, withIntermediateDirectories: true)
+                let metadataURL = metadataDir.appendingPathComponent((base.isEmpty ? artifact.id.uuidString : base) + ".transcript.json")
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                try encoder.encode(artifact).write(to: metadataURL, options: [.atomic])
+                Task { await logger.log("[ASR][Dataset] saved transcript dataset=\(dataset.datasetID) name=\(dataset.name)") }
+                return .success(dataset)
+            }
+            return .failure(Self.transcriptSaveError(String(localized: "No transcript was saved.")))
+        } catch {
+            Task { await logger.log("[ASR][Dataset] export failed=\(error.localizedDescription)") }
+            return .failure(error)
+        }
+    }
+
+    @MainActor
+    func saveTranscriptAttachment(_ attachment: ChatMediaAttachment, toExistingDataset dataset: LocalDataset) async -> Result<LocalDataset, Error> {
+        guard let artifact = attachment.transcript else {
+            return .failure(Self.transcriptSaveError(String(localized: "No transcript was saved.")))
+        }
+        let base = Self.safeTranscriptBaseName(attachment.originalFilename, fallback: artifact.id.uuidString)
+        let mediaTranscriptDir = dataset.url.appendingPathComponent("Media Transcripts", isDirectory: true)
+        let metadataDir = DatasetIndexIO.transcriptMetadataDirectoryURL(for: dataset.url)
+        do {
+            try FileManager.default.createDirectory(at: mediaTranscriptDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: metadataDir, withIntermediateDirectories: true)
+            let textURL = Self.uniqueTranscriptURL(in: mediaTranscriptDir, base: base, ext: "transcript.txt")
+            let metadataURL = Self.uniqueTranscriptURL(in: metadataDir, base: base, ext: "transcript.json")
+            try artifact.exportText.trimmingCharacters(in: .whitespacesAndNewlines)
+                .data(using: .utf8)?.write(to: textURL, options: [.atomic])
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(artifact).write(to: metadataURL, options: [.atomic])
+            datasetManager?.reloadFromDisk()
+            Task { await logger.log("[ASR][Dataset] saved transcript existing dataset=\(dataset.datasetID) name=\(dataset.name)") }
+            return .success(dataset)
+        } catch {
+            Task { await logger.log("[ASR][Dataset] existing save failed=\(error.localizedDescription)") }
+            return .failure(error)
+        }
+    }
+
+    private static func safeTranscriptBaseName(_ name: String, fallback: String) -> String {
+        let base = URL(fileURLWithPath: name).deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+        return base.isEmpty ? fallback : base
+    }
+
+    private static func uniqueTranscriptURL(in directory: URL, base: String, ext: String) -> URL {
+        var candidate = directory.appendingPathComponent(base + "." + ext)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = directory.appendingPathComponent(base + "-\(suffix)." + ext)
+            suffix += 1
+        }
+        return candidate
+    }
+
+    private static func transcriptSaveError(_ message: String) -> NSError {
+        NSError(
+            domain: "Noema.TranscriptSave",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    @MainActor
+    private func writeTranscriptSidecar(_ artifact: TranscriptArtifact) throws -> URL {
+        let sidecarURL = Self.attachmentStorageDirectory()
+            .appendingPathComponent(artifact.id.uuidString + ".transcript.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(artifact).write(to: sidecarURL, options: [.atomic])
+        return sidecarURL
+    }
+
+#if canImport(AVFoundation)
+    @MainActor
+    func toggleAudioRecording() async {
+        if isRecordingAudio {
+            await stopAudioRecording()
+        } else {
+            await startAudioRecording()
+        }
+    }
+
+    @MainActor
+    private func startAudioRecording() async {
+        audioRecordingError = nil
+        do {
+#if os(iOS) || os(visionOS)
+            let session = AVAudioSession.sharedInstance()
+            let granted: Bool
+#if os(iOS)
+            if #available(iOS 17.0, *) {
+                granted = await withCheckedContinuation { continuation in
+                    AVAudioApplication.requestRecordPermission { allowed in
+                        continuation.resume(returning: allowed)
+                    }
+                }
+            } else {
+                granted = await withCheckedContinuation { continuation in
+                    session.requestRecordPermission { allowed in
+                        continuation.resume(returning: allowed)
+                    }
+                }
+            }
+#else
+            granted = await withCheckedContinuation { continuation in
+                session.requestRecordPermission { allowed in
+                    continuation.resume(returning: allowed)
+                }
+            }
+#endif
+            guard granted else {
+                audioRecordingError = String(localized: "Microphone permission is required to record audio.")
+                Haptics.error()
+                AccessibilityAnnouncer.announceLocalized("Microphone permission is required to record audio.")
+                return
+            }
+            // Activation blocks; keep it off the main thread (the OS warns
+            // "AVAudioSession activate/deactivate called on main thread").
+            try await Task.detached(priority: .userInitiated) {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .allowBluetoothHFP])
+                try session.setActive(true)
+            }.value
+#endif
+            let url = Self.attachmentStorageDirectory().appendingPathComponent(UUID().uuidString + ".m4a")
+            let settings: [String: Any] = [
+                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                AVSampleRateKey: 44_100,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+            ]
+            audioRecorder = try AVAudioRecorder(url: url, settings: settings)
+            audioRecorder?.isMeteringEnabled = true
+            audioRecorder?.record()
+            audioRecordingURL = url
+            audioRecordingFriendlyName = Self.friendlyVoiceNoteName()
+            audioRecordingStartedAt = Date()
+            audioRecordingLevel = 0
+            isRecordingAudio = true
+            Haptics.successLight()
+            AccessibilityAnnouncer.announceLocalized("Recording started")
+            startAudioRecordingMeter()
+        } catch {
+            audioRecordingError = error.localizedDescription
+            Haptics.error()
+            AccessibilityAnnouncer.announce(error.localizedDescription)
+        }
+    }
+
+    @MainActor
+    private func stopAudioRecording() async {
+        let friendlyName = audioRecordingFriendlyName
+        audioRecordingMeterTask?.cancel()
+        audioRecordingMeterTask = nil
+        audioRecorder?.stop()
+        audioRecorder = nil
+        isRecordingAudio = false
+        audioRecordingStartedAt = nil
+        audioRecordingLevel = 0
+        audioRecordingFriendlyName = nil
+#if os(iOS) || os(visionOS)
+        Task.detached(priority: .utility) {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+#endif
+        guard let url = audioRecordingURL else { return }
+        audioRecordingURL = nil
+        Haptics.successLight()
+        AccessibilityAnnouncer.announceLocalized("Recording stopped")
+        await savePendingMediaFile(from: url, originalFilename: friendlyName)
+    }
+
+    @MainActor
+    private func startAudioRecordingMeter() {
+        audioRecordingMeterTask?.cancel()
+        audioRecordingMeterTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                self?.audioRecorder?.updateMeters()
+                if let power = self?.audioRecorder?.averagePower(forChannel: 0), power.isFinite {
+                    self?.audioRecordingLevel = max(0, min(1, (power + 55) / 55))
+                }
+                try? await Task.sleep(for: .milliseconds(120))
+            }
+        }
+    }
+
+    private static func friendlyVoiceNoteName(date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH.mm"
+        return String.localizedStringWithFormat(String(localized: "Voice Note %@.m4a"), formatter.string(from: date))
+    }
+#endif
+
     // Heuristic for GGUF VLMs when Hub metadata is unavailable (offline or missing tags)
     @MainActor
     func savePendingImage(_ image: UIImage) async {
@@ -8687,80 +10606,29 @@ extension ChatVM {
                 guard !thinkBlock.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     continue
                 }
-                
-                if let existingViewModel = rollingThoughtViewModels[thinkKey] {
-                    // Check if we need to update the content
-                    if existingViewModel.fullText != thinkBlock.content {
-                        // Create a stream for only the new content
-                        let newContent = String(thinkBlock.content.dropFirst(existingViewModel.fullText.count))
-                        if !newContent.isEmpty {
-                            let tokens = AsyncStream<String> { continuation in
-                                Task {
-                                    // Stream only the new content with slight delay for visual effect
-                                    // Yield in larger chunks to reduce flicker and avoid altering visual layout
-                                    let chunkSize = 16
-                                    var buffer = ""
-                                    buffer.reserveCapacity(chunkSize)
-                                    for ch in newContent {
-                                        buffer.append(ch)
-                                        if buffer.count >= chunkSize {
-                                            continuation.yield(buffer)
-                                            buffer.removeAll(keepingCapacity: true)
-                                        }
-                                    }
-                                    if !buffer.isEmpty { continuation.yield(buffer) }
-                                    continuation.finish()
-                                }
-                            }
-                            let tokenStream = ChatTokenStream(tokens: tokens)
-                            existingViewModel.append(with: tokenStream)
-                        }
-                    }
-                    
-                    // Only mark complete when the final </think> has arrived.
-                    // If the token stream is still appending, defer completion until it ends.
-                    // Call finish() even when expanded so the logical completion flag is set;
-                    // finish() preserves expanded UI but marks the box as complete.
-                    if thinkBlock.isComplete && existingViewModel.phase != .complete {
-                        if existingViewModel.fullText == thinkBlock.content {
-                            existingViewModel.finish()
-                            // Persist state promptly so boxes survive app/model transitions
-                            let storageKey = "RollingThought." + thinkKey
-                            existingViewModel.saveState(forKey: storageKey)
-                        } else {
-                            existingViewModel.deferCompletionUntilStreamEnds()
-                        }
-                    }
+
+                let viewModel: RollingThoughtViewModel
+                if let existing = rollingThoughtViewModels[thinkKey] {
+                    viewModel = existing
                 } else {
-                    // Create new rolling thought view model and start streaming
-                    let viewModel = RollingThoughtViewModel()
-                    
-                    // Create token stream from the think block content
-                    let tokens = AsyncStream<String> { continuation in
-                        Task {
-                            // Stream content in moderate chunks to avoid jitter while preserving order
-                            let text = thinkBlock.content
-                            let chunkSize = 32
-                            var idx = text.startIndex
-                            while idx < text.endIndex {
-                                let next = text.index(idx, offsetBy: chunkSize, limitedBy: text.endIndex) ?? text.endIndex
-                                let slice = String(text[idx..<next])
-                                continuation.yield(slice)
-                                idx = next
-                            }
-                            continuation.finish()
-                        }
-                    }
-                    
-                    let tokenStream = ChatTokenStream(tokens: tokens)
-                    viewModel.start(with: tokenStream)
-                    // If we already saw the closing tag, ensure the box completes once the current
-                    // character stream finishes, even if the model stops emitting more tokens.
-                    if thinkBlock.isComplete {
-                        viewModel.deferCompletionUntilStreamEnds()
-                    }
-                    
+                    viewModel = RollingThoughtViewModel()
                     rollingThoughtViewModels[thinkKey] = viewModel
+                }
+
+                // Assign the authoritative think text directly. `raw` already holds the
+                // full content parsed from the growing stream buffer, so feeding a delta
+                // through a token stream (the old approach) only introduced a race that
+                // duplicated text and broke completion. Setting it outright is race-free
+                // and keeps fullText exactly equal to thinkBlock.content.
+                viewModel.setContent(thinkBlock.content)
+
+                // Mark complete once the closing </think> has arrived. Because fullText
+                // now matches the block exactly, this fires reliably (no deferral needed).
+                // finish() preserves an expanded box while still flagging completion.
+                if thinkBlock.isComplete && viewModel.phase != .complete {
+                    viewModel.finish()
+                    let storageKey = "RollingThought." + thinkKey
+                    viewModel.saveState(forKey: storageKey)
                 }
             }
         }
@@ -8842,7 +10710,14 @@ extension ChatVM {
     /// segment (`<think>`/tool markers). If controls are present and no trailing
     /// answer text exists yet, this returns nil.
     func strictFinalAnswerText(for message: Msg) -> String? {
-        let pieces = parse(message.text, toolCalls: message.toolCalls)
+        strictFinalAnswerText(forText: message.text, toolCalls: message.toolCalls)
+    }
+
+    /// Same as `strictFinalAnswerText(for:)` but operates on a raw visible-text string.
+    /// Used by the streaming loops so the final-answer haptic can be evaluated against the
+    /// live text without first writing it into `sessions`.
+    func strictFinalAnswerText(forText text: String, toolCalls: [ToolCall]?) -> String? {
+        let pieces = parse(text, toolCalls: toolCalls)
         guard !pieces.isEmpty else { return nil }
 
         let lastControlIndex = pieces.lastIndex { piece in
@@ -8926,16 +10801,615 @@ extension ChatVM: ModelBenchmarkingViewModel {
 
 // MARK: –– Chat UI ----------------------------------------------------------
 
+private enum TranscriptSaveFeedback: Equatable {
+    case saving
+    case saved(String?)
+    case failed(String)
+
+    var message: String? {
+        switch self {
+        case .saving:
+            return String(localized: "Saving...")
+        case .saved(let datasetName):
+            if let datasetName, !datasetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return String.localizedStringWithFormat(String(localized: "Saved to %@"), datasetName)
+            }
+            return String(localized: "Saved to Stored")
+        case .failed(let message):
+            return message
+        }
+    }
+
+    var isSaving: Bool {
+        if case .saving = self { return true }
+        return false
+    }
+
+    var isSaved: Bool {
+        if case .saved = self { return true }
+        return false
+    }
+}
+
+enum TranscriptQuickAction: String, CaseIterable, Identifiable {
+    case summarize
+    case ask
+    case actionItems
+    case studyNotes
+    case decisions
+    case timeline
+    case followUp
+
+    var id: String { rawValue }
+
+    var titleKey: LocalizedStringKey {
+        switch self {
+        case .summarize: return "Summarize"
+        case .ask: return "Ask"
+        case .actionItems: return "Extract action items"
+        case .studyNotes: return "Create study notes"
+        case .decisions: return "Find decisions"
+        case .timeline: return "Make timeline"
+        case .followUp: return "Draft follow-up"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .summarize: return "text.bubble"
+        case .ask: return "questionmark.bubble"
+        case .actionItems: return "checklist"
+        case .studyNotes: return "book"
+        case .decisions: return "checkmark.seal"
+        case .timeline: return "list.bullet.rectangle"
+        case .followUp: return "envelope"
+        }
+    }
+
+    func prompt(for title: String) -> String {
+        switch self {
+        case .summarize:
+            return String(localized: "Summarize this transcript.")
+        case .ask:
+            return String.localizedStringWithFormat(String(localized: "Ask about %@: "), title)
+        case .actionItems:
+            return String(localized: "Extract action items from this transcript.")
+        case .studyNotes:
+            return String(localized: "Create study notes from this transcript.")
+        case .decisions:
+            return String(localized: "Find the decisions in this transcript.")
+        case .timeline:
+            return String(localized: "Make a timeline from this transcript.")
+        case .followUp:
+            return String(localized: "Draft a follow-up based on this transcript.")
+        }
+    }
+}
+
+enum ASRRecoveryAction: String, CaseIterable, Identifiable {
+    case openSettings
+    case chooseLocale
+    case downloadWhisperModel
+    case configureEndpoint
+    case retry
+
+    var id: String { rawValue }
+
+    var titleKey: LocalizedStringKey {
+        switch self {
+        case .openSettings: return "Open ASR Settings"
+        case .chooseLocale: return "Choose Locale"
+        case .downloadWhisperModel: return "Download Whisper Model"
+        case .configureEndpoint: return "Configure Endpoint"
+        case .retry: return "Retry"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .openSettings: return "gearshape"
+        case .chooseLocale: return "globe"
+        case .downloadWhisperModel: return "arrow.down.circle"
+        case .configureEndpoint: return "network"
+        case .retry: return "arrow.clockwise"
+        }
+    }
+
+    static func actions(
+        for message: String,
+        includeRetry: Bool,
+        includeRemoteEndpoint: Bool = false
+    ) -> [ASRRecoveryAction] {
+        let lower = message.lowercased()
+        var actions: [ASRRecoveryAction] = []
+        if lower.contains("locale") || lower.contains("on-device") || lower.contains("recognition") {
+            actions.append(.chooseLocale)
+        }
+        if lower.contains("whisper") || lower.contains("model") || lower.contains("download") {
+            actions.append(.downloadWhisperModel)
+        }
+        if includeRemoteEndpoint,
+           lower.contains("endpoint") || lower.contains("remote") || lower.contains("audio-language") || lower.contains("upload") {
+            actions.append(.configureEndpoint)
+        }
+        if lower.contains("permission") || lower.contains("unavailable") || actions.isEmpty {
+            actions.append(.openSettings)
+        }
+        if includeRetry {
+            actions.append(.retry)
+        }
+        return actions.reduce(into: []) { unique, action in
+            if !unique.contains(action) { unique.append(action) }
+        }
+    }
+}
+
+private struct TranscriptReviewSheet: View {
+    let attachment: ChatMediaAttachment
+    let allowsEditing: Bool
+    let onSaveEdits: (String, String) -> Void
+    let onQuickAction: (TranscriptQuickAction) -> Void
+    let onSaveNewDataset: () -> Void
+    let onSaveExistingDataset: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+    @State private var transcriptText: String
+    @State private var showsSegments = false
+
+    init(
+        attachment: ChatMediaAttachment,
+        allowsEditing: Bool,
+        onSaveEdits: @escaping (String, String) -> Void,
+        onQuickAction: @escaping (TranscriptQuickAction) -> Void,
+        onSaveNewDataset: @escaping () -> Void,
+        onSaveExistingDataset: @escaping () -> Void
+    ) {
+        self.attachment = attachment
+        self.allowsEditing = allowsEditing
+        self.onSaveEdits = onSaveEdits
+        self.onQuickAction = onQuickAction
+        self.onSaveNewDataset = onSaveNewDataset
+        self.onSaveExistingDataset = onSaveExistingDataset
+        let artifact = attachment.transcript
+        _title = State(initialValue: artifact?.displaySourceName ?? attachment.originalFilename)
+        _transcriptText = State(initialValue: artifact?.effectiveTranscriptText ?? "")
+    }
+
+    private var visibleSegmentRows: [TranscriptReviewDisplayRow] {
+        guard let artifact = attachment.transcript else {
+            return TranscriptReviewDisplayRow.rows(from: transcriptText)
+        }
+        if !artifact.segments.isEmpty {
+            return artifact.reviewSegmentRows
+        }
+        return TranscriptReviewDisplayRow.rows(from: transcriptText)
+    }
+
+    private var visibleTranscriptText: String {
+        if showsSegments {
+            return visibleSegmentRows.map { "[\($0.label)] \($0.text)" }.joined(separator: "\n")
+        }
+        return transcriptText
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(LocalizedStringKey("Source title"))
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                    TextField(LocalizedStringKey("Source title"), text: $title)
+                        .font(.title3)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 54)
+                        .background(transcriptFieldBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(transcriptBorderColor, lineWidth: 1)
+                        )
+                        .disabled(!allowsEditing)
+                }
+
+                if let artifact = attachment.transcript {
+                    Text(artifact.provenanceSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Picker(LocalizedStringKey("Transcript view"), selection: $showsSegments) {
+                    Text(LocalizedStringKey("Full Text")).tag(false)
+                    Text(LocalizedStringKey("Segments")).tag(true)
+                }
+                .pickerStyle(.segmented)
+
+                if showsSegments {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(Array(visibleSegmentRows.enumerated()), id: \.offset) { _, row in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text(row.label)
+                                        .font(.caption.monospacedDigit().weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 54, alignment: .leading)
+                                    Text(row.text)
+                                        .font(.body)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(14)
+                    .frame(minHeight: 320)
+                    .background(transcriptFieldBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(transcriptBorderColor, lineWidth: 1)
+                    )
+                } else {
+                    TextEditor(text: $transcriptText)
+                        .font(.body)
+                        .scrollContentBackground(.hidden)
+                        .padding(10)
+                        .frame(minHeight: 320)
+                        .background(transcriptFieldBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .disabled(!allowsEditing)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(transcriptBorderColor, lineWidth: 1)
+                        )
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        copyTranscriptToPasteboard(visibleTranscriptText)
+                    } label: {
+                        transcriptActionLabel("Copy", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+
+                    Menu {
+                        Button {
+                            onSaveNewDataset()
+                            dismiss()
+                        } label: {
+                            Label(LocalizedStringKey("Save to Stored"), systemImage: "tray.and.arrow.down")
+                        }
+                        Button {
+                            onSaveExistingDataset()
+                            dismiss()
+                        } label: {
+                            Label(LocalizedStringKey("Save to existing dataset"), systemImage: "folder.badge.plus")
+                        }
+                    } label: {
+                        transcriptActionLabel("Save", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+
+                    Menu {
+                        ForEach(TranscriptQuickAction.allCases) { action in
+                            Button {
+                                onQuickAction(action)
+                                dismiss()
+                            } label: {
+                                Label(action.titleKey, systemImage: action.iconName)
+                            }
+                        }
+                    } label: {
+                        transcriptActionLabel("Actions", systemImage: "sparkles")
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+
+                    if allowsEditing {
+                        Button {
+                            onSaveEdits(title, transcriptText)
+                            dismiss()
+                        } label: {
+                            transcriptActionLabel("Done", systemImage: "checkmark", isProminent: true)
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+            .background(transcriptSheetBackground.ignoresSafeArea())
+            .navigationTitle(Text(LocalizedStringKey("Review Transcript")))
+            #if !os(macOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.title3.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .frame(width: 44, height: 44)
+                            .background(Circle().fill(transcriptActionBackground))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(LocalizedStringKey("Close")))
+                }
+            }
+        }
+    }
+
+    private func transcriptActionLabel(
+        _ titleKey: String,
+        systemImage: String,
+        isProminent: Bool = false
+    ) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: systemImage)
+                .font(.body.weight(.semibold))
+                .imageScale(.medium)
+                .accessibilityHidden(true)
+            Text(LocalizedStringKey(titleKey))
+                .font(.footnote.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.68)
+                .allowsTightening(true)
+        }
+        .foregroundStyle(isProminent ? Color.white : Color.accentColor)
+        .padding(.horizontal, 7)
+        .frame(maxWidth: .infinity, minHeight: 48)
+        .background(
+            Capsule(style: .continuous)
+                .fill(isProminent ? Color.accentColor : transcriptActionBackground)
+        )
+    }
+
+    private var transcriptSheetBackground: Color {
+        #if os(macOS)
+        return Color(nsColor: .windowBackgroundColor)
+        #else
+        return Color(uiColor: .systemBackground)
+        #endif
+    }
+
+    private var transcriptFieldBackground: Color {
+        #if os(macOS)
+        return Color(nsColor: .controlBackgroundColor)
+        #else
+        return Color(uiColor: .secondarySystemBackground)
+        #endif
+    }
+
+    private var transcriptActionBackground: Color {
+        #if os(macOS)
+        return Color(nsColor: .controlBackgroundColor)
+        #else
+        return Color(uiColor: .secondarySystemFill)
+        #endif
+    }
+
+    private var transcriptBorderColor: Color {
+        Color.secondary.opacity(0.18)
+    }
+}
+
+private struct TranscriptDatasetPickerSheet: View {
+    let datasets: [LocalDataset]
+    let onSelect: (LocalDataset) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(datasets) { dataset in
+                Button {
+                    onSelect(dataset)
+                    dismiss()
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(dataset.name)
+                            .font(.body.weight(.semibold))
+                        Text(dataset.datasetID)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle(Text(LocalizedStringKey("Choose Dataset")))
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(LocalizedStringKey("Cancel")) { dismiss() }
+                }
+            }
+            .overlay {
+                if datasets.isEmpty {
+                    ContentUnavailableView(
+                        LocalizedStringKey("No Stored datasets"),
+                        systemImage: "folder",
+                        description: Text(LocalizedStringKey("Create a Stored dataset first, then save transcripts into it."))
+                    )
+                }
+            }
+        }
+    }
+}
+
+private func copyTranscriptToPasteboard(_ text: String) {
+#if canImport(UIKit)
+    UIPasteboard.general.string = text
+#elseif canImport(AppKit)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+#endif
+}
+
+extension ChatVM.Msg {
+    /// Returns a copy of this message with its visible text replaced. Used to render the
+    /// streaming bubble from the live `StreamingMessageStore` text without mutating the
+    /// `sessions`-backed copy on every token.
+    func replacingText(_ newText: String) -> ChatVM.Msg {
+        var copy = self
+        copy.text = newText
+        return copy
+    }
+}
+
+/// Wraps `MessageView` so only the in-flight assistant bubble re-renders from the
+/// `StreamingMessageStore` on every token. All other messages render statically from
+/// their `msg` copy — no `@ObservedObject` subscription here, so a token update
+/// never touches completed messages (tool calls, previous turns, etc.).
+struct StreamingAwareMessageView: View {
+    let msg: ChatVM.Msg
+    let store: StreamingMessageStore   // plain let — no subscription
+
+    /// Tracks whether THIS specific message is the one currently streaming.
+    /// Updated via `onReceive(store.$activeID)` + `onAppear` so the transition
+    /// is immediate even when the view is first mounted mid-stream.
+    @State private var isStreamingThis = false
+
+    var body: some View {
+        Group {
+            if isStreamingThis {
+                ActiveStreamingMessageView(msg: msg, store: store)
+            } else {
+                MessageView(msg: msg)
+            }
+        }
+        .onAppear {
+            // Handle the case where the view mounts while streaming is already active.
+            isStreamingThis = (store.activeID == msg.id)
+        }
+        .onReceive(store.$activeID) { id in
+            let should = (id == msg.id)
+            if isStreamingThis != should { isStreamingThis = should }
+        }
+    }
+}
+
+/// Holds the `@ObservedObject` subscription so only the one in-flight bubble
+/// re-renders per token. Separated into its own struct so the subscription is
+/// mounted/unmounted with the view rather than living on every row.
+private struct ActiveStreamingMessageView: View {
+    let msg: ChatVM.Msg
+    @ObservedObject var store: StreamingMessageStore
+
+    var body: some View {
+        MessageView(msg: msg.replacingText(store.visibleText))
+            // One scoped transaction per store flush (~30 Hz): newly inserted
+            // word fragments fade in (WrappedInline attaches the transitions),
+            // new paragraphs/blocks fade via the default ForEach transition,
+            // and the bubble's height grows smoothly instead of jumping.
+            // Scoped to the live bubble only — finished rows never animate.
+            .animation(.easeOut(duration: 0.22), value: store.visibleText)
+    }
+}
+
+/// Invisible view that follows the streaming text and keeps the chat pinned to the
+/// bottom. It subscribes to the `StreamingMessageStore`, so it (and not the whole chat
+/// list) is what re-renders on every token.
+struct StreamingScrollAnchor: View {
+    @ObservedObject var store: StreamingMessageStore
+    let proxy: ScrollViewProxy
+    let enabled: Bool
+
+    /// `scrollTo` forces a synchronous layout pass of the scroll content. At
+    /// the store's ~30 Hz flush cadence that triples the layout work and makes
+    /// concurrent user scrolling stutter; ~12 Hz is visually identical for a
+    /// bottom pin. A trailing call guarantees the final position after the
+    /// last flush (e.g. `finish()`).
+    @State private var lastScrollAt = Date.distantPast
+    @State private var trailingScrollScheduled = false
+    private static let minScrollInterval: TimeInterval = 0.08
+
+    var body: some View {
+        Color.clear
+            .frame(height: 0)
+            .onChangeCompat(of: store.visibleText) { _, _ in
+                scrollToBottomThrottled()
+            }
+    }
+
+    /// Critically damped spring: retargeting at the throttle cadence preserves
+    /// velocity, so the pinned view glides continuously instead of snapping to
+    /// each new bottom position.
+    private static let followAnimation = Animation.spring(response: 0.28, dampingFraction: 1.0)
+
+    private func scrollToBottomThrottled() {
+        guard enabled, let id = store.activeID else { return }
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastScrollAt)
+        if elapsed >= Self.minScrollInterval {
+            lastScrollAt = now
+            withAnimation(Self.followAnimation) {
+                proxy.scrollTo(id, anchor: .bottom)
+            }
+        } else if !trailingScrollScheduled {
+            trailingScrollScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Self.minScrollInterval - elapsed)) {
+                trailingScrollScheduled = false
+                guard enabled, let id = store.activeID else { return }
+                lastScrollAt = Date()
+                withAnimation(Self.followAnimation) {
+                    proxy.scrollTo(id, anchor: .bottom)
+                }
+            }
+        }
+    }
+}
+
+/// Process-wide memo for pure, deterministic text-parsing results.
+///
+/// Every ChatVM publish (~10 Hz while streaming) re-renders every visible
+/// message row via `@EnvironmentObject`, and each row used to re-parse its
+/// full markdown from scratch — saturating the main thread and making
+/// scrolling/tool-call animations stutter during inference. Caching makes
+/// those re-renders O(1) for unchanged text.
+final class TextComputationCache<Value>: @unchecked Sendable {
+    private final class Box {
+        let value: Value
+        init(_ value: Value) { self.value = value }
+    }
+    private let cache = NSCache<NSString, Box>()
+
+    init(countLimit: Int = 512) {
+        cache.countLimit = countLimit
+    }
+
+    func value(for key: String, compute: () -> Value) -> Value {
+        let nsKey = key as NSString
+        if let hit = cache.object(forKey: nsKey) { return hit.value }
+        let computed = compute()
+        cache.setObject(Box(computed), forKey: nsKey)
+        return computed
+    }
+}
+
 /// Renders a single message. Any text between `<think>` tags is wrapped in a
 /// collapsible box with rounded corners.
 struct MessageView: View {
     let msg: ChatVM.Msg
     @EnvironmentObject var vm: ChatVM
+    @EnvironmentObject var tabRouter: TabRouter
     @Environment(\.colorScheme) private var colorScheme
     @State private var expandedThinkIndices: Set<Int> = []
     @State private var showCopyPopup = false
     @State private var copiedMessage = false
+    @State private var pinnedToScratchpad = false
     @State private var expandedImagePath: String? = nil
+    @State private var showEvidenceSheet = false
+    @State private var transcriptSaveFeedback: [ChatMediaAttachment.ID: TranscriptSaveFeedback] = [:]
+    @State private var transcriptReviewAttachment: ChatMediaAttachment?
+    @State private var existingDatasetSaveAttachment: ChatMediaAttachment?
 #if os(macOS)
     @State private var hoverCopyVisible = false
     @State private var suppressHoverCopy = false
@@ -8947,6 +11421,13 @@ struct MessageView: View {
     @State private var showInteractionOptions = false
     @GestureState private var isPressingMessage = false
 #endif
+
+    private struct PrivacyBadgeDescriptor {
+        let title: LocalizedStringKey
+        let accessibilityLabel: LocalizedStringKey
+        let iconName: String
+        let tint: Color
+    }
     
     private var datasetDisplayName: String? {
         if let stored = msg.datasetName, !stored.isEmpty { return stored }
@@ -8956,8 +11437,123 @@ struct MessageView: View {
         }
         return nil
     }
+
+    private var retrievedContextChunks: [String] {
+        (msg.retrievedContext ?? "")
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private var ragChunkCount: Int {
+        // RAG surfaces the same retrieved chunks three ways: one citation per
+        // chunk, the joined `retrievedContext` string, and the `ragInjectionInfo`
+        // summary. They're the same evidence, so count them once — as the number
+        // of chunks. (e.g. 2 chunks must read as 2, not 2 + 2 + 1 = 5.)
+        msg.citations?.count ?? retrievedContextChunks.count
+    }
+
+    private var evidenceItemCount: Int {
+        var count = 0
+        count += ragChunkCount
+        // A web search is a `noema.web.retrieve` tool call whose results are
+        // already counted via `webHits`. Counting the call itself would
+        // double-count it (e.g. 3 results + 1 call = 4), so only its results
+        // contribute. Every other tool call counts as one evidence point.
+        count += msg.toolCalls?.filter { $0.toolName != "noema.web.retrieve" }.count ?? 0
+        count += msg.webHits?.count ?? 0
+        count += msg.imagePaths?.count ?? 0
+        count += msg.mediaAttachments?.count ?? 0
+        return count
+    }
+
+    private var hasEvidenceReceipt: Bool {
+        msg.role != "🧑‍💻" && evidenceItemCount > 0
+    }
+
+    private var privacyBadgeDescriptor: PrivacyBadgeDescriptor? {
+        guard msg.role != "🧑‍💻" else { return nil }
+        if msg.usedRemoteBackend == true {
+            return PrivacyBadgeDescriptor(
+                title: "Remote",
+                accessibilityLabel: "Remote Answer",
+                iconName: "antenna.radiowaves.left.and.right",
+                tint: .purple
+            )
+        }
+        if msg.ranOnPrivateCloudCompute == true {
+            return PrivacyBadgeDescriptor(
+                title: "Private Cloud",
+                accessibilityLabel: "Answered with Apple Private Cloud Compute",
+                iconName: "lock.icloud",
+                tint: .indigo
+            )
+        }
+        if msg.usedWebSearch == true || msg.webHits?.isEmpty == false {
+            return PrivacyBadgeDescriptor(
+                title: "Network",
+                accessibilityLabel: "Network-Assisted Answer",
+                iconName: "globe",
+                tint: .blue
+            )
+        }
+        // "Local Only" is the expected default for a local-first app, so it only
+        // appears as a diagnostic detail — the toolbar status dot carries the
+        // local/private signal in normal use.
+        if msg.usedRemoteBackend == false, isAdvancedMode {
+            return PrivacyBadgeDescriptor(
+                title: "Local Only",
+                accessibilityLabel: "Local-Only Answer",
+                iconName: "lock.shield",
+                tint: .green
+            )
+        }
+        return nil
+    }
+
+    private var hasReceiptBadges: Bool {
+        privacyBadgeDescriptor != nil
+            || hasEvidenceReceipt
+            || (isAdvancedMode && (shouldNudgeForMissingEvidence || shouldShowModelOnlyUncertainty))
+    }
+
+    private var isCompletedAssistantAnswer: Bool {
+        (msg.role == "🤖" || msg.role.lowercased() == "assistant")
+            && !msg.streaming
+            && !msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var expectedGroundingWithoutEvidence: Bool {
+        guard isCompletedAssistantAnswer, evidenceItemCount == 0 else { return false }
+        let trimmedText = msg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty, !msg.streaming else { return false }
+        return msg.datasetID != nil
+            || msg.datasetName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || msg.usedWebSearch == true
+            || msg.webError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private var shouldNudgeForMissingEvidence: Bool {
+        canAuditMessage && expectedGroundingWithoutEvidence
+    }
+
+    private var shouldShowModelOnlyUncertainty: Bool {
+        isCompletedAssistantAnswer && evidenceItemCount == 0 && !expectedGroundingWithoutEvidence
+    }
     
+    /// Memoized: the result depends only on the text and the tool-call count
+    /// (pieces store indices into the calls array, not the calls themselves),
+    /// verified against `parseUncached`'s body which reads nothing else.
+    private static let parsedPiecesCache = TextComputationCache<[ChatVM.Piece]>()
+
     private func parse(_ text: String, toolCalls: [ChatVM.Msg.ToolCall]? = nil) -> [ChatVM.Piece] {
+        let countTag = toolCalls.map { String($0.count) } ?? "-"
+        return Self.parsedPiecesCache.value(for: "\(countTag)\u{1}\(text)") {
+            parseUncached(text, toolCalls: toolCalls)
+        }
+    }
+
+    private func parseUncached(_ text: String, toolCalls: [ChatVM.Msg.ToolCall]? = nil) -> [ChatVM.Piece] {
         // First parse code blocks
         let codeBlocks = ChatVM.parseCodeBlocks(text)
         
@@ -9223,21 +11819,29 @@ struct MessageView: View {
     
     
     // MARK: - Text or List rendering
-    @ViewBuilder
-    private func renderTextOrList(_ t: String) -> some View {
-        // Enhanced rendering:
-        // - Headings: lines starting with "# ", "## ", "### ", etc. get larger fonts
-        // - Bullets: single-character markers ('-', '*', '+', '•') render with a leading dot
-        // - Math/text runs are grouped into larger MathRichText blocks for smoother selection
-        let text = normalizeListFormatting(t)
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            EmptyView()
-        } else {
+
+    /// Cached output of the line-parsing + render-planning passes; pure
+    /// function of the raw text, so safe to memoize across re-renders.
+    private struct TextRenderPlan {
+        let entries: [TextLineEntry]
+        let units: [ChatMarkdownRenderUnit]
+    }
+
+    private static let renderPlanCache = TextComputationCache<TextRenderPlan>()
+
+    private func renderPlan(for t: String) -> TextRenderPlan {
+        Self.renderPlanCache.value(for: t) {
+            let text = normalizeListFormatting(t)
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return TextRenderPlan(entries: [], units: [])
+            }
             let entries = parseTextEntries(from: text)
             let plannerEntries = entries.map { entry in
                 switch entry {
                 case .blank:
                     return ChatMarkdownPlannerEntry.blank
+                case .thematicBreak:
+                    return .thematicBreak
                 case .heading(let level, let content):
                     return .heading(level: level, content: content)
                 case .bullet(let marker, let content):
@@ -9255,35 +11859,55 @@ struct MessageView: View {
 #else
             let units = ChatMarkdownRenderPlanner.renderUnits(for: plannerEntries, isMacOS: false)
 #endif
+            return TextRenderPlan(entries: entries, units: units)
+        }
+    }
+
+    @ViewBuilder
+    private func renderTextOrList(_ t: String) -> some View {
+        // Enhanced rendering:
+        // - Headings: lines starting with "# ", "## ", "### ", etc. get larger fonts
+        // - Bullets: single-character markers ('-', '*', '+', '•') render with a leading dot
+        // - Math/text runs are grouped into larger MathRichText blocks for smoother selection
+        let plan = renderPlan(for: t)
+        if plan.units.isEmpty {
+            EmptyView()
+        } else {
+            let entries = plan.entries
+            let units = plan.units
             let chatBlockMathStyle = BlockMathStyle.chat(bodyFontSize: preferredFontSize(.body))
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 7) {
                 ForEach(Array(units.enumerated()), id: \.offset) { _, unit in
                     switch unit {
                     case .bulletBlock(let block):
-                        MathRichText(source: block, bodyFont: chatBodyFont, blockMathStyle: chatBlockMathStyle)
+                        MathRichText(source: block, bodyFont: chatBodyFont, bodyPointSize: chatBodyPointSize, blockMathStyle: chatBlockMathStyle)
                             .font(chatBodyFont)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     case .textMathBlock(let block):
-                        MathRichText(source: block, bodyFont: chatBodyFont, blockMathStyle: chatBlockMathStyle)
+                        MathRichText(source: block, bodyFont: chatBodyFont, bodyPointSize: chatBodyPointSize, blockMathStyle: chatBlockMathStyle)
                             .font(chatBodyFont)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     case .entryIndex(let idx):
                         switch entries[idx] {
                         case .blank:
                             Text("")
+                        case .thematicBreak:
+                            Divider()
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 4)
                         case .heading(let level, let content):
-                            MathRichText(source: content, bodyFont: headingFont(for: level), blockMathStyle: chatBlockMathStyle)
+                            MathRichText(source: content, bodyFont: headingFont(for: level), bodyPointSize: headingPointSize(for: level), bodyWeight: .bold, blockMathStyle: chatBlockMathStyle)
                                 .font(headingFont(for: level))
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         case .mathBlock(let source):
-                            MathRichText(source: source, bodyFont: chatBodyFont, blockMathStyle: chatBlockMathStyle)
+                            MathRichText(source: source, bodyFont: chatBodyFont, bodyPointSize: chatBodyPointSize, blockMathStyle: chatBlockMathStyle)
                                 .font(chatBodyFont)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         case .table(let headers, let alignments, let rows):
                             tableView(headers: headers, alignments: alignments, rows: rows)
                         case .text(let line):
-                            MathRichText(source: line, bodyFont: chatBodyFont, blockMathStyle: chatBlockMathStyle)
+                            MathRichText(source: line, bodyFont: chatBodyFont, bodyPointSize: chatBodyPointSize, blockMathStyle: chatBlockMathStyle)
                                 .font(chatBodyFont)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         case .bullet:
@@ -9298,6 +11922,7 @@ struct MessageView: View {
 
     private enum TextLineEntry {
         case blank
+        case thematicBreak
         case heading(level: Int, content: String)
         case bullet(marker: String, content: String)
         case mathBlock(String)
@@ -9394,6 +12019,12 @@ struct MessageView: View {
                 continue
             }
 
+            if isThematicBreakLine(trimmed) {
+                entries.append(.thematicBreak)
+                index += 1
+                continue
+            }
+
             if let level = headingLevel(for: trimmed) {
                 let content = String(trimmed.drop(while: { $0 == "#" || $0 == " " }))
                 entries.append(.heading(level: level, content: content))
@@ -9414,6 +12045,13 @@ struct MessageView: View {
         return entries
     }
 
+    private func isThematicBreakLine(_ line: String) -> Bool {
+        let compact = line.filter { !$0.isWhitespace }
+        guard compact.count >= 3, let first = compact.first else { return false }
+        guard first == "-" || first == "_" || first == "*" else { return false }
+        return compact.allSatisfy { $0 == first }
+    }
+
     @ViewBuilder
     private func tableView(headers: [String], alignments: [TableColumnAlignment], rows: [[String]]) -> some View {
         let columns: [GridItem] = alignments.map { alignment in
@@ -9424,7 +12062,7 @@ struct MessageView: View {
         VStack(spacing: 0) {
             LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
                 ForEach(Array(headers.enumerated()), id: \.offset) { index, header in
-                    MathRichText(source: header, bodyFont: tableHeaderFont, blockMathStyle: chatBlockMathStyle)
+                    MathRichText(source: header, bodyFont: tableHeaderFont, bodyPointSize: 15, bodyWeight: .semibold, blockMathStyle: chatBlockMathStyle)
                         .font(tableHeaderFont)
                         .multilineTextAlignment(alignments[index].textAlignment)
                         .frame(maxWidth: .infinity, alignment: alignments[index].frameAlignment)
@@ -9440,7 +12078,7 @@ struct MessageView: View {
             ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
                     ForEach(Array(row.enumerated()), id: \.offset) { columnIndex, value in
-                        MathRichText(source: value, bodyFont: chatBodyFont, blockMathStyle: chatBlockMathStyle)
+                        MathRichText(source: value, bodyFont: chatBodyFont, bodyPointSize: chatBodyPointSize, blockMathStyle: chatBlockMathStyle)
                             .font(chatBodyFont)
                             .multilineTextAlignment(alignments[columnIndex].textAlignment)
                             .frame(maxWidth: .infinity, alignment: alignments[columnIndex].frameAlignment)
@@ -9557,6 +12195,16 @@ struct MessageView: View {
         case 2: return .title2
         case 3: return .title3
         default: return .headline
+        }
+    }
+
+    /// Point size matching `headingFont(for:)`, plumbed to the macOS renderer.
+    private func headingPointSize(for level: Int) -> CGFloat {
+        switch level {
+        case 1: return preferredFontSize(.largeTitle)
+        case 2: return preferredFontSize(.title2)
+        case 3: return preferredFontSize(.title3)
+        default: return preferredFontSize(.headline)
         }
     }
     
@@ -9679,6 +12327,7 @@ struct MessageView: View {
     }
     
     @AppStorage("isAdvancedMode") private var isAdvancedMode = false
+    @AppStorage("showGenerationDiagnostics") private var showGenerationDiagnostics = true
     
     // MARK: - Code block rendering
     private struct CodeBlockView: View {
@@ -9818,6 +12467,15 @@ struct MessageView: View {
 #endif
     }
 
+    /// Point size matching `chatBodyFont`, plumbed to the macOS AppKit renderer.
+    private var chatBodyPointSize: CGFloat {
+#if os(macOS)
+        return 16
+#else
+        return preferredFontSize(.body)
+#endif
+    }
+
     private var tableHeaderFont: Font {
 #if os(macOS)
         return .system(size: 15, weight: .semibold)
@@ -9851,12 +12509,7 @@ struct MessageView: View {
 
     var bubbleColor: Color {
         if isUserMessage {
-#if os(macOS)
-            let accentOpacity: Double = colorScheme == .dark ? 0.3 : 0.22
-            return Color.accentColor.opacity(accentOpacity)
-#else
-            return Color.accentColor.opacity(0.2)
-#endif
+            return ChatTheme.userBubble(colorScheme)
         }
         return .clear
     }
@@ -9889,6 +12542,143 @@ struct MessageView: View {
             .padding(.horizontal, 4)
         }
         .padding(.horizontal, 12)
+    }
+
+    @ViewBuilder
+    private func mediaAttachmentsView(_ attachments: [ChatMediaAttachment]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(attachments) { attachment in
+                mediaAttachmentCard(attachment)
+            }
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func mediaAttachmentCard(_ attachment: ChatMediaAttachment) -> some View {
+        let saveFeedback = transcriptSaveFeedback[attachment.id]
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: attachment.kind.iconName)
+                    .foregroundStyle(Color.accentColor)
+                Text(attachment.transcript?.displaySourceName ?? attachment.originalFilename)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if attachment.hasCompletedTranscript {
+                    Button {
+                        transcriptReviewAttachment = attachment
+                    } label: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .help(Text("Review Transcript"))
+
+                    Menu {
+                        Button {
+                            saveTranscriptAttachment(attachment)
+                        } label: {
+                            Label(LocalizedStringKey("Save to Stored"), systemImage: "tray.and.arrow.down")
+                        }
+                        Button {
+                            existingDatasetSaveAttachment = attachment
+                        } label: {
+                            Label(LocalizedStringKey("Save to existing dataset"), systemImage: "folder.badge.plus")
+                        }
+                    } label: {
+                        if saveFeedback?.isSaving == true {
+                            ProgressView()
+                                .scaleEffect(0.72)
+                        } else {
+                            Image(systemName: "tray.and.arrow.down")
+                                .font(.caption.weight(.semibold))
+                        }
+                    }
+                    .disabled(saveFeedback?.isSaving == true || saveFeedback?.isSaved == true)
+                    .help(Text("Save transcript to Stored"))
+                }
+            }
+
+            if let mediaDetailLabel = attachment.mediaDetailLabel {
+                Text(mediaDetailLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let transcript = attachment.transcript {
+                Text(transcript.provenanceSummary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(transcript.exportText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(8)
+                    .textSelection(.enabled)
+            } else if let error = attachment.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(Color.red)
+            }
+
+            if let saveFeedback, let message = saveFeedback.message {
+                Text(message)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(saveFeedback.isSaved ? Color.green : (saveFeedback.isSaving ? Color.secondary : Color.red))
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: 360, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
+    }
+
+    private func saveTranscriptAttachment(_ attachment: ChatMediaAttachment) {
+        guard transcriptSaveFeedback[attachment.id]?.isSaving != true else { return }
+        transcriptSaveFeedback[attachment.id] = .saving
+        Task {
+            let result = await vm.saveTranscriptAttachmentAsDataset(attachment)
+            await MainActor.run {
+                switch result {
+                case .success(let dataset):
+                    transcriptSaveFeedback[attachment.id] = .saved(dataset.name)
+                case .failure(let error):
+                    transcriptSaveFeedback[attachment.id] = .failed(
+                        String.localizedStringWithFormat(
+                            String(localized: "Transcript save failed: %@"),
+                            error.localizedDescription
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private func saveTranscriptAttachment(_ attachment: ChatMediaAttachment, toExistingDataset dataset: LocalDataset) {
+        guard transcriptSaveFeedback[attachment.id]?.isSaving != true else { return }
+        transcriptSaveFeedback[attachment.id] = .saving
+        Task {
+            let result = await vm.saveTranscriptAttachment(attachment, toExistingDataset: dataset)
+            await MainActor.run {
+                switch result {
+                case .success(let dataset):
+                    transcriptSaveFeedback[attachment.id] = .saved(dataset.name)
+                case .failure(let error):
+                    transcriptSaveFeedback[attachment.id] = .failed(
+                        String.localizedStringWithFormat(
+                            String(localized: "Transcript save failed: %@"),
+                            error.localizedDescription
+                        )
+                    )
+                }
+            }
+        }
     }
 
     private struct AttachmentPreview: View {
@@ -10180,17 +12970,51 @@ struct MessageView: View {
                         }
                         insertIndex = Self.insertIndexForMissingToolEntries(in: kinds)
                     } else {
-                        // Keep tool calls after think blocks but before generated narrative
-                        // (text/code) when they were detected out-of-band (no inline marker
-                        // in text), so post-tool answer appears below.
-                        insertIndex = results.firstIndex { entry in
-                            switch entry.kind {
-                            case .text, .code:
+                        // Out-of-band tool calls (no inline marker in text) slot in
+                        // after the reasoning that *requested* them but before the
+                        // reasoning/narrative that *reacted* to their result.
+                        func isThinkEntry(_ kind: RenderEntry.Kind) -> Bool {
+                            switch kind {
+                            case .thinkExisting, .thinkNew:
                                 return true
-                            case .thinkExisting, .thinkNew, .tool, .promptProcessing, .genericLoading, .postToolWait:
+                            default:
                                 return false
                             }
-                        } ?? results.endIndex
+                        }
+                        let lastParsedToolIndex = results.lastIndex { entry in
+                            if case .tool = entry.kind { return true }
+                            return false
+                        }
+                        let searchStart = lastParsedToolIndex.map { $0 + 1 } ?? results.startIndex
+                        let thinkIndicesAfterTools = results.indices.filter {
+                            $0 >= searchStart && isThinkEntry(results[$0].kind)
+                        }
+                        let trailingThinkIsStreaming: Bool = {
+                            if case .think(_, let done)? = pieces.last, !done { return true }
+                            return false
+                        }()
+                        let allMissingCallsResolved = missingToolEntries.allSatisfy { entry in
+                            if case .tool(let call) = entry.kind {
+                                return call.phase == .completed || call.phase == .failed
+                            }
+                            return true
+                        }
+                        if let lastThinkIndex = thinkIndicesAfterTools.last,
+                           thinkIndicesAfterTools.count >= 2
+                            || (trailingThinkIsStreaming && allMissingCallsResolved) {
+                            // The final reasoning segment is the model reacting to
+                            // the tool result — the call itself happened before it.
+                            insertIndex = lastThinkIndex
+                        } else {
+                            insertIndex = results.firstIndex { entry in
+                                switch entry.kind {
+                                case .text, .code:
+                                    return true
+                                case .thinkExisting, .thinkNew, .tool, .promptProcessing, .genericLoading, .postToolWait:
+                                    return false
+                                }
+                            } ?? results.endIndex
+                        }
                     }
                     results.insert(contentsOf: missingToolEntries, at: insertIndex)
                 }
@@ -10200,7 +13024,9 @@ struct MessageView: View {
                     RenderEntry(
                         id: "generic-loading-\(msg.id.uuidString)",
                         kind: .genericLoading,
-                        topPadding: 2,
+                        // Clear the preceding tool card's drop shadow (radius 8,
+                        // y 4) so the spinner doesn't sit half-buried under it.
+                        topPadding: 12,
                         bottomPadding: 2
                     )
                 )
@@ -10229,7 +13055,7 @@ struct MessageView: View {
                     RenderEntry(
                         id: "prompt-processing-\(msg.id.uuidString)",
                         kind: .promptProcessing(progress: promptProcessing.progress),
-                        topPadding: 2,
+                        topPadding: 8,
                         bottomPadding: 2
                     ),
                     at: insertIndex
@@ -10242,7 +13068,8 @@ struct MessageView: View {
                     RenderEntry(
                         id: "post-tool-wait-\(msg.id.uuidString)",
                         kind: .postToolWait,
-                        topPadding: 4,
+                        // Clear the preceding tool card's drop shadow.
+                        topPadding: 12,
                         bottomPadding: 2
                     )
                 )
@@ -10279,7 +13106,7 @@ struct MessageView: View {
                             }
                         }
                 case .tool(let call):
-                    ToolCallView(toolCall: call)
+                    ToolCallView(toolCall: call).equatable()
                         .padding(.top, entry.topPadding)
                         .padding(.bottom, entry.bottomPadding)
                 case .promptProcessing(let progress):
@@ -10328,6 +13155,94 @@ struct MessageView: View {
                 }
             }
         }
+    }
+
+    private func toggleMessageBookmark() {
+        vm.toggleBookmark(messageID: msg.id)
+#if os(iOS)
+        Haptics.impact(.light)
+#endif
+    }
+
+    private func pinMessageToScratchpad() {
+        let text = copyableMessageText()
+        vm.pinMessageTextToActiveScratchpad(text, role: msg.role, timestamp: msg.timestamp)
+#if os(iOS)
+        Haptics.impact(.light)
+#endif
+        pinnedToScratchpad = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            pinnedToScratchpad = false
+        }
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showCopyPopup = false
+        }
+    }
+
+    private func branchFromMessage() {
+        _ = vm.branchSession(fromMessageID: msg.id)
+#if os(iOS)
+        Haptics.impact(.light)
+#endif
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showCopyPopup = false
+        }
+    }
+
+    private var canRegenerateMessage: Bool {
+        (msg.role == "🤖" || msg.role.lowercased() == "assistant")
+            && !msg.streaming
+            && vm.canAcceptChatInput
+            && !vm.isStreamingInAnotherSession
+    }
+
+    private var canAskWithAnotherModel: Bool {
+        (msg.role == "🤖" || msg.role.lowercased() == "assistant")
+            && !msg.streaming
+            && !vm.isStreamingInAnotherSession
+    }
+
+    private var canAuditMessage: Bool {
+        (msg.role == "🤖" || msg.role.lowercased() == "assistant")
+            && !msg.streaming
+            && vm.canAcceptChatInput
+            && !vm.isStreamingInAnotherSession
+    }
+
+    private func regenerateMessage() {
+        guard canRegenerateMessage else { return }
+#if os(iOS)
+        Haptics.impact(.light)
+#endif
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showCopyPopup = false
+        }
+        Task { await vm.regenerateAssistantResponse(messageID: msg.id) }
+    }
+
+    private func askWithAnotherModel() {
+        guard canAskWithAnotherModel else { return }
+        guard vm.prepareAskSamePromptWithAnotherModel(messageID: msg.id) else { return }
+#if os(iOS)
+        Haptics.impact(.light)
+#endif
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showCopyPopup = false
+        }
+        UserDefaults.standard.set(ExploreSection.models.rawValue, forKey: "exploreSection")
+        tabRouter.selection = .explore
+    }
+
+    private func auditMessage() {
+        guard canAuditMessage else { return }
+#if os(iOS)
+        Haptics.impact(.light)
+#endif
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showCopyPopup = false
+        }
+        let prompt = String(localized: "Audit the previous answer for unsupported claims, missing caveats, possible errors, and places where the evidence is weak.")
+        Task { await vm.sendMessage(prompt) }
     }
 
     private func copyableMessageText() -> String {
@@ -10408,6 +13323,130 @@ struct MessageView: View {
         )
     }
 
+    @ViewBuilder
+    private var privacyGuaranteeBadge: some View {
+        if let descriptor = privacyBadgeDescriptor {
+            HStack(spacing: 5) {
+                Image(systemName: descriptor.iconName)
+                    .font(.caption2.weight(.semibold))
+                Text(descriptor.title)
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(descriptor.tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(descriptor.tint.opacity(colorScheme == .dark ? 0.16 : 0.10)))
+            .overlay(Capsule().stroke(descriptor.tint.opacity(0.26), lineWidth: 0.8))
+            .accessibilityLabel(Text(descriptor.accessibilityLabel))
+        }
+    }
+
+    @ViewBuilder
+    private var evidenceReceiptButton: some View {
+        if hasEvidenceReceipt {
+            Button {
+                showEvidenceSheet = true
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "list.bullet.rectangle")
+                        .font(.caption2.weight(.semibold))
+                    Text("Evidence")
+                        .font(.caption2.weight(.semibold))
+                    Text(verbatim: "\(evidenceItemCount)")
+                        .font(.caption2.monospacedDigit().weight(.bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.accentColor.opacity(colorScheme == .dark ? 0.20 : 0.14)))
+                }
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.accentColor.opacity(colorScheme == .dark ? 0.14 : 0.08)))
+                .overlay(Capsule().stroke(Color.accentColor.opacity(0.24), lineWidth: 0.8))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(String.localizedStringWithFormat(NSLocalizedString("%d evidence items", comment: "Accessibility label for evidence receipt count"), evidenceItemCount)))
+        } else if isAdvancedMode, shouldNudgeForMissingEvidence {
+            Button(action: auditMessage) {
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.shield")
+                        .font(.caption2.weight(.semibold))
+                    Text("No Evidence")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.10)))
+                .overlay(Capsule().stroke(Color.orange.opacity(0.26), lineWidth: 0.8))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("Audit Evidence"))
+        } else if isAdvancedMode, shouldShowModelOnlyUncertainty {
+            HStack(spacing: 5) {
+                Image(systemName: "questionmark.shield")
+                    .font(.caption2.weight(.semibold))
+                Text("Model Only")
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(Color.secondary.opacity(colorScheme == .dark ? 0.16 : 0.10)))
+            .overlay(Capsule().stroke(Color.secondary.opacity(0.22), lineWidth: 0.8))
+            .accessibilityLabel(Text("Model-only answer. No sources were attached."))
+        }
+    }
+
+    /// Generation-speed details shown only in Advanced mode: token count,
+    /// throughput and time-to-first-token, presented inline with the timestamp
+    /// as one quiet metadata line.
+    private var perfParts: [String] {
+        guard isAdvancedMode, showGenerationDiagnostics, msg.role != "🧑‍💻", !msg.streaming, let perf = msg.perf else { return [] }
+        var out: [String] = []
+        if perf.tokenCount > 0 {
+            out.append(String.localizedStringWithFormat(String(localized: "%lld tokens"), Int64(perf.tokenCount)))
+        }
+        if perf.avgTokPerSec > 0 {
+            out.append(String.localizedStringWithFormat(String(localized: "%.1f tok/s"), perf.avgTokPerSec))
+        }
+        if perf.timeToFirst > 0 {
+            out.append(String.localizedStringWithFormat(String(localized: "%.2fs TFT"), perf.timeToFirst))
+        }
+        if perf.totalDuration > 0 {
+            out.append(String.localizedStringWithFormat(String(localized: "%.2fs total"), perf.totalDuration))
+        }
+        return out
+    }
+
+    /// Single low-contrast footer line: timestamp, plus generation stats when
+    /// diagnostics are enabled.
+    private var messageMetadataRow: some View {
+        HStack(spacing: 6) {
+            Text(msg.timestamp, style: .time)
+            ForEach(perfParts, id: \.self) { part in
+                Text(verbatim: "·")
+                Text(part)
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.tertiary)
+        .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private var messageReceiptBadges: some View {
+        if hasReceiptBadges {
+            HStack(spacing: 6) {
+                privacyGuaranteeBadge
+                evidenceReceiptButton
+            }
+            .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
+            .frame(maxWidth: .infinity, alignment: msg.role == "🧑‍💻" ? .trailing : .leading)
+        }
+    }
+
 #if os(visionOS)
     private func pinMessage() {
         guard let sessionID = vm.activeSessionID else { return }
@@ -10443,26 +13482,23 @@ struct MessageView: View {
         .padding(.horizontal, messageHorizontalPadding)
         .padding(.vertical, messageVerticalPadding)
         .frame(
-            maxWidth: isUserMessage ? currentDeviceWidth() * 0.85 : .infinity,
+            // Cap the user bubble so it reads as a chat bubble, not a banner.
+            maxWidth: isUserMessage
+                ? min(currentDeviceWidth() * 0.85, ChatTheme.userBubbleMaxWidth)
+                : .infinity,
             alignment: isUserMessage ? .trailing : .leading
         )
         .background {
             if isUserMessage {
-                RoundedRectangle(cornerRadius: UIConstants.largeCornerRadius, style: .continuous)
+                RoundedRectangle(cornerRadius: ChatTheme.bubbleRadius, style: .continuous)
                     .fill(bubbleColor)
             }
         }
         .clipShape(
             RoundedRectangle(
-                cornerRadius: isUserMessage ? UIConstants.largeCornerRadius : 0,
+                cornerRadius: isUserMessage ? ChatTheme.bubbleRadius : 0,
                 style: .continuous
             )
-        )
-        .shadow(
-            color: isUserMessage ? Color.black.opacity(0.1) : .clear,
-            radius: 1,
-            x: 0,
-            y: 1
         )
         .overlay(
             RoundedRectangle(cornerRadius: UIConstants.cornerRadius)
@@ -10499,6 +13535,9 @@ struct MessageView: View {
             if let paths = msg.imagePaths, !paths.isEmpty {
                 imagesView(paths: paths)
             }
+            if let mediaAttachments = msg.mediaAttachments, !mediaAttachments.isEmpty {
+                mediaAttachmentsView(mediaAttachments)
+            }
 
             HStack {
                 if msg.role == "🧑‍💻" { Spacer() }
@@ -10508,67 +13547,22 @@ struct MessageView: View {
                 if msg.role != "🧑‍💻" { Spacer() }
             }
 
-            if isAdvancedMode, msg.role == "🤖", let p = msg.perf {
-                let text = String(
-                    format: "%.2f tok/sec · %d tokens · %.2fs to first token",
-                    p.avgTokPerSec,
-                    p.tokenCount,
-                    p.timeToFirst
-                )
-                Text(text)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
+
+            messageMetadataRow
+
+            if msg.isBookmarked {
+                HStack(spacing: 4) {
+                    Image(systemName: "bookmark.fill")
+                        .font(.caption2)
+                    Text(LocalizedStringKey("Bookmarked"))
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(Color.accentColor)
+                .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
+                .accessibilityElement(children: .combine)
             }
 
-            Text(msg.timestamp, style: .time)
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
-
-            if let citations = msg.citations, !citations.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "doc.text.magnifyingglass").font(.caption)
-                            Text("\(citations.count)")
-                                .font(.caption2).bold()
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color(.systemGray6))
-                        .clipShape(Capsule())
-                        ForEach(Array(citations.enumerated()), id: \.offset) { idx, citation in
-                            CitationButton(index: idx + 1, text: citation.text, source: citation.source)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                }
-                .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
-            } else if msg.ragInjectionInfo == nil, let ctx = msg.retrievedContext, !ctx.isEmpty {
-                let parts = ctx
-                    .components(separatedBy: "\n\n")
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "doc.text.magnifyingglass").font(.caption)
-                            Text("\(parts.count)")
-                                .font(.caption2).bold()
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color(.systemGray6))
-                        .clipShape(Capsule())
-                        ForEach(Array(parts.enumerated()), id: \.offset) { idx, t in
-                            CitationButton(index: idx + 1, text: t, source: nil)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                }
-                .padding(msg.role == "🧑‍💻" ? .trailing : .leading, 12)
-            }
+            messageReceiptBadges
         }
         .macWindowDragDisabled()
 #if os(macOS)
@@ -10594,16 +13588,98 @@ struct MessageView: View {
                 .allowsHitTesting(false)
                 .scaleEffect(1.02)
                 
-                Button(action: { copyMessageToPasteboard() }) {
-                    Label(copiedMessage ? "Copied!" : "Copy", systemImage: copiedMessage ? "checkmark" : "doc.on.doc")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(Color.accentColor.opacity(0.15))
-                        .foregroundColor(.accentColor)
-                        .clipShape(Capsule())
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        Button(action: { copyMessageToPasteboard() }) {
+                            Label(copiedMessage ? "Copied!" : "Copy", systemImage: copiedMessage ? "checkmark" : "doc.on.doc")
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Color.accentColor.opacity(0.15))
+                                .foregroundColor(.accentColor)
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        Button(action: toggleMessageBookmark) {
+                            Label(
+                                msg.isBookmarked ? LocalizedStringKey("Remove Bookmark") : LocalizedStringKey("Bookmark Message"),
+                                systemImage: msg.isBookmarked ? "bookmark.slash" : "bookmark"
+                            )
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.secondary.opacity(0.12))
+                            .foregroundColor(.primary)
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        Button(action: pinMessageToScratchpad) {
+                            Label(
+                                pinnedToScratchpad ? LocalizedStringKey("Pinned to Scratchpad") : LocalizedStringKey("Pin to Scratchpad"),
+                                systemImage: pinnedToScratchpad ? "checkmark" : "note.text.badge.plus"
+                            )
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.secondary.opacity(0.12))
+                            .foregroundColor(.primary)
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        Button(action: branchFromMessage) {
+                            Label("Branch", systemImage: "arrow.triangle.branch")
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Color.secondary.opacity(0.12))
+                                .foregroundColor(.primary)
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        if canRegenerateMessage {
+                            Button(action: regenerateMessage) {
+                                Label("Regenerate", systemImage: "arrow.clockwise")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.secondary.opacity(0.12))
+                                    .foregroundColor(.primary)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        if canAuditMessage {
+                            Button(action: auditMessage) {
+                                Label("Audit", systemImage: "checkmark.shield")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.secondary.opacity(0.12))
+                                    .foregroundColor(.primary)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        if canAskWithAnotherModel {
+                            Button(action: askWithAnotherModel) {
+                                Label("Try Model", systemImage: "rectangle.2.swap")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.secondary.opacity(0.12))
+                                    .foregroundColor(.primary)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
-                .buttonStyle(.plain)
             }
             .padding(16)
             .background(.ultraThinMaterial)
@@ -10674,25 +13750,107 @@ struct MessageView: View {
         }
 #endif
 #if os(macOS)
-        .overlay(alignment: msg.role == "🧑‍💻" ? .bottomTrailing : .bottomLeading) {
+        .overlay(alignment: .bottomTrailing) {
             if hoverCopyVisible && !showCopyPopup && !suppressHoverCopy {
-                Button(action: copyMessageToPasteboard) {
-                    Label(copiedMessage ? "Copied!" : "Copy", systemImage: copiedMessage ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 13, weight: .semibold))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .foregroundStyle(Color.accentColor)
-                        .background(.thinMaterial, in: Capsule())
+                HStack(spacing: 0) {
+                    // Copy — shows label for feedback clarity
+                    Button(action: copyMessageToPasteboard) {
+                        HStack(spacing: 5) {
+                            Image(systemName: copiedMessage ? "checkmark" : "doc.on.doc")
+                            Text(copiedMessage ? "Copied" : "Copy")
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .foregroundStyle(copiedMessage ? Color.green : Color.primary.opacity(0.75))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Copy message")
+
+                    Color.primary.opacity(0.1).frame(width: 1, height: 16)
+
+                    Button(action: toggleMessageBookmark) {
+                        Image(systemName: msg.isBookmarked ? "bookmark.fill" : "bookmark")
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .foregroundStyle(msg.isBookmarked ? Color.primary.opacity(0.85) : Color.primary.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help(msg.isBookmarked ? "Remove Bookmark" : "Bookmark")
+                    .accessibilityLabel(msg.isBookmarked ? "Remove Bookmark" : "Bookmark Message")
+
+                    Button(action: pinMessageToScratchpad) {
+                        Image(systemName: pinnedToScratchpad ? "checkmark" : "note.text.badge.plus")
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .foregroundStyle(pinnedToScratchpad ? Color.primary.opacity(0.85) : Color.primary.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help(pinnedToScratchpad ? "Pinned to Scratchpad" : "Pin to Scratchpad")
+                    .accessibilityLabel(pinnedToScratchpad ? "Pinned to Scratchpad" : "Pin to Scratchpad")
+
+                    Button(action: branchFromMessage) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .foregroundStyle(Color.primary.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Branch Conversation")
+                    .accessibilityLabel("Branch Conversation")
+
+                    if canRegenerateMessage {
+                        Color.primary.opacity(0.1).frame(width: 1, height: 16)
+                        Button(action: regenerateMessage) {
+                            Image(systemName: "arrow.clockwise")
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .foregroundStyle(Color.primary.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Regenerate Response")
+                        .accessibilityLabel("Regenerate Response")
+                    }
+
+                    if canAuditMessage {
+                        Button(action: auditMessage) {
+                            Image(systemName: "checkmark.shield")
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .foregroundStyle(Color.primary.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Audit Answer")
+                        .accessibilityLabel("Audit Answer")
+                    }
+
+                    if canAskWithAnotherModel {
+                        Button(action: askWithAnotherModel) {
+                            Image(systemName: "rectangle.2.swap")
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .foregroundStyle(Color.primary.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Ask with Another Model")
+                        .accessibilityLabel("Ask with Another Model")
+                    }
                 }
-                .buttonStyle(.plain)
-                .labelStyle(.titleAndIcon)
-                .accessibilityLabel("Copy message")
-                .offset(y: 20)
-                .transition(.opacity.combined(with: .scale))
+                .font(.system(size: 12, weight: .medium))
+                .fixedSize()
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(.regularMaterial)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .stroke(Color.primary.opacity(0.09), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.1), radius: 5, x: 0, y: 2)
+                .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottomTrailing)))
             }
         }
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.18)) {
+            withAnimation(.easeInOut(duration: 0.14)) {
                 hoverCopyVisible = hovering
             }
             if !hovering {
@@ -10717,6 +13875,47 @@ struct MessageView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Pin message")
+
+                    Button(action: pinMessageToScratchpad) {
+                        Image(systemName: pinnedToScratchpad ? "checkmark" : "note.text.badge.plus")
+                            .font(.system(size: 18, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(pinnedToScratchpad ? "Pinned to Scratchpad" : "Pin to Scratchpad")
+
+                    Button(action: branchFromMessage) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.system(size: 18, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Branch Conversation")
+
+                    if canRegenerateMessage {
+                        Button(action: regenerateMessage) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 18, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Regenerate Response")
+                    }
+
+                    if canAuditMessage {
+                        Button(action: auditMessage) {
+                            Image(systemName: "checkmark.shield")
+                                .font(.system(size: 18, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Audit Answer")
+                    }
+
+                    if canAskWithAnotherModel {
+                        Button(action: askWithAnotherModel) {
+                            Image(systemName: "rectangle.2.swap")
+                                .font(.system(size: 18, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Ask with Another Model")
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
@@ -10785,6 +13984,37 @@ struct MessageView: View {
             }
         }
 #endif
+        .sheet(item: $transcriptReviewAttachment) { attachment in
+            TranscriptReviewSheet(
+                attachment: attachment,
+                allowsEditing: true,
+                onSaveEdits: { title, transcriptText in
+                    vm.updateMessageMediaTranscript(
+                        messageID: msg.id,
+                        attachmentID: attachment.id,
+                        title: title,
+                        transcriptText: transcriptText
+                    )
+                },
+                onQuickAction: { action in
+                    copyTranscriptToPasteboard(action.prompt(for: attachment.transcript?.displaySourceName ?? attachment.originalFilename))
+                },
+                onSaveNewDataset: {
+                    saveTranscriptAttachment(attachment)
+                },
+                onSaveExistingDataset: {
+                    existingDatasetSaveAttachment = attachment
+                }
+            )
+        }
+        .sheet(item: $existingDatasetSaveAttachment) { attachment in
+            TranscriptDatasetPickerSheet(datasets: vm.datasetManager?.datasets ?? []) { dataset in
+                saveTranscriptAttachment(attachment, toExistingDataset: dataset)
+            }
+        }
+        .sheet(isPresented: $showEvidenceSheet) {
+            MessageEvidenceSheet(message: msg)
+        }
 #if os(visionOS)
         .contextMenu {
             Button {
@@ -10793,12 +14023,492 @@ struct MessageView: View {
                 Label("Copy", systemImage: "doc.on.doc")
             }
             Button {
+                toggleMessageBookmark()
+            } label: {
+                Label(msg.isBookmarked ? "Remove Bookmark" : "Bookmark Message", systemImage: msg.isBookmarked ? "bookmark.slash" : "bookmark")
+            }
+            Button {
                 pinMessage()
             } label: {
                 Label("Pin", systemImage: "pin")
             }
+            Button {
+                pinMessageToScratchpad()
+            } label: {
+                Label("Pin to Scratchpad", systemImage: "note.text.badge.plus")
+            }
+            Button {
+                branchFromMessage()
+            } label: {
+                Label("Branch", systemImage: "arrow.triangle.branch")
+            }
+            if canRegenerateMessage {
+                Button {
+                    regenerateMessage()
+                } label: {
+                    Label("Regenerate", systemImage: "arrow.clockwise")
+                }
+            }
+            if canAuditMessage {
+                Button {
+                    auditMessage()
+                } label: {
+                    Label("Audit", systemImage: "checkmark.shield")
+                }
+            }
+            if canAskWithAnotherModel {
+                Button {
+                    askWithAnotherModel()
+                } label: {
+                    Label("Try Model", systemImage: "rectangle.2.swap")
+                }
+            }
         }
 #endif
+    }
+
+    private struct MessageEvidenceSheet: View {
+        let message: ChatVM.Msg
+        @Environment(\.dismiss) private var dismiss
+
+        private var retrievedChunks: [String] {
+            (message.retrievedContext ?? "")
+                .components(separatedBy: "\n\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+
+        private var citationCount: Int { message.citations?.count ?? 0 }
+        // Exclude the `noema.web.retrieve` call from the tool-call tally; web
+        // searches are represented by their results (`webCount`) so the call
+        // itself isn't double-counted. Other tool calls each count as one.
+        private var toolCount: Int { message.toolCalls?.filter { $0.toolName != "noema.web.retrieve" }.count ?? 0 }
+        private var webCount: Int { message.webHits?.count ?? 0 }
+        private var imageCount: Int { message.imagePaths?.count ?? 0 }
+        private var mediaCount: Int { message.mediaAttachments?.count ?? 0 }
+
+        // RAG surfaces the same chunks as citations, the joined retrievedContext,
+        // and the ragInjectionInfo summary. Count them once (as the chunk count)
+        // so the total matches the number of retrieved chunks.
+        private var ragChunkCount: Int { message.citations?.count ?? retrievedChunks.count }
+
+        private var evidenceItemCount: Int {
+            ragChunkCount + toolCount + webCount + imageCount + mediaCount
+        }
+
+        var body: some View {
+#if os(macOS)
+            // macOS sheets collapse a NavigationStack+List to near-zero height;
+            // use an explicit header + sized list instead.
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Evidence")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                Divider().opacity(0.5)
+                List {
+                    summarySection
+                    retrievalSection
+                    citationsSection
+                    retrievedContextSection
+                    toolCallsSection
+                    webResultsSection
+                    attachmentsSection
+                }
+                .listStyle(.inset)
+            }
+            .frame(minWidth: 520, idealWidth: 600, maxWidth: 680, minHeight: 440, idealHeight: 560, maxHeight: 680)
+#else
+            NavigationStack {
+                List {
+                    summarySection
+                    retrievalSection
+                    citationsSection
+                    retrievedContextSection
+                    toolCallsSection
+                    webResultsSection
+                    attachmentsSection
+                }
+                .navigationTitle(Text("Evidence"))
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") {
+                            dismiss()
+                        }
+                    }
+                }
+            }
+#endif
+        }
+
+        @ViewBuilder
+        private var summarySection: some View {
+            Section {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 8)], spacing: 8) {
+                    summaryChip(title: "Evidence", value: String(evidenceItemCount), icon: "list.bullet.rectangle")
+                    summaryChip(title: "Citations", value: String(citationCount), icon: "quote.bubble")
+                    summaryChip(title: "Tool Calls", value: String(toolCount), icon: "wrench.and.screwdriver")
+                    summaryChip(title: "Web Results", value: String(webCount), icon: "globe")
+                    summaryChip(title: "Attachments", value: String(imageCount + mediaCount), icon: "paperclip")
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+            } header: {
+                Text("Evidence Summary")
+            }
+        }
+
+        @ViewBuilder
+        private var retrievalSection: some View {
+            if let info = message.ragInjectionInfo {
+                Section {
+                    detailRow("Dataset", value: info.datasetName)
+                    detailRow("Method", value: retrievalMethodText(info.method))
+                    detailRow("Stage", value: retrievalStageText(info.stage))
+                    detailRow("Chunks", value: "\(info.injectedChunkCount) / \(info.retrievedChunkCount)")
+                    detailRow("Injected Tokens", value: "\(info.injectedContextTokens)")
+                    detailRow("Prompt Budget", value: "\(info.contextBudgetTokens)")
+                    detailRow("Reserved Response", value: "\(info.reservedResponseTokens)")
+                    if !info.decisionReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        previewBlock(title: "Decision", text: info.decisionReason)
+                    }
+                } header: {
+                    Text("Retrieval Decision")
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var citationsSection: some View {
+            if let citations = message.citations, !citations.isEmpty {
+                Section {
+                    ForEach(Array(citations.enumerated()), id: \.offset) { index, citation in
+                        CitationRow(index: index + 1, citation: citation)
+                    }
+                } header: {
+                    Text("Citations")
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var retrievedContextSection: some View {
+            // RAG surfaces the same chunks as citations, so only show the raw
+            // retrieved context when there are no citations — otherwise it just
+            // duplicates the Citations section above.
+            if (message.citations?.isEmpty ?? true), !retrievedChunks.isEmpty {
+                Section {
+                    ForEach(Array(retrievedChunks.enumerated()), id: \.offset) { index, chunk in
+                        previewBlock(title: "#\(index + 1)", text: chunk)
+                    }
+                } header: {
+                    Text("Retrieved Context")
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var toolCallsSection: some View {
+            // Web searches are surfaced in their own Web Results section, so drop
+            // the `noema.web.retrieve` call here to match the Tool Calls tally.
+            let toolCalls = (message.toolCalls ?? []).filter { $0.toolName != "noema.web.retrieve" }
+            if !toolCalls.isEmpty {
+                Section {
+                    ForEach(toolCalls) { tool in
+                        VStack(alignment: .leading, spacing: 7) {
+                            HStack(spacing: 8) {
+                                Image(systemName: tool.iconName)
+                                    .font(.caption)
+                                    .foregroundStyle(Color.accentColor)
+                                Text(verbatim: tool.displayName)
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                                Text(verbatim: tool.phase.rawValue.capitalized)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(tool.phase == .failed ? .orange : .secondary)
+                            }
+                            let entries = ToolCallViewSupport.parameterSummaryEntries(
+                                from: tool.requestParams,
+                                maxEntries: 3,
+                                maxValueLength: 80
+                            )
+                            if !entries.isEmpty {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Parameters")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    ForEach(entries) { entry in
+                                        detailRow(Text(verbatim: entry.key), value: entry.value)
+                                    }
+                                }
+                            }
+                            if let error = tool.error?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty {
+                                previewBlock(title: "Error", text: error, tint: .orange)
+                            } else if let result = tool.result?.trimmingCharacters(in: .whitespacesAndNewlines), !result.isEmpty {
+                                previewBlock(title: "Result", text: ToolCallViewSupport.formatRawResult(result))
+                            } else {
+                                detailRow("Result", value: String(localized: "No result"))
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    Text("Tool Calls")
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var webResultsSection: some View {
+            if let webHits = message.webHits, !webHits.isEmpty {
+                Section {
+                    ForEach(webHits, id: \.id) { hit in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: hit.title)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(2)
+                            HStack(spacing: 10) {
+                                detailPill(title: "Engine", value: hit.engine)
+                                detailPill(title: "Score", value: String(format: "%.2f", hit.score))
+                            }
+                            if !hit.snippet.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text(verbatim: compactPreview(hit.snippet))
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                                    .textSelection(.enabled)
+                            }
+                            if let url = URL(string: hit.url) {
+                                Link(destination: url) {
+                                    Label("URL", systemImage: "link")
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                }
+                            } else {
+                                detailRow("URL", value: hit.url)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    Text("Web Results")
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var attachmentsSection: some View {
+            if imageCount > 0 || mediaCount > 0 {
+                Section {
+                    if let imagePaths = message.imagePaths, !imagePaths.isEmpty {
+                        ForEach(Array(imagePaths.enumerated()), id: \.offset) { index, path in
+                            HStack(spacing: 10) {
+                                Image(systemName: "photo")
+                                    .foregroundStyle(Color.accentColor)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Images")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(verbatim: URL(fileURLWithPath: path).lastPathComponent.isEmpty ? "#\(index + 1)" : URL(fileURLWithPath: path).lastPathComponent)
+                                        .font(.footnote)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+                    if let mediaAttachments = message.mediaAttachments, !mediaAttachments.isEmpty {
+                        ForEach(mediaAttachments) { attachment in
+                            HStack(spacing: 10) {
+                                Image(systemName: attachment.kind.iconName)
+                                    .foregroundStyle(Color.accentColor)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(verbatim: attachment.transcript?.displaySourceName ?? attachment.originalFilename)
+                                        .font(.footnote.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(verbatim: [attachment.kind.title, attachment.mediaDetailLabel].compactMap(\.self).joined(separator: " / "))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Attachments")
+                }
+            }
+        }
+
+        private func summaryChip(title: LocalizedStringKey, value: String, icon: String) -> some View {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(value)
+                        .font(.caption.monospacedDigit().weight(.bold))
+                    Text(title)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.secondary.opacity(0.08))
+            )
+        }
+
+        private func detailRow(_ label: LocalizedStringKey, value: String) -> some View {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Text(verbatim: value)
+                    .font(.caption.weight(.semibold))
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(2)
+            }
+        }
+
+        private func detailRow(_ label: Text, value: String) -> some View {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                label
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Text(verbatim: value)
+                    .font(.caption.weight(.semibold))
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(2)
+            }
+        }
+
+        private func detailPill(title: LocalizedStringKey, value: String) -> some View {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(verbatim: value)
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.secondary.opacity(0.10)))
+        }
+
+        private func previewBlock(title: LocalizedStringKey, text: String, tint: Color = .secondary) -> some View {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(verbatim: compactPreview(text))
+                    .font(.footnote)
+                    .foregroundStyle(tint)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        private func retrievalMethodText(_ method: ChatVM.Msg.RAGInjectionInfo.Method?) -> String {
+            switch method {
+            case .fullContent:
+                return String(localized: "Full Content")
+            case .rag:
+                return String(localized: "RAG")
+            case .none:
+                return String(localized: "Unknown")
+            }
+        }
+
+        private func retrievalStageText(_ stage: ChatVM.Msg.RAGInjectionInfo.Stage) -> String {
+            switch stage {
+            case .deciding:
+                return String(localized: "Deciding")
+            case .chosen:
+                return String(localized: "Chosen")
+            case .injected:
+                return String(localized: "Injected")
+            }
+        }
+
+        private func compactPreview(_ text: String, limit: Int = 420) -> String {
+            let cleaned = text
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            guard cleaned.count > limit else { return cleaned }
+            return String(cleaned.prefix(limit)) + "..."
+        }
+
+        /// A single citation in the evidence sheet. Tapping the row toggles
+        /// between a compact preview and the full chunk text.
+        private struct CitationRow: View {
+            let index: Int
+            let citation: ChatVM.Msg.Citation
+            @State private var expanded = false
+
+            var body: some View {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(verbatim: "#\(index)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Color.accentColor)
+                        Text(verbatim: sourceLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        if let score = citation.score {
+                            Text(String(format: "%.2f", score))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(verbatim: expanded ? citation.text : preview)
+                        .font(.footnote)
+                        .lineLimit(expanded ? nil : 4)
+                        .textSelection(.enabled)
+                }
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+                }
+            }
+
+            private var sourceLabel: String {
+                if let source = citation.source?.trimmingCharacters(in: .whitespacesAndNewlines), !source.isEmpty {
+                    return source
+                }
+                return String(localized: "No source")
+            }
+
+            private var preview: String {
+                let cleaned = citation.text
+                    .components(separatedBy: .whitespacesAndNewlines)
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
+                guard cleaned.count > 420 else { return cleaned }
+                return String(cleaned.prefix(420)) + "..."
+            }
+        }
     }
 
     struct ChatView: View {
@@ -10808,13 +14518,13 @@ struct MessageView: View {
         @EnvironmentObject var tabRouter: TabRouter
         @EnvironmentObject var walkthrough: GuidedWalkthroughManager
         @AppStorage("isAdvancedMode") private var isAdvancedMode = false
+    @AppStorage("showGenerationDiagnostics") private var showGenerationDiagnostics = true
 #if os(macOS)
         @State private var inputFocused = false
 #else
         @FocusState private var inputFocused: Bool
 #endif
         @State private var showSidebar = false
-        @State private var showPercent = false
         @State private var sessionToDelete: ChatVM.Session?
         @State private var shouldAutoScrollToBottom: Bool = true
         // Suggestion overlay state
@@ -10823,12 +14533,61 @@ struct MessageView: View {
         @State private var showModelRequiredAlert = false
         @State private var showContextOverflowAlert = false
         @State private var showMemoryPromptBudgetAlert = false
+        @State private var showRuntimeInfo = false
         @State private var quickLoadInProgress: LocalModel.ID?
+        /// Local draft text for the input box. Using @State instead of @Binding to
+        /// vm.prompt means keystrokes do NOT fire ChatVM.objectWillChange, so the
+        /// whole message list (including every MessageView / ToolCallView) is never
+        /// re-rendered while the user is typing.
+        @State private var draftText: String = ""
+        @State private var chatRecallQuery = ""
+        @State private var showScratchpad = false
+        @State private var scratchpadDraft = ""
+        @State private var showChatInstructions = false
+        @State private var chatInstructionsDraft = ""
+        @State private var showChatSnapshot = false
+        @State private var showChatExportPack = false
+        @State private var showContextPlan = false
 #if os(macOS)
         @EnvironmentObject private var macChatChrome: MacChatChromeState
         @State private var advancedSettings = ModelSettings()
         @State private var suppressSidebarSave = false
+        /// True while the first send of a fresh chat is gliding the composer
+        /// from the centered canvas down to the bottom bar. The actual send is
+        /// deferred until this animation finishes — prompt prefill saturates
+        /// CPU/GPU and would starve the animation to a few frames otherwise.
+        @State private var macComposerHandOff = false
 #endif
+
+        private struct BookmarkedMessageReference: Identifiable {
+            let session: ChatVM.Session
+            let message: ChatVM.Msg
+
+            var id: UUID { message.id }
+        }
+
+        private struct ChatRecallResult: Identifiable {
+            let session: ChatVM.Session
+            let message: ChatVM.Msg
+            let score: Int
+
+            var id: String { "\(session.id.uuidString)-\(message.id.uuidString)" }
+        }
+
+        private struct ChatSnapshotRow: Identifiable {
+            let id = UUID()
+            let title: String
+            let value: String
+        }
+
+        private struct ContextPlanRow: Identifiable {
+            let id: UUID
+            let roleTitle: String
+            let preview: String
+            let tokenCount: Int
+            let statusKey: String
+            let tint: Color
+        }
 
         private var inputFocusBinding: Binding<Bool> {
             Binding(
@@ -10844,55 +14603,82 @@ struct MessageView: View {
             @Binding var showModelRequiredAlert: Bool
             let send: () -> Void
             let stop: () -> Void
+            let stopAfterParagraph: () -> Void
             let canStop: Bool
+            let stopAfterParagraphPending: Bool
             @EnvironmentObject var vm: ChatVM
             @EnvironmentObject var modelManager: AppModelManager
             @EnvironmentObject var tabRouter: TabRouter
+            @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+            @ObservedObject private var settings = SettingsStore.shared
+            @AppStorage("chatStatusBarExpanded") private var statusBarExpanded = false
+            @AppStorage("isAdvancedMode") private var isAdvancedMode = false
+            @AppStorage("showGenerationDiagnostics") private var showGenerationDiagnostics = true
             @State private var showSmallCtxAlert: Bool = false
             @State private var measuredHeight: CGFloat = 0
             @State private var recentlyAddedImageURL: URL?
             @State private var pendingImageFeedbackTask: Task<Void, Never>?
+            @State private var transcriptSaveFeedback: [ChatMediaAttachment.ID: TranscriptSaveFeedback] = [:]
+            @State private var transcriptReviewAttachment: ChatMediaAttachment?
+            @State private var pendingRemovalAttachment: ChatMediaAttachment?
+            @State private var existingDatasetSaveAttachment: ChatMediaAttachment?
+            @State private var remoteUploadConfirmationAttachment: ChatMediaAttachment?
 #if os(iOS)
             @AppStorage(ChatSendBehavior.storageKey) private var chatSendBehaviorRaw = ChatSendBehavior.defaultValue.rawValue
+            @AppStorage("compactChatModeEnabled") private var compactChatModeEnabled = false
 #endif
             private struct InputHeightPreferenceKey: PreferenceKey {
                 static var defaultValue: CGFloat { 0 }
                 static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
             }
             // Keep the input aligned with surrounding buttons; slightly shorter on macOS.
-            private let controlHeight: CGFloat = {
+            private var usesCompactComposer: Bool {
+#if os(iOS)
+                compactChatModeEnabled && horizontalSizeClass == .compact
+#else
+                false
+#endif
+            }
+
+            private var controlHeight: CGFloat {
 #if os(macOS)
                 return 40
+#elseif os(iOS)
+                return usesCompactComposer ? 42 : 48
 #else
                 return 48
 #endif
-            }()
+            }
             // Let the composer grow up to 2x its base control height, then rely on
             // the text input's internal scrolling for additional lines.
             private var inputMaxHeight: CGFloat {
                 controlHeight * 2
             }
-            private let inputVerticalPadding: CGFloat = {
+            private var inputVerticalPadding: CGFloat {
 #if os(macOS)
                 return 4
 #else
-                return 4
+                return usesCompactComposer ? 3 : 4
 #endif
-            }()
-            private let inputBottomInset: CGFloat = {
+            }
+            private var inputBottomInset: CGFloat {
 #if os(macOS)
                 return 4
 #else
-                return 2
+                return usesCompactComposer ? 1 : 2
 #endif
-            }()
-            private let inputOuterVerticalPadding: CGFloat = {
+            }
+            private var inputOuterVerticalPadding: CGFloat {
 #if os(macOS)
                 return 8
 #else
-                return 2
+                return usesCompactComposer ? 1 : 2
 #endif
-            }()
+            }
+
+            private var accessoryRowSpacing: CGFloat {
+                usesCompactComposer ? 5 : 8
+            }
 
             private var resolvedHeight: CGFloat {
                 let minContent = max(controlHeight - (inputOuterVerticalPadding * 2), 0)
@@ -10935,8 +14721,118 @@ struct MessageView: View {
                 !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
 
+            private struct RuntimeStatus {
+                let title: String
+                let detail: String
+                let icon: String
+                let tint: Color
+            }
+
+            private struct ContextMeterSnapshot {
+                let typedTokens: Int
+                let historyTokens: Int
+                let retrievalTokens: Int
+                let imageTokens: Int
+                let reservedResponseTokens: Int
+                let usablePromptTokens: Int
+
+                var usedTokens: Int {
+                    typedTokens + historyTokens + retrievalTokens + imageTokens
+                }
+
+                var fraction: Double {
+                    guard usablePromptTokens > 0 else { return 0 }
+                    return min(1, Double(usedTokens) / Double(usablePromptTokens))
+                }
+
+                var tint: Color {
+                    if fraction >= 0.92 { return .red }
+                    if fraction >= 0.75 { return .orange }
+                    return .green
+                }
+            }
+
+            private var runtimeStatus: RuntimeStatus {
+                if vm.loading || vm.stillLoading {
+                    return RuntimeStatus(
+                        title: String(localized: "Loading model"),
+                        detail: modelManager.loadedModel?.name ?? String(localized: "Preparing runtime"),
+                        icon: "hourglass",
+                        tint: .orange
+                    )
+                }
+
+                if let model = resolvedLoadedModel {
+                    let format = vm.loadedModelFormat?.displayName ?? model.format.displayName
+                    let title = vm.canAcceptChatInput ? String(localized: "Ready") : String(localized: "Model selected")
+                    return RuntimeStatus(
+                        title: title,
+                        detail: "\(model.name) · \(format)",
+                        icon: vm.canAcceptChatInput ? "checkmark.circle.fill" : "circle.dashed",
+                        tint: vm.canAcceptChatInput ? .green : .gray
+                    )
+                }
+
+                if vm.canAcceptChatInput {
+                    return RuntimeStatus(
+                        title: String(localized: "Remote ready"),
+                        detail: String(localized: "Connected backend"),
+                        icon: "network",
+                        tint: .green
+                    )
+                }
+
+                return RuntimeStatus(
+                    title: String(localized: "No model loaded"),
+                    detail: String(localized: "Select a model to start chatting."),
+                    icon: "exclamationmark.circle",
+                    tint: .gray
+                )
+            }
+
+            private var resolvedLoadedModel: LocalModel? {
+                if let model = modelManager.loadedModel {
+                    return model
+                }
+                guard let url = vm.loadedModelURL else { return nil }
+                return modelManager.downloadedModels.first { candidate in
+                    candidate.url == url || candidate.url.path == url.path
+                }
+            }
+
+            private var latestRAGInfo: ChatVM.Msg.RAGInjectionInfo? {
+                vm.streamMsgs.reversed().first { $0.ragInjectionInfo != nil }?.ragInjectionInfo
+            }
+
+            private var contextMeterSnapshot: ContextMeterSnapshot {
+                let budget = ChatVM.promptBudget(for: vm.contextLimit)
+                let activeMessages = Array(vm.streamMsgs.suffix(10))
+                let historyTokens = activeMessages.reduce(0) { total, message in
+                    total + estimatedTokenCount(message.text)
+                }
+                let mediaTranscriptTokens = vm.pendingMediaAttachments.reduce(0) { total, attachment in
+                    total + estimatedTokenCount(attachment.transcript?.effectiveTranscriptText ?? "")
+                }
+                let typedTokens = estimatedTokenCount(text) + mediaTranscriptTokens
+                let retrievalTokens = latestRAGInfo?.injectedContextTokens ?? 0
+                let imageTokens = vm.pendingImageURLs.count * 576
+
+                return ContextMeterSnapshot(
+                    typedTokens: typedTokens,
+                    historyTokens: historyTokens,
+                    retrievalTokens: retrievalTokens,
+                    imageTokens: imageTokens,
+                    reservedResponseTokens: budget.reservedResponseTokens,
+                    usablePromptTokens: budget.usablePromptTokens
+                )
+            }
+
+            private var hasCompletedMediaTranscript: Bool {
+                vm.pendingMediaAttachments.contains(where: \.hasCompletedTranscript)
+            }
+
             private var canKeyboardSubmit: Bool {
-                hasText && !canStop && !vm.isStreamingInAnotherSession && !(vm.loading || vm.stillLoading)
+                (hasText || hasCompletedMediaTranscript) && !canStop && !vm.isStreamingInAnotherSession && !(vm.loading || vm.stillLoading)
             }
 
             private var chatSendBehavior: ChatSendBehavior {
@@ -10994,14 +14890,110 @@ struct MessageView: View {
                 send()
                 text = ""
             }
-            
-            
+
+            /// Extracted so `composerRow` stays type-checkable; macOS uses a clean
+            /// filled circle while iOS/visionOS keep the glass pill treatment.
+            @ViewBuilder
+            private func sendButtonLabel(canSend: Bool) -> some View {
+#if os(macOS)
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: controlHeight - 8, height: controlHeight - 8)
+                    .background(
+                        Circle().fill(
+                            canSend
+                                ? Color.accentColor
+                                : Color.primary.opacity(0.08)
+                        )
+                    )
+                    .foregroundStyle(canSend ? Color.white : Color.secondary)
+                    .frame(width: controlHeight, height: controlHeight)
+                    .contentShape(Circle())
+#else
+                let sendShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+                Image(systemName: "paperplane.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(width: controlHeight, height: controlHeight)
+                    .background(
+                        sendShape
+                            .fill(Color.clear)
+                            .glassifyIfAvailable(in: sendShape)
+                            .overlay(
+                                sendShape.fill(
+                                    canSend
+                                        ? Color.accentColor.opacity(0.36)
+                                        : Color.white.opacity(0.06)
+                                )
+                            )
+                            .overlay(
+                                sendShape.strokeBorder(
+                                    canSend
+                                        ? Color.accentColor.opacity(0.44)
+                                        : Color.white.opacity(0.22),
+                                    lineWidth: 0.8
+                                )
+                            )
+                            .shadow(
+                                color: canSend ? Color.accentColor.opacity(0.28) : .clear,
+                                radius: canSend ? 10 : 0,
+                                y: canSend ? 5 : 0
+                            )
+                    )
+                    .foregroundStyle(canSend ? Color.white : Color.secondary)
+#endif
+            }
+
+
             var body: some View {
-                HStack(alignment: .bottom, spacing: 8) {
+#if os(macOS)
+                macUnifiedInputContainer
+#else
+                VStack(spacing: accessoryRowSpacing) {
+                    statusBarRow
+                    composerRow
+                }
+#endif
+            }
+
+#if os(macOS)
+            /// One clean composer surface: the input row sits on a single card
+            /// and the runtime status collapses into a quiet footer line.
+            private var macUnifiedInputContainer: some View {
+                VStack(spacing: 0) {
+                    composerRow
+                        .padding(.horizontal, 10)
+                        .padding(.top, 8)
+                        .padding(.bottom, 2)
+                    statusBarRow
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: ChatTheme.composerRadius, style: .continuous)
+                        .fill(ChatTheme.cardSurface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: ChatTheme.composerRadius, style: .continuous)
+                        .stroke(ChatTheme.hairline, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: ChatTheme.composerRadius, style: .continuous))
+                .shadow(color: Color.black.opacity(0.04), radius: 10, x: 0, y: 3)
+            }
+#endif
+
+            @ViewBuilder
+            private var statusBarRow: some View {
+                if usesCompactComposer {
+                    compactComposerStatusRow
+                } else {
+                    runtimeStatusBar
+                }
+            }
+
+            private var composerRow: some View {
+                HStack(alignment: .center, spacing: 8) {
 #if os(macOS)
                     VisionAttachmentButton(
-                        showWebSearchOption: true,
-                        showPythonOption: true,
+                        showWebSearchOption: false,
+                        showPythonOption: false,
                         showPlusIcon: true,
                         onModelRequiredTap: {
                             showModelRequiredAlert = true
@@ -11009,12 +15001,12 @@ struct MessageView: View {
                         }
                     )
                         .guideHighlight(.chatWebSearch)
-                        .padding(.trailing, 2)
+                        .frame(width: controlHeight, height: controlHeight)
 #endif
 #if os(iOS) || os(visionOS)
                     VisionAttachmentButton(
-                        showWebSearchOption: true,
-                        showPythonOption: true,
+                        showWebSearchOption: false,
+                        showPythonOption: false,
                         showPlusIcon: true,
                         onModelRequiredTap: {
                             showModelRequiredAlert = true
@@ -11026,10 +15018,15 @@ struct MessageView: View {
 #endif
                     let isChatReady = hasActiveChatModel
                     let isComposerBusy = vm.loading || vm.stillLoading
-                    VStack(spacing: 8) {
+                    VStack(spacing: accessoryRowSpacing) {
                         // Images displayed above the text field
                         if UIConstants.showMultimodalUI && vm.supportsImageInput && !vm.pendingImageURLs.isEmpty {
                             pendingImagesTray
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                        if !vm.pendingMediaAttachments.isEmpty || vm.audioRecordingError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                            pendingMediaTray
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
                         
                         // Input area with vision attachments and multi-line text entry
@@ -11120,7 +15117,12 @@ struct MessageView: View {
                                    alignment: .topLeading)
                             .frame(height: composerContainerHeight, alignment: .topLeading)
                             .clipShape(RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous))
+                            // macOS gets no inner stroke or glass — the editor sits
+                            // flush on the single composer card instead of nesting
+                            // surfaces.
+#if !os(macOS)
                             .glassPill(cornerRadius: composerCornerRadius)
+#endif
                             .frame(maxWidth: .infinity)
 #if os(iOS) || os(visionOS)
                             .overlay {
@@ -11135,8 +15137,16 @@ struct MessageView: View {
                                 }
                             }
 #endif
+
+#if canImport(AVFoundation)
+                            voiceRecordButton(isDisabled: isComposerBusy)
+#endif
                         }
                     }
+                    // Value-scoped: only fires when attachments are added/removed,
+                    // so typing never re-animates the row (see note below the HStack).
+                    .animation(.spring(response: 0.4, dampingFraction: 0.85), value: vm.pendingImageURLs.count)
+                    .animation(.spring(response: 0.4, dampingFraction: 0.85), value: vm.pendingMediaAttachments.count)
                     if canStop {
                         Button(action: stop) {
                             Image(systemName: "stop.fill")
@@ -11149,53 +15159,29 @@ struct MessageView: View {
                                 .foregroundColor(.white)
                         }
                         .buttonStyle(.plain) // Avoid default gray button chrome behind the custom red pill
+                        .accessibilityLabel(Text("Stop generating"))
+                        .transition(.scale(scale: 0.85).combined(with: .opacity))
                     } else {
                         let canSend = isChatReady
                             && !isComposerBusy
                             && !vm.isStreamingInAnotherSession
-                            && hasText
+                            && (hasText || hasCompletedMediaTranscript)
                         Button(action: {
                             performSend()
                         }) {
-                            let sendShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            Image(systemName: "paperplane.fill")
-                                .font(.system(size: 18, weight: .semibold))
-                                .frame(width: controlHeight, height: controlHeight)
-                                .background(
-                                    sendShape
-                                        .fill(Color.clear)
-                                        .glassifyIfAvailable(in: sendShape)
-                                        .overlay(
-                                            sendShape.fill(
-                                                canSend
-                                                    ? Color.accentColor.opacity(0.36)
-                                                    : Color.white.opacity(0.06)
-                                            )
-                                        )
-                                        .overlay(
-                                            sendShape.strokeBorder(
-                                                canSend
-                                                    ? Color.accentColor.opacity(0.44)
-                                                    : Color.white.opacity(0.22),
-                                                lineWidth: 0.8
-                                            )
-                                        )
-                                        .shadow(
-                                            color: canSend ? Color.accentColor.opacity(0.28) : .clear,
-                                            radius: canSend ? 10 : 0,
-                                            y: canSend ? 5 : 0
-                                        )
-                                )
-                                .foregroundStyle(canSend ? Color.white : Color.secondary)
+                            sendButtonLabel(canSend: canSend)
                         }
                         .accessibilityIdentifier("chat-send-button")
                         .buttonStyle(.plain)
-                        .disabled(!hasText || vm.isStreamingInAnotherSession || isComposerBusy)
+                        .disabled((!hasText && !hasCompletedMediaTranscript) || vm.isStreamingInAnotherSession || isComposerBusy)
+                        .transition(.scale(scale: 0.85).combined(with: .opacity))
                     }
                 }
                 // Avoid animating the entire input row on every keystroke,
                 // which caused attachment thumbnails to flicker.
-                // If animation is desired for send/stop swaps, animate those states specifically.
+                // The animations below are value-scoped to the send/stop swap only;
+                // keystrokes don't change `canStop`, so they can't re-trigger it.
+                .animation(.spring(response: 0.35, dampingFraction: 0.8), value: canStop)
                 .alert("Finish current response", isPresented: Binding(
                     get: { vm.crossSessionSendBlocked },
                     set: { vm.crossSessionSendBlocked = $0 }
@@ -11221,6 +15207,76 @@ struct MessageView: View {
                 } message: {
                     Text(LocalizedStringKey("Open Stored to choose a model to run locally or connect to a remote endpoint."))
                 }
+                .confirmationDialog(
+                    Text(LocalizedStringKey("Remove unsaved transcript?")),
+                    isPresented: Binding(
+                        get: { pendingRemovalAttachment != nil },
+                        set: { if !$0 { pendingRemovalAttachment = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button(LocalizedStringKey("Remove"), role: .destructive) {
+                        if let attachment = pendingRemovalAttachment {
+                            vm.removePendingMediaAttachment(id: attachment.id)
+                        }
+                        pendingRemovalAttachment = nil
+                    }
+                    Button(LocalizedStringKey("Cancel"), role: .cancel) {
+                        pendingRemovalAttachment = nil
+                    }
+                } message: {
+                    Text(LocalizedStringKey("This transcript has not been sent or saved yet."))
+                }
+                .confirmationDialog(
+                    Text(LocalizedStringKey("Upload media for remote transcription?")),
+                    isPresented: Binding(
+                        get: { remoteUploadConfirmationAttachment != nil },
+                        set: { if !$0 { remoteUploadConfirmationAttachment = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button(LocalizedStringKey("Upload and Transcribe")) {
+                        if let attachment = remoteUploadConfirmationAttachment {
+                            TranscriptionSettings.confirmRemoteUpload()
+                            vm.beginTranscribingPendingMediaAttachment(id: attachment.id)
+                        }
+                        remoteUploadConfirmationAttachment = nil
+                    }
+                    Button(LocalizedStringKey("Cancel"), role: .cancel) {
+                        remoteUploadConfirmationAttachment = nil
+                    }
+                } message: {
+                    Text(LocalizedStringKey("Remote ASR sends the selected media to your configured audio-language endpoint. Use it only with endpoints you trust."))
+                }
+                .sheet(item: $transcriptReviewAttachment) { attachment in
+                    TranscriptReviewSheet(
+                        attachment: latestPendingAttachment(matching: attachment) ?? attachment,
+                        allowsEditing: true,
+                        onSaveEdits: { title, transcriptText in
+                            vm.updatePendingMediaTranscript(id: attachment.id, title: title, transcriptText: transcriptText)
+                        },
+                        onQuickAction: { action in
+                            performTranscriptQuickAction(action, for: latestPendingAttachment(matching: attachment) ?? attachment)
+                        },
+                        onSaveNewDataset: {
+                            if let latest = latestPendingAttachment(matching: attachment) {
+                                saveTranscriptAttachment(latest)
+                            }
+                        },
+                        onSaveExistingDataset: {
+                            existingDatasetSaveAttachment = latestPendingAttachment(matching: attachment) ?? attachment
+                        }
+                    )
+                }
+                .sheet(item: $existingDatasetSaveAttachment) { attachment in
+                    TranscriptDatasetPickerSheet(datasets: vm.datasetManager?.datasets ?? []) { dataset in
+                        if let latest = latestPendingAttachment(matching: attachment) {
+                            saveTranscriptAttachment(latest, toExistingDataset: dataset)
+                        } else {
+                            saveTranscriptAttachment(attachment, toExistingDataset: dataset)
+                        }
+                    }
+                }
                 .onChangeCompat(of: vm.pendingImageURLs) { oldURLs, newURLs in
                     handlePendingImagesChange(from: oldURLs, to: newURLs)
                 }
@@ -11229,19 +15285,1081 @@ struct MessageView: View {
                 }
             }
 
+            private var statusModelName: String? {
+                if let remote = modelManager.activeRemoteSession {
+                    return remote.modelName
+                }
+                if let model = resolvedLoadedModel {
+                    return model.name
+                }
+                return nil
+            }
+
+            /// Collapsible "Ready · Model" status box shown directly above the composer.
+            /// Mirrors the input bar's liquid-glass treatment so it stays legible against
+            /// the bottom gradient, and tucks the tool/context detail away until expanded.
+            /// On macOS this renders as a quiet single-line footer inside the composer card.
+            private var statusTitleFont: Font {
+#if os(macOS)
+                .caption2.weight(.medium)
+#else
+                .caption.weight(.semibold)
+#endif
+            }
+
+            private var statusDetailFont: Font {
+#if os(macOS)
+                .caption2
+#else
+                .caption
+#endif
+            }
+
+            private var statusRowVerticalPadding: CGFloat {
+#if os(macOS)
+                7
+#else
+                9
+#endif
+            }
+
+            private var runtimeStatusBar: some View {
+                let status = runtimeStatus
+                let snapshot = contextMeterSnapshot
+                let showsBudget = snapshot.usablePromptTokens > 0 && vm.modelLoaded
+                return VStack(spacing: 0) {
+                    Button {
+                        // No withAnimation here: statusBarExpanded is @AppStorage, whose
+                        // update can land outside the transaction. The scoped
+                        // .animation(value:) on the container drives the animation instead.
+                        statusBarExpanded.toggle()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(status.tint)
+                                .frame(width: 7, height: 7)
+                            Text(verbatim: status.title)
+                                .font(statusTitleFont)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .fixedSize()
+                            if let name = statusModelName {
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.35))
+                                    .frame(width: 1, height: 11)
+                                Text(verbatim: name)
+                                    .font(statusDetailFont)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer(minLength: 6)
+                            if showsBudget {
+                                Text(verbatim: "\(Self.shortTokenLabel(snapshot.usedTokens)) / \(Self.shortTokenLabel(snapshot.usablePromptTokens))")
+                                    .font(statusDetailFont.monospacedDigit())
+                                    .foregroundStyle(snapshot.tint.opacity(0.85))
+                                    .lineLimit(1)
+                                    .fixedSize()
+                            }
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                                .rotationEffect(.degrees(statusBarExpanded ? 180 : 0))
+                                // Slightly bouncier than the container so the chevron
+                                // feels like it leads the expansion.
+                                .animation(.spring(response: 0.35, dampingFraction: 0.65), value: statusBarExpanded)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, statusRowVerticalPadding)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(String.localizedStringWithFormat(
+                        String(localized: "Runtime status: %@, %@"), status.title, status.detail)))
+                    .accessibilityHint(Text(statusBarExpanded
+                        ? String(localized: "Collapse tool and context details")
+                        : String(localized: "Expand tool and context details")))
+
+                    if statusBarExpanded {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Divider().opacity(0.4)
+                            toolsSection
+                            contextBudgetMeter
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(
+                            .asymmetric(
+                                insertion: .opacity
+                                    .combined(with: .move(edge: .top))
+                                    .combined(with: .scale(scale: 0.96, anchor: .top)),
+                                removal: .opacity
+                                    .combined(with: .move(edge: .top))
+                                    .combined(with: .scale(scale: 0.97, anchor: .top))
+                                    .animation(.spring(response: 0.32, dampingFraction: 0.9))
+                            )
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity)
+#if !os(macOS)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .glassPill(cornerRadius: 20)
+#endif
+                // Animate as one coherent unit so labels don't jitter mid-resize, and
+                // bind the animation to the value itself — @AppStorage changes don't
+                // reliably animate via withAnimation alone.
+                .geometryGroup()
+                .animation(.spring(response: 0.45, dampingFraction: 0.85), value: statusBarExpanded)
+            }
+
+            private var runtimeStatusPill: some View {
+                let status = runtimeStatus
+                return HStack(spacing: 7) {
+                    Image(systemName: status.icon)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(status.tint)
+                    Text(verbatim: status.title)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(verbatim: status.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(status.tint.opacity(0.10))
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(status.tint.opacity(0.20), lineWidth: 0.8)
+                )
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(String.localizedStringWithFormat(String(localized: "Runtime status: %@, %@"), status.title, status.detail)))
+            }
+
+            private var compactComposerStatusRow: some View {
+                let snapshot = contextMeterSnapshot
+                let percent = Int((snapshot.fraction * 100).rounded())
+                let usedTokens = snapshot.usedTokens
+                let usableTokens = max(0, snapshot.usablePromptTokens)
+                let showTokenCounts = isAdvancedMode && showGenerationDiagnostics
+                let showContextGauge = vm.modelLoaded
+                let isAFM = vm.loadedModelFormat == .afm
+                return HStack(spacing: 6) {
+                    runtimeStatusPill
+                        .layoutPriority(1)
+                    if !isAFM {
+                    Menu {
+                        toolPermissionMenuItems
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "wrench.and.screwdriver")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text(verbatim: "\(vm.activeToolPermissions.enabledCount)/4")
+                                .font(.caption2.monospacedDigit().weight(.semibold))
+                        }
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Capsule(style: .continuous).fill(Color.secondary.opacity(0.10)))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(String.localizedStringWithFormat(
+                        String(localized: "Chat tools: %d of 4 allowed"),
+                        vm.activeToolPermissions.enabledCount
+                    )))
+                    } // if !isAFM
+
+                    if showContextGauge {
+                        HStack(spacing: 4) {
+                            Image(systemName: "gauge.with.dots.needle.50percent")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(snapshot.tint)
+                            if showTokenCounts {
+                                Text(verbatim: "\(usedTokens)/\(usableTokens)")
+                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                            } else {
+                                Text(verbatim: "\(percent)%")
+                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Capsule(style: .continuous).fill(snapshot.tint.opacity(0.10)))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(snapshot.tint.opacity(0.18), lineWidth: 0.7)
+                        )
+                        .accessibilityLabel(Text(String.localizedStringWithFormat(
+                            String(localized: "Context used: %lld of %lld tokens (%d%%)"),
+                            Int64(usedTokens), Int64(usableTokens), percent
+                        )))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            @ViewBuilder
+            private var toolPermissionMenuItems: some View {
+                let isAFM = vm.loadedModelFormat == .afm
+                if !isAFM {
+                    Toggle(isOn: toolPermissionBinding(.webSearch)) {
+                        Label(LocalizedStringKey("Web Search"), systemImage: "globe")
+                    }
+                    .disabled(!settings.webSearchEnabled)
+
+                    Toggle(isOn: toolPermissionBinding(.python)) {
+                        Label(LocalizedStringKey("Python"), systemImage: "terminal")
+                    }
+                    .disabled(!settings.pythonEnabled || !PythonRuntime.status().isAvailable)
+
+                    Toggle(isOn: toolPermissionBinding(.memory)) {
+                        Label(LocalizedStringKey("Memory"), systemImage: "brain")
+                    }
+                    .disabled(!settings.memoryEnabled)
+                }
+
+                Toggle(isOn: toolPermissionBinding(.datasetRetrieval)) {
+                    Label(LocalizedStringKey("Dataset Retrieval"), systemImage: "doc.text.magnifyingglass")
+                }
+
+                Divider()
+
+                Button {
+                    vm.setAllToolPermissionsForActiveSession(enabled: true)
+                } label: {
+                    Label(LocalizedStringKey("Allow All Tools"), systemImage: "checkmark.circle")
+                }
+
+                Button {
+                    vm.setAllToolPermissionsForActiveSession(enabled: false)
+                } label: {
+                    Label(LocalizedStringKey("Block Chat Tools"), systemImage: "slash.circle")
+                }
+            }
+
+            private var toolsSection: some View {
+                let isAFM = vm.loadedModelFormat == .afm
+                let permissions = vm.activeToolPermissions
+                let webAvailable = !isAFM && settings.webSearchEnabled
+                let pythonAvailable = !isAFM && settings.pythonEnabled && PythonRuntime.status().isAvailable
+                let memoryAvailable = !isAFM && settings.memoryEnabled
+                let ragAvailable = vm.activeSessionDataset?.isIndexed == true
+
+                // A tool counts as "on" only when it is both selected and currently usable.
+                // AFM suppresses web/python/memory entirely — only RAG context injection remains.
+                let webOn = settings.webSearchArmed && webAvailable
+                let pythonOn = settings.pythonArmed && pythonAvailable
+                let memoryOn = permissions.memory && memoryAvailable
+                let ragOn = permissions.datasetRetrieval && ragAvailable
+                let activeCount = [webOn, pythonOn, memoryOn, ragOn].filter { $0 }.count
+
+                return VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "wrench.and.screwdriver")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(LocalizedStringKey("Tools"))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 6)
+                        Text(String.localizedStringWithFormat(
+                            String(localized: "%d of 4 on"),
+                            activeCount
+                        ))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 6) {
+                        // Always show all chips; for AFM the web/python/memory chips are grayed out
+                        // (available=false) rather than hidden so users can see they exist.
+                        toolToggleChip(title: String(localized: "Web"), systemImage: "globe",
+                                       isOn: settings.webSearchArmed, available: webAvailable) {
+                            let newValue = !settings.webSearchArmed
+                            settings.webSearchArmed = newValue
+                            vm.setToolPermissionForActiveSession(.webSearch, enabled: newValue)
+                        }
+                        toolToggleChip(title: String(localized: "Python"), systemImage: "terminal",
+                                       isOn: settings.pythonArmed, available: pythonAvailable) {
+                            let newValue = !settings.pythonArmed
+                            settings.pythonArmed = newValue
+                            vm.setToolPermissionForActiveSession(.python, enabled: newValue)
+                        }
+                        toolToggleChip(title: String(localized: "Memory"), systemImage: "brain",
+                                       isOn: permissions.memory, available: memoryAvailable) {
+                            vm.setToolPermissionForActiveSession(.memory, enabled: !permissions.memory)
+                        }
+                        toolToggleChip(title: String(localized: "RAG"), systemImage: "doc.text.magnifyingglass",
+                                       isOn: permissions.datasetRetrieval, available: ragAvailable) {
+                            vm.setToolPermissionForActiveSession(.datasetRetrieval, enabled: !permissions.datasetRetrieval)
+                        }
+                    }
+                    if isAFM {
+                        Text(LocalizedStringKey("Web search, Python, and Memory are not available with Apple Foundation Models."))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            private func toolToggleChip(
+                title: String,
+                systemImage: String,
+                isOn: Bool,
+                available: Bool,
+                toggle: @escaping () -> Void
+            ) -> some View {
+                let enabled = isOn && available
+                let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+                return Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        toggle()
+                    }
+                } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: systemImage)
+                            .font(.system(size: 14, weight: .semibold))
+                        Text(verbatim: title)
+                            .font(.system(size: 9, weight: .semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .foregroundStyle(enabled ? Color.accentColor : Color.secondary)
+                    .background(shape.fill(enabled ? Color.accentColor.opacity(0.16) : Color.secondary.opacity(0.08)))
+                    .overlay(shape.stroke(enabled ? Color.accentColor.opacity(0.30) : Color.secondary.opacity(0.12), lineWidth: 0.8))
+                    .opacity(available ? 1 : 0.5)
+                    .contentShape(shape)
+                }
+                .buttonStyle(.plain)
+                .disabled(!available)
+                .accessibilityLabel(Text(title))
+                .accessibilityAddTraits(enabled ? .isSelected : [])
+            }
+
+            private func toolPermissionBinding(_ kind: ChatVM.ChatToolPermissionKind) -> Binding<Bool> {
+                Binding(
+                    get: {
+                        let permissions = vm.activeToolPermissions
+                        switch kind {
+                        case .webSearch: return permissions.webSearch
+                        case .python: return permissions.python
+                        case .memory: return permissions.memory
+                        case .datasetRetrieval: return permissions.datasetRetrieval
+                        }
+                    },
+                    set: { enabled in
+                        vm.setToolPermissionForActiveSession(kind, enabled: enabled)
+                    }
+                )
+            }
+
+            private var contextBudgetMeter: some View {
+                let snapshot = contextMeterSnapshot
+                return VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "gauge.with.dots.needle.50percent")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(snapshot.tint)
+                        Text(LocalizedStringKey("Context"))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 6)
+                        Text(
+                            String.localizedStringWithFormat(
+                                String(localized: "%@ / %@ used"),
+                                Self.shortTokenLabel(snapshot.usedTokens),
+                                Self.shortTokenLabel(snapshot.usablePromptTokens)
+                            )
+                        )
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+
+                    GeometryReader { proxy in
+                        ZStack(alignment: .leading) {
+                            Capsule(style: .continuous)
+                                .fill(Color.secondary.opacity(0.16))
+                            Capsule(style: .continuous)
+                                .fill(snapshot.tint.opacity(0.72))
+                                .frame(width: max(4, proxy.size.width * snapshot.fraction))
+                        }
+                    }
+                    .frame(height: 5)
+
+                    HStack(spacing: 8) {
+                        contextMeterChip(title: String(localized: "History"), value: snapshot.historyTokens)
+                        contextMeterChip(title: String(localized: "Retrieval"), value: snapshot.retrievalTokens)
+                        contextMeterChip(title: String(localized: "Images"), value: snapshot.imageTokens)
+                        contextMeterChip(title: String(localized: "Reserve"), value: snapshot.reservedResponseTokens)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(String.localizedStringWithFormat(
+                    String(localized: "Context budget: %@ of %@ used"),
+                    Self.shortTokenLabel(snapshot.usedTokens),
+                    Self.shortTokenLabel(snapshot.usablePromptTokens)
+                )))
+            }
+
+            private func contextMeterChip(title: String, value: Int) -> some View {
+                HStack(spacing: 3) {
+                    Text(verbatim: title)
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(verbatim: Self.shortTokenLabel(value))
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                }
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            }
+
+            private func estimatedTokenCount(_ value: String) -> Int {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return 0 }
+                let wordEstimate = trimmed.split { $0.isWhitespace || $0.isNewline }.count
+                let charEstimate = Int(ceil(Double(trimmed.count) / 4.0))
+                return max(1, max(wordEstimate, charEstimate))
+            }
+
+            private static func shortTokenLabel(_ value: Int) -> String {
+                if value >= 10_000 {
+                    return String(format: "%.1fk", Double(value) / 1000.0)
+                }
+                if value >= 1_000 {
+                    return String(format: "%.1fk", Double(value) / 1000.0)
+                }
+                return "\(value)"
+            }
+
             private var pendingImagesWithIndices: [(index: Int, url: URL)] {
                 Array(vm.pendingImageURLs.prefix(5).enumerated()).map { (index: $0.offset, url: $0.element) }
             }
 
-            private var pendingImagesTray: some View {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(pendingImagesWithIndices, id: \.url.path) { item in
-                            pendingImageTile(index: item.index, url: item.url)
+            /// Compact attachment tray: one quiet surface, tight rows, no
+            /// oversized glass card.
+            private var pendingMediaTray: some View {
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if let error = vm.audioRecordingError, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            audioRecordingErrorRow(error)
+                            if !vm.pendingMediaAttachments.isEmpty {
+                                Divider()
+                                    .padding(.vertical, 8)
+                            }
+                        }
+                        ForEach(Array(vm.pendingMediaAttachments.enumerated()), id: \.element.id) { index, attachment in
+                            pendingMediaRow(attachment)
+                            if index < vm.pendingMediaAttachments.count - 1 {
+                                Divider()
+                                    .padding(.vertical, 8)
+                            }
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .frame(maxHeight: 220)
+                .background(
+                    RoundedRectangle(cornerRadius: ChatTheme.controlRadius, style: .continuous)
+                        .fill(ChatTheme.cardSurface)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: ChatTheme.controlRadius, style: .continuous)
+                                .strokeBorder(ChatTheme.hairline, lineWidth: 1)
+                        )
+                )
+                .clipShape(RoundedRectangle(cornerRadius: ChatTheme.controlRadius, style: .continuous))
+            }
+
+#if canImport(AVFoundation)
+            private func voiceRecordButton(isDisabled: Bool) -> some View {
+                let isRecording = vm.isRecordingAudio
+                let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+
+                return Button {
+                    Task { await vm.toggleAudioRecording() }
+                } label: {
+                    ZStack {
+                        Image(systemName: isRecording ? "stop.fill" : "mic.fill")
+                            .font(.system(size: 17, weight: .semibold))
+                        if isRecording {
+                            VStack {
+                                Spacer()
+                                recordingLevelBars
+                                    .padding(.bottom, 6)
+                            }
+                        }
+                    }
+                    .frame(width: controlHeight, height: controlHeight)
+                    .background(
+                        shape
+                            .fill(Color.clear)
+                            .glassifyIfAvailable(in: shape)
+                            .overlay(
+                                shape.fill(
+                                    isRecording
+                                        ? Color.red.opacity(0.34)
+                                        : Color.white.opacity(0.06)
+                                )
+                            )
+                            .overlay(
+                                shape.strokeBorder(
+                                    isRecording
+                                        ? Color.red.opacity(0.52)
+                                        : Color.white.opacity(0.22),
+                                    lineWidth: 0.8
+                                )
+                            )
+                    )
+                    .foregroundStyle(isRecording ? Color.white : Color.secondary)
+                    .overlay(alignment: .top) {
+                        if isRecording, let started = vm.audioRecordingStartedAt {
+                            TimelineView(.periodic(from: started, by: 1)) { context in
+                                Text(Self.recordingElapsedLabel(from: started, to: context.date))
+                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(Color.white)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(
+                                        Capsule(style: .continuous)
+                                            .fill(Color.red.opacity(0.7))
+                                    )
+                                    .offset(y: -8)
+                            }
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(isDisabled)
+                .accessibilityLabel(Text(LocalizedStringKey(isRecording ? "Stop Recording" : "Record Audio")))
+                .accessibilityHint(Text(LocalizedStringKey("Record a voice note for transcription.")))
+            }
+
+            private var recordingLevelBars: some View {
+                HStack(spacing: 2) {
+                    ForEach(0..<4, id: \.self) { index in
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(0.78))
+                            .frame(width: 3, height: max(3, CGFloat(vm.audioRecordingLevel) * CGFloat(index + 2) * 4))
+                    }
+                }
+                .frame(height: 18, alignment: .bottom)
+                .accessibilityHidden(true)
+            }
+
+            private static func recordingElapsedLabel(from start: Date, to now: Date) -> String {
+                let elapsed = max(0, Int(now.timeIntervalSince(start)))
+                return String(format: "%d:%02d", elapsed / 60, elapsed % 60)
+            }
+#endif
+
+            private func audioRecordingErrorRow(_ message: String) -> some View {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white, Color.red)
+                            .frame(width: 28, height: 28)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(Color.red.opacity(0.10))
+                            )
+
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(Color.red)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Button {
+                            vm.audioRecordingError = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 22, height: 22)
+                                .background(Circle().fill(Color.primary.opacity(0.06)))
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(Text(LocalizedStringKey("Dismiss")))
+                    }
+
+                    recoveryActionsRow(message: message, attachment: nil)
+                }
+            }
+
+            private func pendingMediaRow(_ attachment: ChatMediaAttachment) -> some View {
+                VStack(alignment: .leading, spacing: 8) {
+                    mediaHeader(for: attachment)
+
+                    // "Ready to transcribe" is implied by the Transcribe button;
+                    // only surface standalone status text when something is wrong.
+                    if attachment.status == .failed, attachment.status.showsStandaloneStatusLabel {
+                        Text(mediaStatusText(attachment))
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if attachment.status == .transcribing,
+                       let partial = attachment.partialTranscript,
+                       !partial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(partial)
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                            .lineLimit(5)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(ChatTheme.quietSurface)
+                            )
+                    }
+
+                    if let transcript = attachment.transcript {
+                        Text(transcript.provenanceSummary)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    mediaActionRow(for: attachment)
+                }
+                .accessibilityElement(children: .combine)
+            }
+
+            private func mediaHeader(for attachment: ChatMediaAttachment) -> some View {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: attachment.kind.iconName)
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 28, height: 28)
+                        .foregroundStyle(Color.accentColor)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.10))
+                        )
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(attachment.transcript?.displaySourceName ?? attachment.originalFilename)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        if let mediaDetailLabel = attachment.mediaDetailLabel {
+                            Text(mediaDetailLabel)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        if attachment.hasCompletedTranscript && transcriptSaveFeedback[attachment.id]?.isSaved != true {
+                            pendingRemovalAttachment = attachment
+                        } else {
+                            vm.removePendingMediaAttachment(id: attachment.id)
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 22, height: 22)
+                            .background(Circle().fill(Color.primary.opacity(0.06)))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(LocalizedStringKey("Remove")))
+                }
+            }
+
+            private func mediaStatusBadge(_ status: ChatMediaTranscriptionStatus) -> some View {
+                Text(LocalizedStringKey(mediaStatusBadgeKey(status)))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(mediaStatusBadgeForeground(status))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(mediaStatusBadgeBackground(status))
+                    )
+            }
+
+            private func mediaStatusBadgeKey(_ status: ChatMediaTranscriptionStatus) -> String {
+                status.badgeLocalizationKey
+            }
+
+            private func mediaStatusBadgeForeground(_ status: ChatMediaTranscriptionStatus) -> Color {
+                switch status {
+                case .failed:
+                    return .red
+                case .completed:
+                    return .green
+                case .transcribing:
+                    return .accentColor
+                case .notStarted:
+                    return .secondary
+                }
+            }
+
+            private func mediaStatusBadgeBackground(_ status: ChatMediaTranscriptionStatus) -> Color {
+                switch status {
+                case .failed:
+                    return Color.red.opacity(0.12)
+                case .completed:
+                    return Color.green.opacity(0.12)
+                case .transcribing:
+                    return Color.accentColor.opacity(0.12)
+                case .notStarted:
+                    return Color.primary.opacity(0.06)
+                }
+            }
+
+            @ViewBuilder
+            private func mediaActionRow(for attachment: ChatMediaAttachment) -> some View {
+                if attachment.status == .transcribing {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                        Text(LocalizedStringKey("Transcribing..."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        cancelTranscriptionButton(for: attachment)
+                    }
+                } else if attachment.hasCompletedTranscript {
+                    let saveFeedback = transcriptSaveFeedback[attachment.id]
+                    VStack(alignment: .leading, spacing: 8) {
+                        ViewThatFits(in: .horizontal) {
+                            completedTranscriptActionsWide(for: attachment, saveFeedback: saveFeedback)
+                            completedTranscriptActionsStacked(for: attachment, saveFeedback: saveFeedback)
+                        }
+
+                        if let saveFeedback, let message = saveFeedback.message {
+                            Text(message)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(saveFeedback.isSaved ? Color.green : (saveFeedback.isSaving ? Color.secondary : Color.red))
+                                .lineLimit(nil)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                } else if attachment.status != .completed {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let error = attachment.errorMessage, attachment.status == .failed {
+                            recoveryActionsRow(message: error, attachment: attachment)
+                        }
+
+                        HStack {
+                            Spacer(minLength: 0)
+                            Button {
+                                beginTranscribingWithRemoteConfirmation(attachment)
+                            } label: {
+                                Label {
+                                    Text(LocalizedStringKey("Transcribe"))
+                                } icon: {
+                                    Image(systemName: "waveform")
+                                }
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            }
+
+            private func completedTranscriptActionsWide(for attachment: ChatMediaAttachment, saveFeedback: TranscriptSaveFeedback?) -> some View {
+                HStack(spacing: 8) {
+                    transcriptTextActionButton(title: "Summarize", systemImage: "text.bubble") {
+                        performTranscriptQuickAction(.summarize, for: attachment)
+                    }
+
+                    transcriptTextActionButton(title: "Review", systemImage: "doc.text.magnifyingglass") {
+                        transcriptReviewAttachment = attachment
+                    }
+
+                    Spacer(minLength: 0)
+
+                    transcriptMoreActionsMenu(for: attachment)
+                    transcriptSaveMenu(for: attachment, saveFeedback: saveFeedback)
+                }
+            }
+
+            private func completedTranscriptActionsStacked(for attachment: ChatMediaAttachment, saveFeedback: TranscriptSaveFeedback?) -> some View {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        transcriptTextActionButton(title: "Summarize", systemImage: "text.bubble") {
+                            performTranscriptQuickAction(.summarize, for: attachment)
+                        }
+
+                        transcriptTextActionButton(title: "Review", systemImage: "doc.text.magnifyingglass") {
+                            transcriptReviewAttachment = attachment
+                        }
+                    }
+
+                    HStack(spacing: 10) {
+                        Spacer(minLength: 0)
+                        transcriptMoreActionsMenu(for: attachment)
+                        transcriptSaveMenu(for: attachment, saveFeedback: saveFeedback)
+                    }
+                }
+            }
+
+            private func cancelTranscriptionButton(for attachment: ChatMediaAttachment) -> some View {
+                Button {
+                    vm.cancelPendingMediaTranscription(id: attachment.id)
+                } label: {
+                    Label {
+                        Text(LocalizedStringKey("Cancel"))
+                    } icon: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            private func transcriptTextActionButton(
+                title: LocalizedStringKey,
+                systemImage: String,
+                minWidth: CGFloat? = nil,
+                action: @escaping () -> Void
+            ) -> some View {
+                Button(action: action) {
+                    Label {
+                        Text(title)
+                    } icon: {
+                        Image(systemName: systemImage)
+                    }
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .frame(minWidth: minWidth)
+            }
+
+            private func transcriptIconActionLabel(systemImage: String) -> some View {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(width: 26, height: 20)
+            }
+
+            private func transcriptMoreActionsMenu(for attachment: ChatMediaAttachment) -> some View {
+                Menu {
+                    ForEach(TranscriptQuickAction.allCases.filter { $0 != .summarize && $0 != .ask }) { action in
+                        Button {
+                            performTranscriptQuickAction(action, for: attachment)
+                        } label: {
+                            Label(action.titleKey, systemImage: action.iconName)
+                        }
+                    }
+                } label: {
+                    transcriptIconActionLabel(systemImage: "ellipsis")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel(Text(LocalizedStringKey("More actions")))
+                .help(Text("More actions"))
+            }
+
+            private func transcriptSaveMenu(for attachment: ChatMediaAttachment, saveFeedback: TranscriptSaveFeedback?) -> some View {
+                Menu {
+                    Button {
+                        saveTranscriptAttachment(attachment)
+                    } label: {
+                        Label(LocalizedStringKey("Save to Stored"), systemImage: "tray.and.arrow.down")
+                    }
+                    Button {
+                        existingDatasetSaveAttachment = attachment
+                    } label: {
+                        Label(LocalizedStringKey("Save to existing dataset"), systemImage: "folder.badge.plus")
+                    }
+                } label: {
+                    if saveFeedback?.isSaving == true {
+                        ProgressView()
+                            .scaleEffect(0.55)
+                            .frame(width: 26, height: 20)
+                    } else {
+                        transcriptIconActionLabel(systemImage: saveFeedback?.isSaved == true ? "checkmark" : "tray.and.arrow.down")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(saveFeedback?.isSaving == true || saveFeedback?.isSaved == true)
+                .accessibilityLabel(Text(LocalizedStringKey("Save transcript")))
+                .help(Text("Save transcript to Stored"))
+            }
+
+            private func saveTranscriptAttachment(_ attachment: ChatMediaAttachment) {
+                guard transcriptSaveFeedback[attachment.id]?.isSaving != true else { return }
+                transcriptSaveFeedback[attachment.id] = .saving
+                Task {
+                    let result = await vm.saveTranscriptAttachmentAsDataset(attachment)
+                    await MainActor.run {
+                        switch result {
+                        case .success(let dataset):
+                            transcriptSaveFeedback[attachment.id] = .saved(dataset.name)
+                        case .failure(let error):
+                            transcriptSaveFeedback[attachment.id] = .failed(
+                                String.localizedStringWithFormat(
+                                    String(localized: "Transcript save failed: %@"),
+                                    error.localizedDescription
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            private func saveTranscriptAttachment(_ attachment: ChatMediaAttachment, toExistingDataset dataset: LocalDataset) {
+                guard transcriptSaveFeedback[attachment.id]?.isSaving != true else { return }
+                transcriptSaveFeedback[attachment.id] = .saving
+                Task {
+                    let result = await vm.saveTranscriptAttachment(attachment, toExistingDataset: dataset)
+                    await MainActor.run {
+                        switch result {
+                        case .success(let dataset):
+                            transcriptSaveFeedback[attachment.id] = .saved(dataset.name)
+                        case .failure(let error):
+                            transcriptSaveFeedback[attachment.id] = .failed(
+                                String.localizedStringWithFormat(
+                                    String(localized: "Transcript save failed: %@"),
+                                    error.localizedDescription
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            private func latestPendingAttachment(matching attachment: ChatMediaAttachment) -> ChatMediaAttachment? {
+                vm.pendingMediaAttachments.first { $0.id == attachment.id }
+            }
+
+            private func performTranscriptQuickAction(_ action: TranscriptQuickAction, for attachment: ChatMediaAttachment) {
+                let title = attachment.transcript?.displaySourceName ?? attachment.originalFilename
+                text = action.prompt(for: title)
+                if action == .ask {
+                    focus.wrappedValue = true
+                } else {
+                    performSend()
+                }
+            }
+
+            private func beginTranscribingWithRemoteConfirmation(_ attachment: ChatMediaAttachment) {
+                if TranscriptionSettings.selectedEngineID == .audioLanguageModel,
+                   !TranscriptionSettings.hasConfirmedRemoteUpload {
+                    remoteUploadConfirmationAttachment = attachment
+                    return
+                }
+                vm.beginTranscribingPendingMediaAttachment(id: attachment.id)
+            }
+
+            @ViewBuilder
+            private func recoveryActionsRow(message: String, attachment: ChatMediaAttachment?) -> some View {
+                let actions = ASRRecoveryAction.actions(
+                    for: message,
+                    includeRetry: attachment != nil,
+                    includeRemoteEndpoint: TranscriptionSettings.selectedEngineID == .audioLanguageModel
+                )
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(actions) { action in
+                            Button {
+                                handleRecoveryAction(action, attachment: attachment)
+                            } label: {
+                                Label(action.titleKey, systemImage: action.iconName)
+                                    .font(.caption2.weight(.semibold))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+                    }
+                }
+            }
+
+            private func handleRecoveryAction(_ action: ASRRecoveryAction, attachment: ChatMediaAttachment?) {
+                switch action {
+                case .retry:
+                    if let attachment {
+                        beginTranscribingWithRemoteConfirmation(attachment)
+                    }
+                case .openSettings, .chooseLocale, .downloadWhisperModel, .configureEndpoint:
+                    tabRouter.selection = .settings
+                }
+            }
+
+            private func mediaStatusText(_ attachment: ChatMediaAttachment) -> String {
+                switch attachment.status {
+                case .notStarted:
+                    return String(localized: "Ready to transcribe")
+                case .transcribing:
+                    return String(localized: "Transcribing...")
+                case .completed:
+                    return String(localized: "Transcript ready")
+                case .failed:
+                    return attachment.errorMessage ?? String(localized: "Transcription failed")
+                }
+            }
+
+            private var pendingImagesTray: some View {
+                VStack(alignment: .leading, spacing: 6) {
+                    let estimate = pendingImageBudgetEstimate
+                    HStack(spacing: 8) {
+                        Label(LocalizedStringKey("Images"), systemImage: "photo.stack")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(pendingImageBudgetTint(estimate.status))
+                        Text(verbatim: "\(estimate.imageCount)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text(pendingImageBudgetSummary(estimate))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
+                    .padding(.top, 8)
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(pendingImagesWithIndices, id: \.url.path) { item in
+                                pendingImageTile(index: item.index, url: item.url)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.bottom, 8)
+                    }
                 }
                 .background(
                     RoundedRectangle(cornerRadius: UIConstants.largeCornerRadius, style: .continuous)
@@ -11254,50 +16372,138 @@ struct MessageView: View {
                 .animation(.spring(response: 0.3, dampingFraction: 0.78), value: vm.pendingImageURLs.count)
             }
 
+            private var pendingImageBudgetEstimate: ImagePromptBudgetEstimate {
+                let totalBytes = vm.pendingImageURLs.reduce(Int64(0)) { total, url in
+                    total + pendingImageFileSizeBytes(for: url)
+                }
+                return ImagePromptBudgetEstimator.estimate(
+                    imageCount: vm.pendingImageURLs.count,
+                    totalFileBytes: totalBytes,
+                    usablePromptTokens: ChatVM.promptBudget(for: vm.contextLimit).usablePromptTokens
+                )
+            }
+
+            private func pendingImageBudgetSummary(_ estimate: ImagePromptBudgetEstimate) -> String {
+                let totalSize = estimate.totalFileBytes > 0
+                    ? ByteCountFormatter.string(fromByteCount: estimate.totalFileBytes, countStyle: .file)
+                    : String(localized: "Size unknown")
+                return String.localizedStringWithFormat(
+                    String(localized: "%@ · %@ img tok"),
+                    totalSize,
+                    Self.shortTokenLabel(estimate.estimatedPromptTokens)
+                )
+            }
+
+            private func pendingImageBudgetTint(_ status: ImagePromptBudgetEstimate.Status) -> Color {
+                switch status {
+                case .comfortable: return .green
+                case .tight: return .orange
+                case .overBudget: return .red
+                }
+            }
+
             @ViewBuilder
             private func pendingImageTile(index: Int, url: URL) -> some View {
                 let thumbnail = vm.pendingThumbnail(for: url)
                 let isRecentlyAdded = (recentlyAddedImageURL == url)
 
-                ZStack(alignment: .topTrailing) {
-                    pendingImageContent(thumbnail)
-                        .frame(width: 84, height: 84)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.8)
-                        )
-                        .overlay(alignment: .bottomTrailing) {
-                            if isRecentlyAdded {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(.system(size: 22, weight: .semibold))
-                                    .foregroundStyle(Color.white, Color.green)
-                                    .padding(6)
-                                    .transition(.scale(scale: 0.7).combined(with: .opacity))
-                            }
-                        }
-
-                    Button(action: { vm.removePendingImage(at: index) }) {
-                        Image(systemName: "xmark")
-                            .foregroundColor(.white)
-                            .font(.system(size: 10, weight: .black))
-                            .padding(6)
-                            .background(
-                                Circle()
-                                    .fill(Color.black.opacity(0.72))
-                                    .overlay(
-                                        Circle().strokeBorder(Color.white.opacity(0.24), lineWidth: 0.8)
-                                    )
+                VStack(alignment: .leading, spacing: 5) {
+                    ZStack(alignment: .topTrailing) {
+                        pendingImageContent(thumbnail)
+                            .frame(width: 88, height: 84)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.8)
                             )
-                            .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+                            .overlay(alignment: .bottomTrailing) {
+                                if isRecentlyAdded {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 22, weight: .semibold))
+                                        .foregroundStyle(Color.white, Color.green)
+                                        .padding(6)
+                                        .transition(.scale(scale: 0.7).combined(with: .opacity))
+                                }
+                            }
+
+                        Button(action: { vm.removePendingImage(at: index) }) {
+                            Image(systemName: "xmark")
+                                .foregroundColor(.white)
+                                .font(.system(size: 10, weight: .black))
+                                .padding(6)
+                                .background(
+                                    Circle()
+                                        .fill(Color.black.opacity(0.72))
+                                        .overlay(
+                                            Circle().strokeBorder(Color.white.opacity(0.24), lineWidth: 0.8)
+                                        )
+                                )
+                                .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(5)
                     }
-                    .buttonStyle(.plain)
-                    .padding(5)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(pendingImageDimensionLabel(thumbnail))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text(pendingImageBudgetLabel(for: url))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(width: 88, alignment: .leading)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(Text(pendingImagePreflightAccessibilityLabel(thumbnail: thumbnail, url: url)))
                 }
+                .frame(width: 88, alignment: .leading)
                 .transition(.asymmetric(
                     insertion: .scale(scale: 0.9).combined(with: .opacity),
                     removal: .scale(scale: 0.92).combined(with: .opacity)
                 ))
+            }
+
+            private func pendingImageDimensionLabel(_ thumbnail: UIImage?) -> String {
+                guard let size = thumbnail?.size else { return String(localized: "Preparing image") }
+                let scale = max(thumbnail?.scale ?? 1, 1)
+                let width = max(1, Int((size.width * scale).rounded()))
+                let height = max(1, Int((size.height * scale).rounded()))
+                return "\(width)x\(height)"
+            }
+
+            private func pendingImageBudgetLabel(for url: URL) -> String {
+                let fileSize = pendingImageFileSizeLabel(for: url)
+                return String.localizedStringWithFormat(
+                    String(localized: "%@ · %@ img tok"),
+                    fileSize,
+                    Self.shortTokenLabel(576)
+                )
+            }
+
+            private func pendingImageFileSizeLabel(for url: URL) -> String {
+                let bytes = pendingImageFileSizeBytes(for: url)
+                guard bytes > 0 else {
+                    return String(localized: "Size unknown")
+                }
+                return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            }
+
+            private func pendingImageFileSizeBytes(for url: URL) -> Int64 {
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                      let size = attrs[.size] as? NSNumber else {
+                    return 0
+                }
+                return max(0, size.int64Value)
+            }
+
+            private func pendingImagePreflightAccessibilityLabel(thumbnail: UIImage?, url: URL) -> String {
+                String.localizedStringWithFormat(
+                    String(localized: "Image preflight: %@, %@."),
+                    pendingImageDimensionLabel(thumbnail),
+                    pendingImageBudgetLabel(for: url)
+                )
             }
 
             @ViewBuilder
@@ -11352,6 +16558,8 @@ struct MessageView: View {
                         Color.black.opacity(0.3)
                             .ignoresSafeArea()
                             .onTapGesture { withAnimation { showSidebar = false } }
+                            // Fade the scrim in step with the sidebar slide instead of popping.
+                            .transition(.opacity)
                         sidebar
                             .frame(width: currentDeviceWidth() * 0.48)
                             .transition(.move(edge: .leading))
@@ -11361,23 +16569,15 @@ struct MessageView: View {
 #if os(iOS) || os(visionOS)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarLeading) {
-                        Button {
-                            withAnimation { showSidebar.toggle() }
-                        } label: {
-                            Image(systemName: "line.3.horizontal")
-                        }
-                        .padding(.vertical, 6)
-                        .padding(.horizontal, 4)
-                        .guideHighlight(.chatSidebarButton)
-                    }
-                    ToolbarItem(placement: .principal) {
                         modelHeader
                     }
                     ToolbarItem(placement: .navigationBarTrailing) {
-                        Button { vm.startNewSession() } label: { Image(systemName: "plus") }
-                            .padding(.vertical, 6)
-                            .padding(.horizontal, 4)
-                            .guideHighlight(.chatNewChatButton)
+                        let slots = adaptiveTrailingSlots
+                        HStack(spacing: 6) {
+                            if slots >= 2 { sidebarToolbarButton }
+                            moreToolbarMenu(includeSidebar: slots < 2, includeNewChat: slots == 0)
+                            if slots >= 1 { newChatToolbarButton }
+                        }
                     }
                 }
                 .navigationBarTitleDisplayMode(.inline)
@@ -11399,6 +16599,68 @@ struct MessageView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(vm.memoryPromptBudgetAlertBody)
+            }
+            .sheet(isPresented: $showRuntimeInfo) {
+                ChatRuntimeInfoSheet()
+                    .environmentObject(vm)
+                    .environmentObject(modelManager)
+            }
+            .sheet(isPresented: $showScratchpad) {
+                ChatScratchpadSheet(
+                    text: $scratchpadDraft,
+                    titleKey: "Private Scratchpad",
+                    placeholderKey: "Notes for this chat",
+                    clearTitleKey: "Clear Scratchpad",
+                    onCancel: { showScratchpad = false },
+                    onSave: {
+                        vm.setScratchpadForActiveSession(scratchpadDraft)
+                        showScratchpad = false
+                    },
+                    onClear: {
+                        scratchpadDraft = ""
+                        vm.setScratchpadForActiveSession("")
+                        showScratchpad = false
+                    }
+                )
+            }
+            .sheet(isPresented: $showChatInstructions) {
+                ChatScratchpadSheet(
+                    text: $chatInstructionsDraft,
+                    titleKey: "Chat Instructions",
+                    placeholderKey: "Instructions for this chat",
+                    clearTitleKey: "Clear Instructions",
+                    onCancel: { showChatInstructions = false },
+                    onSave: {
+                        vm.setChatInstructionsForActiveSession(chatInstructionsDraft)
+                        showChatInstructions = false
+                    },
+                    onClear: {
+                        chatInstructionsDraft = ""
+                        vm.setChatInstructionsForActiveSession("")
+                        showChatInstructions = false
+                    }
+                )
+            }
+            .sheet(isPresented: $showChatSnapshot) {
+                ChatSnapshotSheet(
+                    rows: chatSnapshotRows,
+                    exportText: chatSnapshotExportText
+                )
+            }
+            .sheet(isPresented: $showChatExportPack) {
+                ChatExportPackSheet(
+                    noteTitle: sessionDisplayTitle(for: vm.sessions.first { $0.id == vm.activeSessionID } ?? ChatVM.Session(title: "", messages: [], date: Date())),
+                    markdownNote: chatMarkdownNoteText,
+                    citationsJSON: chatCitationsJSONText,
+                    promptReceipt: chatSnapshotExportText,
+                    generationReplayJSON: chatGenerationReplayJSONText
+                )
+            }
+            .sheet(isPresented: $showContextPlan) {
+                ChatContextPlanSheet(
+                    rows: contextPlanRows,
+                    summary: contextPlanSummary
+                )
             }
             .overlay(alignment: .top) {
                 if let active = modelManager.activeDataset,
@@ -11467,26 +16729,20 @@ struct MessageView: View {
                 VStack(spacing: 0) {
                     HStack(spacing: 8) {
                         Text("Chats")
-                            .font(.headline)
-                            .foregroundStyle(.primary)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.secondary)
                         Spacer()
-                        Button(action: { vm.startNewSession() }) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 14, weight: .semibold))
+                        ChatToolbarIconButton(systemImage: "plus", help: "New Chat") {
+                            vm.startNewSession()
                         }
-                        .buttonStyle(.plain)
-                        .help("New Chat")
                         .guideHighlight(.chatNewChatButton)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
-                    .padding(.bottom, 10)
-
-                    Divider()
-                        .padding(.top, 4)
+                    .padding(.horizontal, ChatTheme.spacingL)
+                    .padding(.top, ChatTheme.spacingM)
+                    .padding(.bottom, 6)
 
                     ScrollView {
-                        LazyVStack(spacing: 4) {
+                        LazyVStack(spacing: 2) {
                             ForEach(vm.sessions) { session in
                                 drawerRow(for: session)
                                     .contentShape(Rectangle())
@@ -11509,7 +16765,7 @@ struct MessageView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            .frame(width: 280)
+            .frame(width: 264)
             .frame(maxHeight: .infinity, alignment: .bottom)
             .guideHighlight(.chatSidebar)
             .confirmationDialog(
@@ -11542,40 +16798,61 @@ struct MessageView: View {
         }
 
         private func drawerRow(for session: ChatVM.Session) -> some View {
-            let isSelected = session.id == vm.activeSessionID
-            return VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(drawerTitle(for: session))
-                        .font(.subheadline.weight(isSelected ? .semibold : .medium))
-                        .lineLimit(1)
-                        .foregroundStyle(isSelected ? .primary : .secondary)
+            MacChatDrawerRow(
+                title: drawerTitle(for: session),
+                preview: drawerPreview(for: session) ?? "",
+                isSelected: session.id == vm.activeSessionID,
+                isFavorite: session.isFavorite
+            )
+        }
 
-                    if session.isFavorite {
-                        Image(systemName: "star.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(.yellow)
+        /// One chat row in the macOS drawer: quiet by default, a pale neutral
+        /// wash on hover, and a subtle (non-accent) selection state.
+        private struct MacChatDrawerRow: View {
+            let title: String
+            let preview: String
+            let isSelected: Bool
+            let isFavorite: Bool
+
+            @State private var hovering = false
+
+            var body: some View {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(title)
+                            .font(.subheadline.weight(isSelected ? .medium : .regular))
+                            .lineLimit(1)
+                            .foregroundStyle(isSelected ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.primary.opacity(0.75)))
+
+                        if isFavorite {
+                            Image(systemName: "star.fill")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.yellow.opacity(0.8))
+                        }
+
+                        Spacer(minLength: 0)
                     }
 
-                    Spacer(minLength: 0)
+                    Text(preview.isEmpty ? " " : preview)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .opacity(preview.isEmpty ? 0 : 1)
                 }
-
-                let preview = drawerPreview(for: session) ?? ""
-                Text(preview.isEmpty ? " " : preview)
-                    .font(.caption)
-                    .foregroundStyle(isSelected ? .secondary : .tertiary)
-                    .lineLimit(1)
-                    .opacity(preview.isEmpty ? 0 : 1)
+                .padding(.vertical, 8)
+                .padding(.horizontal, ChatTheme.spacingM)
+                .background(
+                    RoundedRectangle(cornerRadius: ChatTheme.controlRadius - 2, style: .continuous)
+                        .fill(isSelected
+                              ? ChatTheme.selectionSurface
+                              : (hovering ? ChatTheme.hoverSurface : Color.clear))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: ChatTheme.controlRadius - 2, style: .continuous)
+                        .stroke(ChatTheme.hairline.opacity(isSelected ? 1 : 0), lineWidth: 1)
+                )
+                .onHover { hovering = $0 }
             }
-            .padding(.vertical, 10)
-            .padding(.horizontal, 12)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.accentColor.opacity(isSelected ? 0.2 : 0), lineWidth: 1)
-            )
         }
 
         private func drawerPreview(for session: ChatVM.Session) -> String? {
@@ -11663,86 +16940,854 @@ struct MessageView: View {
 #if os(macOS)
             return 16
 #else
-            return 80
+            // The input stack is a safeAreaInset now, so the viewport already
+            // ends above it — this is just breathing room under the last message.
+            return 12
 #endif
         }
 
         private var hasActiveChatModel: Bool { vm.hasActiveChatModel }
+
+        private var bookmarkedMessages: [BookmarkedMessageReference] {
+            vm.sessions.flatMap { session in
+                session.messages
+                    .filter { $0.isBookmarked && $0.role.lowercased() != "system" }
+                    .map { BookmarkedMessageReference(session: session, message: $0) }
+            }
+        }
+
+        private var chatRecallResults: [ChatRecallResult] {
+            let terms = recallSearchTerms(from: chatRecallQuery)
+            guard !terms.isEmpty else { return [] }
+
+            return vm.sessions.flatMap { session in
+                session.messages.compactMap { message -> ChatRecallResult? in
+                    guard message.role.lowercased() != "system" else { return nil }
+                    let text = recallSearchText(for: message)
+                    guard !text.isEmpty else { return nil }
+
+                    let searchable = "\(sessionDisplayTitle(for: session)) \(message.role) \(text)"
+                        .lowercased()
+                    var score = 0
+                    for term in terms {
+                        if searchable.contains(term) {
+                            score += term.count >= 5 ? 5 : 3
+                            score += searchable.components(separatedBy: term).count - 1
+                        }
+                    }
+                    if message.isBookmarked { score += 2 }
+                    guard score > 0 else { return nil }
+                    return ChatRecallResult(session: session, message: message, score: score)
+                }
+            }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                return lhs.message.timestamp > rhs.message.timestamp
+            }
+            .prefix(12)
+            .map { $0 }
+        }
+
+        private func sessionDisplayTitle(for session: ChatVM.Session) -> String {
+            let trimmed = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? String(localized: "New chat") : trimmed
+        }
+
+        private var activeScratchpadHasText: Bool {
+            !vm.activeScratchpad.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        private var activeChatInstructionsHasText: Bool {
+            !vm.activeChatInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        private var chatModeBinding: Binding<ChatVM.ChatMode> {
+            Binding(
+                get: { vm.activeChatMode },
+                set: { vm.setChatModeForActiveSession($0) }
+            )
+        }
+
+        private var answerStyleBinding: Binding<ChatVM.AnswerStyle> {
+            Binding(
+                get: { vm.activeAnswerStyle },
+                set: { vm.setAnswerStyleForActiveSession($0) }
+            )
+        }
+
+        private var chatSnapshotRows: [ChatSnapshotRow] {
+            let session = vm.sessions.first { $0.id == vm.activeSessionID }
+            let modelName = modelManager.activeRemoteSession?.modelName
+                ?? modelManager.loadedModel?.name
+                ?? String(localized: "No model loaded")
+            let backend = modelManager.activeRemoteSession?.backendName
+                ?? modelManager.loadedModel?.format.displayName
+                ?? String(localized: "None")
+            let datasetName = vm.activeSessionDataset?.name ?? String(localized: "No dataset")
+            let modeTitle = String(localized: String.LocalizationValue(vm.activeChatMode.titleKey))
+            let answerStyleTitle = String(localized: String.LocalizationValue(vm.activeAnswerStyle.titleKey))
+            let instructionsStatus = activeChatInstructionsHasText ? String(localized: "Set") : String(localized: "Inherited")
+            let permissionCount = vm.activeToolPermissions.enabledCount
+            let messageCount = vm.msgs.filter { $0.role.lowercased() != "system" }.count
+            let prompt = vm.systemPromptText
+            let settingsSummary = activeSettingsSummary()
+
+            return [
+                ChatSnapshotRow(title: String(localized: "Created"), value: Date().formatted(date: .abbreviated, time: .shortened)),
+                ChatSnapshotRow(title: String(localized: "Chat"), value: sessionDisplayTitle(for: session ?? ChatVM.Session(title: "", messages: [], date: Date()))),
+                ChatSnapshotRow(title: String(localized: "Active Model"), value: modelName),
+                ChatSnapshotRow(title: String(localized: "Backend"), value: backend),
+                ChatSnapshotRow(title: String(localized: "Chat Mode"), value: modeTitle),
+                ChatSnapshotRow(title: String(localized: "Answer Style"), value: answerStyleTitle),
+                ChatSnapshotRow(title: String(localized: "Chat Instructions"), value: instructionsStatus),
+                ChatSnapshotRow(title: String(localized: "Active Dataset"), value: datasetName),
+                ChatSnapshotRow(title: String(localized: "Tool Permissions"), value: "\(permissionCount) / 4"),
+                ChatSnapshotRow(title: String(localized: "Message Count"), value: "\(messageCount)"),
+                ChatSnapshotRow(title: String(localized: "System Prompt Fingerprint"), value: "len=\(prompt.count) hash=\(ChatVM.diagnosticHash(for: prompt))"),
+                ChatSnapshotRow(title: String(localized: "Settings Summary"), value: settingsSummary)
+            ]
+        }
+
+        private var chatSnapshotExportText: String {
+            var lines = [String(localized: "Chat Snapshot")]
+            lines.append(String(repeating: "-", count: 24))
+            for row in chatSnapshotRows {
+                lines.append("\(row.title): \(row.value)")
+            }
+            return lines.joined(separator: "\n")
+        }
+
+        private var chatMarkdownNoteText: String {
+            let session = vm.sessions.first { $0.id == vm.activeSessionID }
+            let title = sessionDisplayTitle(for: session ?? ChatVM.Session(title: "", messages: [], date: Date()))
+            var lines: [String] = ["# \(title)", ""]
+            lines.append("Generated: \(Date().formatted(date: .abbreviated, time: .shortened))")
+            lines.append("")
+            lines.append("## Snapshot")
+            for row in chatSnapshotRows {
+                lines.append("- \(row.title): \(row.value)")
+            }
+            lines.append("")
+            lines.append("## Conversation")
+
+            let visibleMessages = vm.msgs.filter { $0.role.lowercased() != "system" }
+            if visibleMessages.isEmpty {
+                lines.append("")
+                lines.append("_\(String(localized: "No messages"))_")
+            } else {
+                for message in visibleMessages {
+                    let roleTitle = markdownRoleTitle(for: message)
+                    let text = markdownMessageText(for: message)
+                    guard !text.isEmpty else { continue }
+                    lines.append("")
+                    lines.append("### \(roleTitle) - \(message.timestamp.formatted(date: .omitted, time: .shortened))")
+                    lines.append("")
+                    lines.append(text)
+                    if let citations = message.citations, !citations.isEmpty {
+                        lines.append("")
+                        lines.append("Citations:")
+                        for (index, citation) in citations.enumerated() {
+                            let source = (citation.source ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                            let score = citation.score.map { String(format: "%.3f", $0) } ?? String(localized: "n/a")
+                            lines.append("\(index + 1). \(source.isEmpty ? String(localized: "Unknown Source") : source) (score \(score))")
+                        }
+                    }
+                }
+            }
+
+            return lines.joined(separator: "\n")
+        }
+
+        private var chatCitationsJSONText: String {
+            let formatter = ISO8601DateFormatter()
+            let messages: [[String: Any]] = vm.msgs.enumerated().compactMap { index, message in
+                guard let citations = message.citations, !citations.isEmpty else { return nil }
+                return [
+                    "message_index": index,
+                    "message_id": message.id.uuidString,
+                    "role": markdownRoleTitle(for: message),
+                    "timestamp": formatter.string(from: message.timestamp),
+                    "citations": citations.enumerated().map { citationIndex, citation in
+                        var citationPayload: [String: Any] = [
+                            "index": citationIndex + 1,
+                            "source": citation.source ?? "",
+                            "text": citation.text
+                        ]
+                        if let score = citation.score {
+                            citationPayload["score"] = score
+                        }
+                        return citationPayload
+                    }
+                ]
+            }
+            let payload: [String: Any] = [
+                "chat_title": sessionDisplayTitle(for: vm.sessions.first { $0.id == vm.activeSessionID } ?? ChatVM.Session(title: "", messages: [], date: Date())),
+                "exported_at": formatter.string(from: Date()),
+                "messages": messages
+            ]
+            guard JSONSerialization.isValidJSONObject(payload),
+                  let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else {
+                return "{\n  \"messages\" : []\n}"
+            }
+            return text
+        }
+
+        private var chatGenerationReplayJSONText: String {
+            let formatter = ISO8601DateFormatter()
+            let session = vm.sessions.first { $0.id == vm.activeSessionID }
+            let visibleMessages: [[String: Any]] = vm.msgs.enumerated().compactMap { index, message in
+                guard message.role.lowercased() != "system" else { return nil }
+                var payload: [String: Any] = [
+                    "index": index,
+                    "id": message.id.uuidString,
+                    "role": markdownRoleTitle(for: message),
+                    "timestamp": formatter.string(from: message.timestamp),
+                    "text": markdownMessageText(for: message)
+                ]
+                if let datasetID = message.datasetID, !datasetID.isEmpty {
+                    payload["dataset_id"] = datasetID
+                }
+                if let datasetName = message.datasetName, !datasetName.isEmpty {
+                    payload["dataset_name"] = datasetName
+                }
+                if let perf = message.perf {
+                    payload["timings"] = [
+                        "token_count": perf.tokenCount,
+                        "avg_tokens_per_second": perf.avgTokPerSec,
+                        "time_to_first_token_seconds": perf.timeToFirst,
+                        "latency_samples_ms": perf.latencySamplesMs
+                    ]
+                }
+                if let promptProcessing = message.promptProcessing {
+                    payload["prompt_processing"] = [
+                        "progress": promptProcessing.progress
+                    ]
+                }
+                if let rag = message.ragInjectionInfo {
+                    var ragPayload: [String: Any] = [
+                        "dataset_name": rag.datasetName,
+                        "stage": rag.stage.rawValue,
+                        "requested_max_chunks": rag.requestedMaxChunks,
+                        "retrieved_chunk_count": rag.retrievedChunkCount,
+                        "injected_chunk_count": rag.injectedChunkCount,
+                        "trimmed_chunk_count": rag.trimmedChunkCount,
+                        "partial_chunk_injected": rag.partialChunkInjected,
+                        "configured_context_tokens": rag.configuredContextTokens,
+                        "reserved_response_tokens": rag.reservedResponseTokens,
+                        "context_budget_tokens": rag.contextBudgetTokens,
+                        "injected_context_tokens": rag.injectedContextTokens,
+                        "decision_reason": rag.decisionReason
+                    ]
+                    if let method = rag.method {
+                        ragPayload["method"] = method.rawValue
+                    }
+                    if let estimate = rag.fullContentEstimateTokens {
+                        ragPayload["full_content_estimate_tokens"] = estimate
+                    }
+                    payload["rag"] = ragPayload
+                }
+                if let citations = message.citations, !citations.isEmpty {
+                    payload["citations"] = citations.enumerated().map { citationIndex, citation in
+                        var citationPayload: [String: Any] = [
+                            "index": citationIndex + 1,
+                            "text": citation.text,
+                            "source": citation.source ?? ""
+                        ]
+                        if let score = citation.score {
+                            citationPayload["score"] = score
+                        }
+                        return citationPayload
+                    }
+                }
+                if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                    payload["tool_calls"] = toolCalls.map { toolCall in
+                        var toolPayload: [String: Any] = [
+                            "id": toolCall.id.uuidString,
+                            "tool_name": toolCall.toolName,
+                            "display_name": toolCall.displayName,
+                            "phase": toolCall.phase.rawValue,
+                            "timestamp": formatter.string(from: toolCall.timestamp),
+                            "request_params": jsonReadyDictionary(toolCall.requestParams.mapValues { $0.value })
+                        ]
+                        if let externalID = toolCall.externalToolCallID {
+                            toolPayload["external_tool_call_id"] = externalID
+                        }
+                        if let result = toolCall.result {
+                            toolPayload["result"] = result
+                        }
+                        if let error = toolCall.error {
+                            toolPayload["error"] = error
+                        }
+                        return toolPayload
+                    }
+                }
+                if let webHits = message.webHits, !webHits.isEmpty {
+                    payload["web_hits"] = webHits.map { hit in
+                        [
+                            "id": hit.id,
+                            "title": hit.title,
+                            "snippet": hit.snippet,
+                            "url": hit.url,
+                            "engine": hit.engine,
+                            "score": hit.score
+                        ]
+                    }
+                }
+                if let webError = message.webError, !webError.isEmpty {
+                    payload["web_error"] = webError
+                }
+                if let imagePaths = message.imagePaths, !imagePaths.isEmpty {
+                    payload["image_count"] = imagePaths.count
+                    payload["image_names"] = imagePaths.map { URL(fileURLWithPath: $0).lastPathComponent }
+                }
+                if let attachments = message.mediaAttachments, !attachments.isEmpty {
+                    payload["media_attachment_count"] = attachments.count
+                }
+                payload["used_web_search"] = message.usedWebSearch ?? false
+                payload["used_remote_backend"] = message.usedRemoteBackend ?? false
+                if let backend = message.remoteBackendName, !backend.isEmpty {
+                    payload["remote_backend_name"] = backend
+                }
+                if let model = message.remoteModelName, !model.isEmpty {
+                    payload["remote_model_name"] = model
+                }
+                return payload
+            }
+
+            let payload: [String: Any] = [
+                "schema": "noema.generation_replay",
+                "schema_version": 1,
+                "exported_at": formatter.string(from: Date()),
+                "chat_title": sessionDisplayTitle(for: session ?? ChatVM.Session(title: "", messages: [], date: Date())),
+                "prompt_receipt": chatSnapshotRows.map { ["title": $0.title, "value": $0.value] },
+                "messages": visibleMessages
+            ]
+            guard JSONSerialization.isValidJSONObject(payload),
+                  let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else {
+                return "{\n  \"schema\" : \"noema.generation_replay\",\n  \"messages\" : []\n}"
+            }
+            return text
+        }
+
+        private func jsonReadyDictionary(_ dictionary: [String: Any]) -> [String: Any] {
+            dictionary.mapValues { jsonReadyValue($0) }
+        }
+
+        private func jsonReadyValue(_ value: Any) -> Any {
+            switch value {
+            case let string as String:
+                return string
+            case let bool as Bool:
+                return bool
+            case let int as Int:
+                return int
+            case let double as Double:
+                return double
+            case let float as Float:
+                return Double(float)
+            case let dictionary as [String: Any]:
+                return dictionary.mapValues { jsonReadyValue($0) }
+            case let array as [Any]:
+                return array.map { jsonReadyValue($0) }
+            default:
+                return String(describing: value)
+            }
+        }
+
+        private func markdownRoleTitle(for message: ChatVM.Msg) -> String {
+            let role = message.role.lowercased()
+            if role == "assistant" || message.role == "🤖" {
+                return String(localized: "Assistant")
+            }
+            if role == "user" || message.role == "🧑‍💻" {
+                return String(localized: "User")
+            }
+            return message.role
+        }
+
+        private func markdownMessageText(for message: ChatVM.Msg) -> String {
+            let role = message.role.lowercased()
+            let text: String?
+            if role == "assistant" || message.role == "🤖" {
+                text = vm.finalAnswerText(for: message)
+            } else {
+                text = message.text
+            }
+            return (text ?? "")
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        private var contextPlanRows: [ContextPlanRow] {
+            let messages = vm.msgs.filter { $0.role.lowercased() != "system" }
+            let usableBudget = ChatVM.promptBudget(for: vm.contextLimit).usablePromptTokens
+            var used = 0
+            var keptIDs = Set<UUID>()
+
+            for message in messages.reversed() {
+                let tokens = estimatedContextTokens(for: message)
+                if used + tokens <= usableBudget || keptIDs.isEmpty {
+                    keptIDs.insert(message.id)
+                    used += tokens
+                }
+            }
+
+            return messages.map { message in
+                let kept = keptIDs.contains(message.id)
+                return ContextPlanRow(
+                    id: message.id,
+                    roleTitle: markdownRoleTitle(for: message),
+                    preview: contextPlanPreview(for: message),
+                    tokenCount: estimatedContextTokens(for: message),
+                    statusKey: kept ? "Kept" : "At risk",
+                    tint: kept ? .green : .orange
+                )
+            }
+        }
+
+        private var contextPlanSummary: String {
+            let rows = contextPlanRows
+            let used = rows.filter { $0.statusKey == "Kept" }.reduce(0) { $0 + $1.tokenCount }
+            let budget = ChatVM.promptBudget(for: vm.contextLimit).usablePromptTokens
+            return String.localizedStringWithFormat(
+                String(localized: "%@ of %@ estimated"),
+                shortTokenLabel(used),
+                shortTokenLabel(budget)
+            )
+        }
+
+        private func contextPlanPreview(for message: ChatVM.Msg) -> String {
+            let text = markdownMessageText(for: message)
+            let condensed = text
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            guard !condensed.isEmpty else { return String(localized: "Empty message") }
+            if condensed.count > 120 {
+                return String(condensed.prefix(117)) + "..."
+            }
+            return condensed
+        }
+
+        private func estimatedContextTokens(for message: ChatVM.Msg) -> Int {
+            var total = estimatedTokenCount(markdownMessageText(for: message)) + 8
+            if let retrievedContext = message.retrievedContext {
+                total += estimatedTokenCount(retrievedContext)
+            }
+            if let citations = message.citations, !citations.isEmpty {
+                total += citations.reduce(0) { $0 + estimatedTokenCount($1.text) }
+            }
+            if let imagePaths = message.imagePaths {
+                total += imagePaths.count * 576
+            }
+            if let mediaAttachments = message.mediaAttachments {
+                total += mediaAttachments.reduce(0) { partial, attachment in
+                    partial + estimatedTokenCount(attachment.transcript?.effectiveTranscriptText ?? "")
+                }
+            }
+            return max(1, total)
+        }
+
+        private func estimatedTokenCount(_ value: String) -> Int {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return 0 }
+            let wordEstimate = trimmed.split { $0.isWhitespace || $0.isNewline }.count
+            let charEstimate = Int(ceil(Double(trimmed.count) / 4.0))
+            return max(1, max(wordEstimate, charEstimate))
+        }
+
+        private func shortTokenLabel(_ value: Int) -> String {
+            if value >= 1_000 {
+                return String(format: "%.1fk", Double(value) / 1000.0)
+            }
+            return "\(value)"
+        }
+
+        private func activeSettingsSummary() -> String {
+            let settings = vm.loadedModelSettings
+                ?? modelManager.loadedModel.map { modelManager.settings(for: $0) }
+            guard let settings else { return String(localized: "None") }
+            let context = Int(settings.contextLength.rounded())
+            let gpu = settings.gpuLayers < 0 ? String(localized: "Auto") : "\(settings.gpuLayers)"
+            return "ctx=\(context), temp=\(String(format: "%.2f", settings.temperature)), top-p=\(String(format: "%.2f", settings.topP)), gpu=\(gpu)"
+        }
+
+        private func openScratchpad() {
+            scratchpadDraft = vm.activeScratchpad
+            showScratchpad = true
+        }
+
+        private func openChatInstructions() {
+            chatInstructionsDraft = vm.activeChatInstructions
+            showChatInstructions = true
+        }
+
+        private func bookmarkPreview(for message: ChatVM.Msg) -> String {
+            let sourceText = recallSearchText(for: message)
+            let condensed = sourceText
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            guard !condensed.isEmpty else { return String(localized: "Empty message") }
+            if condensed.count > 90 {
+                return String(condensed.prefix(87)) + "..."
+            }
+            return condensed
+        }
+
+        private func recallSearchTerms(from query: String) -> [String] {
+            let parts = query
+                .lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { $0.count >= 2 }
+            var seen = Set<String>()
+            return parts.filter { seen.insert($0).inserted }
+        }
+
+        private func recallSearchText(for message: ChatVM.Msg) -> String {
+            let visible = message.trimmedVisibleAssistantText
+            return visible.isEmpty ? message.text : visible
+        }
+
+        private func openMessage(session: ChatVM.Session, messageID: UUID) {
+            shouldAutoScrollToBottom = false
+            vm.select(session)
+            withAnimation { showSidebar = false }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                vm.focus(onMessageWithID: messageID)
+            }
+        }
+
+        private func openBookmark(_ bookmark: BookmarkedMessageReference) {
+            openMessage(session: bookmark.session, messageID: bookmark.message.id)
+        }
+
+        private func openRecallResult(_ result: ChatRecallResult) {
+            openMessage(session: result.session, messageID: result.message.id)
+        }
+
+        // MARK: - Chat status pills
+
+        /// Shared capsule chrome for the status pills above the transcript,
+        /// matching the dataset pill's tinted-glass look.
+        private func statusPillBackground(tint: Color, secondary: Color) -> some View {
+            Capsule()
+                .fill(tint.opacity(0.22))
+                .glassifyIfAvailable(in: Capsule())
+                .overlay(
+                    Capsule().fill(
+                        LinearGradient(
+                            colors: [tint.opacity(0.35), secondary.opacity(0.20)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                )
+                .overlay(
+                    Capsule().strokeBorder(tint.opacity(0.48), lineWidth: 0.9)
+                )
+        }
+
+        /// Status row above the transcript: active dataset, context overflow,
+        /// and memory budget pills. Scrolls horizontally so multiple pills
+        /// never clip on narrow screens.
+        @ViewBuilder
+        private var chatStatusPillRow: some View {
+            let hasModel = modelManager.activeRemoteSession != nil || modelManager.loadedModel != nil
+            let overflowBanner = hasModel ? vm.contextOverflowBanner : nil
+            let memoryNotice = hasModel ? vm.memoryPromptBudgetNoticeText : nil
+            if vm.activeSessionDataset != nil || overflowBanner != nil || memoryNotice != nil {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        if let ds = vm.activeSessionDataset {
+                            datasetStatusPill(ds)
+                        }
+                        if let banner = overflowBanner {
+                            contextOverflowPill(banner)
+                        }
+                        if let memoryNotice {
+                            memoryBudgetPill(memoryNotice)
+                        }
+                    }
+                    .padding(.horizontal, UIConstants.defaultPadding)
+                    .padding(.vertical, 8)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+
+        private func datasetStatusPill(_ ds: LocalDataset) -> some View {
+            Menu {
+                Button(role: .destructive) {
+                    vm.setDatasetForActiveSession(nil)
+                } label: {
+                    Label(LocalizedStringKey("Stop Using Dataset"), systemImage: "xmark.circle")
+                }
+                Button {
+                    openStoredDatasetDetails(ds)
+                } label: {
+                    Label("See details", systemImage: "info.circle")
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.caption.weight(.semibold))
+                    Text("Using \(ds.name)")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .opacity(0.9)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(statusPillBackground(tint: .blue, secondary: .cyan))
+                .shadow(color: Color.blue.opacity(0.25), radius: 8, x: 0, y: 4)
+            }
+            .buttonStyle(.plain)
+        }
+
+        private func contextOverflowPill(_ banner: ChatVM.ContextOverflowBannerState) -> some View {
+            let isStop = banner.strategy.isHardStop
+            let tint: Color = isStop ? .red : .orange
+            let secondary: Color = isStop ? .orange : .yellow
+            return HStack(spacing: 0) {
+                Button {
+                    showContextOverflowAlert = true
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: banner.strategy.pillSymbolName)
+                            .font(.caption.weight(.semibold))
+                        Text(LocalizedStringKey(banner.strategy.pillTitleKey))
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .lineLimit(1)
+                    }
+                    .padding(.leading, 12)
+                    .padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(LocalizedStringKey(banner.strategy.pillTitleKey)))
+                .accessibilityHint(Text("Shows details about the context window."))
+
+                Button {
+                    vm.dismissActiveContextOverflowBanner()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .opacity(0.85)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 9)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text("Dismiss context warning"))
+            }
+            .foregroundStyle(.white)
+            .background(statusPillBackground(tint: tint, secondary: secondary))
+            .shadow(color: tint.opacity(0.25), radius: 8, x: 0, y: 4)
+        }
+
+        private func memoryBudgetPill(_ notice: String) -> some View {
+            Button {
+                showMemoryPromptBudgetAlert = true
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "bookmark.slash.fill")
+                        .font(.caption.weight(.semibold))
+                    Text(notice)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(statusPillBackground(tint: .yellow, secondary: .orange))
+                .shadow(color: Color.yellow.opacity(0.25), radius: 8, x: 0, y: 4)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(notice)
+        }
 
         private var chatContent: some View {
             return VStack(spacing: 0) {
 #if os(macOS)
                 macChatToolbar
 #endif
-                if let ds = vm.activeSessionDataset {
-                    // RAG dataset indicator pill
-                    HStack {
-                        Menu {
-                            Button(role: .destructive) {
-                                vm.setDatasetForActiveSession(nil)
-                            } label: {
-                                Label(LocalizedStringKey("Stop Using Dataset"), systemImage: "xmark.circle")
-                            }
-                            Button {
-                                openStoredDatasetDetails(ds)
-                            } label: {
-                                Label("See details", systemImage: "info.circle")
-                            }
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: "doc.text.magnifyingglass")
-                                    .font(.caption.weight(.semibold))
-                                Text("Using \(ds.name)")
-                                    .font(.caption)
-                                    .fontWeight(.semibold)
-                                    .lineLimit(1)
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .opacity(0.9)
-                            }
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .background(
-                                Capsule()
-                                    .fill(Color.blue.opacity(0.22))
-                                    .glassifyIfAvailable(in: Capsule())
-                                    .overlay(
-                                        Capsule().fill(
-                                            LinearGradient(
-                                                colors: [
-                                                    Color.blue.opacity(0.35),
-                                                    Color.cyan.opacity(0.20)
-                                                ],
-                                                startPoint: .topLeading,
-                                                endPoint: .bottomTrailing
-                                            )
-                                        )
-                                    )
-                                    .overlay(
-                                        Capsule()
-                                            .strokeBorder(Color.blue.opacity(0.48), lineWidth: 0.9)
-                                    )
-                            )
-                            .shadow(color: Color.blue.opacity(0.25), radius: 8, x: 0, y: 4)
-                        }
-                        .buttonStyle(.plain)
+                chatStatusPillRow
 
-                        Spacer()
-                    }
-                    .padding(.horizontal, UIConstants.defaultPadding)
-                    .padding(.vertical, 8)
+#if os(macOS)
+                // The composer is the SAME structural node in both states, so
+                // the hand-off animates only its position — no matched-geometry
+                // duplicate, no NSTextView remount, focus carries over.
+                if isMacNewChatCanvas {
+                    Spacer(minLength: ChatTheme.spacingXL)
+                    Text("How can I help you today?")
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .padding(.bottom, 30)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                } else {
+                    conversationScrollArea
+                        .transition(.opacity)
                 }
-                
+                macComposerStack
+                if isMacNewChatCanvas {
+                    macSuggestionPills
+                        .padding(.top, 22)
+                        .transition(.opacity)
+                    Spacer(minLength: ChatTheme.spacingXL)
+                    Spacer(minLength: 0)
+                }
+#else
+                conversationScrollArea
+#if !os(iOS)
+                nonMacDesktopComposerStack
+#endif
+#endif
+            }
+#if os(macOS)
+            // One coherent spring drives the hero→bottom composer hand-off.
+            .animation(.spring(response: 0.42, dampingFraction: 0.9), value: isMacNewChatCanvas)
+#endif
+            .onAppear {
+                // Pick suggestions when entering a new empty chat (only once)
+                let isEmpty = vm.msgs.first(where: { $0.role != "system" }) == nil
+                if isEmpty {
+                    suggestionTriplet = ChatSuggestions.nextThree(datasetName: vm.activeSessionDataset?.name)
+                    suggestionsSessionID = vm.activeSessionID
+                }
+            }
+            .onChangeCompat(of: vm.activeSessionID) { _, newID in
+                showContextOverflowAlert = false
+#if os(macOS)
+                macComposerHandOff = false
+#endif
+                // Rotate suggestions per new session if starting empty
+                let isEmpty = vm.msgs.first(where: { $0.role != "system" }) == nil
+                if isEmpty && newID != suggestionsSessionID {
+                    suggestionTriplet = ChatSuggestions.nextThree(datasetName: vm.activeSessionDataset?.name)
+                    suggestionsSessionID = newID
+                }
+            }
+            .onChangeCompat(of: vm.activeSessionDataset?.datasetID) { _, _ in
+                let isEmpty = vm.msgs.first(where: { $0.role != "system" }) == nil
+                if isEmpty {
+                    suggestionTriplet = ChatSuggestions.nextThree(datasetName: vm.activeSessionDataset?.name)
+                    suggestionsSessionID = vm.activeSessionID
+                }
+            }
+#if os(iOS)
+            // Decorative bottom glow. Stays an overlay (anchored to the full
+            // chat bounds, behind the input stack) and never intercepts touches.
+            .overlay(alignment: .bottom) {
+                GeometryReader { proxy in
+                    let menuBarOffset = max(proxy.safeAreaInsets.bottom, 52)
+                    LinearGradient(
+                        stops: [
+                            .init(color: Color.white.opacity(0.18), location: 0.0),
+                            .init(color: Color.white.opacity(0.11), location: 0.22),
+                            .init(color: Color.white.opacity(0.06), location: 0.52),
+                            .init(color: Color.white.opacity(0.03), location: 0.78),
+                            .init(color: .clear, location: 1.0)
+                        ],
+                        startPoint: .bottom,
+                        endPoint: .top
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 620)
+                    .offset(y: menuBarOffset)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                }
+                .ignoresSafeArea(edges: .bottom)
+                .allowsHitTesting(false)
+            }
+            // The input stack is a safe-area inset (NOT an overlay) so the
+            // ScrollView's viewport ends above it: `scrollTo(_, anchor: .bottom)`
+            // and manual scrolling both land the last message's bottom —
+            // badges, perf footer — fully visible above the status bar +
+            // composer, while content still scrolls beneath the glass.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                let isIndexing = datasetManager.indexingDatasetID != nil
+                VStack(spacing: 0) {
+                    if isIndexing {
+                        VStack(spacing: 4) {
+                            HStack(spacing: 6) {
+                                ProgressView().scaleEffect(0.8)
+                                Text("Dataset indexing in progress...")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text("You can keep chatting while indexing finishes")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.bottom, 4)
+                    }
+
+                    ChatInputBox(text: $draftText, focus: inputFocusBinding,
+                                 showModelRequiredAlert: $showModelRequiredAlert,
+                                 send: { let text = draftText; draftText = ""; Task { await vm.sendMessage(text) } },
+                                 stop: { vm.stop() },
+                                 stopAfterParagraph: { vm.requestStopAfterParagraph() },
+                                 canStop: vm.isStreaming,
+                                 stopAfterParagraphPending: vm.stopAfterParagraphRequested)
+                    .guideHighlight(.chatInput)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
+                    .padding(.bottom, 8)
+                }
+            }
+#endif
+            .alert("Load Failed", isPresented: Binding(get: { vm.loadError != nil }, set: { _ in vm.loadError = nil })) {
+                if vm.pendingETRepairCandidate != nil {
+                    Button("Repair") {
+                        Task { await vm.repairPendingETArtifacts() }
+                    }
+                }
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(vm.loadError ?? "")
+            }
+            // Keep draftText in sync when ChatVM sets prompt externally — e.g.
+            // branch creation pre-fills the input, or a blocked send restores it.
+            .onChangeCompat(of: vm.prompt) { _, newPrompt in
+                if draftText != newPrompt { draftText = newPrompt }
+            }
+            // Value-scoped: only animates the status pill row appearing/disappearing.
+            .animation(.easeInOut(duration: 0.2), value: vm.contextOverflowBanner)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        }
+
+        private var conversationScrollArea: some View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             ForEach(vm.msgs.filter { $0.role != "system" }) { m in
-                                MessageView(msg: m)
+                                StreamingAwareMessageView(msg: m, store: vm.streamingStore)
                                     .id(m.id)
                             }
+                            // Drives auto-scroll from the streaming store so the view
+                            // follows tokens smoothly without re-rendering the whole list.
+                            StreamingScrollAnchor(store: vm.streamingStore, proxy: proxy, enabled: shouldAutoScrollToBottom)
                         }
+#if os(macOS)
+                        // Constrain the conversation to a readable column with
+                        // generous breathing room on either side.
+                        .padding(.vertical, ChatTheme.spacingL)
+                        .padding(.horizontal, ChatTheme.conversationHorizontalInset)
+                        .frame(maxWidth: ChatTheme.conversationMaxWidth + ChatTheme.conversationHorizontalInset * 2)
+                        .frame(maxWidth: .infinity)
+#else
                         .padding()
+#endif
                         .padding(.bottom, scrollBottomInset)
 #if os(macOS)
                         .background(
@@ -11766,47 +17811,67 @@ struct MessageView: View {
                     // Avoid attaching this drag gesture on macOS so text selection remains uninterrupted.
                     .simultaneousGesture(DragGesture().onChanged { _ in shouldAutoScrollToBottom = false })
 #endif
+#if !os(macOS)
                     // Centered suggestions overlay for brand-new empty chats
+                    // (macOS uses the dedicated new-chat canvas instead).
                     .overlay(alignment: .center) {
                         let isEmptyChat = vm.msgs.first(where: { $0.role != "system" }) == nil
-                        if isEmptyChat && !vm.isStreaming && !vm.loading {
-                            SuggestionsOverlay(
-                                suggestions: suggestionTriplet,
-                                enabled: hasActiveChatModel,
-                                onTap: { text in
-                                    guard hasActiveChatModel else { return }
-                                    guard !vm.isStreamingInAnotherSession else {
-                                        vm.crossSessionSendBlocked = true
-                                        return
+                        let hasPendingMediaSurface = !vm.pendingMediaAttachments.isEmpty
+                            || vm.audioRecordingError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        let showsSuggestions = isEmptyChat && !hasPendingMediaSurface && !vm.isStreaming && !vm.loading
+                        Group {
+                            if showsSuggestions {
+                                SuggestionsOverlay(
+                                    suggestions: suggestionTriplet,
+                                    enabled: hasActiveChatModel,
+                                    onTap: { text in
+                                        guard hasActiveChatModel else { return }
+                                        guard !vm.isStreamingInAnotherSession else {
+                                            vm.crossSessionSendBlocked = true
+                                            return
+                                        }
+                                        suggestionTriplet = []
+                                        Task { await vm.sendMessage(text) }
+                                    },
+                                    onDisabledTap: {
+                                        inputFocused = false
+                                        showModelRequiredAlert = true
                                     }
-                                    suggestionTriplet = []
-                                    Task { await vm.sendMessage(text) }
-                                },
-                                onDisabledTap: {
-                                    inputFocused = false
-                                    showModelRequiredAlert = true
-                                }
-                            )
-                            .transition(.opacity.combined(with: .scale))
-                        }
-                    }
-                    .overlay(alignment: .bottomTrailing) {
-                        if !shouldAutoScrollToBottom && vm.isStreaming {
-                            Button {
-                                if let id = vm.msgs.last?.id {
-                                    withAnimation { proxy.scrollTo(id, anchor: .bottom) }
-                                }
-                                shouldAutoScrollToBottom = true
-                            } label: {
-                                Image(systemName: "arrow.down")
-                                    .font(.caption)
-                                    .padding(10)
-                                    .background(.thinMaterial)
-                                    .clipShape(Circle())
+                                )
+                                .transition(.opacity.combined(with: .scale))
                             }
-                            .padding(.trailing, 16)
-                            .padding(.bottom, 96)
                         }
+                        // The gating state changes outside withAnimation (vm publishes),
+                        // so bind the animation to the value or the transition never fires.
+                        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: showsSuggestions)
+                    }
+#endif
+                    .overlay(alignment: .bottomTrailing) {
+                        let showsJumpToBottom = !shouldAutoScrollToBottom && vm.isStreaming
+                        Group {
+                            if showsJumpToBottom {
+                                Button {
+                                    if let id = vm.msgs.last?.id {
+                                        withAnimation { proxy.scrollTo(id, anchor: .bottom) }
+                                    }
+                                    shouldAutoScrollToBottom = true
+                                } label: {
+                                    Image(systemName: "arrow.down")
+                                        .font(.caption)
+                                        .padding(10)
+                                        .background(.thinMaterial)
+                                        .clipShape(Circle())
+                                }
+                                .padding(.trailing, 16)
+                                // The input stack is a safeAreaInset, so the
+                                // overlay's bottom already sits above it.
+                                .padding(.bottom, 12)
+                                .transition(.scale(scale: 0.6).combined(with: .opacity))
+                            }
+                        }
+                        // Driven by drag gestures / vm state, never withAnimation —
+                        // animate on the value so the button doesn't pop in.
+                        .animation(.spring(response: 0.3, dampingFraction: 0.75), value: showsJumpToBottom)
                     }
                     .onTapGesture {
                         let wasInputFocused = inputFocused
@@ -11829,128 +17894,161 @@ struct MessageView: View {
                             proxy.scrollTo(uuid, anchor: .top)
                         }
                     }
+                    .onChangeCompat(of: vm.spotlightMessageID) { _, id in
+                        guard let id else { return }
+                        withAnimation {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    }
                     .onChangeCompat(of: vm.msgs) { _, msgs in
                         if shouldAutoScrollToBottom, let id = msgs.last?.id {
-                            // Use instant scroll during streaming for better performance,
-                            // animated scroll only when not actively streaming
+                            // Critically damped spring while streaming: matches
+                            // StreamingScrollAnchor's follow animation so the
+                            // pinned view glides instead of snapping. (Instant
+                            // scroll was only needed before the anchor was
+                            // throttled to ~12 Hz.)
                             if vm.isStreaming {
-                                proxy.scrollTo(id, anchor: .bottom)
+                                withAnimation(.spring(response: 0.28, dampingFraction: 1.0)) {
+                                    proxy.scrollTo(id, anchor: .bottom)
+                                }
                             } else {
                                 withAnimation { proxy.scrollTo(id, anchor: .bottom) }
                             }
                         }
                     }
-                    .onAppear {
-                        // Pick suggestions when entering a new empty chat (only once)
-                        let isEmpty = vm.msgs.first(where: { $0.role != "system" }) == nil
-                        if isEmpty && suggestionTriplet.isEmpty {
-                            suggestionTriplet = ChatSuggestions.nextThree()
-                            suggestionsSessionID = vm.activeSessionID
-                        }
-                    }
-                    .onChangeCompat(of: vm.activeSessionID) { _, newID in
-                        showContextOverflowAlert = false
-                        // Rotate suggestions per new session if starting empty
-                        let isEmpty = vm.msgs.first(where: { $0.role != "system" }) == nil
-                        if isEmpty && newID != suggestionsSessionID {
-                            suggestionTriplet = ChatSuggestions.nextThree()
-                            suggestionsSessionID = newID
-                        }
-                    }
-                    
                 }
-#if !os(iOS)
-                let isIndexing = datasetManager.indexingDatasetID != nil
-                ChatInputBox(text: $vm.prompt, focus: inputFocusBinding,
-                             showModelRequiredAlert: $showModelRequiredAlert,
-                             send: { let text = vm.prompt; vm.prompt = ""; Task { await vm.sendMessage(text) } },
-                             stop: { vm.stop() },
-                             canStop: vm.isStreaming)
-                .guideHighlight(.chatInput)
-#if os(macOS)
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 6)
-#else
-                .padding()
-#endif
-                if isIndexing {
-                    VStack(spacing: 4) {
-                        HStack(spacing: 6) {
-                            ProgressView().scaleEffect(0.8)
-                            Text("Dataset indexing in progress...")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text("You can keep chatting while indexing finishes")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    .padding(.bottom)
-                }
-#endif
-            }
-#if os(iOS)
-            .overlay(alignment: .bottom) {
-                let isIndexing = datasetManager.indexingDatasetID != nil
-                ZStack(alignment: .bottom) {
-                    GeometryReader { proxy in
-                        let menuBarOffset = max(proxy.safeAreaInsets.bottom, 52)
-                        LinearGradient(
-                            stops: [
-                                .init(color: Color.white.opacity(0.18), location: 0.0),
-                                .init(color: Color.white.opacity(0.11), location: 0.22),
-                                .init(color: Color.white.opacity(0.06), location: 0.52),
-                                .init(color: Color.white.opacity(0.03), location: 0.78),
-                                .init(color: .clear, location: 1.0)
-                            ],
-                            startPoint: .bottom,
-                            endPoint: .top
-                        )
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 620)
-                        .offset(y: menuBarOffset)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    }
-                    .ignoresSafeArea(edges: .bottom)
-                    .allowsHitTesting(false)
-
-                    VStack(spacing: 0) {
-                        if isIndexing {
-                            VStack(spacing: 4) {
-                                HStack(spacing: 6) {
-                                    ProgressView().scaleEffect(0.8)
-                                    Text("Dataset indexing in progress...")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text("You can keep chatting while indexing finishes")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(.bottom, 4)
-                        }
-
-                        ChatInputBox(text: $vm.prompt, focus: inputFocusBinding,
-                                     showModelRequiredAlert: $showModelRequiredAlert,
-                                     send: { let text = vm.prompt; vm.prompt = ""; Task { await vm.sendMessage(text) } },
-                                     stop: { vm.stop() },
-                                     canStop: vm.isStreaming)
-                        .guideHighlight(.chatInput)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 10)
-                        .padding(.bottom, 8)
-                    }
-                }
-            }
-#endif
-            .alert("Load Failed", isPresented: Binding(get: { vm.loadError != nil }, set: { _ in vm.loadError = nil })) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(vm.loadError ?? "")
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
+
+        /// The composer instance shared by every desktop placement (hero canvas
+        /// and bottom bar) so its bindings and identity stay consistent.
+        private var composerCore: some View {
+            ChatInputBox(text: $draftText, focus: inputFocusBinding,
+                         showModelRequiredAlert: $showModelRequiredAlert,
+                         send: { sendCurrentDraft() },
+                         stop: { vm.stop() },
+                         stopAfterParagraph: { vm.requestStopAfterParagraph() },
+                         canStop: vm.isStreaming,
+                         stopAfterParagraphPending: vm.stopAfterParagraphRequested)
+                .guideHighlight(.chatInput)
+        }
+
+        private func sendCurrentDraft() {
+            let text = draftText
+            draftText = ""
+#if os(macOS)
+            if isMacNewChatCanvas {
+                sendWithMacHandOff(text)
+                return
+            }
+#endif
+            Task { await vm.sendMessage(text) }
+        }
+
+        @ViewBuilder
+        private var indexingNotice: some View {
+            if datasetManager.indexingDatasetID != nil {
+                VStack(spacing: 4) {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("Dataset indexing in progress...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("You can keep chatting while indexing finishes")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.bottom)
+            }
+        }
+
+#if os(macOS)
+        /// True when the active chat has no visible conversation yet — the
+        /// composer is centered on a hero canvas until the first send.
+        private var isMacNewChatCanvas: Bool {
+            !macComposerHandOff
+                && vm.msgs.first(where: { $0.role != "system" }) == nil
+                && !vm.isStreaming
+        }
+
+        /// First send in a fresh chat: collapse the hero canvas and let the
+        /// composer slide to the bottom *before* inference starts. Prompt
+        /// prefill saturates CPU and GPU, so an animation overlapping it drops
+        /// to single frames — the short deferral keeps the hand-off fluid.
+        private func sendWithMacHandOff(_ text: String) {
+            macComposerHandOff = true
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                await vm.sendMessage(text)
+                macComposerHandOff = false
+            }
+        }
+
+        /// Compact, quiet starter prompts under the hero composer.
+        @ViewBuilder
+        private var macSuggestionPills: some View {
+            if !suggestionTriplet.isEmpty && !vm.loading {
+                VStack(spacing: ChatTheme.spacingS) {
+                    ForEach(suggestionTriplet.prefix(3), id: \.self) { suggestion in
+                        Button {
+                            guard hasActiveChatModel else {
+                                inputFocused = false
+                                showModelRequiredAlert = true
+                                return
+                            }
+                            guard !vm.isStreamingInAnotherSession else {
+                                vm.crossSessionSendBlocked = true
+                                return
+                            }
+                            suggestionTriplet = []
+                            sendWithMacHandOff(suggestion)
+                        } label: {
+                            Text(suggestion)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .padding(.horizontal, ChatTheme.spacingM)
+                                .padding(.vertical, 7)
+                                .background(Capsule().fill(ChatTheme.quietSurface))
+                                .overlay(Capsule().stroke(ChatTheme.hairline, lineWidth: 1))
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(hasActiveChatModel ? 1 : 0.55)
+                    }
+                }
+                .frame(maxWidth: ChatTheme.heroComposerMaxWidth)
+            }
+        }
+
+        /// The composer bar: centered narrow on the new-chat canvas, aligned
+        /// with the conversation column once a chat is underway. One node in
+        /// both states — only its width and position animate.
+        private var macComposerStack: some View {
+            VStack(spacing: 0) {
+                composerCore
+                    .frame(maxWidth: isMacNewChatCanvas
+                           ? ChatTheme.heroComposerMaxWidth
+                           : ChatTheme.conversationMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, ChatTheme.conversationHorizontalInset)
+                    .padding(.top, ChatTheme.spacingM)
+                    .padding(.bottom, ChatTheme.spacingM)
+                indexingNotice
+            }
+        }
+#endif
+
+#if os(visionOS)
+        /// visionOS keeps the previous bottom composer arrangement.
+        @ViewBuilder
+        private var nonMacDesktopComposerStack: some View {
+            composerCore
+                .padding()
+            indexingNotice
+        }
+#endif
 
         private func openStoredDatasetDetails(_ dataset: LocalDataset) {
             tabRouter.pendingStoredDatasetID = dataset.datasetID
@@ -11966,107 +18064,203 @@ struct MessageView: View {
 #if os(macOS)
         private var macChatToolbar: some View {
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
+                HStack(spacing: ChatTheme.spacingS) {
                     MacModelSelectorBar()
-                        .frame(minWidth: 340, idealWidth: 400, maxWidth: 460)
+                        .frame(minWidth: 260, idealWidth: 360, maxWidth: 420)
                     Spacer()
-                    Button { vm.startNewSession() } label: {
-                        Image(systemName: "plus")
+                    ChatToolbarIconButton(systemImage: "info.circle", help: "Runtime Information") {
+                        showRuntimeInfo = true
                     }
-                    .padding(.vertical, 6)
-                    .help("New Chat")
-                    .buttonStyle(.plain)
+                    ChatToolbarIconButton(systemImage: "square.and.pencil", help: "New Chat") {
+                        vm.startNewSession()
+                    }
                     .guideHighlight(.chatNewChatButton)
                 }
-                .padding(.horizontal, 20)
-                .frame(height: 48)
-                Divider()
+                .padding(.horizontal, ChatTheme.spacingL)
+                .frame(height: 46)
+                AppTheme.separator.frame(height: 1)
             }
-            .background(AppTheme.windowBackground.opacity(0.5))
-            .glassifyIfAvailable(in: Rectangle())
+            .background(AppTheme.windowBackground)
             .macWindowDragDisabled()
             // Ensure toolbar sits visually above background visuals.
             .zIndex(2)
         }
 #endif
 
+        // MARK: - Adaptive top bar
+
+        /// Estimated widths used to decide how many trailing icons fit beside the model name.
+        private static let toolbarIconSlotWidth: CGFloat = 44   // one toolbar icon button + spacing
+        /// Nav-bar insets, glass-capsule padding, and the gap between the leading and
+        /// trailing groups. Underestimating this makes the system collapse the trailing
+        /// buttons into its own nested "•••" overflow (a second tap to reach the menu),
+        /// so err high.
+        private static let toolbarChromeWidth: CGFloat = 104
+        private static let modelChipChromeWidth: CGFloat = 18   // disclosure chevron + spacing
+        private static let minModelChipWidth: CGFloat = 90
+
+        private var currentModelDisplayName: String {
+            if let remote = modelManager.activeRemoteSession { return remote.modelName }
+            if let loaded = modelManager.loadedModel { return loaded.name }
+            return String(localized: "No model")
+        }
+
+        /// Precise rendered width of a string in the model-name font, computed synchronously
+        /// so the toolbar can size itself without a measurement/relayout pass.
+        private func modelNameDisplayWidth(_ name: String) -> CGFloat {
+#if canImport(UIKit)
+            let base = UIFont.preferredFont(forTextStyle: .subheadline)
+            let font = UIFont(descriptor: base.fontDescriptor.withSymbolicTraits(.traitBold) ?? base.fontDescriptor,
+                              size: base.pointSize)
+#else
+            let font = NSFont.preferredFont(forTextStyle: .subheadline)
+#endif
+            return ceil((name as NSString).size(withAttributes: [.font: font]).width)
+        }
+
+        /// Upper bound for the model-name chip so the trailing controls that stay inline
+        /// always have room — preventing the system's own nested overflow.
+        private var maxModelNameWidth: CGFloat {
+            let inlineButtons = CGFloat(adaptiveTrailingSlots + 1)  // More (•••) is always inline
+            let total = currentDeviceWidth()
+            return max(Self.minModelChipWidth,
+                       total - Self.toolbarChromeWidth - inlineButtons * Self.toolbarIconSlotWidth)
+        }
+
+        /// Trailing tier beside the model name: 2 = sidebar + More + New inline,
+        /// 1 = More + New (sidebar folds into More), 0 = More only (New Chat folds too).
+        private var adaptiveTrailingSlots: Int {
+            let total = currentDeviceWidth()
+            let available = total - Self.toolbarChromeWidth
+            let nameWidth = modelNameDisplayWidth(currentModelDisplayName) + Self.modelChipChromeWidth
+            if nameWidth + 3 * Self.toolbarIconSlotWidth <= available { return 2 }
+            if Self.minModelChipWidth + 2 * Self.toolbarIconSlotWidth <= available { return 1 }
+            return 0
+        }
+
+        @ViewBuilder
+        private var sidebarToolbarButton: some View {
+            Button {
+                withAnimation { showSidebar.toggle() }
+            } label: {
+                Image(systemName: "line.3.horizontal")
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 2)
+            .guideHighlight(.chatSidebarButton)
+        }
+
+        @ViewBuilder
+        private var chatModePickers: some View {
+            Picker(LocalizedStringKey("Chat Mode"), selection: chatModeBinding) {
+                ForEach(ChatVM.ChatMode.allCases) { mode in
+                    Text(LocalizedStringKey(mode.titleKey)).tag(mode)
+                }
+            }
+            Divider()
+            Picker(LocalizedStringKey("Answer Style"), selection: answerStyleBinding) {
+                ForEach(ChatVM.AnswerStyle.allCases) { style in
+                    Text(LocalizedStringKey(style.titleKey)).tag(style)
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var newChatToolbarButton: some View {
+            Button { vm.startNewSession() } label: { Image(systemName: "plus") }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 2)
+                .guideHighlight(.chatNewChatButton)
+        }
+
+        /// Single flat overflow menu. Folds in the sidebar/new-chat controls when they
+        /// don't fit as inline icons, so options always open directly (never a nested menu).
+        @ViewBuilder
+        private func moreToolbarMenu(includeSidebar: Bool, includeNewChat: Bool) -> some View {
+            Menu {
+                if includeNewChat {
+                    Button { vm.startNewSession() } label: {
+                        Label("New Chat", systemImage: "plus")
+                    }
+                }
+                if includeSidebar {
+                    Button {
+                        withAnimation { showSidebar.toggle() }
+                    } label: {
+                        Label("Chat History", systemImage: "line.3.horizontal")
+                    }
+                }
+                Button { showRuntimeInfo = true } label: {
+                    Label("Runtime Information", systemImage: "info.circle")
+                }
+                Button { showContextPlan = true } label: {
+                    Label("Context Plan", systemImage: "list.bullet.rectangle")
+                }
+                Divider()
+                Button { openScratchpad() } label: {
+                    Label("Private Scratchpad", systemImage: activeScratchpadHasText ? "note.text" : "note.text.badge.plus")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 2)
+            .accessibilityLabel(Text("More options"))
+        }
+
         private var modelHeader: some View {
             VStack(alignment: .leading, spacing: 4) {
                 Group {
                     if let remote = modelManager.activeRemoteSession {
-                        HStack(spacing: 8) {
-                            VStack(alignment: .leading, spacing: 2) {
+                        Menu {
+                            Section(remote.backendName) {
+                                Button(role: .destructive) {
+                                    performMediumImpact()
+                                    AppSoundPlayer.play(.loadPress)
+                                    vm.deactivateRemoteSession()
+                                } label: {
+                                    Label(LocalizedStringKey("Disconnect"), systemImage: "eject")
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                remoteConnectionIndicator(for: remote)
                                 Text(remote.modelName)
                                     .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
-                                    .layoutPriority(10)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                Text(remote.backendName)
-                                    .font(.caption2)
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 10, weight: .bold))
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
                             }
-                            remoteConnectionIndicator(for: remote)
-                            Button(action: {
-                                performMediumImpact()
-                                AppSoundPlayer.play(.loadPress)
-                                vm.deactivateRemoteSession()
-                            }) {
-                                Image(systemName: "eject")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .padding(6)
-                                    .background(Color.secondary.opacity(0.12))
-                                    .clipShape(Circle())
-                            }
-                            .buttonStyle(.plain)
-                            Text(
-                                showPercent
-                                    ? "\(Int(Double(vm.totalTokens) / vm.contextLimit * 100)) %"
-                                    : "\(vm.totalTokens) tok"
-                            )
-                            .font(.caption2)
-                            .monospacedDigit()
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                            .background(Color.secondary.opacity(0.12))
-                            .clipShape(Capsule())
-                            .foregroundColor(.secondary)
-                            .onTapGesture { showPercent.toggle() }
+                            .frame(maxWidth: maxModelNameWidth, alignment: .leading)
                         }
+                        .menuIndicator(.hidden)
                     } else if let loaded = modelManager.loadedModel {
-                        HStack(spacing: 8) {
-                            Text(loaded.name)
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Button(action: {
+                        Menu {
+                            Button(role: .destructive) {
                                 performMediumImpact()
                                 AppSoundPlayer.play(.loadPress)
                                 modelManager.loadedModel = nil
                                 Task { await vm.unload() }
-                            }) {
-                                Image(systemName: "eject")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .padding(6)
-                                    .background(Color.secondary.opacity(0.12))
-                                    .clipShape(Circle())
+                            } label: {
+                                Label(LocalizedStringKey("Unload Model"), systemImage: "eject")
                             }
-                            .buttonStyle(.plain)
-                            Text(
-                                showPercent
-                                    ? "\(Int(Double(vm.totalTokens) / vm.contextLimit * 100)) %"
-                                    : "\(vm.totalTokens) tok"
-                            )
-                            .font(.caption2)
-                            .monospacedDigit()
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                            .background(Color.secondary.opacity(0.12))
-                            .clipShape(Capsule())
-                            .foregroundColor(.secondary)
-                            .onTapGesture { showPercent.toggle() }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(loaded.name)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: maxModelNameWidth, alignment: .leading)
                         }
+                        .menuIndicator(.hidden)
                     } else {
                         let favourites = quickLoadFavourites
                         let recents = quickLoadRecents
@@ -12111,54 +18305,6 @@ struct MessageView: View {
                     }
                 }
 
-                if vm.contextOverflowBanner != nil,
-                   modelManager.activeRemoteSession != nil || modelManager.loadedModel != nil {
-                    Button {
-                        showContextOverflowAlert = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                            Text("Context Length Exceeded")
-                        }
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.orange.opacity(0.18), in: Capsule())
-                        .glassifyIfAvailable(in: Capsule())
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.orange.opacity(0.58), lineWidth: 0.9)
-                        )
-                        .foregroundStyle(Color.orange)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Context Length Exceeded")
-                }
-
-                if let memoryNotice = vm.memoryPromptBudgetNoticeText,
-                   modelManager.activeRemoteSession != nil || modelManager.loadedModel != nil {
-                    Button {
-                        showMemoryPromptBudgetAlert = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "bookmark.slash.fill")
-                            Text(memoryNotice)
-                                .lineLimit(1)
-                        }
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.yellow.opacity(0.18), in: Capsule())
-                        .glassifyIfAvailable(in: Capsule())
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.yellow.opacity(0.58), lineWidth: 0.9)
-                        )
-                        .foregroundStyle(Color.yellow)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(memoryNotice)
-                }
             }
         }
         
@@ -12247,7 +18393,38 @@ struct MessageView: View {
                 parts.append(model.quant)
             }
             parts.append(model.format.displayName)
+            parts.append(quickLoadContextEstimate(for: model))
+            parts.append(quickLoadMemoryEstimate(for: model))
             return parts.joined(separator: " · ")
+        }
+
+        private func quickLoadContextEstimate(for model: LocalModel) -> String {
+            let settings = modelManager.settings(for: model)
+            let context = Int(settings.contextLength.rounded())
+            let formatted = NumberFormatter.localizedString(from: NSNumber(value: context), number: .decimal)
+            return String.localizedStringWithFormat(String(localized: "%@ ctx"), formatted)
+        }
+
+        private func quickLoadMemoryEstimate(for model: LocalModel) -> String {
+            let settings = modelManager.settings(for: model)
+            let sizeBytes = Int64(model.sizeGB * 1_073_741_824.0)
+            let layerHint: Int? = model.totalLayers > 0 ? model.totalLayers : nil
+            let kvCacheEstimate = model.format == .gguf
+                ? ModelRAMAdvisor.GGUFKVCacheEstimate.resolved(from: settings)
+                : .f16F16
+            let estimate = ModelRAMAdvisor.estimateAndBudget(
+                format: model.format,
+                sizeBytes: sizeBytes,
+                contextLength: Int(settings.contextLength),
+                layerCount: layerHint,
+                moeInfo: model.moeInfo,
+                kvCacheEstimate: kvCacheEstimate
+            )
+            let estimateText = ByteCountFormatter.string(fromByteCount: estimate.estimate, countStyle: .memory)
+            if let budget = estimate.budget, estimate.estimate > budget {
+                return String.localizedStringWithFormat(String(localized: "~%@ over budget"), estimateText)
+            }
+            return String.localizedStringWithFormat(String(localized: "~%@ load"), estimateText)
         }
         
         private func quickLoadIfPossible(_ model: LocalModel) {
@@ -12287,7 +18464,8 @@ struct MessageView: View {
                 let ctx = Int(settings.contextLength)
                 let layerHint: Int? = model.totalLayers > 0 ? model.totalLayers : nil
                 let kvCacheEstimate = ModelRAMAdvisor.GGUFKVCacheEstimate.resolved(from: settings)
-                if !ModelRAMAdvisor.fitsInRAM(
+                let bypassRAM = UserDefaults.standard.bool(forKey: "bypassRAMCheck")
+                if !bypassRAM && !ModelRAMAdvisor.fitsInRAM(
                     format: model.format,
                     sizeBytes: sizeBytes,
                     contextLength: ctx,
@@ -12386,8 +18564,11 @@ struct MessageView: View {
                 case .afm:
                     loadURL = InstalledModelsStore.baseDir(for: .afm, modelID: model.modelID)
                     try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
+                case .coreai:
+                    loadURL = InstalledModelsStore.baseDir(for: .coreai, modelID: model.modelID)
+                    try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
                 }
-                
+
                 var pendingFlagSet = false
                 defer {
                     if pendingFlagSet {
@@ -12406,6 +18587,813 @@ struct MessageView: View {
                 } else {
                     modelManager.loadedModel = nil
                 }
+            }
+        }
+
+        private struct ChatSnapshotSheet: View {
+            @Environment(\.dismiss) private var dismiss
+            let rows: [ChatSnapshotRow]
+            let exportText: String
+
+            var body: some View {
+                NavigationStack {
+                    List {
+                        Section(LocalizedStringKey("Snapshot Receipt")) {
+                            ForEach(rows) { row in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(LocalizedStringKey(row.title))
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(row.value)
+                                        .font(.callout)
+                                        .textSelection(.enabled)
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+                    .navigationTitle(Text("Chat Snapshot"))
+#if os(iOS) || os(visionOS)
+                    .navigationBarTitleDisplayMode(.inline)
+#endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { dismiss() }
+                        }
+                        ToolbarItem(placement: .primaryAction) {
+                            ShareLink(item: exportText) {
+                                Label("Share Snapshot", systemImage: "square.and.arrow.up")
+                            }
+                        }
+                    }
+                }
+#if os(macOS)
+                .frame(minWidth: 500, idealWidth: 580, minHeight: 460, idealHeight: 580)
+#endif
+            }
+        }
+
+        private struct ChatExportPackSheet: View {
+            @Environment(\.dismiss) private var dismiss
+            let noteTitle: String
+            let markdownNote: String
+            let citationsJSON: String
+            let promptReceipt: String
+            let generationReplayJSON: String
+            @State private var exportFileURLs: [ChatExportPackBuilder.ExportKind: URL] = [:]
+            @State private var exportFileError: String?
+            @State private var markdownNoteURL: URL?
+            @State private var markdownNoteError: String?
+
+            var body: some View {
+                NavigationStack {
+                    List {
+                        Section(LocalizedStringKey("Export Pack")) {
+                            exportFileRow(
+                                kind: .markdown,
+                                titleKey: "Markdown Note",
+                                subtitleKey: "Clean conversation note",
+                                systemImage: "doc.plaintext"
+                            )
+                            exportFileRow(
+                                kind: .pdf,
+                                titleKey: "PDF Document",
+                                subtitleKey: "Paginated conversation copy",
+                                systemImage: "doc.richtext"
+                            )
+                            exportFileRow(
+                                kind: .docx,
+                                titleKey: "DOCX Document",
+                                subtitleKey: "Word-compatible conversation package",
+                                systemImage: "doc.text"
+                            )
+                            exportFileRow(
+                                kind: .citationsJSON,
+                                titleKey: "Citations JSON",
+                                subtitleKey: "Source metadata for cited answers",
+                                systemImage: "curlybraces"
+                            )
+                            exportFileRow(
+                                kind: .promptReceipt,
+                                titleKey: "Prompt Receipt",
+                                subtitleKey: "Model, settings, dataset, and prompt fingerprint",
+                                systemImage: "doc.badge.gearshape"
+                            )
+                            exportFileRow(
+                                kind: .generationReplayJSON,
+                                titleKey: "Replay JSON",
+                                subtitleKey: "Prompt, output, timings, tools, and citations",
+                                systemImage: "arrow.trianglehead.clockwise"
+                            )
+
+                            if let exportFileError, !exportFileError.isEmpty {
+                                Text(exportFileError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
+                        }
+
+                        Section(LocalizedStringKey("Local Note")) {
+                            Button {
+                                saveMarkdownNote()
+                            } label: {
+                                Label(LocalizedStringKey("Save Markdown Note"), systemImage: "square.and.arrow.down")
+                            }
+
+                            if let markdownNoteURL {
+                                ShareLink(item: markdownNoteURL) {
+                                    Label(LocalizedStringKey("Share Saved Note"), systemImage: "square.and.arrow.up")
+                                }
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(LocalizedStringKey("Note File"))
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(markdownNoteURL.lastPathComponent)
+                                        .font(.callout)
+                                        .textSelection(.enabled)
+                                }
+                                .padding(.vertical, 4)
+                            }
+
+                            if let markdownNoteError, !markdownNoteError.isEmpty {
+                                Text(markdownNoteError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            } else {
+                                Text(LocalizedStringKey("Save the conversation as a local Markdown note."))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .navigationTitle(Text("Export Pack"))
+#if os(iOS) || os(visionOS)
+                    .navigationBarTitleDisplayMode(.inline)
+#endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { dismiss() }
+                        }
+                    }
+                    .task(id: exportTaskID) {
+                        generateExportFiles()
+                    }
+                }
+#if os(macOS)
+                .frame(minWidth: 500, idealWidth: 560, minHeight: 360, idealHeight: 460)
+#endif
+            }
+
+            private var exportTaskID: String {
+                "\(noteTitle)|\(markdownNote.count)|\(citationsJSON.count)|\(promptReceipt.count)|\(generationReplayJSON.count)"
+            }
+
+            @ViewBuilder
+            private func exportFileRow(
+                kind: ChatExportPackBuilder.ExportKind,
+                titleKey: String,
+                subtitleKey: String,
+                systemImage: String
+            ) -> some View {
+                if let url = exportFileURLs[kind] {
+                    ShareLink(item: url) {
+                        exportFileLabel(titleKey: titleKey, subtitleKey: subtitleKey, systemImage: systemImage)
+                    }
+                } else {
+                    Button {
+                        generateExportFiles()
+                    } label: {
+                        exportFileLabel(titleKey: titleKey, subtitleKey: subtitleKey, systemImage: systemImage)
+                    }
+                }
+            }
+
+            private func exportFileLabel(titleKey: String, subtitleKey: String, systemImage: String) -> some View {
+                Label {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(LocalizedStringKey(titleKey))
+                            .font(.body.weight(.medium))
+                        Text(LocalizedStringKey(subtitleKey))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: systemImage)
+                }
+                .padding(.vertical, 4)
+            }
+
+            private func generateExportFiles() {
+                do {
+                    exportFileURLs = try ChatExportPackBuilder.writeExportPack(
+                        title: noteTitle,
+                        markdownNote: markdownNote,
+                        citationsJSON: citationsJSON,
+                        promptReceipt: promptReceipt,
+                        generationReplayJSON: generationReplayJSON
+                    )
+                    exportFileError = nil
+                } catch {
+                    exportFileURLs = [:]
+                    exportFileError = error.localizedDescription
+                }
+            }
+
+            private func saveMarkdownNote() {
+                do {
+                    let filename = "\(ChatExportPackBuilder.sanitizedFileStem(noteTitle))-note-\(ChatExportPackBuilder.fileTimestamp()).md"
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+                    try markdownNote.write(to: url, atomically: true, encoding: .utf8)
+                    markdownNoteURL = url
+                    markdownNoteError = nil
+                } catch {
+                    markdownNoteURL = nil
+                    markdownNoteError = error.localizedDescription
+                }
+            }
+        }
+
+        private struct ChatContextPlanSheet: View {
+            @Environment(\.dismiss) private var dismiss
+            let rows: [ContextPlanRow]
+            let summary: String
+
+            var body: some View {
+                NavigationStack {
+                    List {
+                        Section {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Prompt window")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(verbatim: summary)
+                                    .font(.body.weight(.medium))
+                            }
+                            .padding(.vertical, 4)
+                        } footer: {
+                            Text("Older messages marked at risk are the first candidates for summarizing or dropping when the prompt gets too large.")
+                        }
+
+                        Section(LocalizedStringKey("Messages")) {
+                            if rows.isEmpty {
+                                Text("No conversation messages")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(rows) { row in
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack(spacing: 8) {
+                                            Text(verbatim: row.roleTitle)
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                            Spacer()
+                                            Text(LocalizedStringKey(row.statusKey))
+                                                .font(.caption2.weight(.bold))
+                                                .foregroundStyle(row.tint)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(row.tint.opacity(0.12), in: Capsule())
+                                            Text(verbatim: "\(row.tokenCount) tok")
+                                                .font(.caption2.monospacedDigit())
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Text(verbatim: row.preview)
+                                            .font(.callout)
+                                            .lineLimit(3)
+                                    }
+                                    .padding(.vertical, 4)
+                                }
+                            }
+                        }
+                    }
+                    .navigationTitle(Text("Context Plan"))
+#if os(iOS) || os(visionOS)
+                    .navigationBarTitleDisplayMode(.inline)
+#endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { dismiss() }
+                        }
+                    }
+                }
+#if os(macOS)
+                .frame(minWidth: 520, idealWidth: 620, minHeight: 460, idealHeight: 620)
+#endif
+            }
+        }
+
+        private struct ChatScratchpadSheet: View {
+            @Binding var text: String
+            let titleKey: String
+            let placeholderKey: String
+            let clearTitleKey: String
+            let onCancel: () -> Void
+            let onSave: () -> Void
+            let onClear: () -> Void
+
+            var body: some View {
+                NavigationStack {
+                    VStack(spacing: 12) {
+                        ZStack(alignment: .topLeading) {
+                            TextEditor(text: $text)
+                                .font(.body)
+                                .scrollContentBackground(.hidden)
+                                .padding(14)
+                                .background(Color.secondary.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                            if text.isEmpty {
+                                Text(LocalizedStringKey(placeholderKey))
+                                    .font(.body)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 22)
+                                    .padding(.leading, 20)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+
+                        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button(role: .destructive, action: onClear) {
+                                Label {
+                                    Text(LocalizedStringKey(clearTitleKey))
+                                        .frame(maxWidth: .infinity)
+                                } icon: {
+                                    Image(systemName: "trash")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding()
+                    .navigationTitle(Text(LocalizedStringKey(titleKey)))
+#if os(iOS) || os(visionOS)
+                    .navigationBarTitleDisplayMode(.inline)
+#endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel", action: onCancel)
+                        }
+                        ToolbarItem(placement: .primaryAction) {
+                            Button("Done", action: onSave)
+                        }
+                    }
+                }
+#if os(macOS)
+                .frame(minWidth: 480, idealWidth: 560, minHeight: 420, idealHeight: 520)
+#endif
+            }
+        }
+
+        private struct ChatRuntimeInfoSheet: View {
+            @Environment(\.dismiss) private var dismiss
+            @EnvironmentObject private var vm: ChatVM
+            @EnvironmentObject private var modelManager: AppModelManager
+            @State private var latestResponse: LoopbackResponseDiagnostics?
+            @State private var lastStartOptions: LlamaServerBridge.StartOptions?
+
+            private var loadedModel: LocalModel? { modelManager.loadedModel }
+
+            private var activeSettings: ModelSettings? {
+                if let settings = vm.loadedModelSettings {
+                    return settings
+                }
+                if let loadedModel {
+                    return modelManager.settings(for: loadedModel)
+                }
+                return nil
+            }
+
+            var body: some View {
+                NavigationStack {
+                    ZStack {
+                        RuntimeInfoSurfaceBackground()
+                            .ignoresSafeArea()
+
+                        VStack(spacing: 0) {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 24) {
+                                    Text("Runtime Information")
+                                        .font(.system(.largeTitle, design: .rounded, weight: .bold))
+                                        .foregroundStyle(.primary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                                    RuntimeInfoSection(
+                                        title: "Runtime",
+                                        systemImage: "cpu",
+                                        isCollapsible: false,
+                                        items: runtimeRows
+                                    )
+
+                                    if let settings = activeSettings {
+                                        RuntimeInfoSection(
+                                            title: "Sampling Parameters",
+                                            systemImage: "thermometer.medium",
+                                            items: samplingRows(settings)
+                                        )
+                                        RuntimeInfoSection(
+                                            title: "Draft Information",
+                                            systemImage: "square.and.pencil",
+                                            items: draftRows(settings)
+                                        )
+                                    } else {
+                                        RuntimeInfoSection(
+                                            title: "Sampling Parameters",
+                                            systemImage: "thermometer.medium",
+                                            items: [
+                                                RuntimeInfoItem("Status", value: String(localized: "No local model loaded"))
+                                            ]
+                                        )
+                                    }
+
+                                    RuntimeInfoSection(
+                                        title: "Draft Diagnostics",
+                                        systemImage: "chart.line.uptrend.xyaxis",
+                                        items: diagnosticsRows
+                                    )
+                                    RuntimeInfoSection(
+                                        title: "Server Launch",
+                                        systemImage: "server.rack",
+                                        items: serverRows
+                                    )
+                                }
+                                .padding(.horizontal, runtimeHorizontalPadding)
+                                .padding(.top, runtimeTopPadding)
+                                .padding(.bottom, 24)
+                                .frame(maxWidth: 760)
+                                .frame(maxWidth: .infinity)
+                            }
+                            .scrollIndicators(.hidden)
+
+                            RuntimeInfoFooter(
+                                close: { dismiss() },
+                                refresh: { refreshDiagnostics() }
+                            )
+                        }
+                    }
+                }
+#if os(macOS)
+                .frame(minWidth: 620, idealWidth: 720, maxWidth: 820, minHeight: 560, idealHeight: 760)
+#endif
+                .task { refreshDiagnostics() }
+            }
+
+            private var runtimeHorizontalPadding: CGFloat {
+#if os(macOS)
+                28
+#else
+                20
+#endif
+            }
+
+            private var runtimeTopPadding: CGFloat {
+#if os(macOS)
+                28
+#else
+                22
+#endif
+            }
+
+            private var runtimeRows: [RuntimeInfoItem] {
+                if let remote = modelManager.activeRemoteSession {
+                    return [
+                        RuntimeInfoItem("Model", value: remote.modelName),
+                        RuntimeInfoItem("Backend", value: remote.backendName),
+                        RuntimeInfoItem("Format", value: String(localized: "Remote"))
+                    ]
+                } else if let loadedModel {
+                    var rows = [
+                        RuntimeInfoItem("Model", value: loadedModel.name),
+                        RuntimeInfoItem("Format", value: loadedModel.format.displayName)
+                    ]
+                    if !loadedModel.quant.isEmpty {
+                        rows.append(RuntimeInfoItem("Quantization", value: loadedModel.quant))
+                    }
+                    rows.append(RuntimeInfoItem("Path", value: loadedModel.url.lastPathComponent))
+                    return rows
+                }
+                return [
+                    RuntimeInfoItem("Model", value: String(localized: "None"))
+                ]
+            }
+
+            private func samplingRows(_ settings: ModelSettings) -> [RuntimeInfoItem] {
+                [
+                    RuntimeInfoItem("Temperature", value: decimal(settings.temperature)),
+                    RuntimeInfoItem("Top-p", value: decimal(settings.topP)),
+                    RuntimeInfoItem("Top-k", value: "\(settings.topK)"),
+                    RuntimeInfoItem("Min-p", value: decimal(settings.minP)),
+                    RuntimeInfoItem("Repetition Penalty", value: decimal(Double(settings.repetitionPenalty))),
+                    RuntimeInfoItem("Repeat Last N", value: "\(settings.repeatLastN)"),
+                    RuntimeInfoItem("Presence Penalty", value: decimal(Double(settings.presencePenalty))),
+                    RuntimeInfoItem("Frequency Penalty", value: decimal(Double(settings.frequencyPenalty))),
+                    RuntimeInfoItem("Seed", value: settings.seed.map(String.init) ?? String(localized: "Default")),
+                    RuntimeInfoItem("Context", value: "\(Int(settings.contextLength))"),
+                    RuntimeInfoItem("CPU Threads", value: settings.cpuThreads > 0 ? "\(settings.cpuThreads)" : String(localized: "Auto")),
+                    RuntimeInfoItem("GPU Layers", value: settings.gpuLayers < 0 ? String(localized: "Auto") : "\(settings.gpuLayers)"),
+                    RuntimeInfoItem("Flash Attention", value: flag(settings.flashAttention)),
+                    RuntimeInfoItem("KV Offload", value: flag(settings.kvCacheOffload)),
+                    RuntimeInfoItem("K Cache", value: settings.kCacheQuant.rawValue),
+                    RuntimeInfoItem("V Cache", value: settings.vCacheQuant.rawValue),
+                    RuntimeInfoItem("Prompt Cache", value: flag(settings.promptCacheEnabled))
+                ]
+            }
+
+            private func draftRows(_ settings: ModelSettings) -> [RuntimeInfoItem] {
+                [
+                    RuntimeInfoItem("Speculative Mode", value: speculativeSelectionTitle(settings.speculativeDecoding.selection)),
+                    RuntimeInfoItem("MTP Draft Tokens", value: "\(settings.speculativeDecoding.resolvedMTPDraftNMax)"),
+                    RuntimeInfoItem("MTP Min Draft Tokens", value: "\(settings.speculativeDecoding.resolvedMTPDraftNMin)"),
+                    RuntimeInfoItem("MTP Draft P-Min", value: String(format: "%.2f", settings.speculativeDecoding.resolvedMTPDraftPMin)),
+                    RuntimeInfoItem("Draft Strategy", value: draftModeTitle(settings.speculativeDecoding.mode)),
+                    RuntimeInfoItem("Draft Value", value: "\(settings.speculativeDecoding.value)"),
+                    RuntimeInfoItem("Helper Model", value: settings.speculativeDecoding.helperModelID ?? String(localized: "None")),
+                    RuntimeInfoItem("MTP Support", value: mtpSupportText),
+                    RuntimeInfoItem("MTP Source", value: mtpSourceText)
+                ]
+            }
+
+            private var diagnosticsRows: [RuntimeInfoItem] {
+                var rows: [RuntimeInfoItem] = []
+                if let timings = latestResponse?.timings {
+                    rows.append(RuntimeInfoItem("Draft Generated", value: timings.draftN.map(String.init) ?? String(localized: "Unavailable")))
+                    rows.append(RuntimeInfoItem("Draft Accepted", value: timings.draftNAccepted.map(String.init) ?? String(localized: "Unavailable")))
+                    rows.append(RuntimeInfoItem("Acceptance", value: timings.acceptanceRate.map { percent($0) } ?? String(localized: "Unavailable")))
+                    rows.append(RuntimeInfoItem("Predicted Speed", value: timings.predictedPerSecond.map { String.localizedStringWithFormat(String(localized: "%.1f tok/s"), $0) } ?? String(localized: "Unavailable")))
+                    rows.append(RuntimeInfoItem("Prompt Speed", value: timings.promptPerSecond.map { String.localizedStringWithFormat(String(localized: "%.1f tok/s"), $0) } ?? String(localized: "Unavailable")))
+                    rows.append(RuntimeInfoItem("Prompt Tokens", value: timings.promptN.map(String.init) ?? String(localized: "Unavailable")))
+                    rows.append(RuntimeInfoItem("Output Tokens", value: timings.predictedN.map(String.init) ?? String(localized: "Unavailable")))
+                } else {
+                    rows.append(RuntimeInfoItem("Status", value: String(localized: "No response diagnostics yet")))
+                }
+                if let latestResponse {
+                    rows.append(RuntimeInfoItem("Endpoint", value: latestResponse.endpoint))
+                    rows.append(RuntimeInfoItem("Request Mode", value: latestResponse.requestMode))
+                    rows.append(RuntimeInfoItem("Streaming", value: flag(latestResponse.streaming)))
+                    rows.append(RuntimeInfoItem("Finish Reason", value: latestResponse.finishReason ?? String(localized: "None")))
+                    rows.append(RuntimeInfoItem("Output Characters", value: "\(latestResponse.outputCharacters)"))
+                }
+                return rows
+            }
+
+            private var serverRows: [RuntimeInfoItem] {
+                if let lastStartOptions {
+                    return [
+                        RuntimeInfoItem("Port", value: "\(lastStartOptions.port)"),
+                        RuntimeInfoItem("Speculative Type", value: lastStartOptions.speculativeType.isEmpty ? String(localized: "None") : lastStartOptions.speculativeType),
+                        RuntimeInfoItem("Draft Model", value: lastStartOptions.mtpPath.isEmpty ? String(localized: "Embedded MTP head or none") : URL(fileURLWithPath: lastStartOptions.mtpPath).lastPathComponent),
+                        RuntimeInfoItem("MTP Draft Tokens", value: lastStartOptions.specDraftNMax.map(String.init) ?? String(localized: "None")),
+                        RuntimeInfoItem("Server Arguments", value: lastStartOptions.argv.joined(separator: " "))
+                    ]
+                }
+                return [
+                    RuntimeInfoItem("Status", value: String(localized: "No server launch recorded"))
+                ]
+            }
+
+            private var mtpSupportText: String {
+                guard let url = vm.loadedModelURL ?? loadedModel?.url else { return String(localized: "Unavailable") }
+                let sidecar = MtpLocator.mtpPath(alongside: url) != nil
+                let embedded = GGUFMetadata.hasMTP(at: url)
+                if sidecar && embedded { return String(localized: "MTP sidecar and embedded head") }
+                if sidecar { return String(localized: "MTP sidecar") }
+                if embedded { return String(localized: "Embedded MTP head") }
+                return String(localized: "Unavailable")
+            }
+
+            private var mtpSourceText: String {
+                guard let url = vm.loadedModelURL ?? loadedModel?.url else {
+                    return String(localized: "None")
+                }
+                if let path = MtpLocator.mtpPath(alongside: url) {
+                    return URL(fileURLWithPath: path).lastPathComponent
+                }
+                if GGUFMetadata.hasMTP(at: url) {
+                    return String(localized: "Embedded MTP head")
+                }
+                return String(localized: "None")
+            }
+
+            private func refreshDiagnostics() {
+                lastStartOptions = LlamaServerBridge.lastStartOptions()
+                Task {
+                    let snapshot = await LoopbackRuntimeDiagnostics.shared.latestResponseSnapshot()
+                    await MainActor.run {
+                        latestResponse = snapshot
+                    }
+                }
+            }
+
+            private func speculativeSelectionTitle(_ selection: ModelSettings.SpeculativeDecodingSettings.Selection) -> String {
+                switch selection {
+                case .off: return String(localized: "Off")
+                case .helperDraftModel: return String(localized: "Helper Model")
+                case .mtp: return String(localized: "Multi-Token Prediction")
+                }
+            }
+
+            private func draftModeTitle(_ mode: ModelSettings.SpeculativeDecodingSettings.Mode) -> String {
+                switch mode {
+                case .tokens: return String(localized: "Draft Tokens")
+                case .max: return String(localized: "Draft Window")
+                }
+            }
+
+            private func flag(_ value: Bool) -> String {
+                value ? String(localized: "On") : String(localized: "Off")
+            }
+
+            private func decimal(_ value: Double, digits: Int = 2) -> String {
+                String(format: "%.\(digits)f", value)
+            }
+
+            private func percent(_ value: Double) -> String {
+                String.localizedStringWithFormat(String(localized: "%.1f%%"), value * 100)
+            }
+        }
+
+        private struct RuntimeInfoItem {
+            let title: LocalizedStringKey
+            let value: String
+
+            init(_ title: LocalizedStringKey, value: String) {
+                self.title = title
+                self.value = value
+            }
+        }
+
+        private struct RuntimeInfoSurfaceBackground: View {
+            @Environment(\.colorScheme) private var colorScheme
+
+            var body: some View {
+                baseColor
+                    .overlay {
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(colorScheme == .dark ? 0.03 : 0.42),
+                                Color.blue.opacity(colorScheme == .dark ? 0.04 : 0.035),
+                                Color.primary.opacity(colorScheme == .dark ? 0.035 : 0.02)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    }
+            }
+
+            @ViewBuilder
+            private var baseColor: some View {
+#if os(macOS)
+                Color(nsColor: .windowBackgroundColor)
+#elseif os(visionOS)
+                Color.clear
+#else
+                Color(uiColor: .systemGroupedBackground)
+#endif
+            }
+        }
+
+        private struct RuntimeInfoSection: View {
+            let title: LocalizedStringKey
+            let systemImage: String
+            let isCollapsible: Bool
+            let items: [RuntimeInfoItem]
+            @State private var isExpanded: Bool
+
+            init(title: LocalizedStringKey, systemImage: String, isCollapsible: Bool = true, items: [RuntimeInfoItem]) {
+                self.title = title
+                self.systemImage = systemImage
+                self.isCollapsible = isCollapsible
+                self.items = items
+                _isExpanded = State(initialValue: true)
+            }
+
+            var body: some View {
+                VStack(alignment: .leading, spacing: 10) {
+                    if isCollapsible {
+                        Button {
+                            withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                                isExpanded.toggle()
+                            }
+                        } label: {
+                            header
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        header
+                    }
+
+                    if isExpanded {
+                        VStack(spacing: 0) {
+                            ForEach(items.indices, id: \.self) { index in
+                                RuntimeInfoRow(title: items[index].title, value: items[index].value)
+                                if index < items.count - 1 {
+                                    Divider()
+                                        .overlay(Color.primary.opacity(0.05))
+                                        .padding(.leading, 14)
+                                }
+                            }
+                        }
+                        .background {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(.regularMaterial)
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .shadow(color: Color.black.opacity(0.045), radius: 14, x: 0, y: 8)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+            }
+
+            private var header: some View {
+                HStack(spacing: 12) {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 17, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.primary)
+                        .frame(width: 28, height: 28)
+
+                    Text(title)
+                        .font(.system(.headline, design: .rounded, weight: .semibold))
+                        .foregroundStyle(.primary)
+
+                    Spacer(minLength: 12)
+
+                    if isCollapsible {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                    }
+                }
+                .contentShape(Rectangle())
+                .accessibilityElement(children: .combine)
+            }
+        }
+
+        private struct RuntimeInfoFooter: View {
+            let close: () -> Void
+            let refresh: () -> Void
+
+            var body: some View {
+                HStack(spacing: 12) {
+                    Spacer()
+                    Button(action: close) {
+                        Text("Close")
+                            .frame(minWidth: 82)
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.roundedRectangle(radius: 8))
+                    .controlSize(.large)
+                    .keyboardShortcut(.cancelAction)
+
+                    Button(action: refresh) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 17, weight: .semibold))
+                            .frame(minWidth: 70)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.roundedRectangle(radius: 8))
+                    .controlSize(.large)
+                    .tint(.blue)
+                    .accessibilityLabel(Text("Refresh"))
+                }
+                .padding(.horizontal, 28)
+                .padding(.top, 14)
+                .padding(.bottom, 18)
+                .background(.regularMaterial)
+                .overlay(alignment: .top) {
+                    Divider()
+                        .overlay(Color.primary.opacity(0.06))
+                }
+            }
+        }
+
+        private struct RuntimeInfoRow: View {
+            let title: LocalizedStringKey
+            let value: String
+
+            var body: some View {
+                HStack(alignment: .firstTextBaseline, spacing: 16) {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 12)
+                    Text(value)
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .monospacedDigit()
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .font(.system(.callout, design: .rounded))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .frame(minHeight: 34)
             }
         }
 
@@ -12431,6 +19419,11 @@ struct MessageView: View {
                 }
             }
 
+            private var modelHasMTPSupport: Bool {
+                guard let model, model.format == .gguf else { return false }
+                return MtpLocator.hasMtpFile(alongside: model.url) || GGUFMetadata.hasMTP(at: model.url)
+            }
+
             private var format: ModelFormat? { model?.format }
 
             private var supportsMinP: Bool { format == .gguf }
@@ -12438,8 +19431,7 @@ struct MessageView: View {
             private var supportsFrequencyPenalty: Bool { format == .gguf }
             private var supportsSpeculativeDecoding: Bool {
 #if os(macOS)
-                // Hide speculative decoding controls on macOS
-                return false
+                return format == .gguf
 #elseif os(visionOS)
                 return false
 #else
@@ -12585,10 +19577,41 @@ struct MessageView: View {
             private var speculativeSection: some View {
                 sidebarSection(title: "Speculative Decoding", systemImage: "bolt.fill") {
                     VStack(alignment: .leading, spacing: 16) {
-                        Text("Speed up with a smaller helper model.")
+                        Text("Speed up generation with a helper model or Multi-Token Prediction.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
+                        Picker("Speculative Mode", selection: speculativeSelectionBinding) {
+                            ForEach(ModelSettings.SpeculativeDecodingSettings.Selection.allCases) { selection in
+                                Text(selection.title).tag(selection)
+                                    .disabled(selection == .mtp && !modelHasMTPSupport)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .onAppear { enforceSpeculativeSelectionAvailability() }
+                        .onChange(of: modelHasMTPSupport) { _ in enforceSpeculativeSelectionAvailability() }
+
+                        if !modelHasMTPSupport {
+                            mtpUnavailableNotice
+                        }
+
+                        if settings.speculativeDecoding.selection == .mtp {
+                            Stepper(value: $settings.speculativeDecoding.mtpDraftNMax, in: 1...6, step: 1) {
+                                Text(String.localizedStringWithFormat(String(localized: "MTP draft tokens: %@"), "\(settings.speculativeDecoding.resolvedMTPDraftNMax)"))
+                            }
+                            Stepper(value: $settings.speculativeDecoding.mtpDraftNMin, in: 0...6, step: 1) {
+                                Text(String.localizedStringWithFormat(String(localized: "MTP min draft tokens: %@"), "\(settings.speculativeDecoding.resolvedMTPDraftNMin)"))
+                            }
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(String.localizedStringWithFormat(String(localized: "MTP draft probability floor: %@"), String(format: "%.2f", settings.speculativeDecoding.resolvedMTPDraftPMin)))
+                                Slider(value: $settings.speculativeDecoding.mtpDraftPMin, in: 0.0...1.0, step: 0.05)
+                                Text("Lower values let the MTP head draft more tokens before bailing (more speculation, lower per-token acceptance). 0.75 is the conservative llama.cpp default.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        if settings.speculativeDecoding.selection == .helperDraftModel {
                         Picker("Helper Model", selection: Binding(
                             get: { settings.speculativeDecoding.helperModelID },
                             set: { settings.speculativeDecoding.helperModelID = $0 }
@@ -12622,7 +19645,42 @@ struct MessageView: View {
                                 }
                             }
                         }
+                        }
                     }
+                }
+            }
+
+            private var speculativeSelectionBinding: Binding<ModelSettings.SpeculativeDecodingSettings.Selection> {
+                Binding(
+                    get: {
+                        if settings.speculativeDecoding.selection == .mtp, !modelHasMTPSupport {
+                            return .off
+                        }
+                        return settings.speculativeDecoding.selection
+                    },
+                    set: { selection in
+                        settings.speculativeDecoding.selection = (selection == .mtp && !modelHasMTPSupport) ? .off : selection
+                    }
+                )
+            }
+
+            @ViewBuilder
+            private var mtpUnavailableNotice: some View {
+                Label {
+                    Text("MTP is unavailable for this model. Choose another GGUF with an MTP head or bundled MTP weights. Helper-model speculative decoding is still available.")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+
+            private func enforceSpeculativeSelectionAvailability() {
+                if settings.speculativeDecoding.selection == .mtp, !modelHasMTPSupport {
+                    settings.speculativeDecoding.selection = .off
                 }
             }
 
@@ -12654,7 +19712,94 @@ struct MessageView: View {
                     Button(action: { vm.startNewSession() }) { Image(systemName: "plus") }
                 }
                 .padding()
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextField(LocalizedStringKey("Search chats"), text: $chatRecallQuery)
+                        .platformAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                        .font(.caption)
+                    if !chatRecallQuery.isEmpty {
+                        Button {
+                            chatRecallQuery = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(LocalizedStringKey("Clear Chat Search"))
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .padding(.horizontal)
+                .padding(.bottom, 4)
+
                 List(selection: $vm.activeSessionID) {
+                    if !chatRecallQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Section(LocalizedStringKey("Chat Recall")) {
+                            if chatRecallResults.isEmpty {
+                                Text(LocalizedStringKey("No matching messages"))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(chatRecallResults.prefix(8)) { result in
+                                    Button {
+                                        openRecallResult(result)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            HStack(spacing: 5) {
+                                                Image(systemName: result.message.isBookmarked ? "bookmark.fill" : "text.magnifyingglass")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(Color.accentColor)
+                                                Text(sessionDisplayTitle(for: result.session))
+                                                    .font(.caption.weight(.semibold))
+                                                    .lineLimit(1)
+                                            }
+                                            Text(bookmarkPreview(for: result.message))
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel(LocalizedStringKey("Chat search result"))
+                                }
+                            }
+                        }
+                    }
+
+                    if !bookmarkedMessages.isEmpty {
+                        Section(LocalizedStringKey("Bookmarks")) {
+                            ForEach(bookmarkedMessages.prefix(8)) { bookmark in
+                                Button {
+                                    openBookmark(bookmark)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack(spacing: 5) {
+                                            Image(systemName: "bookmark.fill")
+                                                .font(.caption2)
+                                                .foregroundStyle(Color.accentColor)
+                                            Text(sessionDisplayTitle(for: bookmark.session))
+                                                .font(.caption.weight(.semibold))
+                                                .lineLimit(1)
+                                        }
+                                        Text(bookmarkPreview(for: bookmark.message))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+
                     ForEach(vm.sessions) { session in
                         HStack {
                             Image(systemName: session.isFavorite ? "star.fill" : "message")
@@ -12895,53 +20040,6 @@ struct MessageView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.primary)
                     .multilineTextAlignment(.trailing)
-            }
-        }
-    }
-
-    private struct CitationButton: View {
-        let index: Int
-        let text: String
-        let source: String?
-        @State private var show = false
-        
-        var body: some View {
-            Button(action: { show = true }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "book")
-                        .font(.caption)
-                    Text("\(index)")
-                        .font(.caption2).bold()
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color(.systemGray6))
-                .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .sheet(isPresented: $show) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Citation \(index)").font(.headline)
-                            if let source = source {
-                                Text("Source: \(source)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        Spacer()
-                        Button("Close") { show = false }
-                    }
-                    ScrollView {
-                        MathRichText(source: text)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 4)
-                    }
-                    .frame(maxHeight: .infinity)
-                }
-                .padding()
-                .frame(minWidth: 300, minHeight: 200)
             }
         }
     }

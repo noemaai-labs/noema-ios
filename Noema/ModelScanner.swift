@@ -14,6 +14,8 @@ enum ModelScanner {
             return 0
         case .afm:
             return 0
+        case .coreai:
+            return 0
         }
     }
 
@@ -32,7 +34,7 @@ enum ModelScanner {
             return GGUFMetadata.moeInfo(at: target)
         case .mlx:
             return MLXMetadata.moeInfo(at: url)
-        case .et, .ane, .afm:
+        case .et, .ane, .afm, .coreai:
             return nil
         }
     }

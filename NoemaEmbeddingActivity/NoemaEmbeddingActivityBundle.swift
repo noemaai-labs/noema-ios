@@ -12,8 +12,6 @@ import SwiftUI
 @main
 struct NoemaEmbeddingActivityBundle: WidgetBundle {
     var body: some Widget {
-        NoemaEmbeddingActivity()
-        NoemaEmbeddingActivityControl()
         NoemaEmbeddingActivityLiveActivity()
     }
 }

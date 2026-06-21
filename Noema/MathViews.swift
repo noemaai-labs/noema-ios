@@ -206,6 +206,10 @@ private struct InlineMathUILabel: NSViewRepresentable {
         v.textColor = color
         v.contentInsets = insets
         v.font = MTFontManager().termesFont(withSize: fontSize)
+        v.setContentHuggingPriority(.required, for: .horizontal)
+        v.setContentHuggingPriority(.required, for: .vertical)
+        v.setContentCompressionResistancePriority(.required, for: .horizontal)
+        v.setContentCompressionResistancePriority(.required, for: .vertical)
         v.latex = latex
         return v
     }

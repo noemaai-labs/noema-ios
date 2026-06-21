@@ -140,7 +140,9 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
             python: tools?.contains(where: { $0.function.name == "noema.python.execute" }) == true
                 && PythonToolGate.isAvailable(currentFormat: .mlx),
             memory: tools?.contains(where: { $0.function.name == "noema.memory" }) == true
-                && MemoryToolGate.isAvailable(currentFormat: .mlx)
+                && MemoryToolGate.isAvailable(currentFormat: .mlx),
+            calculator: tools?.contains(where: { $0.function.name == "noema.math.calculate" }) == true,
+            unitConverter: tools?.contains(where: { $0.function.name == "noema.units.convert" }) == true
         )
         var systemContent = existingSystem?.isEmpty == false ? existingSystem! : SystemPromptResolver.general(
             currentFormat: .mlx,
@@ -345,6 +347,8 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
 
         ### WHEN TO USE TOOLS:
         - Use web search for current information, recent events, or facts that may have changed.
+        - Use calculator for quick deterministic arithmetic or single-expression math.
+        - Use unit conversion for deterministic common-unit conversions.
         - Use Python for calculations, statistics, parsing, transformations, algorithms, or any other computational work.
         - If a tool would clearly improve accuracy, use it instead of guessing.
         
@@ -425,6 +429,30 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
                 - The runtime is sandboxed with a 30-second timeout and no network access
                 
                 """
+            } else if tool.function.name == "noema.math.calculate" {
+                instructions += """
+                **Example Usage:**
+                <tool_call>
+                {"name": "noema.math.calculate", "arguments": {"expression": "sqrt(144) + 3 * 2"}}
+                </tool_call>
+                
+                **Notes:**
+                - Use for quick deterministic arithmetic, constants, and common math functions
+                - Trigonometric functions use radians
+                
+                """
+            } else if tool.function.name == "noema.units.convert" {
+                instructions += """
+                **Example Usage:**
+                <tool_call>
+                {"name": "noema.units.convert", "arguments": {"value": 10, "from_unit": "km", "to_unit": "mi"}}
+                </tool_call>
+                
+                **Notes:**
+                - Use source and target units from the same family
+                - Supports length, mass, temperature, volume, time, data-size, and speed units
+                
+                """
             }
         }
         
@@ -439,6 +467,7 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
         - Be concise and relevant in your final response
         - Use the tool results to enhance your answer with current/accurate information
         - Treat web search findings as the authoritative/latest facts for current-information queries
+        - Treat calculator and unit-conversion outputs as authoritative for the requested expression or conversion
         - Treat Python outputs as authoritative for the computation you executed
         - If multiple search results are returned, synthesize the most relevant information
         - Always maintain a helpful and professional tone
@@ -463,7 +492,9 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
             python: tools?.contains(where: { $0.function.name == "noema.python.execute" }) == true
                 && PythonToolGate.isAvailable(currentFormat: .mlx),
             memory: tools?.contains(where: { $0.function.name == "noema.memory" }) == true
-                && MemoryToolGate.isAvailable(currentFormat: .mlx)
+                && MemoryToolGate.isAvailable(currentFormat: .mlx),
+            calculator: tools?.contains(where: { $0.function.name == "noema.math.calculate" }) == true,
+            unitConverter: tools?.contains(where: { $0.function.name == "noema.units.convert" }) == true
         )
         var systemContent = existingSystem?.isEmpty == false ? existingSystem! : SystemPromptResolver.general(
             currentFormat: .mlx,
@@ -480,6 +511,8 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
                 let jsonUsage = """
                 TOOLS ARE ARMED AND AVAILABLE.
                 Use `noema.web.retrieve` for fresh/current information.
+                Use `noema.math.calculate` for quick deterministic arithmetic or single-expression math.
+                Use `noema.units.convert` for deterministic unit conversions.
                 Use `noema.python.execute` for calculations, code execution, parsing, algorithms, and other computational work.
                 Use `noema.memory` for durable user preferences, project constraints, and other cross-conversation facts.
 
@@ -497,9 +530,10 @@ public final class ToolCapableMLXClient: ToolCapableLLM {
                 5) Include all required parameters; optional parameters when helpful.
                 6) Make exactly ONE tool call, then WAIT for the tool result before continuing.
                 7) You may mention tools inside your Chain of Thought, but finish reasoning before emitting the <tool_call> tag or JSON object that actually triggers the call.
-                8) For Python, always send runnable Python 3 code and use print() for returned values.
-                9) When a tool result arrives, base your final answer on it instead of guessing.
-                10) Do not mix JSON and XML.
+                8) Prefer calculator or unit conversion for simple math/conversion tasks; use Python for multi-step computation, data processing, or code-friendly analysis.
+                9) For Python, always send runnable Python 3 code and use print() for returned values.
+                10) When a tool result arrives, base your final answer on it instead of guessing.
+                11) Do not mix JSON and XML.
 
                 Available tools (including web search if present):
                 """ + generateJSONGrammarToolCatalog(tools) + "\n\n" + constraint

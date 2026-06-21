@@ -341,6 +341,13 @@ struct NoemaVisionMainScene: SwiftUI.Scene {
             .environmentObject(localizationManager)
             .environment(\.locale, localizationManager.locale)
             .visionAppearance(colorScheme)
+            .onAppear {
+                AppIntentDriver.shared.bind(chatVM: chatVM,
+                                            modelManager: modelManager,
+                                            datasetManager: datasetManager,
+                                            tabRouter: tabRouter,
+                                            downloadController: downloadController)
+            }
         }
         .defaultSize(width: 1100, height: 840)
 
@@ -701,6 +708,7 @@ private final class VisionImmersiveScene {
         case .et: baseColor = UIColor(red: 0.16, green: 0.73, blue: 0.86, alpha: 0.85)
         case .ane: baseColor = UIColor(red: 0.33, green: 0.78, blue: 0.45, alpha: 0.85)
         case .afm: baseColor = UIColor(red: 0.35, green: 0.46, blue: 0.86, alpha: 0.85)
+        case .coreai: baseColor = UIColor(red: 0.55, green: 0.35, blue: 0.86, alpha: 0.85)
         }
         let body = ModelEntity(mesh: .generateBox(width: 0.18, height: 0.07, depth: 0.04, cornerRadius: 0.02), materials: [SimpleMaterial(color: baseColor, roughness: 0.25, isMetallic: false)])
         body.position = [0, 0, 0]

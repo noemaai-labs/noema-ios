@@ -1,3 +1,5 @@
 /* Auto-generated localization file for Info.plist */
+"NSMicrophoneUsageDescription" = "Noema がオーディオを録音できるようにして、利用可能なときにローカルで文字起こしできるようにします。";
+"NSSpeechRecognitionUsageDescription" = "Noema がオーディオおよびビデオの添付ファイルをテキストに転写できるようにします。";
 "NSBluetoothAlwaysUsageDescription" = "Noema は Bluetooth を使用してリレー設定の詳細を他のデバイスと共有します。";
 "NSBluetoothPeripheralUsageDescription" = "Noema は Bluetooth を使用してリレー設定の詳細を他のデバイスと共有します。";

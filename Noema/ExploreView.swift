@@ -67,6 +67,7 @@ struct ExploreView: View {
     @EnvironmentObject var chromeState: ExploreChromeState
 #endif
     @AppStorage("huggingFaceToken") private var huggingFaceToken = ""
+    @AppStorage("offGrid") private var offGrid = false
     @StateObject private var vm: ExploreViewModel
 
     init() {
@@ -76,6 +77,7 @@ struct ExploreView: View {
                                        extras: [ManualModelRegistry(), AppleFoundationModelRegistry()])))
     }
     @State private var selected: ModelDetails?
+    @State private var selectedFormatFilter: ModelFormat?
 #if canImport(LeapSDK) && !os(macOS)
     @State private var selectedSLMGroup: SLMModelGroup?
 #endif
@@ -84,8 +86,13 @@ struct ExploreView: View {
     // Import flow state
     @State private var showImportMenu = false
     @State private var activeImportRequest: ExploreImportRequest?
+    // Drives `.fileImporter` presentation. Kept separate from `activeImportRequest`
+    // so the dismissal (isPresented = false) doesn't wipe the routing data that the
+    // completion handler needs — see the fileImporter below.
+    @State private var isImporterPresented = false
     @State private var pendingPickedURLs: [URL] = []
     @State private var importError: String?
+    @State private var importSuccess: String?
     @State private var isImporting = false
 
     private enum ImportFormat: Equatable { case gguf, ggufFolder, mlx }
@@ -135,10 +142,12 @@ struct ExploreView: View {
                 Task { await vm.loadCurated(force: true) }
             }
             .task {
+                vm.loadCachedRecords()
                 await vm.loadCurated()
                 vm.setFilterManager(filterManager)
             }
             .onAppear {
+                vm.loadCachedRecords()
                 enforceGGUFSearchModeIfNeeded(triggerSearch: true)
                 enforceAFMSearchModeIfNeeded(triggerSearch: true)
                 // Belt-and-suspenders: on visionOS real hardware, .task may not
@@ -162,11 +171,14 @@ struct ExploreView: View {
                 if let detail {
                     presentDetail(detail)
                 } else if macModalPresenter.isPresented {
+                    selectedFormatFilter = nil
                     macModalPresenter.dismiss()
                 }
             }
 #else
-            .sheet(item: $selected, content: detailSheet)
+            .sheet(item: $selected, onDismiss: {
+                selectedFormatFilter = nil
+            }, content: detailSheet)
 #if canImport(LeapSDK)
             .sheet(item: $selectedSLMGroup, content: slmDetailSheet)
 #endif
@@ -213,6 +225,14 @@ struct ExploreView: View {
                 Button(LocalizedStringKey("OK"), role: .cancel) { importError = nil }
             } message: {
                 Text(importError ?? String(localized: "Unknown error"))
+            }
+            .alert(LocalizedStringKey("Import Complete"), isPresented: Binding(
+                get: { importSuccess != nil },
+                set: { if !$0 { importSuccess = nil } }
+            )) {
+                Button(LocalizedStringKey("OK"), role: .cancel) { importSuccess = nil }
+            } message: {
+                Text(importSuccess ?? "")
             }
 #if os(macOS)
             .onAppear {
@@ -273,16 +293,24 @@ struct ExploreView: View {
                     break
                 }
             }
+            // Search requested from outside the view hierarchy (Siri / App Intents)
+            .onAppear { consumePendingExploreSearchIfNeeded() }
+            .onReceive(tabRouter.$pendingExploreSearch) { _ in
+                consumePendingExploreSearchIfNeeded()
+            }
             // File importers for iOS/visionOS (mac uses NSOpenPanel; tvOS lacks Files access)
             #if !os(tvOS)
             .fileImporter(
-                isPresented: Binding(
-                    get: { activeImportRequest != nil },
-                    set: { if !$0 { activeImportRequest = nil } }
-                ),
+                isPresented: $isImporterPresented,
                 allowedContentTypes: activeImportRequest?.allowedContentTypes ?? [.data],
                 allowsMultipleSelection: activeImportRequest?.allowsMultipleSelection ?? false
             ) { result in
+                // Capture the routing case BEFORE clearing it. SwiftUI sets
+                // `isPresented` to false *before* calling onCompletion; because
+                // presentation is now driven by `isImporterPresented` (not by
+                // `activeImportRequest != nil`), that dismissal no longer nils this
+                // value out from under us. Previously it did, so the guard below
+                // failed and folder/file selection silently did nothing.
                 let request = activeImportRequest
                 activeImportRequest = nil
 
@@ -302,6 +330,15 @@ struct ExploreView: View {
                 }
             }
             #endif
+    }
+
+    /// Runs a search handed over by an App Intent once this view owns Explore.
+    private func consumePendingExploreSearchIfNeeded() {
+        DispatchQueue.main.async {
+            guard let query = tabRouter.consumePendingExploreSearch(for: .models) else { return }
+            vm.searchText = query
+            vm.triggerSearch()
+        }
     }
 
     @ViewBuilder
@@ -337,18 +374,12 @@ struct ExploreView: View {
     }
 
     private func exploreCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-        return content()
-            .padding(AppTheme.padding)
-            .glassifyIfAvailable(in: shape)
-            .background(shape.fill(AppTheme.cardFill))
-            .overlay(
-                shape
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-            )
-            .clipShape(shape)
-            .shadow(color: Color.black.opacity(0.01), radius: 4, x: 0, y: 1)
-            .visionHoverHighlight(cornerRadius: AppTheme.cornerRadius)
+        VStack(spacing: 0) {
+            content()
+                .padding(.vertical, 12)
+                .padding(.horizontal, AppTheme.padding)
+            Divider()
+        }
     }
 
     private func updateRegistry(_ token: String) {
@@ -486,6 +517,7 @@ struct ExploreView: View {
 
     private func handleNavigation(_ detail: ModelDetails?) {
         if let d = detail {
+            selectedFormatFilter = nil
             selected = d
             downloadController.navigateToDetail = nil
         }
@@ -500,7 +532,8 @@ struct ExploreView: View {
         ExploreDetailView(
             detail: detail,
             downloadController: downloadController,
-            remoteDownloadTargetBackendID: remoteDownloadTargetBackend?.id
+            remoteDownloadTargetBackendID: remoteDownloadTargetBackend?.id,
+            formatFilter: selectedFormatFilter
         )
             .environmentObject(modelManager)
             .environmentObject(chatVM)
@@ -569,12 +602,16 @@ struct ExploreView: View {
                 maxHeight: 820
             ),
             contentInsets: EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0),
-            onDismiss: { selected = nil }
+            onDismiss: {
+                selected = nil
+                selectedFormatFilter = nil
+            }
         ) {
             ExploreDetailView(
                 detail: detail,
                 downloadController: downloadController,
-                remoteDownloadTargetBackendID: remoteDownloadTargetBackend?.id
+                remoteDownloadTargetBackendID: remoteDownloadTargetBackend?.id,
+                formatFilter: selectedFormatFilter
             )
                 .environmentObject(modelManager)
                 .environmentObject(chatVM)
@@ -585,7 +622,9 @@ struct ExploreView: View {
 
     @ViewBuilder
     private var searchEmptyOverlay: some View {
-        if vm.isSearching && !vm.isLoadingSearch && vm.searchResults.isEmpty {
+        // Use the rendered result set (live + offline-cached matches) so the empty
+        // state doesn't appear while cached models are still shown below.
+        if vm.isSearching && !vm.isLoadingSearch && filteredSearchResults.isEmpty {
             VStack(spacing: 8) {
                 Text(String.localizedStringWithFormat(String(localized: "No models found for '%@'"), vm.searchText))
                     .font(.headline)
@@ -830,20 +869,14 @@ struct ExploreView: View {
                 
                 let featuredModels = filteredRecommended
                 if !featuredModels.isEmpty {
-                    #if os(macOS)
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 24) {
-                        ForEach(featuredModels, id: \.id) { featured in
-                             featuredCard(featured)
+                    VStack(spacing: 0) {
+                        ForEach(Array(featuredModels.enumerated()), id: \.element.id) { index, featured in
+                            featuredCard(featured)
+                            if index < featuredModels.count - 1 {
+                                Divider().padding(.leading, 56)
+                            }
                         }
                     }
-                    #else
-						// iOS implementation
-						VStack(spacing: 16) {
-							ForEach(featuredModels, id: \.id) { featured in
-								featuredCard(featured)
-							}
-						}
-                    #endif
                 }
             }
             .padding(.bottom, 12)
@@ -852,73 +885,47 @@ struct ExploreView: View {
 
     private func featuredCard(_ featured: ModelRecord) -> some View {
         Button { Task { await open(featured) } } label: {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Text(LocalizedStringKey("Featured"))
-                        .font(FontTheme.caption)
-                        .fontWeight(.bold)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.accentColor, in: Capsule())
-                    
-                    if showsFitsBadge(for: featured) {
-                        Text(LocalizedStringKey("Fits on your device"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.medium)
-                            .foregroundStyle(Color.green)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.green.opacity(0.1), in: Capsule())
-                    }
-                    
-                    if featured.pipeline_tag == "image-text-to-text" {
-                        Text(LocalizedStringKey("Vision"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.medium)
-                            .foregroundStyle(Color.purple)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.purple.opacity(0.1), in: Capsule())
-                    }
-
-                    Spacer()
-                }
-                
-                Text(featured.displayName)
-                    .font(FontTheme.heading(size: 22))
-                    .foregroundStyle(AppTheme.text)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                
-                Text(featured.publisher)
-                    .font(FontTheme.body)
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(1)
-                
-                Spacer(minLength: 0)
-            }
-            .padding(20)
-            .background(AppTheme.cardFill)
-            #if os(macOS)
-            .frame(height: 200)
-            .overlay(alignment: .bottomTrailing) {
+            HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "sparkles")
-                    .font(.system(size: 60))
-                    .foregroundStyle(Color.accentColor.opacity(0.1))
-                    .offset(x: 10, y: 10)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 30, height: 30)
+                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(featured.displayName)
+                        .font(FontTheme.body.weight(.semibold))
+                        .foregroundStyle(AppTheme.text)
+                        .lineLimit(1)
+                    Text(featured.publisher)
+                        .font(FontTheme.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if featured.pipeline_tag == "image-text-to-text" {
+                    Image(systemName: "eye.fill")
+                        .font(.caption2)
+                        .foregroundStyle(Color.purple)
+                        .help(LocalizedStringKey("Vision"))
+                }
+                if showsFitsBadge(for: featured) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.caption)
+                        .foregroundStyle(Color.green)
+                        .help(LocalizedStringKey("Fits on your device"))
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
             }
-            #else
-            .frame(minHeight: 130)
-            #endif
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-            )
-            .shadow(color: Color.black.opacity(0.03), radius: 15, x: 0, y: 8)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .visionHoverHighlight(cornerRadius: 24)
+        .visionHoverHighlight(cornerRadius: 14)
         .buttonStyle(.plain)
     }
 
@@ -928,7 +935,6 @@ struct ExploreView: View {
             #if os(macOS) || os(visionOS)
             VStack(alignment: .leading, spacing: 24) {
                 heroSection
-
             }
             #else
             // iOS implementation
@@ -939,7 +945,6 @@ struct ExploreView: View {
             }
             .listRowBackground(Color.clear)
             .listRowInsets(EdgeInsets(top: 0, leading: AppTheme.padding, bottom: 0, trailing: AppTheme.padding))
-
             #endif
         } else {
             #if os(macOS) || os(visionOS)
@@ -968,7 +973,7 @@ struct ExploreView: View {
             #endif
         }
     }
-    
+
     // MARK: - Filtered Results
     
     private var filteredRecommended: [ModelRecord] {
@@ -979,30 +984,20 @@ struct ExploreView: View {
             if rec.formats.contains(.afm) {
                 return filterManager.shouldIncludeModel(rec)
             }
+            // CoreAI-only catalog entries are isolated to the CoreAI tab so they
+            // never leak into other format modes (e.g. ET's pass-through filter).
+            // Multi-format curated entries that merely carry a CoreAI quant keep
+            // showing in every mode, like MLX/ET/CML extras do.
+            if rec.formats == [.coreai] {
+                return mode == .coreai && filterManager.shouldIncludeModel(rec)
+            }
 
             // Respect the GGUF/MLX toggle when showing curated recommendations
             // on iOS/iPadOS so formats don’t mix across modes.
-            let matchesMode: Bool = {
-                switch mode {
-                case .gguf:
-                    return rec.formats.contains(.gguf)
-                case .mlx:
-                    // Allow MLX-tagged repos and common MLX publisher namespaces
-                    return rec.formats.contains(.mlx)
-                        || rec.id.hasPrefix("mlx-community/")
-                        || rec.id.hasPrefix("lmstudio-community/")
-                case .et:
-                    // Curated GGUF/MLX section isn’t shown in ET mode, but keep permissive
-                    // behavior here to avoid surprising empty lists if reused.
-                    return true
-                case .ane:
-                    return rec.formats.contains(.ane)
-                case .afm:
-                    return rec.formats.contains(.afm)
-                }
-            }()
+            let matchesMode = mode == .et ? true : mode.includes(rec)
 
-            return matchesMode && filterManager.shouldIncludeModel(rec)
+            return matchesMode
+                && filterManager.shouldIncludeModel(rec)
         }
     }
 
@@ -1023,12 +1018,39 @@ struct ExploreView: View {
 
     private var filteredSearchResults: [ModelRecord] {
         var seen = Set<String>()
-        return vm.searchResults.filter { rec in
+        let liveResults = vm.searchResults.filter { rec in
             filterManager.shouldIncludeModel(rec) && seen.insert(rec.id).inserted
         }
+        // Surface offline-cached models that match the query so previously viewed
+        // models stay findable without a network round-trip. Cached entries are
+        // only used while searching — never on the featured page.
+        let query = vm.searchText.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !query.isEmpty else { return liveResults }
+        let cachedMatches = vm.cachedRecords.filter { rec in
+            guard rec.formats.contains(.afm) == false else { return false }
+            guard effectiveSearchMode.includes(rec) else { return false }
+            guard filterManager.shouldIncludeModel(rec) else { return false }
+            guard recordMatchesQuery(rec, query: query) else { return false }
+            return seen.insert(rec.id).inserted
+        }
+        return liveResults + cachedMatches
     }
 
-    private enum RecordBadgeContext { case curated, search }
+    private func recordMatchesQuery(_ record: ModelRecord, query: String) -> Bool {
+        guard !query.isEmpty else { return true }
+        let haystack = [
+            record.id,
+            record.displayName,
+            record.publisher,
+            record.summary ?? "",
+            (record.tags ?? []).joined(separator: " ")
+        ]
+        .joined(separator: " ")
+        .lowercased()
+        return haystack.contains(query)
+    }
+
+    private enum RecordBadgeContext { case curated, search, cached }
 
     /// Conservative gate for the “Fits on your device” badge so it only shows
     /// when we have a curated minimum RAM hint that is comfortably under the
@@ -1048,77 +1070,99 @@ struct ExploreView: View {
         let showsVisionLabel = context == .curated
 
         Button { Task { await open(record) } } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Text(record.displayName)
-                        .font(FontTheme.body)
-                        .fontWeight(.medium)
-                        .foregroundStyle(AppTheme.text)
-                    // Vision badge (non-blocking) — hidden while multimodal UI is disabled.
-                    // On iOS in particular, surface an immediate badge when the Hub pipeline
-                    // already identifies the repo as VLM to avoid waiting for metadata fetches.
-                    if UIConstants.showMultimodalUI && !record.formats.contains(.afm) {
-                        if record.pipeline_tag == "image-text-to-text" {
-                            if showsVisionEye {
-                                ZStack {
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .stroke(Color.yellow, lineWidth: 2)
-                                        .frame(width: 22, height: 22)
+            HStack(alignment: .center, spacing: 14) {
+                Image(systemName: context == .cached ? "clock.arrow.circlepath" : "cube.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(context == .cached ? Color.orange : Color.accentColor)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        (context == .cached ? Color.orange : Color.accentColor).opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(record.displayName)
+                            .font(FontTheme.body.weight(.medium))
+                            .foregroundStyle(AppTheme.text)
+                            .lineLimit(1)
+                        
+                        if UIConstants.showMultimodalUI && !record.formats.contains(.afm) {
+                            if record.pipeline_tag == "image-text-to-text" {
+                                if showsVisionEye {
                                     Image(systemName: "eye.fill")
-                                        .foregroundColor(Color.yellow)
-                                        .font(.system(size: 11, weight: .semibold))
+                                        .font(.caption2)
+                                        .foregroundStyle(Color.purple)
+                                        .help(LocalizedStringKey("Vision-capable model"))
                                 }
-                                .accessibilityLabel(LocalizedStringKey("Vision-capable model"))
-                                .help(LocalizedStringKey("Vision-capable model"))
+                            } else {
+                                VisionBadge(repoId: record.id, token: huggingFaceToken, showsIcon: showsVisionEye)
                             }
-                        } else {
-                            VisionBadge(repoId: record.id, token: huggingFaceToken, showsIcon: showsVisionEye)
+                        }
+                        
+                        if showsFitsBadge(for: record) {
+                            Text(LocalizedStringKey("Fits"))
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Color.green)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.green.opacity(0.15), in: Capsule())
+                        }
+                        
+                        if context == .cached {
+                            Text(LocalizedStringKey("Offline cache"))
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Color.orange)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.15), in: Capsule())
+                        }
+                        
+                        if showsVisionLabel && record.pipeline_tag == "image-text-to-text" {
+                            Text(LocalizedStringKey("Vision"))
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Color.purple)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.purple.opacity(0.15), in: Capsule())
+                        }
+                        
+                        if !record.formats.contains(.afm) {
+                            ToolBadge(repoId: record.id, token: huggingFaceToken)
+                        }
+                        if record.isReasoningModel {
+                            Image(systemName: "brain")
+                                .font(.caption2)
+                                .foregroundColor(.purple)
                         }
                     }
                     
-                    if showsFitsBadge(for: record) {
-                        Text(LocalizedStringKey("Fits on your device"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.medium)
-                            .foregroundStyle(Color.green)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.green.opacity(0.1), in: Capsule())
-                    }
-
-                    if showsVisionLabel && record.pipeline_tag == "image-text-to-text" {
-                        Text(LocalizedStringKey("Vision"))
-                            .font(FontTheme.caption)
-                            .fontWeight(.medium)
-                            .foregroundStyle(Color.purple)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.purple.opacity(0.1), in: Capsule())
-                    }
-
-                    if !record.formats.contains(.afm) {
-                        // Tool capability badge (non-blocking)
-                        ToolBadge(repoId: record.id, token: huggingFaceToken)
-                    }
-                    if record.isReasoningModel {
-                        Image(systemName: "brain")
-                            .font(.caption)
-                            .foregroundColor(.purple)
+                    HStack(spacing: 6) {
+                        if !record.publisher.isEmpty {
+                            Text(authorListText(for: record))
+                                .font(FontTheme.caption)
+                                .foregroundStyle(AppTheme.secondaryText)
+                                .lineLimit(1)
+                        }
+                        if !record.hasInstallableQuant {
+                            Text("•")
+                                .font(FontTheme.caption)
+                                .foregroundStyle(AppTheme.tertiaryText)
+                            Text(LocalizedStringKey("No quant files available"))
+                                .font(FontTheme.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
-                if !record.publisher.isEmpty {
-                    Text(authorListText(for: record))
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
-                if !record.hasInstallableQuant {
-                    Text(LocalizedStringKey("No quant files available"))
-                        .font(FontTheme.caption)
-                        .foregroundColor(.secondary)
-                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
     }
 
     private func authorListText(for record: ModelRecord) -> String {
@@ -1162,6 +1206,8 @@ struct ExploreView: View {
             return ModelFormat.ane.tagGradient
         case .afm:
             return ModelFormat.afm.tagGradient
+        case .coreai:
+            return ModelFormat.coreai.tagGradient
         }
     }
     private var searchModeColor: Color {
@@ -1178,6 +1224,8 @@ struct ExploreView: View {
             return .green
         case .afm:
             return .indigo
+        case .coreai:
+            return .purple
         }
     }
 
@@ -1258,27 +1306,23 @@ struct ExploreView: View {
             presentMacMLXImporter()
         }
 #else
+        let request: ExploreImportRequest
         switch format {
         case .gguf:
-            let request: ExploreImportRequest = .ggufFiles
-            activeImportRequest = nil
-            DispatchQueue.main.async {
-                self.activeImportRequest = request
-            }
+            request = .ggufFiles
         case .ggufFolder:
-            let request: ExploreImportRequest = .ggufFolder
-            activeImportRequest = nil
-            DispatchQueue.main.async {
-                self.activeImportRequest = request
-            }
+            request = .ggufFolder
         case .mlx:
             guard supportsMLXImport else { return }
-            let request: ExploreImportRequest = .mlxFolder
-            activeImportRequest = nil
-            DispatchQueue.main.async {
-                self.activeImportRequest = request
-            }
+            request = .mlxFolder
         }
+        // Set the routing data first so the importer reads the right content types,
+        // then present via the dedicated boolean. Driving presentation off
+        // `isImporterPresented` keeps `activeImportRequest` alive for the completion
+        // handler and makes repeated re-presentation reliable (the old optional-derived
+        // binding could no-op when the same request was re-selected).
+        activeImportRequest = request
+        isImporterPresented = true
 #endif
     }
 
@@ -1286,7 +1330,11 @@ struct ExploreView: View {
     @MainActor
     private func presentMacGGUFImporter() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = ggufFileAllowedTypes()
+        // Include `.folder` so a directory of GGUF shards can be selected directly.
+        // Without it, AppKit leaves the Import button disabled while a plain folder is
+        // highlighted (the user perceives "nothing happens"). importGGUF already
+        // recurses directory roots, so a chosen folder imports correctly.
+        panel.allowedContentTypes = ggufFileAllowedTypes() + [UTType.folder]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
@@ -1327,7 +1375,8 @@ struct ExploreView: View {
         // We'll fetch details and metadata only when needed in the detail view
 
         loadingDetail = true
-        if let d = await vm.details(for: record.id) {
+        if let d = await vm.details(for: record.id, preferCached: offGrid, allowNetwork: !offGrid) {
+            selectedFormatFilter = nil
             selected = d
         }
         loadingDetail = false
@@ -1473,6 +1522,7 @@ struct ExploreDetailView: View, Identifiable {
     let detail: ModelDetails
     let downloadController: DownloadController
     let remoteDownloadTargetBackendID: RemoteBackend.ID?
+    let formatFilter: ModelFormat?
     @EnvironmentObject var modelManager: AppModelManager
     @EnvironmentObject var chatVM: ChatVM
     @EnvironmentObject var tabRouter: TabRouter
@@ -1512,6 +1562,14 @@ struct ExploreDetailView: View, Identifiable {
                         }
                     }
 
+                    if let note = curatedModelNote {
+                        curatedModelNoteCard(note)
+                    }
+
+                    if let guidance = moeGuidance {
+                        moeGuidanceCard(guidance)
+                    }
+
                     infoCard(title: LocalizedStringKey("Available Quantizations"), trailing: {
                         Picker(LocalizedStringKey("Sort"), selection: $quantSort) {
                             ForEach(QuantSortOption.allCases, id: \.self) { opt in
@@ -1527,8 +1585,11 @@ struct ExploreDetailView: View, Identifiable {
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         } else {
-                            VStack(spacing: 12) {
-                                ForEach(sortedQuants) { q in
+                            VStack(spacing: 0) {
+                                ForEach(Array(sortedQuants.enumerated()), id: \.element.id) { index, q in
+                                    if index > 0 {
+                                        Divider().opacity(0.5)
+                                    }
                                     quantTile(for: q)
                                 }
                             }
@@ -1573,11 +1634,17 @@ struct ExploreDetailView: View, Identifiable {
     }
 
     private var eligibleQuants: [QuantInfo] {
-        detail.quants
+        // Hide CoreAI quants from users below OS 27, even on multi-format models
+        // that ship a CoreAI variant alongside GGUF/MLX/etc.
+        let base = ModelFormat.isCoreAIRuntimeAvailable
+            ? detail.quants
+            : detail.quants.filter { $0.format != .coreai }
+        guard let formatFilter else { return base }
+        return base.filter { $0.format == formatFilter }
     }
 
     private var lowBitOnlyRepository: Bool {
-        !detail.quants.isEmpty && detail.quants.allSatisfy(\.isLowBitQuant)
+        !eligibleQuants.isEmpty && eligibleQuants.allSatisfy(\.isLowBitQuant)
     }
 
     private var sortedQuants: [QuantInfo] {
@@ -1626,6 +1693,12 @@ struct ExploreDetailView: View, Identifiable {
     private func quantSortKey(_ q: QuantInfo) -> (Int, Int, Int, Int, Int, String) {
         // Lower tuple compares first; smaller values rank higher
         let label = q.label.uppercased()
+        // Core AI bundles are platform targets, not a quality ladder — rank by
+        // fit for the current device, then by size (smaller first).
+        if q.format == .coreai {
+            let familyRank = CoreAIBundleFamily.detect(from: q.label)?.sortRank ?? 9
+            return (9, familyRank, Int(clamping: q.sizeBytes), 0, 0, label)
+        }
         let bits = q.inferredBitWidth ?? 999
         let formatRank: Int = {
             switch q.format {
@@ -1634,6 +1707,7 @@ struct ExploreDetailView: View, Identifiable {
             case .et: return 6
             case .ane: return 7
             case .afm: return 8
+            case .coreai: return 9
             }
         }()
 
@@ -1685,6 +1759,12 @@ struct ExploreDetailView: View, Identifiable {
 
     @MainActor
     private func download(info: QuantInfo) async {
+        if info.format == .coreai, info.downloadURL.scheme?.lowercased() == "coreai" {
+            // Local-catalog CoreAI entries are export recipes, not downloadable
+            // artifacts. Hugging Face repos with real .aimodel files download normally.
+            remoteDownloadErrorMap[info.label] = CoreAIModelRegistry.sideLoadNotice
+            return
+        }
         if isRemoteDownloadMode {
             await startRemoteDownload(info: info)
             return
@@ -1911,6 +1991,8 @@ struct ExploreDetailView: View, Identifiable {
                 isVision = false
             case .afm:
                 isVision = false
+            case .coreai:
+                isVision = false
             }
         }
         // For capabilities on open, check hub/template hints with a single call; fallback to local scan
@@ -1923,7 +2005,7 @@ struct ExploreDetailView: View, Identifiable {
         switch info.format {
         case .gguf, .mlx:
             moeInfo = ModelScanner.moeInfo(for: url, format: info.format)
-        case .et, .ane, .afm:
+        case .et, .ane, .afm, .coreai:
             moeInfo = nil
         }
         let architectureLabels = LocalModel.architectureLabels(for: url, format: info.format, modelID: detail.id)
@@ -1990,7 +2072,7 @@ extension ExploreView {
             let importPlans = GGUFImportSupport.modelImportPlans(from: urls, fileManager: fm)
 
             guard !importPlans.isEmpty else {
-                importError = "No GGUF model files found in selection."
+                importError = String(localized: "No GGUF model files found in selection.")
                 return
             }
 
@@ -2024,6 +2106,13 @@ extension ExploreView {
                     copiedProjector = destination
                 }
 
+                var copiedMTP: URL? = nil
+                if let mtp = plan.mtp {
+                    let destination = uniqueDestination(for: destDir.appendingPathComponent(mtp.lastPathComponent))
+                    try safeCopy(from: mtp, to: destination)
+                    copiedMTP = destination
+                }
+
                 for sidecar in plan.sidecars {
                     let destination = destDir.appendingPathComponent(sidecar.lastPathComponent)
                     try safeCopy(from: sidecar, to: destination)
@@ -2032,7 +2121,8 @@ extension ExploreView {
                 GGUFImportSupport.writeArtifactsJSON(
                     in: destDir,
                     weightFiles: copiedWeights,
-                    projector: copiedProjector
+                    projector: copiedProjector,
+                    mtp: copiedMTP
                 )
 
                 // Resolve canonical URL (prefers first valid .gguf inside directories)
@@ -2079,13 +2169,17 @@ extension ExploreView {
                 )
                 modelManager.install(installed)
             }
+
+            importSuccess = importPlans.count == 1
+                ? String(localized: "Imported 1 model. Find it in the Stored tab.")
+                : String(localized: "Imported \(importPlans.count) models. Find them in the Stored tab.")
         } catch {
             if let err = error as? CocoaError,
                (err.code == .fileReadNoPermission || err.code == .fileWriteNoPermission) {
                 let path = (err.userInfo[NSFilePathErrorKey] as? String) ?? "selected files"
-                importError = "Import failed: Permission denied for \(path). Please allow access when prompted or move the files to a readable location."
+                importError = String(localized: "Import failed: Permission denied for \(path). Please allow access when prompted or move the files to a readable location.")
             } else {
-                importError = "Import failed: \(error.localizedDescription)"
+                importError = String(localized: "Import failed: \(error.localizedDescription)")
             }
         }
     }
@@ -2103,7 +2197,7 @@ extension ExploreView {
             let fm = FileManager.default
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else {
-                importError = "Selected path is not a directory."
+                importError = String(localized: "Selected path is not a directory.")
                 return
             }
 
@@ -2115,6 +2209,20 @@ extension ExploreView {
 
             // Copy entire folder contents into destination (merge-safe)
             try copyDirectoryContents(from: directory, to: destDir)
+
+            // Copying an empty (or fully-unreadable) directory succeeds without throwing,
+            // which would otherwise register a phantom model with no files and no feedback.
+            // Mirror the GGUF importer's empty-guard.
+            let copiedContents = (try? fm.contentsOfDirectory(at: destDir, includingPropertiesForKeys: nil)) ?? []
+            let hasMLXWeights = copiedContents.contains { url in
+                let name = url.lastPathComponent.lowercased()
+                return name.hasSuffix(".safetensors") || name == "config.json" || name.hasSuffix(".npz")
+            }
+            guard !copiedContents.isEmpty, hasMLXWeights else {
+                try? fm.removeItem(at: destDir)
+                importError = String(localized: "No MLX model files were found in the selected folder. Make sure you pick the folder that contains config.json and the .safetensors weights.")
+                return
+            }
 
             // Determine canonical directory
             let canonical = InstalledModelsStore.canonicalURL(for: destDir, format: .mlx)
@@ -2143,13 +2251,14 @@ extension ExploreView {
                 moeInfo: moeInfo
             )
             modelManager.install(installed)
+            importSuccess = String(localized: "Imported \(folderName). Find it in the Stored tab.")
         } catch {
             if let err = error as? CocoaError,
                (err.code == .fileReadNoPermission || err.code == .fileWriteNoPermission) {
                 let path = (err.userInfo[NSFilePathErrorKey] as? String) ?? directory.path
-                importError = "Import failed: Permission denied for \(path). Please allow access when prompted or move the model folder to a readable location."
+                importError = String(localized: "Import failed: Permission denied for \(path). Please allow access when prompted or move the model folder to a readable location.")
             } else {
-                importError = "Import failed: \(error.localizedDescription)"
+                importError = String(localized: "Import failed: \(error.localizedDescription)")
             }
         }
     }
@@ -2239,16 +2348,18 @@ enum GGUFImportSupport {
         let primaryWeight: URL
         let weightFiles: [URL]
         let projector: URL?
+        let mtp: URL?
         let sidecars: [URL]
     }
 
     private static let projectorKeywords = ["mmproj", "projector", "image_proj"]
+    private static let mtpKeywords = ["mtp", "draft", "nextn"]
     private static let sidecarExtensions = Set(["json", "jinja"])
     private static let sidecarFilenames = Set(["chat_template.txt"])
     private static let excludedSidecarNames = Set(["artifacts.json", "ds_markers.cache.json"])
 
     static func isImportCandidate(_ url: URL) -> Bool {
-        isWeightFile(url) || isProjector(url) || isSidecar(url)
+        isWeightFile(url) || isProjector(url) || isMTP(url) || isSidecar(url)
     }
 
     static func isProjector(_ url: URL) -> Bool {
@@ -2265,7 +2376,14 @@ enum GGUFImportSupport {
     }
 
     static func isWeightFile(_ url: URL) -> Bool {
-        url.pathExtension.lowercased() == "gguf" && !isProjector(url)
+        url.pathExtension.lowercased() == "gguf" && !isProjector(url) && !isMTP(url)
+    }
+
+    static func isMTP(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "gguf" else { return false }
+        let lowerName = url.lastPathComponent.lowercased()
+        guard !isProjector(url) else { return false }
+        return mtpKeywords.contains(where: { lowerName.contains($0) })
     }
 
     static func collectImportableFiles(from roots: [URL], fileManager: FileManager = .default) -> [URL] {
@@ -2317,11 +2435,13 @@ enum GGUFImportSupport {
             let scopeFiles = scopeFiles(in: scopeDirectory, fileManager: fileManager)
             let projectors = scopeFiles.filter(isProjector)
             let projector = matchedProjector(for: orderedWeights, among: projectors, directory: scopeDirectory)
+            let mtp = matchedMTP(for: orderedWeights, among: scopeFiles.filter(isMTP), directory: scopeDirectory)
             let sidecars = deduplicatedSidecars(from: scopeFiles.filter(isSidecar))
             return ModelImportPlan(
                 primaryWeight: primaryWeight,
                 weightFiles: orderedWeights,
                 projector: projector,
+                mtp: mtp,
                 sidecars: sidecars
             )
         }
@@ -2329,7 +2449,7 @@ enum GGUFImportSupport {
     }
 
     @discardableResult
-    static func writeArtifactsJSON(in directory: URL, weightFiles: [URL], projector: URL?) -> URL {
+    static func writeArtifactsJSON(in directory: URL, weightFiles: [URL], projector: URL?, mtp: URL? = nil) -> URL {
         let artifactsURL = directory.appendingPathComponent("artifacts.json")
         var payload: [String: Any] = [:]
         if let primaryWeight = weightFiles.first?.lastPathComponent {
@@ -2340,6 +2460,8 @@ enum GGUFImportSupport {
         }
         payload["mmproj"] = projector?.lastPathComponent ?? NSNull()
         payload["mmprojChecked"] = true
+        payload["mtp"] = mtp?.lastPathComponent ?? NSNull()
+        payload["mtpChecked"] = true
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
             try? data.write(to: artifactsURL, options: [.atomic])
         }
@@ -2473,6 +2595,28 @@ enum GGUFImportSupport {
         }.first
     }
 
+    private static func matchedMTP(for weights: [URL], among mtpFiles: [URL], directory: URL) -> URL? {
+        guard !mtpFiles.isEmpty else { return nil }
+
+        if let hinted = hintedMTP(in: directory, among: mtpFiles) {
+            return hinted
+        }
+        if mtpFiles.count == 1 {
+            return mtpFiles[0]
+        }
+
+        let weightTokens = Set(normalizedTokens(for: weights.first))
+        let weightStem = normalizedStem(for: weights.first)
+        return mtpFiles.sorted { lhs, rhs in
+            let leftScore = mtpScore(lhs, weightTokens: weightTokens, weightStem: weightStem)
+            let rightScore = mtpScore(rhs, weightTokens: weightTokens, weightStem: weightStem)
+            if leftScore != rightScore {
+                return leftScore > rightScore
+            }
+            return lhs.lastPathComponent.localizedCaseInsensitiveCompare(rhs.lastPathComponent) == .orderedAscending
+        }.first
+    }
+
     private static func hintedProjector(in directory: URL, among projectors: [URL]) -> URL? {
         let artifactsURL = directory.appendingPathComponent("artifacts.json")
         guard let data = try? Data(contentsOf: artifactsURL),
@@ -2485,6 +2629,24 @@ enum GGUFImportSupport {
         let normalizedHint = raw.replacingOccurrences(of: "\\", with: "/")
         let hintedName = URL(fileURLWithPath: normalizedHint).lastPathComponent.lowercased()
         return projectors.first(where: { candidate in
+            let candidatePath = candidate.path.lowercased().replacingOccurrences(of: "\\", with: "/")
+            return candidate.lastPathComponent.lowercased() == hintedName
+                || candidatePath.hasSuffix(normalizedHint.lowercased())
+        })
+    }
+
+    private static func hintedMTP(in directory: URL, among mtpFiles: [URL]) -> URL? {
+        let artifactsURL = directory.appendingPathComponent("artifacts.json")
+        guard let data = try? Data(contentsOf: artifactsURL),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = payload["mtp"] as? String,
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let normalizedHint = raw.replacingOccurrences(of: "\\", with: "/")
+        let hintedName = URL(fileURLWithPath: normalizedHint).lastPathComponent.lowercased()
+        return mtpFiles.first(where: { candidate in
             let candidatePath = candidate.path.lowercased().replacingOccurrences(of: "\\", with: "/")
             return candidate.lastPathComponent.lowercased() == hintedName
                 || candidatePath.hasSuffix(normalizedHint.lowercased())
@@ -2507,6 +2669,23 @@ enum GGUFImportSupport {
         return score
     }
 
+    private static func mtpScore(_ candidate: URL, weightTokens: Set<String>, weightStem: String) -> Int {
+        let candidateTokens = Set(normalizedTokens(for: candidate))
+        var score = weightTokens.intersection(candidateTokens).count * 100
+        let candidateStem = normalizedStem(for: candidate)
+        if !weightStem.isEmpty, !candidateStem.isEmpty {
+            if candidateStem.contains(weightStem) || weightStem.contains(candidateStem) {
+                score += 50
+            }
+        }
+        let lower = candidate.lastPathComponent.lowercased()
+        if lower.contains("mtp-") || lower.contains("-mtp") { score += 30 }
+        if lower.contains("nextn") { score += 20 }
+        if lower.contains("draft") { score += 10 }
+        if lower.contains("f16") || lower.contains("f32") { score += 5 }
+        return score
+    }
+
     private static func normalizedStem(for url: URL?) -> String {
         guard let url else { return "" }
         let stripped = GGUFShardNaming.strippedShardPath(url.lastPathComponent)
@@ -2520,6 +2699,7 @@ enum GGUFImportSupport {
         let stopwords: Set<String> = [
             "gguf", "mmproj", "projector", "image", "proj", "vision",
             "clip", "siglip", "model", "main", "weights", "weight",
+            "mtp", "draft", "nextn",
             "f16", "f32", "bf16", "of"
         ]
         let raw = normalizedStem(for: url)
@@ -2586,6 +2766,16 @@ private extension ExploreDetailView {
                     .foregroundStyle(Color.orange)
             }
 
+            if ExploreModelDetailCache.cachedAt(repoID: detail.id) != nil {
+                Label(LocalizedStringKey("Available offline"), systemImage: "externaldrive.fill")
+                    .font(FontTheme.caption)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.green.opacity(0.14), in: Capsule())
+                    .foregroundStyle(Color.green)
+                    .accessibilityLabel(LocalizedStringKey("Available offline"))
+            }
+
             if UIConstants.showMultimodalUI && detail.isVision {
                 Label(LocalizedStringKey("Vision-capable"), systemImage: "eye.fill")
                     .font(FontTheme.caption)
@@ -2606,13 +2796,7 @@ private extension ExploreDetailView {
                     .accessibilityLabel(LocalizedStringKey("Mixture-of-Experts model"))
             }
         }
-        .padding(26)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .fill(AppTheme.cardFill)
-                .shadow(color: Color.black.opacity(0.06), radius: 20, x: 0, y: 12)
-        )
     }
 
     private var isMoE: Bool {
@@ -2621,29 +2805,100 @@ private extension ExploreDetailView {
         return detail.isMoE
     }
 
+    private var curatedModelNote: CuratedModelNote? {
+        CuratedModelNotes.note(for: detail.id)
+    }
+
+    private var moeGuidance: ModelMoEGuidance? {
+        _ = metaVersion
+        return ModelMoEGuidance.make(for: detail)
+    }
+
+    func curatedModelNoteCard(_ note: CuratedModelNote) -> some View {
+        infoCard(title: LocalizedStringKey("Curated Notes")) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: note.systemImage)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 28)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(LocalizedStringKey(note.titleKey))
+                        .font(FontTheme.body.weight(.semibold))
+                        .foregroundStyle(AppTheme.text)
+                    Text(LocalizedStringKey(note.bodyKey))
+                        .font(FontTheme.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    func moeGuidanceCard(_ guidance: ModelMoEGuidance) -> some View {
+        infoCard(title: LocalizedStringKey("MoE Guidance")) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text(LocalizedStringKey(guidance.summaryKey))
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(guidance.metrics) { metric in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Image(systemName: metric.systemImage)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Color.moeAccent)
+                                .frame(width: 18)
+
+                            Text(LocalizedStringKey(metric.titleKey))
+                                .font(FontTheme.caption.weight(.semibold))
+                                .foregroundStyle(AppTheme.text)
+
+                            Spacer(minLength: 12)
+
+                            Text(metric.value)
+                                .font(FontTheme.caption)
+                                .foregroundStyle(AppTheme.secondaryText)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                }
+
+                Label(LocalizedStringKey(guidance.cautionKey), systemImage: "exclamationmark.triangle.fill")
+                    .font(FontTheme.caption)
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // Flat, industrial "spec-sheet" section: an uppercase tracked header over a
+    // hairline rule, with content flush to the view's margins. No card fill, shadow,
+    // or inner padding — those wasted horizontal space and added visual bulk.
     func infoCard<Content: View, Trailing: View>(
         title: LocalizedStringKey,
         @ViewBuilder trailing: () -> Trailing,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 Text(title)
-                    .font(FontTheme.heading)
-                    .foregroundStyle(AppTheme.text)
+                    .font(.caption.weight(.semibold))
+                    .textCase(.uppercase)
+                    .tracking(1.1)
+                    .foregroundStyle(AppTheme.secondaryText)
                 Spacer(minLength: 16)
                 trailing()
             }
 
+            Rectangle()
+                .fill(AppTheme.cardStroke)
+                .frame(height: 1)
+
             content()
         }
-        .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(AppTheme.cardFill)
-                .shadow(color: Color.black.opacity(0.04), radius: 14, x: 0, y: 10)
-        )
     }
 
     func infoCard<Content: View>(
@@ -2706,16 +2961,8 @@ private extension ExploreDetailView {
             downloadAction: { await download(info: quant) },
             cancelAction: { cancelDownload(label: quant.label) }
         )
-        .padding(18)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(Color.quantTileBackground)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color.quantTileBorder, lineWidth: 1)
-        )
     }
 }
 
@@ -2760,7 +3007,7 @@ private final class QuantRowDownloadObserver: ObservableObject {
         observedItemID = itemID
         snapshot = Self.snapshot(for: itemID, in: downloadController.items)
 
-        cancellable = downloadController.$items
+        cancellable = downloadController.itemsPublisher
             .map { Self.snapshot(for: itemID, in: $0) }
             .removeDuplicates()
             .throttle(for: .milliseconds(250), scheduler: RunLoop.main, latest: true)
@@ -2798,6 +3045,7 @@ struct QuantRow: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @StateObject private var localDownloadObserver = QuantRowDownloadObserver()
     @State private var showQuantTypeInfo = false
+    @State private var showDownloadPlan = false
 
     private static let byteCountFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -2831,12 +3079,17 @@ struct QuantRow: View {
     }
 
     private var regularLayout: some View {
-        HStack(alignment: .center, spacing: 12) {
-            metadataBlock
-                .layoutPriority(1)
-            Spacer(minLength: 8)
-            suitabilityBadge
-            trailingControls
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                metadataBlock
+                    .layoutPriority(1)
+                Spacer(minLength: 8)
+                suitabilityBadge
+                trailingControls
+            }
+            if showDownloadPlan {
+                DownloadPlanPreview(rootTitle: info.label, plan: downloadPlan, byteCountFormatter: Self.byteCountFormatter)
+            }
         }
     }
 
@@ -2857,38 +3110,78 @@ struct QuantRow: View {
                     trailingControls
                 }
             }
+            if showDownloadPlan {
+                DownloadPlanPreview(rootTitle: info.label, plan: downloadPlan, byteCountFormatter: Self.byteCountFormatter)
+            }
         }
     }
 
     private var metadataBlock: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(info.label)
+                Text(displayTitle)
                     .font(FontTheme.body)
                     .fontWeight(.medium)
                     .foregroundStyle(AppTheme.text)
                     .fixedSize(horizontal: false, vertical: true)
-                quantTypeChip
+                if coreAIFamily?.isRecommendedOnThisDevice == true {
+                    Image(systemName: "star.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.yellow)
+                        .help(LocalizedStringKey("Recommended for this device"))
+                        .accessibilityLabel(LocalizedStringKey("Recommended for this device"))
+                }
                 if showsLowQualityMarker {
                     lowQualityQuantBadge
                 }
             }
             .lineLimit(2)
 
-            HStack(spacing: 6) {
-                Text(sizeText)
+            HStack(spacing: 4) {
+                quantMetaButton
+                downloadPlanToggle
+            }
+
+            if let coreAIFamily {
+                Text(coreAIFamily.caption)
                     .font(FontTheme.caption)
                     .foregroundStyle(AppTheme.secondaryText)
-
-                if info.isMultipart {
-                    Text("\(info.partCount) parts")
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
-
-                formatBadge
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    /// Core AI labels carry the family as a "family/" prefix; the meta line
+    /// already names the family, so the title shows just the bundle stem.
+    private var displayTitle: String {
+        guard info.format == .coreai, let slash = info.label.lastIndex(of: "/") else {
+            return info.label
+        }
+        let stem = String(info.label[info.label.index(after: slash)...])
+        return stem.isEmpty ? info.label : stem
+    }
+
+    private var downloadPlanToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) {
+                showDownloadPlan.toggle()
+            }
+        } label: {
+            Image(systemName: showDownloadPlan ? "list.bullet.rectangle.fill" : "list.bullet.rectangle")
+                .font(.caption2)
+                .foregroundStyle(AppTheme.secondaryText.opacity(0.7))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(LocalizedStringKey("Download Plan"))
+        .accessibilityLabel(LocalizedStringKey("Download Plan"))
+        .accessibilityValue(showDownloadPlan ? Text(LocalizedStringKey("Expanded")) : Text(LocalizedStringKey("Collapsed")))
+    }
+
+    private var coreAIFamily: CoreAIBundleFamily? {
+        guard info.format == .coreai else { return nil }
+        return CoreAIBundleFamily.detect(from: info.label)
     }
 
     private var lowQualityQuantBadge: some View {
@@ -2902,25 +3195,45 @@ struct QuantRow: View {
             .background(Color.orange.opacity(0.12), in: Capsule())
     }
 
-    private var formatBadge: some View {
-        Text(info.format.displayName)
-            .font(FontTheme.caption)
-            .fontWeight(.bold)
-            .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(info.format.tagGradient)
-            .clipShape(Capsule())
-            .foregroundColor(.white)
-    }
-
     @ViewBuilder
     private var suitabilityBadge: some View {
-        // Use a reasonable default context for discovery views where per-model settings are not yet bound.
         let defaultCtx = 4096
-        // We do not know the layer count at listing time; pass nil to use heuristic.
-        ModelRAMAdvisor.badge(format: info.format, sizeBytes: info.sizeBytes, contextLength: defaultCtx, layerCount: nil)
+        let assessment = ModelDeviceFitAdvisor.assess(
+            format: info.format,
+            sizeBytes: info.sizeBytes,
+            contextLength: defaultCtx,
+            layerCount: nil,
+            benchmark: installedBenchmarkResult
+        )
+        
+        let labelText: String = {
+            switch assessment.status {
+            case .works: return "FITS"
+            case .tight: return "TIGHT FIT"
+            case .unlikely: return "DOESN'T FIT"
+            }
+        }()
+        
+        let color: Color = {
+            switch assessment.status {
+            case .works: return Color.green
+            case .tight: return Color.orange
+            case .unlikely: return Color.red
+            }
+        }()
+
+        Text(LocalizedStringKey(labelText))
+            .font(.system(.caption2, design: .monospaced, weight: .bold))
+            .foregroundStyle(color.opacity(0.85))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.1))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(color.opacity(0.2), lineWidth: 0.5)
+            )
+            .help(LocalizedStringKey("Device fit assessment"))
     }
 
     @ViewBuilder
@@ -3062,6 +3375,13 @@ struct QuantRow: View {
         modelManager.downloadedModels.contains { $0.modelID == canonicalID && $0.quant == info.label }
     }
 
+    private var installedBenchmarkResult: ModelBenchmarkResult? {
+        guard let model = modelManager.downloadedModels.first(where: { $0.modelID == canonicalID && $0.quant == info.label }) else {
+            return nil
+        }
+        return ModelBenchmarkResultStore.result(for: model)?.result
+    }
+
     private var itemID: String {
         "\(canonicalID)-\(info.label)"
     }
@@ -3119,16 +3439,42 @@ struct QuantRow: View {
         return String(format: "%.0f KB/s", kb)
     }
 
-    private var quantTypeChip: some View {
+    private var downloadPlan: ModelDownloadPlan {
+        ModelDownloadPlan.make(for: info)
+    }
+
+    private var quantMetaButton: some View {
         let descriptor = info.quantTypeDescriptor
         return Button(action: { showQuantTypeInfo = true }) {
-            Text(descriptor.chipLabel)
-                .font(.caption2.weight(.semibold))
-                .lineLimit(1)
-                .foregroundStyle(AppTheme.secondaryText)
-                .padding(.horizontal, 8)
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(info.format.tagGradient)
+                        .frame(width: 5, height: 5)
+                    Text(info.format.displayName.uppercased())
+                        .font(.system(.caption2, design: .monospaced, weight: .semibold))
+                        .foregroundStyle(AppTheme.text.opacity(0.85))
+                }
+                .padding(.horizontal, 6)
                 .padding(.vertical, 3)
-                .background(Color.secondary.opacity(0.12), in: Capsule())
+                .background(Color.secondary.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+                )
+
+                if let coreAIFamily {
+                    Text(coreAIFamily.displayName)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                
+                Text(sizeText)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+            .lineLimit(1)
         }
         .buttonStyle(.plain)
         .help(LocalizedStringKey("Quant type details"))
@@ -3164,6 +3510,318 @@ struct QuantRow: View {
         }
     }
 
+}
+
+private struct DownloadPlanPreview: View {
+    let rootTitle: String
+    let plan: ModelDownloadPlan
+    let byteCountFormatter: ByteCountFormatter
+
+    private var dependencyGraph: ModelDependencyGraph {
+        ModelDependencyGraph.make(rootTitle: rootTitle, plan: plan)
+    }
+
+    private var visibleEntries: [ModelDownloadPlan.Entry] {
+        Array(plan.entries.prefix(6))
+    }
+
+    private var hiddenCount: Int {
+        max(0, plan.entries.count - visibleEntries.count)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Label(LocalizedStringKey("Download Plan"), systemImage: "list.bullet.rectangle")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(AppTheme.text)
+                Spacer(minLength: 8)
+                Text(totalText)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 8)], alignment: .leading, spacing: 6) {
+                ForEach(visibleEntries) { entry in
+                    DownloadPlanEntryView(entry: entry, byteCountFormatter: byteCountFormatter)
+                }
+            }
+
+            if hiddenCount > 0 {
+                Text(String.localizedStringWithFormat(String(localized: "%d more install items"), hiddenCount))
+                    .font(.caption2)
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+
+            if plan.installTimeCheckCount > 0 {
+                Text(LocalizedStringKey("Some sidecars are checked during install."))
+                    .font(.caption2)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            DownloadDependencyGraphView(graph: dependencyGraph)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var totalText: String {
+        let size = plan.knownTotalBytes > 0
+            ? byteCountFormatter.string(fromByteCount: plan.knownTotalBytes)
+            : String(localized: "Size unknown")
+        let files = String.localizedStringWithFormat(String(localized: "%d known files"), plan.knownFileCount)
+        if plan.unknownSizeCount > 0 {
+            return String.localizedStringWithFormat(String(localized: "%@ · %@ · %d unknown sizes"), size, files, plan.unknownSizeCount)
+        }
+        return "\(size) · \(files)"
+    }
+}
+
+private struct DownloadDependencyGraphView: View {
+    let graph: ModelDependencyGraph
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(LocalizedStringKey("Dependency Graph"), systemImage: "point.3.connected.trianglepath.dotted")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppTheme.text)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 8) {
+                    dependencyNode(graph.root)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .padding(.top, 10)
+                    VStack(alignment: .leading, spacing: 5) {
+                        dependencyGroup(
+                            title: "Required",
+                            systemImage: "checkmark.seal.fill",
+                            nodes: graph.requiredDependencies
+                        )
+                        dependencyGroup(
+                            title: "Optional",
+                            systemImage: "plus.circle",
+                            nodes: graph.optionalDependencies
+                        )
+                        dependencyGroup(
+                            title: "Install checks",
+                            systemImage: "magnifyingglass",
+                            nodes: graph.installChecks
+                        )
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        }
+    }
+
+    private func dependencyGroup(title: LocalizedStringKey, systemImage: String, nodes: [ModelDependencyGraph.Node]) -> some View {
+        HStack(alignment: .top, spacing: 5) {
+            Label(title, systemImage: systemImage)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(nodes.isEmpty ? AppTheme.secondaryText.opacity(0.7) : AppTheme.text)
+                .frame(width: 94, alignment: .leading)
+            if nodes.isEmpty {
+                Text(LocalizedStringKey("None"))
+                    .font(.caption2)
+                    .foregroundStyle(AppTheme.secondaryText)
+            } else {
+                HStack(spacing: 5) {
+                    ForEach(nodes.prefix(4)) { node in
+                        dependencyNode(node)
+                    }
+                    if nodes.count > 4 {
+                        Text("+\(nodes.count - 4)")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background(Color.secondary.opacity(0.10), in: Capsule())
+                    }
+                }
+            }
+        }
+    }
+
+    private func dependencyNode(_ node: ModelDependencyGraph.Node) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: iconName(for: node))
+                .font(.caption2.weight(.semibold))
+            Text(nodeTitle(for: node))
+                .font(.caption2.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .foregroundStyle(foregroundColor(for: node))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(backgroundColor(for: node), in: Capsule())
+        .accessibilityLabel(Text(nodeTitle(for: node)))
+        .accessibilityValue(Text(node.detail))
+    }
+
+    private func nodeTitle(for node: ModelDependencyGraph.Node) -> String {
+        guard node.role != .root else { return String(localized: "Selected quant") }
+        if let entryKind = node.entryKind {
+            return title(for: entryKind)
+        }
+        return node.title
+    }
+
+    private func title(for kind: ModelDownloadPlan.Entry.Kind) -> String {
+        switch kind {
+        case .weights, .weightShard:
+            return String(localized: "Weights")
+        case .config:
+            return String(localized: "Config")
+        case .importanceMatrix:
+            return String(localized: "iMatrix")
+        case .mtp:
+            return String(localized: "MTP")
+        case .tokenizer:
+            return String(localized: "Tokenizer")
+        case .template:
+            return String(localized: "Template")
+        case .processor:
+            return String(localized: "Processor")
+        case .projector:
+            return String(localized: "Projector")
+        case .params:
+            return String(localized: "Params")
+        }
+    }
+
+    private func iconName(for node: ModelDependencyGraph.Node) -> String {
+        switch node.role {
+        case .root:
+            return "cube"
+        case .required:
+            return "checkmark.circle.fill"
+        case .optional:
+            return "plus.circle"
+        case .installCheck:
+            return "magnifyingglass"
+        }
+    }
+
+    private func foregroundColor(for node: ModelDependencyGraph.Node) -> Color {
+        switch node.role {
+        case .root:
+            return Color.accentColor
+        case .required:
+            return AppTheme.text
+        case .optional, .installCheck:
+            return AppTheme.secondaryText
+        }
+    }
+
+    private func backgroundColor(for node: ModelDependencyGraph.Node) -> Color {
+        switch node.role {
+        case .root:
+            return Color.accentColor.opacity(0.12)
+        case .required:
+            return Color.green.opacity(0.12)
+        case .optional:
+            return Color.secondary.opacity(0.10)
+        case .installCheck:
+            return Color.orange.opacity(0.12)
+        }
+    }
+}
+
+private struct DownloadPlanEntryView: View {
+    let entry: ModelDownloadPlan.Entry
+    let byteCountFormatter: ByteCountFormatter
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            Image(systemName: iconName)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(iconColor)
+                .frame(width: 14)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(kindTitle)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(AppTheme.text)
+                        .lineLimit(1)
+                    if entry.isRequired {
+                        Text(LocalizedStringKey("Required"))
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(Color.red)
+                            .lineLimit(1)
+                    }
+                }
+                Text(detailText)
+                    .font(.caption2)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var kindTitle: LocalizedStringKey {
+        switch entry.kind {
+        case .weights, .weightShard:
+            return "Weights"
+        case .config:
+            return "Config"
+        case .importanceMatrix:
+            return "iMatrix"
+        case .mtp:
+            return "MTP"
+        case .tokenizer:
+            return "Tokenizer"
+        case .template:
+            return "Template"
+        case .processor:
+            return "Processor"
+        case .projector:
+            return "Projector"
+        case .params:
+            return "Params"
+        }
+    }
+
+    private var detailText: String {
+        let sizeText: String
+        if let size = entry.sizeBytes, size > 0 {
+            sizeText = byteCountFormatter.string(fromByteCount: size)
+        } else if entry.isResolvedDuringInstall {
+            sizeText = String(localized: "Install-time check")
+        } else {
+            sizeText = String(localized: "Size unknown")
+        }
+        return "\(entry.relativePath) · \(sizeText)"
+    }
+
+    private var iconName: String {
+        switch entry.kind {
+        case .weights, .weightShard:
+            return "shippingbox"
+        case .config, .params:
+            return "doc.text"
+        case .importanceMatrix:
+            return "slider.horizontal.3"
+        case .mtp:
+            return "forward.end.fill"
+        case .tokenizer:
+            return "textformat.abc"
+        case .template:
+            return "text.bubble"
+        case .processor, .projector:
+            return "photo"
+        }
+    }
+
+    private var iconColor: Color {
+        entry.isResolvedDuringInstall ? AppTheme.secondaryText : Color.accentColor
+    }
 }
 
 #if canImport(LeapSDK)
@@ -3224,7 +3882,7 @@ struct LeapRowView: View {
         }
         .padding(.vertical, 8)
         .onAppear { refresh() }
-        .onReceive(downloadController.$leapItems) { _ in
+        .onReceive(downloadController.leapItemsPublisher) { _ in
             if let item = downloadController.leapItems.first(where: { $0.id == entry.slug }) {
                 progress = item.progress
                 speed = item.speed

@@ -8,6 +8,7 @@ enum AppSecrets {
     enum Key: String {
         case searxngURL = "SearXNGURL"
         case searxngAPIKey = "SearXNGAPIKey"
+        case teamsAPIURL = "TeamsAPIURL"
     }
 
     private static let secrets: [String: String]? = {
@@ -36,6 +37,8 @@ enum AppSecrets {
             return env["SEARXNG_URL"]
         case .searxngAPIKey:
             return env["NOEMA_SEARCH_KEY"]
+        case .teamsAPIURL:
+            return env["NOEMA_TEAMS_URL"]
         }
     }
 
@@ -89,5 +92,13 @@ enum AppSecrets {
     /// `SearXNGAPIKey` or env var `NOEMA_SEARCH_KEY`.
     static var searxngAPIKey: String? {
         string(for: .searxngAPIKey)
+    }
+
+    /// Root of the Noema Teams workspace API (paths live under /v1/teams).
+    /// Override via Secrets.plist `TeamsAPIURL`, env `NOEMA_TEAMS_URL`, or the
+    /// `enterpriseAPIBaseURL` UserDefaults key for local development.
+    /// search.noemaai.com/v1/teams serves the same API as a fallback.
+    static var teamsAPIBaseURL: URL {
+        url(for: .teamsAPIURL) ?? URL(string: "https://api.noemaai.com")!
     }
 }

@@ -111,6 +111,7 @@ import threading
 import tempfile
 import traceback
 import contextlib
+import base64
 
 _noema_user_code = __noema_user_code
 _noema_sandbox_preamble = __noema_sandbox_preamble
@@ -196,6 +197,93 @@ if error_message:
     if exit_code == 0 and not timed_out:
         exit_code = 1
 
+def _noema_artifact_kind(path):
+    ext = os.path.splitext(path)[1].lower().lstrip('.')
+    if ext == 'png':
+        return 'image', 'image/png'
+    if ext in ('jpg', 'jpeg'):
+        return 'image', 'image/jpeg'
+    if ext == 'gif':
+        return 'image', 'image/gif'
+    if ext == 'webp':
+        return 'image', 'image/webp'
+    if ext == 'bmp':
+        return 'image', 'image/bmp'
+    if ext in ('tif', 'tiff'):
+        return 'image', 'image/tiff'
+    if ext == 'svg':
+        return 'text', 'image/svg+xml'
+    if ext == 'csv':
+        return 'table', 'text/csv'
+    if ext == 'tsv':
+        return 'table', 'text/tab-separated-values'
+    if ext == 'json':
+        return 'json', 'application/json'
+    if ext == 'jsonl':
+        return 'text', 'application/x-ndjson'
+    if ext in ('txt', 'md', 'markdown', 'log', 'out', 'err', 'py'):
+        return 'text', 'text/plain'
+    return 'file', None
+
+def _noema_collect_artifacts():
+    artifacts = []
+    max_artifacts = 12
+    max_preview_bytes = 32768
+    max_embedded_bytes = 700000
+    max_total_embedded_bytes = 1400000
+    embedded_bytes = 0
+
+    for root, dirs, files in os.walk(_noema_temp_directory):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+        for name in files:
+            if len(artifacts) >= max_artifacts:
+                return artifacts
+            if name.startswith('.'):
+                continue
+            path = os.path.join(root, name)
+            relative_path = os.path.relpath(path, _noema_temp_directory)
+            if relative_path == 'script.py' or relative_path.endswith('.pyc'):
+                continue
+
+            try:
+                size_bytes = os.path.getsize(path)
+            except OSError:
+                continue
+
+            kind, mime_type = _noema_artifact_kind(path)
+            data = None
+            if 0 <= size_bytes <= max_embedded_bytes and embedded_bytes + size_bytes <= max_total_embedded_bytes:
+                try:
+                    with open(path, 'rb') as handle:
+                        data = handle.read()
+                    embedded_bytes += size_bytes
+                except OSError:
+                    data = None
+
+            preview = None
+            base64_data = None
+            if data is not None:
+                if kind == 'image':
+                    base64_data = base64.b64encode(data).decode('ascii')
+                else:
+                    try:
+                        preview = data[:max_preview_bytes].decode('utf-8').strip()
+                    except UnicodeDecodeError:
+                        preview = None
+
+            artifacts.append({
+                'relativePath': relative_path,
+                'filename': name,
+                'kind': kind,
+                'mimeType': mime_type,
+                'sizeBytes': size_bytes,
+                'preview': preview,
+                'base64Data': base64_data,
+            })
+    return artifacts
+
+artifacts = _noema_collect_artifacts()
+
 __noema_result_json = json.dumps({
     'stdout': stdout_buffer.getvalue(),
     'stderr': stderr_buffer.getvalue(),
@@ -203,6 +291,7 @@ __noema_result_json = json.dumps({
     'executionTimeMs': execution_time_ms,
     'error': error_message,
     'timedOut': timed_out,
+    'artifacts': artifacts,
 })
 )PY";
 

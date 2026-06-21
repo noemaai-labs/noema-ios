@@ -17,22 +17,51 @@ enum EmbeddingError: Error, LocalizedError {
     }
 }
 
-enum EmbeddingTask {
+enum EmbeddingTask: Sendable {
     case generic
     case searchQuery
     case searchDocument
+}
 
-    var prefix: String? {
-        switch self {
-        case .generic: return nil
-        case .searchQuery: return "search_query:"
-        case .searchDocument: return "search_document:"
-        }
+struct EmbeddingDocumentInput: Sendable, Equatable {
+    let text: String
+    let title: String?
+
+    init(text: String, title: String? = nil) {
+        self.text = text
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.title = (trimmedTitle?.isEmpty == false) ? trimmedTitle : nil
     }
 }
 
-enum EmbeddingPooling {
-    case none
+enum EmbeddingWarmUpPhase: Sendable {
+    case loadingModel
+    case primingFirstPass
+}
+
+enum EmbeddingProgressEvent: Sendable {
+    case heartbeat(current: Int, total: Int)
+    case itemCompleted(completed: Int, total: Int)
+}
+
+enum EmbeddingPooling: String, Codable, CaseIterable, Sendable {
+    case modelDefault
+    case mean
+    case cls
+    case lastToken
+
+    var nativeRawValue: Int32 {
+        switch self {
+        case .modelDefault:
+            return -1
+        case .mean:
+            return 1
+        case .cls:
+            return 2
+        case .lastToken:
+            return 3
+        }
+    }
 }
 
 protocol EmbeddingsBackend: AnyObject {
@@ -48,9 +77,12 @@ protocol EmbeddingsBackend: AnyObject {
         pooling: EmbeddingPooling,
         normalize: Bool
     ) throws -> [[Float]]
+    func embedDocuments(
+        _ documents: [EmbeddingDocumentInput],
+        pooling: EmbeddingPooling,
+        normalize: Bool
+    ) throws -> [[Float]]
     /// Unload/free any native resources and stop background work. After this call
     /// the backend should be considered unusable until `load()` is called again.
     func unload()
 }
-
-

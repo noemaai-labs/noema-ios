@@ -1,7 +1,7 @@
 import Foundation
 
-struct StartupPreferences: Codable, Equatable {
-    enum Priority: String, Codable, CaseIterable, Identifiable {
+struct StartupPreferences: Codable, Equatable, Sendable {
+    enum Priority: String, Codable, CaseIterable, Identifiable, Sendable {
         case remoteFirst
         case localFirst
 
@@ -17,7 +17,7 @@ struct StartupPreferences: Codable, Equatable {
         }
     }
 
-    struct RemoteSelection: Identifiable, Codable, Equatable {
+    struct RemoteSelection: Identifiable, Codable, Equatable, Sendable {
         var id: UUID
         var backendID: RemoteBackend.ID
         var backendName: String
@@ -40,7 +40,7 @@ struct StartupPreferences: Codable, Equatable {
         }
     }
 
-    enum Attempt: Equatable {
+    enum Attempt: Equatable, Sendable {
         case local(path: String)
         case remote(RemoteSelection)
     }
@@ -243,7 +243,10 @@ enum StartupLoader {
         if UserDefaults.standard.bool(forKey: "bypassRAMLoadPending") {
             UserDefaults.standard.set(false, forKey: "bypassRAMLoadPending")
             modelManager.refresh()
-            chatVM.loadError = "Previous model failed to load because it likely exceeded memory. Lower context size or choose a smaller model."
+            chatVM.loadError = String(
+                localized: "Previous model did not finish loading. Noema did not change its saved settings; adjust Model Settings manually before trying again.",
+                locale: LocalizationManager.preferredLocale()
+            )
             return
         }
 

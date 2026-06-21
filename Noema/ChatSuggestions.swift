@@ -41,11 +41,92 @@ struct ChatSuggestions {
         "Create a grocery list for 3 easy dinners this week.",
         "How can I reduce phone distractions without missing important alerts?",
         "Suggest 3 warm‑up stretches before a run.",
-        "Give an example of a SMART goal for fitness."
+        "Give an example of a SMART goal for fitness.",
+        "Give me an interesting fact.",
+        "Tell me a joke.",
+        "Surprise me!",
+        "Explain how LLMs work.",
+        "What are the masses and volumes of the Earth and the Sun, and what is the distance between them?",
+        "Act as a translator and translate all future prompts into the language I will specify.",
+        "Write a poem about AI.",
+        "Write a short story about a scientist.",
+        "Who first used the digit “0”?",
+        "List some of the most dangerous species.",
+        "How to overcome procrastination?",
+        "How did the Ancient Egyptians build the pyramids?",
+        "Provide an overview of historical and contemporary indigenous communities and civilizations in the Americas.",
+        "Give 5 wilderness survival tips.",
+        "List 10 emergency response and first aid procedures for different scenarios like fires, earthquakes, heart attacks, car accidents, and drowning incidents.",
+        "Give me a simple Python script with commentary.",
+        "Provide information on the golden ratio and where it occurs in nature.",
+        "List some highly efficient or otherwise unique human-powered vehicles like extreme bicycles and ornithopters.",
+        "Let’s play a trivia game. Ask me 10 questions and offer 4 choices for each. If my answer is correct, proceed directly to the next question. If I give an incorrect answer, tell me the correct answer and explain why before moving on to the next question. Once I answer all 10 questions, tell me my score (correct vs. incorrect answers).",
+        "How does wireless charging work, and is it good for the battery and the environment?",
+        "Provide 5 battery health tips.",
+        "Provide a short history of mobile phones from the earliest keypad cellphones to today’s touchscreen devices, and discuss possible future designs.",
+        "Provide a brief history of the Internet.",
+        "Provide a brief history of computers.",
+        "Provide a brief history of AI.",
+        "Describe the current scientific understanding of dark matter.",
+        "Explain how quantum entanglement works.",
+        "Describe the differences between quantum mechanics and general relativity.",
+        "Explain why time dilation occurs.",
+        "Explain the physics behind superconductors.",
+        "Explain how CRISPR gene editing works.",
+        "Explain how the immune system responds to infection.",
+        "Explain how planets, stars, and black holes form and evolve.",
+        "Describe the structure and properties of graphene.",
+        "Explain the chemistry of batteries and energy storage.",
+        "Discuss the challenges of carbon capture technologies.",
+        "Compare different renewable energy technologies, and discuss why their adoption is slower than necessary.",
+        "Explain how plate tectonics shapes the Earth’s surface.",
+        "Discuss the prospects for human settlement on Mars.",
+        "List some ancient tools and practices used in various fields like chemistry, medicine, and engineering that are still considered scientifically valid and effective (e.g., herbs, construction methods).",
+        "List 10 inventions or discoveries commonly attributed to European scientists but actually achieved by Muslim scholars during the Islamic Golden Age.",
+        "How was chess invented?",
+        "How do slot machines and other gambling games ultimately profit their owners, even though players feel they can profit from them?",
+        "How does addiction occur, and how can it be overcome?",
+        "List 5 memorization techniques.",
+        "Provide 5 cybersecurity tips to protect against data breaches, fraud, phishing, malware, and spyware.",
+        "List 10 ways to protect my privacy (e.g., using ad blockers and VPNs, preferring local LLM inference apps like Noema instead of sharing data with large corporations).",
+        "Create a step‑by‑step study plan for learning Python in 30 days.",
+        "Proofread the following, point out any typos or grammatical errors, and rewrite a polished version.",
+        "Summarize the attached document.",
+        "Describe this image in detail.",
+        "Help me break down a complex problem into smaller steps and solve it.",
+        "Check the following code for bugs or possible improvements.",
+        "Help me outline a sci‑fi novel.",
+        "Explain quantum computing as if I’m 12 years old.",
+        "Teach me the basics of linear algebra with examples.",
+        "Give me 10 startup ideas in the healthcare industry.",
+        "Help me brainstorm solutions to global climate change.",
+        "Help me brainstorm unusual uses for a drone.",
+        "Generate a list of innovative mobile app concepts.",
+        "Give me an overview of the latest advances in fusion energy."
     ]
 
     private static let shuffledKey = "ChatSuggestions.Shuffled"
     private static let indexKey = "ChatSuggestions.Index"
+
+    static func nextThree(datasetName: String?) -> [String] {
+        guard let datasetName = sanitizedDatasetName(datasetName) else {
+            return nextThree()
+        }
+        return [
+            String.localizedStringWithFormat(
+                String(localized: "Summarize %@ with citations."),
+                datasetName
+            ),
+            String.localizedStringWithFormat(
+                String(localized: "What are the most important open questions in %@?"),
+                datasetName
+            ),
+            String.localizedStringWithFormat(
+                String(localized: "Make a study guide from %@."),
+                datasetName
+            )
+        ]
+    }
 
     /// Returns 3 suggestions, rotating through a persisted shuffled list.
     /// When a full cycle completes, the list is reshuffled to keep it fresh.
@@ -78,5 +159,16 @@ struct ChatSuggestions {
         if d.stringArray(forKey: shuffledKey) == nil { d.set(shuffled, forKey: shuffledKey) }
         
         return picks
+    }
+
+    private static func sanitizedDatasetName(_ name: String?) -> String? {
+        guard let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        if trimmed.count <= 48 {
+            return trimmed
+        }
+        return String(trimmed.prefix(45)) + "..."
     }
 }

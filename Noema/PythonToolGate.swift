@@ -4,6 +4,7 @@ import Foundation
 struct PythonToolGate {
     /// Background-safe gate that avoids MainActor by reading persisted defaults directly.
     static func isAvailable(currentFormat: ModelFormat? = nil) -> Bool {
+        guard EnterprisePolicyGate.allowsTool("noema.python.execute") else { return false }
         let d = UserDefaults.standard
 
         // Master toggle from Settings
@@ -30,9 +31,11 @@ struct PythonToolGate {
             }
         }
 
-        // MLX local models are unreliable with tool calling
+        // MLX local models are unreliable with tool calling; AFM has its own
+        // tool system (FoundationModels) and must not use the loopback tool loop.
         if let f = fmt {
             if f == .mlx && !isRemote { return false }
+            if f == .afm { return false }
         }
 
         // Only allow when the loaded model supports function calling

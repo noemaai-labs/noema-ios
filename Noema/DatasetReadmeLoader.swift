@@ -104,7 +104,7 @@ final class DatasetReadmeLoader: ObservableObject {
                 result.removeSubrange(result.startIndex..<firstBlank.upperBound)
             }
         }
-        let base = "https://huggingface.co/datasets/\(repo)/resolve/main/"
+        let base = "\(HFEndpoint.webBaseString)/datasets/\(repo)/resolve/main/"
         let linkRegex = try? NSRegularExpression(pattern: #"(?<=\]\()(?!(https?|data):|#)([^)]+)"#)
         let imgRegex = try? NSRegularExpression(pattern: #"(?<=!\[.*\]\()(?!(https?|data):)([^)]+)"#)
         let rootRegex = try? NSRegularExpression(pattern: #"(?<=\]|!\[.*\]\()/(?!/)([^)]+)"#)
@@ -125,7 +125,7 @@ final class DatasetReadmeLoader: ObservableObject {
             let matches = regex.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length)).reversed()
             for m in matches {
                 if m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: result) {
-                    let replacement = "https://huggingface.co/" + result[r]
+                    let replacement = "\(HFEndpoint.webBaseString)/" + result[r]
                     ns = ns.replacingCharacters(in: m.range(at: 1), with: replacement) as NSString
                 }
             }

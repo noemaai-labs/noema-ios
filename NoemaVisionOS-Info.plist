@@ -13,6 +13,10 @@
         </array>
         <key>ITSAppUsesNonExemptEncryption</key>
         <false/>
+        <key>NSMicrophoneUsageDescription</key>
+        <string>Allow Noema to record audio so it can be transcribed locally when available.</string>
+        <key>NSSpeechRecognitionUsageDescription</key>
+        <string>Allow Noema to transcribe audio and video attachments into text.</string>
         <key>NSBluetoothAlwaysUsageDescription</key>
         <string>Noema uses Bluetooth to share relay setup details with your other devices.</string>
         <key>NSBluetoothPeripheralUsageDescription</key>

@@ -43,12 +43,56 @@ enum AFMGuardrailsMode: String, Codable, CaseIterable, Identifiable, Equatable {
 
     var id: String { rawValue }
 
-    var title: String {
+    var titleKey: String {
         switch self {
         case .default:
-            return "Default"
+            return "Standard"
         case .permissiveContentTransformations:
-            return "Permissive Content Transformations"
+            return "Content Transformation"
+        }
+    }
+
+    var detailKey: String {
+        switch self {
+        case .default:
+            return "Uses Apple's default AFM guardrails for general chat."
+        case .permissiveContentTransformations:
+            return "Allows Apple's permissive content-transformation guardrails for rewriting or transforming user-provided content."
+        }
+    }
+}
+
+/// How an Apple Foundation Model request may use Private Cloud Compute (iOS 27+).
+enum AFMPrivateCloudComputeMode: String, Codable, CaseIterable, Identifiable, Equatable {
+    /// Route every reply through Private Cloud Compute.
+    case always
+    /// Run on-device, but let the model escalate individual replies to Private Cloud Compute when helpful.
+    case smart
+    /// Stay fully on-device; never use Private Cloud Compute.
+    case off
+
+    var id: String { rawValue }
+
+    /// Short label suitable for a segmented control.
+    var titleKey: String {
+        switch self {
+        case .always:
+            return "Always"
+        case .smart:
+            return "Smart"
+        case .off:
+            return "Off"
+        }
+    }
+
+    var detailKey: String {
+        switch self {
+        case .always:
+            return "Every reply runs on Apple's Private Cloud Compute — same privacy guarantees, larger context and deeper reasoning. Falls back to on-device automatically when offline or the daily limit is reached."
+        case .smart:
+            return "Replies run on-device and hand off mid-answer to Private Cloud Compute only when more capability is needed. The conversation is shared with Apple's secure cloud only when that happens. Requires iOS 27."
+        case .off:
+            return "Keeps every reply fully on-device. Private Cloud Compute is never used."
         }
     }
 }
@@ -143,26 +187,51 @@ struct ModelSettings: Codable, Equatable {
     var etBackend: ETBackend = .xnnpack
     /// Optional so older persisted settings decode cleanly; defaults to `.all` at use sites.
     var processingUnitConfiguration: ProcessingUnitConfiguration? = nil
-    var afmGuardrails: AFMGuardrailsMode = .default
+    /// Always pinned to the most permissive guardrails — see
+    /// `AFMLLMClient.resolvedGuardrailsMode(from:)`, which ignores any stored value
+    /// so new installs *and* anyone updating from a build that persisted `.default`
+    /// run with the lax content-transformation guardrails.
+    var afmGuardrails: AFMGuardrailsMode = .permissiveContentTransformations
+    /// How Apple Foundation Model requests may use Private Cloud Compute (iOS 27+).
+    /// `.smart` (the default) keeps inference on-device but allows per-reply escalation;
+    /// `.always` routes everything through PCC; `.off` stays fully on-device.
+    var afmPrivateCloudComputeMode: AFMPrivateCloudComputeMode = .smart
     var systemPromptMode: SystemPromptMode = .inheritGlobal
     var systemPromptOverride: String? = nil
+
+    /// Default inference thread count. Reserves two cores so the UI, input handling,
+    /// SwiftUI layout, and decode callbacks aren't starved while inference runs — on
+    /// small models this is usually *smoother* than using every core.
+    static var recommendedInferenceThreadCount: Int {
+        max(1, ProcessInfo.processInfo.activeProcessorCount - 2)
+    }
+
+    /// Hard ceiling for inference threads. Always leaves at least one core free for the
+    /// UI, so even an explicit user override (or an old persisted setting) can't fully
+    /// starve the main thread.
+    static var maxInferenceThreadCount: Int {
+        max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
+    }
 
     static func `default`(for format: ModelFormat) -> ModelSettings {
         var s = ModelSettings()
         switch format {
         case .mlx:
             s.gpuLayers = 0
-            s.cpuThreads = ProcessInfo.processInfo.activeProcessorCount
+            s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
         case .gguf:
-            s.cpuThreads = ProcessInfo.processInfo.activeProcessorCount
+            s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
         case .et:
-            s.cpuThreads = ProcessInfo.processInfo.activeProcessorCount
+            s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
             s.etBackend = .xnnpack
         case .ane:
-            s.cpuThreads = ProcessInfo.processInfo.activeProcessorCount
+            s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
             s.processingUnitConfiguration = .cpuAndNeuralEngine
         case .afm:
-            s.cpuThreads = ProcessInfo.processInfo.activeProcessorCount
+            s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
+            s.gpuLayers = 0
+        case .coreai:
+            s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
             s.gpuLayers = 0
         }
         s.tokenizerPath = nil
@@ -191,6 +260,8 @@ struct ModelSettings: Codable, Equatable {
         settings.promptTemplate = templateResolution.template
         if model.format == .ane {
             settings.tokenizerPath = resolvedTokenizerPath(for: model)
+        } else if model.format == .et {
+            settings.tokenizerPath = ETModelResolver.tokenizerURL(for: dir)?.path
         }
 
         if let paramsURL = Self.locateParamsFile(in: dir),
@@ -238,7 +309,7 @@ struct ModelSettings: Codable, Equatable {
 }
 
 extension ModelSettings {
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case contextLength
         case gpuLayers
         case cpuThreads
@@ -272,6 +343,9 @@ extension ModelSettings {
         case etBackend
         case processingUnitConfiguration
         case afmGuardrails
+        case afmPrivateCloudComputeMode
+        /// Legacy boolean key; migrated to `afmPrivateCloudComputeMode` on decode.
+        case afmUsePrivateCloudCompute
         case systemPromptMode
         case systemPromptOverride
     }
@@ -313,6 +387,14 @@ extension ModelSettings {
         self.etBackend = try container.decodeIfPresent(ETBackend.self, forKey: .etBackend) ?? defaults.etBackend
         self.processingUnitConfiguration = try container.decodeIfPresent(ProcessingUnitConfiguration.self, forKey: .processingUnitConfiguration)
         self.afmGuardrails = try container.decodeIfPresent(AFMGuardrailsMode.self, forKey: .afmGuardrails) ?? defaults.afmGuardrails
+        if let pccMode = try container.decodeIfPresent(AFMPrivateCloudComputeMode.self, forKey: .afmPrivateCloudComputeMode) {
+            self.afmPrivateCloudComputeMode = pccMode
+        } else if let legacyUsePCC = try container.decodeIfPresent(Bool.self, forKey: .afmUsePrivateCloudCompute) {
+            // Migrate the old boolean: on → always, off → smart (the prior default behavior).
+            self.afmPrivateCloudComputeMode = legacyUsePCC ? .always : .smart
+        } else {
+            self.afmPrivateCloudComputeMode = defaults.afmPrivateCloudComputeMode
+        }
         self.systemPromptMode = try container.decodeIfPresent(SystemPromptMode.self, forKey: .systemPromptMode) ?? defaults.systemPromptMode
         self.systemPromptOverride = try container.decodeIfPresent(String.self, forKey: .systemPromptOverride)
     }
@@ -352,6 +434,7 @@ extension ModelSettings {
         try container.encode(etBackend, forKey: .etBackend)
         try container.encodeIfPresent(processingUnitConfiguration, forKey: .processingUnitConfiguration)
         try container.encode(afmGuardrails, forKey: .afmGuardrails)
+        try container.encode(afmPrivateCloudComputeMode, forKey: .afmPrivateCloudComputeMode)
         try container.encode(systemPromptMode, forKey: .systemPromptMode)
         try container.encodeIfPresent(systemPromptOverride, forKey: .systemPromptOverride)
     }
@@ -398,6 +481,8 @@ extension ModelSettings {
             return GGUFMetadata.contextLength(at: canonicalURL)
         case .mlx, .et:
             return inferredConfigContextLength(for: model)
+        case .coreai:
+            return inferredCoreAIContextLength(for: model)
         case .ane, .afm:
             return nil
         }
@@ -409,13 +494,13 @@ extension ModelSettings {
             return inferredCMLContextLength(for: model)
         case .afm:
             return 4096
-        case .gguf, .mlx, .et:
+        case .gguf, .mlx, .et, .coreai:
             return nil
         }
     }
 }
 
-private extension ModelSettings {
+extension ModelSettings {
     static func inferredConfigContextLength(for model: LocalModel) -> Int? {
         let configURL = settingsDirectory(for: model).appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: configURL),
@@ -458,6 +543,13 @@ private extension ModelSettings {
         }
 
         return nil
+    }
+
+    /// Core AI exports record their context budget in the variant-level
+    /// `metadata.json` (`language.max_context_length`).
+    static func inferredCoreAIContextLength(for model: LocalModel) -> Int? {
+        let root = InstalledModelsStore.canonicalURL(for: model.url, format: .coreai)
+        return CoreAILLMClient.exportedMaxContext(resourceRoot: root)
     }
 
     static func inferredCMLContextLength(for model: LocalModel) -> Int? {
@@ -514,7 +606,7 @@ private extension ModelSettings {
         switch model.format {
         case .gguf, .et:
             return model.url.deletingLastPathComponent()
-        case .mlx, .ane, .afm:
+        case .mlx, .ane, .afm, .coreai:
             return InstalledModelsStore.canonicalURL(for: model.url, format: model.format)
         }
     }
@@ -702,6 +794,21 @@ private extension ModelSettings {
 
 extension ModelSettings {
     struct SpeculativeDecodingSettings: Codable, Equatable {
+        enum Selection: String, Codable, CaseIterable, Identifiable {
+            case off
+            case helperDraftModel
+            case mtp
+
+            var id: String { rawValue }
+            var title: String {
+                switch self {
+                case .off: return "Off"
+                case .helperDraftModel: return "Helper Model"
+                case .mtp: return "Multi-Token Prediction"
+                }
+            }
+        }
+
         enum Mode: String, Codable, CaseIterable, Identifiable {
             case tokens
             case max
@@ -715,11 +822,38 @@ extension ModelSettings {
             }
         }
 
+        var selection: Selection = .off
         var helperModelID: String? = nil
         var mode: Mode = .tokens
         var value: Int = 64
+        var mtpDraftNMax: Int = 2
+        var mtpDraftNMin: Int = 0
+        var mtpDraftPMin: Double = 0.1
 
-        var hasSelection: Bool { helperModelID != nil }
+        var hasSelection: Bool {
+            switch selection {
+            case .off:
+                return false
+            case .helperDraftModel:
+                return helperModelID?.isEmpty == false
+            case .mtp:
+                return true
+            }
+        }
+
+        var mtpEnabled: Bool { selection == .mtp }
+
+        var resolvedMTPDraftNMax: Int {
+            max(1, min(6, mtpDraftNMax))
+        }
+
+        var resolvedMTPDraftNMin: Int {
+            max(0, min(resolvedMTPDraftNMax, mtpDraftNMin))
+        }
+
+        var resolvedMTPDraftPMin: Double {
+            min(1.0, max(0.0, mtpDraftPMin))
+        }
     }
 
     struct RopeScalingSettings: Codable, Equatable {
@@ -765,25 +899,40 @@ extension ModelSettings {
 
 extension ModelSettings.SpeculativeDecodingSettings {
     private enum CodingKeys: String, CodingKey {
+        case selection
         case helperModelID
         case mode
         case value
+        case mtpDraftNMax
+        case mtpDraftNMin
+        case mtpDraftPMin
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let defaults = ModelSettings.SpeculativeDecodingSettings()
 
+        self.selection = try container.decodeIfPresent(Selection.self, forKey: .selection) ?? defaults.selection
         self.helperModelID = try container.decodeIfPresent(String.self, forKey: .helperModelID)
         self.mode = try container.decodeIfPresent(Mode.self, forKey: .mode) ?? defaults.mode
         self.value = try container.decodeIfPresent(Int.self, forKey: .value) ?? defaults.value
+        self.mtpDraftNMax = try container.decodeIfPresent(Int.self, forKey: .mtpDraftNMax) ?? defaults.mtpDraftNMax
+        self.mtpDraftNMin = try container.decodeIfPresent(Int.self, forKey: .mtpDraftNMin) ?? defaults.mtpDraftNMin
+        self.mtpDraftPMin = try container.decodeIfPresent(Double.self, forKey: .mtpDraftPMin) ?? defaults.mtpDraftPMin
+        if !container.contains(.selection), helperModelID?.isEmpty == false {
+            self.selection = .helperDraftModel
+        }
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(selection, forKey: .selection)
         try container.encodeIfPresent(helperModelID, forKey: .helperModelID)
         try container.encode(mode, forKey: .mode)
         try container.encode(value, forKey: .value)
+        try container.encode(mtpDraftNMax, forKey: .mtpDraftNMax)
+        try container.encode(mtpDraftNMin, forKey: .mtpDraftNMin)
+        try container.encode(mtpDraftPMin, forKey: .mtpDraftPMin)
     }
 }
 

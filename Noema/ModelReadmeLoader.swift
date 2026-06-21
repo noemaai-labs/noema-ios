@@ -265,8 +265,8 @@ final class ModelReadmeLoader: ObservableObject {
             }
         }
         
-        // rewrite relative urls
-        let base = "https://huggingface.co/\(repo)/resolve/main/"
+        // rewrite relative urls (via the configured HF endpoint so images load behind mirrors)
+        let base = "\(HFEndpoint.webBaseString)/\(repo)/resolve/main/"
         let linkRegex = try? NSRegularExpression(pattern: #"(?<=\]\()(?!(https?|data):|#)([^)]+)"#)
         let imgRegex = try? NSRegularExpression(pattern: #"(?<=!\[.*\]\()(?!(https?|data):)([^)]+)"#)
         let rootRegex = try? NSRegularExpression(pattern: #"(?<=\]|!\[.*\]\()/(?!/)([^)]+)"#)
@@ -287,7 +287,7 @@ final class ModelReadmeLoader: ObservableObject {
             let matches = regex.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length)).reversed()
             for m in matches {
                 if m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: result) {
-                    let replacement = "https://huggingface.co/" + result[r]
+                    let replacement = "\(HFEndpoint.webBaseString)/" + result[r]
                     ns = ns.replacingCharacters(in: m.range(at: 1), with: replacement) as NSString
                 }
             }

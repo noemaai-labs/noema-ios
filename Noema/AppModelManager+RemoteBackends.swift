@@ -18,6 +18,19 @@ extension AppModelManager {
         remoteBackends.first { $0.id == id }
     }
 
+    /// Remote backends the active Noema Teams policy permits (everything, when no
+    /// workspace is connected). UI lists use this to grey out blocked backends;
+    /// execution is independently guarded in ChatVM.activateRemoteSession.
+    var policyAllowedRemoteBackends: [RemoteBackend] {
+        remoteBackends.filter {
+            EnterprisePolicyGate.allowsRemoteBackend(id: $0.id, endpointType: $0.endpointType)
+        }
+    }
+
+    func isRemoteBackendAllowedByPolicy(_ backend: RemoteBackend) -> Bool {
+        EnterprisePolicyGate.allowsRemoteBackend(id: backend.id, endpointType: backend.endpointType)
+    }
+
     func setLMStudioRemoteDownloadTarget(_ backendID: RemoteBackend.ID?) {
         guard let backendID else {
             activeLMStudioRemoteDownloadTargetID = nil
@@ -38,6 +51,7 @@ extension AppModelManager {
     func refreshRemoteBackends(offGrid: Bool) {
         guard !offGrid else { return }
         for backend in remoteBackends {
+            guard isRemoteBackendAllowedByPolicy(backend) else { continue }
             Task { [weak self] in
                 await self?.fetchRemoteModels(for: backend.id)
             }
@@ -115,6 +129,7 @@ extension AppModelManager {
 
     func fetchRemoteModels(for backendID: RemoteBackend.ID) async {
         guard let backend = remoteBackends.first(where: { $0.id == backendID }) else { return }
+        guard isRemoteBackendAllowedByPolicy(backend) else { return }
         if remoteBackendsFetching.contains(backendID) { return }
         remoteBackendsFetching.insert(backendID)
         defer { remoteBackendsFetching.remove(backendID) }

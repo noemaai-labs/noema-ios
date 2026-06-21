@@ -30,6 +30,7 @@ struct LocalDatasetDetailView: View {
     @State private var showDisabledUseReason = false
     @State private var disabledUseReason = ""
     @State private var indexReport: DatasetIndexReport?
+    @State private var indexMetadata: DatasetIndexMetadata?
     @State private var datasetPendingDeletion: LocalDataset?
 
     private func close() {
@@ -44,22 +45,51 @@ struct LocalDatasetDetailView: View {
         let displayedDataset = liveDataset
         NavigationStack {
             ScrollView {
-                VStack(spacing: 24) {
-                    // Header
-                    VStack(spacing: 8) {
-                        Text(displayedDataset.datasetID)
-                            .font(.title2)
-                            .bold()
-                            .multilineTextAlignment(.center)
-                        
-                        Text(displayedDataset.source)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(spacing: 12) {
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(Color.secondary.opacity(0.35))
+                            .frame(width: 42, height: 5)
+                            .frame(maxWidth: .infinity)
+
+                        HStack {
+                            Button { close() } label: {
+                                Image(systemName: "xmark")
+                                    .font(.title3.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 52, height: 52)
+                                    .background(
+                                        Circle()
+                                            .fill(closeButtonBackgroundColor)
+                                            .shadow(color: Color.black.opacity(0.06), radius: 14, y: 8)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(Text(LocalizedStringKey("Close")))
+
+                            Spacer(minLength: 0)
+                        }
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(displayedDataset.name)
+                                .font(.largeTitle.weight(.bold))
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.76)
+
+                            Text(displayedDataset.datasetID)
+                                .font(.title3.weight(.bold))
+
+                            Text(displayedDataset.source)
+                                .font(.title3)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(.top, 20)
+                    .padding(.top, 10)
                     
                     // Info Card
-                VStack(spacing: 16) {
+                    VStack(spacing: 16) {
                         let datasetBytes = Int64(displayedDataset.sizeMB * 1_048_576.0)
                         let sizeString = localizedFileSizeString(bytes: datasetBytes, locale: locale)
                         InfoRow(label: String(localized: "Downloaded"), value: formatDate(displayedDataset.downloadDate))
@@ -97,8 +127,12 @@ struct LocalDatasetDetailView: View {
                         RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                     )
-                    .padding(.horizontal)
-                    
+
+                    // Embedding Card
+                    if let metadata = indexMetadata, let fingerprint = metadata.embeddingFingerprint {
+                        embeddingCard(metadata: metadata, fingerprint: fingerprint)
+                    }
+
                     // Preparation Card
                     VStack(alignment: .leading, spacing: 16) {
                         Text(LocalizedStringKey("Preparation"))
@@ -119,7 +153,6 @@ struct LocalDatasetDetailView: View {
                         RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                     )
-                    .padding(.horizontal)
                     
                     // Files Card
                     if !files.isEmpty {
@@ -162,12 +195,10 @@ struct LocalDatasetDetailView: View {
                             RoundedRectangle(cornerRadius: 12)
                                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                         )
-                        .padding(.horizontal)
                     }
                     
                     // Actions
                     VStack(spacing: 12) {
-                        let isCurrentlyIndexing = datasetManager.indexingDatasetID == dataset.datasetID
                         let isReady = isDatasetReady
                         
                         if modelManager.activeDataset?.datasetID == displayedDataset.datasetID {
@@ -203,22 +234,6 @@ struct LocalDatasetDetailView: View {
                             .disabled(!isReady)
                         }
                         
-                        if isCurrentlyIndexing, let s = datasetManager.processingStatus[dataset.datasetID] {
-                            VStack(spacing: 4) {
-                                ProgressView(value: s.progress)
-                                    .tint(.blue)
-                                let eta: String = {
-                                    if let e = s.etaSeconds, e > 0 {
-                                        return String(format: "~%dm %02ds", Int(e)/60, Int(e)%60)
-                                    } else { return "…" }
-                                }()
-                                Text(String.localizedStringWithFormat(String(localized: "Indexing: %d%% · %@"), Int(s.progress * 100), eta))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.horizontal)
-                        }
-                        
                         Button(role: .destructive) {
                             datasetPendingDeletion = displayedDataset
                         } label: {
@@ -229,16 +244,14 @@ struct LocalDatasetDetailView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.large)
                     }
-                    .padding(.horizontal)
                     .padding(.bottom, 30)
                 }
+                .padding(.horizontal, 20)
             }
             .background(windowBackgroundColor) // Use window background
-            .navigationTitle(liveDataset.name)
+            .navigationTitle("")
             #if !os(macOS)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button(LocalizedStringKey("Close")) { close() } }
-            }
+            .navigationBarTitleDisplayMode(.inline)
             #endif
             .alert(LocalizedStringKey("Unavailable"), isPresented: $showDisabledUseReason) {
                 Button(LocalizedStringKey("OK"), role: .cancel) { disabledUseReason = "" }
@@ -271,7 +284,12 @@ struct LocalDatasetDetailView: View {
             .task {
                 loadFiles()
                 loadIndexReport()
+                loadIndexMetadata()
                 await computeCompressedSize()
+            }
+            .onChange(of: liveDataset.isIndexed) { _ in
+                loadIndexMetadata()
+                loadIndexReport()
             }
         }
     }
@@ -290,14 +308,80 @@ struct LocalDatasetDetailView: View {
         var body: some View {
             HStack {
                 Text(label)
+                    .font(.body)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
                 Spacer()
                 Text(value)
-                    .bold()
+                    .font(.body.weight(.semibold))
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.82)
             }
         }
     }
     
+    @ViewBuilder
+    private func embeddingCard(metadata: DatasetIndexMetadata, fingerprint: EmbeddingIndexFingerprint) -> some View {
+        let record = EmbeddingModelCatalog.record(for: fingerprint.modelID)
+        let modelDisplay = record?.displayName ?? fingerprint.modelID
+        let quantization = record?.artifacts.first(where: { $0.id == fingerprint.artifactID })?.quantization
+            ?? record?.primaryArtifact?.quantization
+
+        VStack(alignment: .leading, spacing: 16) {
+            Text(LocalizedStringKey("Embedding"))
+                .font(.headline)
+                .padding(.bottom, 4)
+
+            VStack(spacing: 16) {
+                InfoRow(label: String(localized: "Model"), value: modelDisplay)
+                if let publisher = record?.publisher {
+                    Divider()
+                    InfoRow(label: String(localized: "Publisher"), value: publisher)
+                }
+                Divider()
+                InfoRow(label: String(localized: "Vector Dimension"), value: "\(fingerprint.dimension)")
+                Divider()
+                InfoRow(label: String(localized: "Pooling"), value: poolingDisplay(fingerprint.pooling))
+                Divider()
+                InfoRow(
+                    label: String(localized: "Normalized"),
+                    value: fingerprint.normalized ? String(localized: "Yes") : String(localized: "No")
+                )
+                if let quantization, !quantization.isEmpty {
+                    Divider()
+                    InfoRow(label: String(localized: "Quantization"), value: quantization)
+                }
+                Divider()
+                InfoRow(
+                    label: String(localized: "Chunk Token Limit"),
+                    value: "\(fingerprint.chunkTokenLimit)"
+                )
+                Divider()
+                InfoRow(label: String(localized: "Chunks"), value: "\(metadata.chunkCount)")
+                Divider()
+                InfoRow(label: String(localized: "Indexed"), value: formatDate(metadata.createdAt))
+            }
+        }
+        .padding(16)
+        .background(cardBackgroundColor)
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+        )
+    }
+
+    private func poolingDisplay(_ raw: String) -> String {
+        switch EmbeddingPooling(rawValue: raw) {
+        case .mean: return String(localized: "Mean")
+        case .cls: return String(localized: "CLS")
+        case .lastToken: return String(localized: "Last Token")
+        case .modelDefault: return String(localized: "Model Default")
+        case .none: return raw
+        }
+    }
+
     @ViewBuilder
     private func processingView(status s: DatasetProcessingStatus) -> some View {
         let presentation = DatasetIndexingPresentation.make(for: s, locale: locale)
@@ -316,10 +400,24 @@ struct LocalDatasetDetailView: View {
             case .none:
                 Color.clear.frame(height: 0)
             case .cancelOnly:
-                Button(LocalizedStringKey("Stop"), role: .destructive) {
-                    datasetManager.cancelProcessingForID(dataset.datasetID)
+                VStack(alignment: .leading, spacing: 8) {
+                    Button(LocalizedStringKey("Stop"), role: .destructive) {
+                        datasetManager.cancelProcessingForID(dataset.datasetID)
+                    }
+                    .buttonStyle(.bordered)
+
+                    if s.stage == .embedding {
+                        Text(LocalizedStringKey("Keep Noema open while embedding — locking the screen pauses progress."))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if s.stage == .extracting || s.stage == .compressing {
+                        Text(LocalizedStringKey("You can leave Noema during this step — embedding hasn't started yet."))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-                .buttonStyle(.bordered)
             case .startAndCancel:
                 VStack(alignment: .leading, spacing: 8) {
                     Button {
@@ -348,6 +446,10 @@ struct LocalDatasetDetailView: View {
                     Text(LocalizedStringKey("For best performance, please plug in your device until this completes."))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                    Text(LocalizedStringKey("Keep Noema open while embedding — locking the screen pauses progress."))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -721,6 +823,10 @@ struct LocalDatasetDetailView: View {
         indexReport = DatasetIndexIO.loadReport(from: liveDataset.url)
     }
 
+    private func loadIndexMetadata() {
+        indexMetadata = DatasetIndexIO.loadMetadata(from: liveDataset.url)
+    }
+
     private func estimateTokens() async {
         await MainActor.run { isEstimatingTokens = true }
         let tokens = await DatasetRetriever.shared.estimateTokens(in: liveDataset)
@@ -827,7 +933,7 @@ private extension LocalDatasetDetailView {
         #if os(macOS)
         return Color(nsColor: .controlBackgroundColor)
         #else
-        return Color(uiColor: .secondarySystemBackground)
+        return Color(uiColor: .systemBackground)
         #endif
     }
 
@@ -836,6 +942,14 @@ private extension LocalDatasetDetailView {
         return Color(nsColor: .windowBackgroundColor)
         #else
         return Color(uiColor: .systemBackground)
+        #endif
+    }
+
+    var closeButtonBackgroundColor: Color {
+        #if os(macOS)
+        return Color(nsColor: .controlBackgroundColor)
+        #else
+        return Color(uiColor: .secondarySystemBackground)
         #endif
     }
 

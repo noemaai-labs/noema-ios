@@ -17,8 +17,13 @@ public enum QuantExtractor {
 
         for file in files {
             let lower = file.path.lowercased()
-            // Skip projector artifacts (.mmproj or *.gguf that contain projector keywords)
-            if lower.contains("mmproj") || lower.contains("projector") || lower.contains("image_proj") {
+            // Skip companion artifacts (.mmproj/projector and MTP draft heads).
+            if lower.contains("mmproj")
+                || lower.contains("projector")
+                || lower.contains("image_proj")
+                || lower.contains("mtp-")
+                || lower.contains("-mtp")
+                || lower.contains("nextn") {
                 continue
             }
             guard lower.hasSuffix(".gguf") else { continue }
@@ -124,7 +129,7 @@ public enum QuantExtractor {
                                    configURL: cfg))
         }
 
-        // ExecuTorch detection (.pte program files)
+        // ExecuTorch detection (.pte program files plus required tokenizer sidecars)
         let pteFiles = files.filter { $0.path.lowercased().hasSuffix(".pte") }
         if !pteFiles.isEmpty {
             let orderedPTE = pteFiles.sorted { lhs, rhs in
@@ -138,17 +143,22 @@ public enum QuantExtractor {
             for file in orderedPTE {
                 let label = Self.etLabel(for: file.path, repoID: repoID)
                 guard seenLabels.insert(label).inserted else { continue }
-                let url = URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(file.path)?download=1")!
+                let parts = Self.etDownloadParts(primaryPTE: file, files: files, repoID: repoID)
+                let totalBytes = parts.reduce(into: Int64(0)) { sum, part in
+                    sum += max(part.sizeBytes, 0)
+                }
+                let url = parts.first?.downloadURL
+                    ?? URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(file.path)?download=1")!
                 let cfg = URL(string: "https://huggingface.co/\(repoID)/raw/main/tokenizer_config.json")
-                    ?? URL(string: "https://huggingface.co/\(repoID)/raw/main/config.json")
                 quants.append(
                     QuantInfo(
                         label: label,
                         format: .et,
-                        sizeBytes: file.size,
+                        sizeBytes: max(file.size, totalBytes),
                         downloadURL: url,
                         sha256: file.sha256,
-                        configURL: cfg
+                        configURL: cfg,
+                        downloadParts: parts.count > 1 ? parts : nil
                     )
                 )
             }
@@ -159,6 +169,11 @@ public enum QuantExtractor {
             if seenLabels.insert(aneQuant.label).inserted {
                 quants.append(aneQuant)
             }
+        }
+
+        // Core AI detection (.aimodel / .aimodelc bundles, one quant per variant)
+        for quant in coreAIQuants(from: files, repoID: repoID) where seenLabels.insert(quant.label).inserted {
+            quants.append(quant)
         }
         return quants
     }
@@ -195,6 +210,53 @@ public enum QuantExtractor {
         if combined.contains("coreml") || combined.contains("core-ml") { return "ET-CoreML" }
         if combined.contains("mps") || combined.contains("metal") { return "ET-MPS" }
         return "ET"
+    }
+
+    private static func etDownloadParts(primaryPTE: RepoFile, files: [RepoFile], repoID: String) -> [QuantInfo.DownloadPart] {
+        var orderedPaths: [String] = [primaryPTE.path]
+        var seen = Set(orderedPaths)
+
+        let primaryDirectory = URL(fileURLWithPath: primaryPTE.path).deletingLastPathComponent().path
+        let normalizedPrimaryDirectory = primaryDirectory == "." ? "" : primaryDirectory
+        let sidecarNames = Set(ETModelResolver.sidecarFileNames.map { $0.lowercased() })
+
+        let sidecars = files
+            .map(\.path)
+            .filter { path in
+                guard path != primaryPTE.path else { return false }
+                let url = URL(fileURLWithPath: path)
+                let name = url.lastPathComponent.lowercased()
+                guard sidecarNames.contains(name) else { return false }
+                let dir = url.deletingLastPathComponent().path
+                let normalizedDir = dir == "." ? "" : dir
+                return normalizedDir.isEmpty
+                    || normalizedDir == normalizedPrimaryDirectory
+                    || normalizedDir.lowercased().contains("tokenizer")
+            }
+            .sorted { lhs, rhs in
+                let lName = URL(fileURLWithPath: lhs).lastPathComponent.lowercased()
+                let rName = URL(fileURLWithPath: rhs).lastPathComponent.lowercased()
+                let lRank = ETModelResolver.sidecarFileNames.firstIndex(of: lName) ?? Int.max
+                let rRank = ETModelResolver.sidecarFileNames.firstIndex(of: rName) ?? Int.max
+                if lRank != rRank { return lRank < rRank }
+                return lhs < rhs
+            }
+
+        for path in sidecars where seen.insert(path).inserted {
+            orderedPaths.append(path)
+        }
+
+        let byPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        return orderedPaths.compactMap { path in
+            guard let file = byPath[path],
+                  let url = resolveDownloadURL(repoID: repoID, path: path) else { return nil }
+            return QuantInfo.DownloadPart(
+                path: path,
+                sizeBytes: file.size,
+                sha256: file.sha256,
+                downloadURL: url
+            )
+        }
     }
 
     private static let aneSidecarNames: [String] = [
@@ -308,6 +370,150 @@ public enum QuantExtractor {
         )
     }
 
+    /// Detects Core AI `.aimodel` / `.aimodelc` bundles published on Hugging Face
+    /// (repos tagged "coreai"/"aimodel"). Each bundle becomes one installable quant;
+    /// download parts cover the bundle contents plus any variant-level companions
+    /// (metadata.json, tokenizer files) sitting next to the bundle.
+    private static func coreAIQuants(from files: [RepoFile], repoID: String) -> [QuantInfo] {
+        let roots = Set(files.compactMap { coreAIBundleRoot(from: $0.path) })
+        guard !roots.isEmpty else { return [] }
+
+        var filesByPath: [String: RepoFile] = [:]
+        for file in files where filesByPath[file.path] == nil {
+            filesByPath[file.path] = file
+        }
+        let sidecarNames = Set((aneSidecarNames + ["metadata.json"]).map { $0.lowercased() })
+        let cfg = URL(string: "https://huggingface.co/\(repoID)/raw/main/config.json")
+
+        func isPrefillRoot(_ root: String) -> Bool {
+            URL(fileURLWithPath: root).deletingPathExtension().lastPathComponent
+                .lowercased().contains("prefill")
+        }
+        func parentDir(of root: String) -> String {
+            root.contains("/") ? String(root[..<root.lastIndex(of: "/")!]) : ""
+        }
+
+        var quants: [QuantInfo] = []
+        for root in roots.sorted() {
+            // Chunked-prefill companion graphs aren't standalone chat models —
+            // they ride along with the decode bundles in their directory instead
+            // (see below).
+            if isPrefillRoot(root) { continue }
+
+            // Largest file first (main.mlirb) so the primary part lives inside the
+            // bundle — canonical install URLs resolve from it.
+            let bundleFiles = files
+                .filter { $0.path == root || $0.path.hasPrefix(root + "/") }
+                .sorted { lhs, rhs in
+                    if lhs.size != rhs.size { return lhs.size > rhs.size }
+                    return lhs.path < rhs.path
+                }
+            guard !bundleFiles.isEmpty else { continue }
+
+            let variantDir = root.contains("/") ? String(root[..<root.lastIndex(of: "/")!]) : ""
+            let prefix = variantDir.isEmpty ? "" : variantDir + "/"
+            let sidecars = files
+                .map(\.path)
+                .filter { path in
+                    guard path.hasPrefix(prefix), coreAIBundleRoot(from: path) == nil else { return false }
+                    let rel = String(path.dropFirst(prefix.count)).lowercased()
+                    if sidecarNames.contains(rel) { return true }
+                    if rel.hasPrefix("tokenizer/"), !rel.dropFirst("tokenizer/".count).contains("/") { return true }
+                    return false
+                }
+                .sorted()
+
+            // The chunked-prefill companion (e.g. `*_prefill_q16_*.aimodel`) is
+            // the fast prefill path for the q=1 decode graphs in its directory:
+            // it consumes the prompt in fixed-size token blocks with the same
+            // state contract, then hands the states to the decode graph. Install
+            // it alongside every decode bundle that shares its directory.
+            let companionPaths = roots
+                .filter { $0 != root && isPrefillRoot($0) && parentDir(of: $0) == variantDir }
+                .sorted()
+                .flatMap { companionRoot in
+                    files
+                        .filter { $0.path == companionRoot || $0.path.hasPrefix(companionRoot + "/") }
+                        .map(\.path)
+                        .sorted()
+                }
+
+            var orderedPaths = bundleFiles.map(\.path)
+            var seen = Set(orderedPaths)
+            for companion in companionPaths where seen.insert(companion).inserted {
+                orderedPaths.append(companion)
+            }
+            for sidecar in sidecars where seen.insert(sidecar).inserted {
+                orderedPaths.append(sidecar)
+            }
+
+            let parts: [QuantInfo.DownloadPart] = orderedPaths.compactMap { path in
+                guard let file = filesByPath[path],
+                      let url = resolveDownloadURL(repoID: repoID, path: path) else { return nil }
+                return QuantInfo.DownloadPart(
+                    path: path,
+                    sizeBytes: file.size,
+                    sha256: file.sha256,
+                    downloadURL: url
+                )
+            }
+            guard let primary = parts.first else { continue }
+            let totalBytes = parts.reduce(into: Int64(0)) { $0 += max($1.sizeBytes, 0) }
+
+            quants.append(QuantInfo(
+                label: coreAILabel(for: root, repoID: repoID),
+                format: .coreai,
+                sizeBytes: totalBytes,
+                downloadURL: primary.downloadURL,
+                sha256: nil,
+                configURL: cfg,
+                downloadParts: parts
+            ))
+        }
+        return quants
+    }
+
+    private static func coreAIBundleRoot(from path: String) -> String? {
+        let normalized = path.replacingOccurrences(of: "\\", with: "/")
+        let components = normalized.split(separator: "/", omittingEmptySubsequences: true)
+        guard !components.isEmpty else { return nil }
+        for idx in components.indices {
+            let component = components[idx].lowercased()
+            if component.hasSuffix(".aimodel") || component.hasSuffix(".aimodelc") {
+                return components[components.startIndex...idx].map(String.init).joined(separator: "/")
+            }
+        }
+        return nil
+    }
+
+    /// Builds a compact quant label from a bundle path, e.g.
+    /// `ios-ane/qwen3_5_0_8b_decode_int8.aimodel` → "ios-ane/decode_int8":
+    /// leading stem tokens already present in the repo name are dropped, and the
+    /// top-level folder (platform / compute-unit grouping) is kept as a prefix.
+    private static func coreAILabel(for root: String, repoID: String) -> String {
+        let stem = URL(fileURLWithPath: root).deletingPathExtension().lastPathComponent
+        let repoName = (repoID.split(separator: "/").last.map(String.init) ?? repoID)
+        let normalizedRepo = repoName.lowercased().replacingOccurrences(of: "[^a-z0-9]", with: "", options: .regularExpression)
+
+        var kept: [Substring] = []
+        var dropping = true
+        for token in stem.split(whereSeparator: { $0 == "_" || $0 == "-" || $0 == "." }) {
+            if dropping {
+                let normalized = token.lowercased().replacingOccurrences(of: "[^a-z0-9]", with: "", options: .regularExpression)
+                if !normalized.isEmpty, normalizedRepo.contains(normalized) { continue }
+                dropping = false
+            }
+            kept.append(token)
+        }
+        let cleanedStem = kept.isEmpty ? stem : kept.joined(separator: "_")
+
+        let components = root.split(separator: "/")
+        if components.count > 1 {
+            return "\(components[0])/\(cleanedStem)"
+        }
+        return cleanedStem
+    }
+
     private static func coreMLPriority(for path: String) -> Int {
         let lower = path.lowercased()
         if lower.hasSuffix(".mlmodelc") { return 0 }
@@ -368,6 +574,8 @@ public enum QuantExtractor {
         case .ane:
             return label
         case .afm:
+            return label
+        case .coreai:
             return label
         }
     }

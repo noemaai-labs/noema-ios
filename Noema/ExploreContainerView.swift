@@ -125,7 +125,16 @@ final class ExploreChromeState: ObservableObject {
 }
 
 struct ExploreContainerView: View {
+    @ObservedObject private var enterpriseManager = EnterprisePolicyManager.shared
+
+    /// Explicit model allowlist from the active Noema Teams policy (nil = consumer Explore).
+    private var enterpriseLockedModelIDs: [String]? {
+        guard enterpriseManager.state.isEnrolledOnDevice else { return nil }
+        return enterpriseManager.policy?.allowedModelIDs
+    }
+
     @EnvironmentObject var walkthrough: GuidedWalkthroughManager
+    @EnvironmentObject var tabRouter: TabRouter
     @AppStorage("exploreSection") private var exploreSectionRaw = ExploreSection.models.rawValue
     @AppStorage("modelTypeFilter") private var modelTypeFilterRaw = ModelTypeFilter.all.rawValue
     @StateObject private var filterManager = ModelTypeFilterManager(filter: .all)
@@ -164,9 +173,13 @@ struct ExploreContainerView: View {
                 Group {
                     switch exploreSection {
                     case .models:
-                        ExploreView()
-                            .environmentObject(filterManager)
-                            .environmentObject(chromeState)
+                        if let lockedIDs = enterpriseLockedModelIDs {
+                            EnterpriseModelsExploreView(allowedModelIDs: lockedIDs)
+                        } else {
+                            ExploreView()
+                                .environmentObject(filterManager)
+                                .environmentObject(chromeState)
+                        }
                     case .datasets:
                         DatasetsExploreView()
                             .environmentObject(chromeState)
@@ -182,6 +195,10 @@ struct ExploreContainerView: View {
                 modelTypeFilterRaw = ModelTypeFilter.all.rawValue
             }
             filterManager.filter = modelTypeFilter
+            applyPendingExploreSection(tabRouter.pendingExploreSection)
+        }
+        .onReceive(tabRouter.$pendingExploreSection) { section in
+            applyPendingExploreSection(section)
         }
         .onReceive(walkthrough.$step) { step in
             switch step {
@@ -204,6 +221,19 @@ struct ExploreContainerView: View {
                 modelTypeFilterRaw = ModelTypeFilter.all.rawValue
                 filterManager.filter = .all
             }
+        }
+    }
+
+    /// Applies a section switch requested by an App Intent. When no search
+    /// query is pending, the request ends here; otherwise the target explore
+    /// view consumes the query (and clears both fields) once visible.
+    private func applyPendingExploreSection(_ section: ExploreSection?) {
+        guard let section else { return }
+        if exploreSection != section {
+            withAnimation(.snappy) { exploreSectionRaw = section.rawValue }
+        }
+        if tabRouter.pendingExploreSearch == nil {
+            DispatchQueue.main.async { tabRouter.pendingExploreSection = nil }
         }
     }
 }
@@ -308,6 +338,8 @@ private struct ExploreChromeBar: View {
             return ModelFormat.ane.tagGradient
         case .afm:
             return ModelFormat.afm.tagGradient
+        case .coreai:
+            return ModelFormat.coreai.tagGradient
         }
     }
 
@@ -345,6 +377,14 @@ private struct ExploreChromeBar: View {
 #else
 
 struct ExploreContainerView: View {
+    @ObservedObject private var enterpriseManager = EnterprisePolicyManager.shared
+
+    /// Explicit model allowlist from the active Noema Teams policy (nil = consumer Explore).
+    private var enterpriseLockedModelIDs: [String]? {
+        guard enterpriseManager.state.isEnrolledOnDevice else { return nil }
+        return enterpriseManager.policy?.allowedModelIDs
+    }
+
     @EnvironmentObject var tabRouter: TabRouter
     @EnvironmentObject var walkthrough: GuidedWalkthroughManager
     @AppStorage("exploreSection") private var exploreSectionRaw = ExploreSection.models.rawValue
@@ -373,8 +413,12 @@ struct ExploreContainerView: View {
             ZStack {
                 switch exploreSection {
                 case .models:
-                    ExploreView()
-                        .environmentObject(filterManager)
+                    if let lockedIDs = enterpriseLockedModelIDs {
+                        EnterpriseModelsExploreView(allowedModelIDs: lockedIDs)
+                    } else {
+                        ExploreView()
+                            .environmentObject(filterManager)
+                    }
                 case .datasets:
                     DatasetsExploreView()
                 }
@@ -422,6 +466,10 @@ struct ExploreContainerView: View {
                 filterManager.filter = .all
                 modelTypeFilterRaw = ModelTypeFilter.all.rawValue
             }
+            applyPendingExploreSection(tabRouter.pendingExploreSection)
+        }
+        .onReceive(tabRouter.$pendingExploreSection) { section in
+            applyPendingExploreSection(section)
         }
         .onReceive(walkthrough.$step) { step in
             switch step {
@@ -464,6 +512,19 @@ struct ExploreContainerView: View {
             }
         }
         #endif
+    }
+
+    /// Applies a section switch requested by an App Intent. When no search
+    /// query is pending, the request ends here; otherwise the target explore
+    /// view consumes the query (and clears both fields) once visible.
+    private func applyPendingExploreSection(_ section: ExploreSection?) {
+        guard let section else { return }
+        if exploreSection != section {
+            withAnimation(.snappy) { exploreSectionRaw = section.rawValue }
+        }
+        if tabRouter.pendingExploreSearch == nil {
+            DispatchQueue.main.async { tabRouter.pendingExploreSection = nil }
+        }
     }
 }
 

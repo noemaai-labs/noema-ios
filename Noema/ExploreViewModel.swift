@@ -9,19 +9,57 @@ enum ExploreSearchMode: String {
     case et  = "ET"
     case ane = "ANE"
     case afm = "AFM"
+    case coreai = "CoreAI"
 
     var displayName: String {
         switch self {
         case .ane:
             return "CML"
+        case .coreai:
+            return "Core AI"
         default:
             return rawValue
+        }
+    }
+
+    var formatFilter: ModelFormat {
+        switch self {
+        case .gguf:
+            return .gguf
+        case .mlx:
+            return .mlx
+        case .et:
+            return .et
+        case .ane:
+            return .ane
+        case .afm:
+            return .afm
+        case .coreai:
+            return .coreai
+        }
+    }
+
+    func includes(_ record: ModelRecord) -> Bool {
+        switch self {
+        case .gguf:
+            return record.formats.contains(.gguf)
+        case .mlx:
+            return record.formats.contains(.mlx)
+        case .et:
+            return record.formats.contains(.et)
+        case .ane:
+            return record.formats.contains(.ane)
+        case .afm:
+            return record.formats.contains(.afm)
+        case .coreai:
+            return record.formats.contains(.coreai)
         }
     }
 }
 @MainActor
 final class ExploreViewModel: ObservableObject {
     @Published private(set) var recommended: [ModelRecord] = []
+    @Published private(set) var cachedRecords: [ModelRecord] = []
     @Published private(set) var searchResults: [ModelRecord] = []
     @Published var searchText: String = ""
     @Published private(set) var isSearching = false
@@ -83,9 +121,33 @@ final class ExploreViewModel: ObservableObject {
         }
     }
 
-    func details(for id: String) async -> ModelDetails? {
+    func loadCachedRecords() {
+        cachedRecords = ExploreModelDetailCache.records()
+    }
+
+    func details(for id: String, preferCached: Bool = false, allowNetwork: Bool = true) async -> ModelDetails? {
+        if preferCached, let snapshot = ExploreModelDetailCache.snapshot(repoID: id) {
+            return snapshot.details
+        }
+
+        guard allowNetwork, !NetworkKillSwitch.isEnabled else {
+            searchError = String(localized: "No offline Explore cache is available for this model.")
+            return nil
+        }
+
         let reg = registry
-        return try? await reg.details(for: id)
+        do {
+            let details = try await reg.details(for: id)
+            ExploreModelDetailCache.save(details)
+            loadCachedRecords()
+            return details
+        } catch {
+            if let snapshot = ExploreModelDetailCache.snapshot(repoID: id) {
+                return snapshot.details
+            }
+            searchError = error.localizedDescription
+            return nil
+        }
     }
 
     private func handleSearchInput(_ text: String) {
@@ -111,15 +173,7 @@ final class ExploreViewModel: ObservableObject {
         isLoadingSearch = true
         let reg = registry
         let mode = searchMode
-        let formatFilter: ModelFormat? = {
-            switch mode {
-            case .gguf: return .gguf
-            case .mlx: return .mlx
-            case .et: return .et
-            case .ane: return .ane
-            case .afm: return .afm
-            }
-        }()
+        let formatFilter: ModelFormat? = mode.formatFilter
         let startPage = page
         var existing = reset ? Set<String>() : Set(searchResults.map { $0.id })
 
@@ -160,23 +214,25 @@ final class ExploreViewModel: ObservableObject {
                 case .gguf:
                     // In GGUF mode, only allow repos that advertise GGUF.
                     // If Vision filter is active, require VLM as well.
-                    shouldInclude = rec.formats.contains(.gguf) && (!visionOnly || isVLM)
+                    shouldInclude = mode.includes(rec) && (!visionOnly || isVLM)
                 case .mlx:
-                    // In MLX mode, allow explicit MLX formats and well-known MLX namespaces.
+                    // In MLX mode, require an actual MLX signal. Namespace-only
+                    // matches from GGUF publishers are intentionally not enough.
                     // If Vision filter is active, require VLM as well.
-                    let matchesMLX = rec.formats.contains(.mlx)
-                        || rec.id.hasPrefix("mlx-community/")
-                        || rec.id.hasPrefix("lmstudio-community/")
-                    shouldInclude = matchesMLX && (!visionOnly || isVLM)
+                    shouldInclude = mode.includes(rec) && (!visionOnly || isVLM)
                 case .et:
                     // ET mode uses Hugging Face `filter=executorch`.
-                    shouldInclude = rec.formats.contains(.et) && (!visionOnly || isVLM)
+                    shouldInclude = mode.includes(rec) && (!visionOnly || isVLM)
                 case .ane:
                     // ANE mode uses Hugging Face `filter=coreml`.
-                    shouldInclude = rec.formats.contains(.ane) && (!visionOnly || isVLM)
+                    shouldInclude = mode.includes(rec) && (!visionOnly || isVLM)
                 case .afm:
                     // AFM mode is local-only and text-only.
-                    shouldInclude = rec.formats.contains(.afm) && !isVLM
+                    shouldInclude = mode.includes(rec) && !isVLM
+                case .coreai:
+                    // CoreAI mode searches Hugging Face repos tagged "coreai"/"aimodel".
+                    // No vision chat support yet, so honor a strict vision-only filter.
+                    shouldInclude = mode.includes(rec) && !visionOnly
                 }
                 
                 #if DEBUG
@@ -244,11 +300,14 @@ final class ExploreViewModel: ObservableObject {
                 searchMode = .ane
             case .ane:
                 searchMode = .gguf
+            case .coreai:
+                searchMode = .gguf
             case .afm:
                 searchMode = .gguf
             }
         } else {
-            // GPU-capable cycle: GGUF -> MLX -> ET -> ANE -> GGUF.
+            // GPU-capable cycle: GGUF -> MLX -> ET -> ANE -> CoreAI -> GGUF.
+            // CoreAI is skipped below OS 27, where those models are hidden.
             switch searchMode {
             case .gguf:
                 searchMode = .mlx
@@ -257,6 +316,8 @@ final class ExploreViewModel: ObservableObject {
             case .et:
                 searchMode = .ane
             case .ane:
+                searchMode = ModelFormat.isCoreAIRuntimeAvailable ? .coreai : .gguf
+            case .coreai:
                 searchMode = .gguf
             case .afm:
                 searchMode = .gguf

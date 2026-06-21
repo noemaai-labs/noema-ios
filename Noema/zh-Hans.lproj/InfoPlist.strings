@@ -1,3 +1,5 @@
 /* Auto-generated localization file for Info.plist */
-"NSBluetoothAlwaysUsageDescription" = "Noema 使用蓝牙与您的其他设备共享继电器设置详细信息。";
-"NSBluetoothPeripheralUsageDescription" = "Noema 使用蓝牙与您的其他设备共享继电器设置详细信息。";
+"NSMicrophoneUsageDescription" = "允许 Noema 录制音频，以便在可用时可以在本地转录。";
+"NSSpeechRecognitionUsageDescription" = "允许Noema将音频和视频附件转录为文本。";
+"NSBluetoothAlwaysUsageDescription" = "Noema 使用蓝牙与您的其他设备共享中继设置详情。";
+"NSBluetoothPeripheralUsageDescription" = "Noema 使用蓝牙与您的其他设备共享中继设置详情。";

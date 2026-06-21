@@ -139,6 +139,40 @@ enum ToolCapabilityDetector {
             return false
         case .afm:
             return true
+        case .coreai:
+            var root = InstalledModelsStore.canonicalURL(for: url, format: .coreai)
+            var isDir: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir) || !isDir.boolValue {
+                root = root.deletingLastPathComponent()
+            }
+
+            // Core AI installs mirror the repo layout, so the tokenizer and any
+            // config sidecars can sit several levels down (e.g. ios-ane/<variant>/).
+            // Walk the tree, but never descend into the .aimodel(c) bundles.
+            let candidateNames: Set<String> = [
+                "config.json", "tokenizer_config.json", "tokenizer.json",
+                "added_tokens.json", "chat_template.json"
+            ]
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { return false }
+            for case let file as URL in enumerator {
+                if ["aimodel", "aimodelc"].contains(file.pathExtension.lowercased()) {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                guard candidateNames.contains(file.lastPathComponent.lowercased()) else { continue }
+                if let data = try? Data(contentsOf: file), let s = String(data: data, encoding: .utf8) {
+                    if textContainsToolHints(s) { return true }
+                    if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let ct = obj["chat_template"] as? String, textContainsToolHints(ct) {
+                        return true
+                    }
+                }
+            }
+            return false
         }
     }
 

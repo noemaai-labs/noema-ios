@@ -25,11 +25,29 @@ final class GGUFImportSupportTests: XCTestCase {
         XCTAssertFalse(GGUFImportSupport.isProjector(URL(fileURLWithPath: "/tmp/model-q4_k_m.gguf")))
     }
 
+    func testMTPDetectionHandlesDraftSidecarsWithoutTreatingThemAsWeights() {
+        let mtp = URL(fileURLWithPath: "/tmp/qwen3-mtp-f16.gguf")
+        let draft = URL(fileURLWithPath: "/tmp/qwen3-draft.gguf")
+        let nextn = URL(fileURLWithPath: "/tmp/qwen3-nextn.gguf")
+        let main = URL(fileURLWithPath: "/tmp/qwen3-q4_k_m.gguf")
+        let projector = URL(fileURLWithPath: "/tmp/qwen3-mtp-mmproj.gguf")
+
+        XCTAssertTrue(GGUFImportSupport.isMTP(mtp))
+        XCTAssertTrue(GGUFImportSupport.isMTP(draft))
+        XCTAssertTrue(GGUFImportSupport.isMTP(nextn))
+        XCTAssertFalse(GGUFImportSupport.isMTP(main))
+        XCTAssertFalse(GGUFImportSupport.isMTP(projector))
+        XCTAssertFalse(GGUFImportSupport.isWeightFile(mtp))
+        XCTAssertTrue(GGUFImportSupport.isWeightFile(main))
+    }
+
     func testModelImportPlansIncludeHintedProjectorAndSidecars() throws {
         let root = try makeTemporaryDirectory()
         let weight = root.appendingPathComponent("Next2.5-Q4_K_M.gguf")
         let preferredProjector = root.appendingPathComponent("next2.5-projector.mmproj")
         let otherProjector = root.appendingPathComponent("other-model-projector.mmproj")
+        let preferredMTP = root.appendingPathComponent("next2.5-mtp-f16.gguf")
+        let otherMTP = root.appendingPathComponent("other-draft.gguf")
         let tokenizerConfig = root.appendingPathComponent("tokenizer_config.json")
         let chatTemplate = root.appendingPathComponent("chat_template.jinja")
         let config = root.appendingPathComponent("config.json")
@@ -38,16 +56,25 @@ final class GGUFImportSupportTests: XCTestCase {
         FileManager.default.createFile(atPath: weight.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: preferredProjector.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: otherProjector.path, contents: Data("GGUF".utf8))
+        FileManager.default.createFile(atPath: preferredMTP.path, contents: Data("GGUF".utf8))
+        FileManager.default.createFile(atPath: otherMTP.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: tokenizerConfig.path, contents: Data("{}".utf8))
         FileManager.default.createFile(atPath: chatTemplate.path, contents: Data("{{ enable_thinking }}".utf8))
         FileManager.default.createFile(atPath: config.path, contents: Data("{}".utf8))
-        try JSONSerialization.data(withJSONObject: ["mmproj": preferredProjector.lastPathComponent], options: [])
+        try JSONSerialization.data(
+            withJSONObject: [
+                "mmproj": preferredProjector.lastPathComponent,
+                "mtp": preferredMTP.lastPathComponent
+            ],
+            options: []
+        )
             .write(to: artifacts)
 
         let plans = GGUFImportSupport.modelImportPlans(from: [root])
 
         XCTAssertEqual(plans.count, 1)
         XCTAssertEqual(plans.first?.projector?.lastPathComponent, preferredProjector.lastPathComponent)
+        XCTAssertEqual(plans.first?.mtp?.lastPathComponent, preferredMTP.lastPathComponent)
         XCTAssertEqual(
             Set(plans.first?.sidecars.map(\.lastPathComponent) ?? []),
             Set(["tokenizer_config.json", "chat_template.jinja", "config.json"])
@@ -73,14 +100,17 @@ final class GGUFImportSupportTests: XCTestCase {
         let primary = root.appendingPathComponent("Next2.5-Q4_K_M-00001-of-00002.gguf")
         let shard = root.appendingPathComponent("Next2.5-Q4_K_M-00002-of-00002.gguf")
         let projector = root.appendingPathComponent("next2.5-projector.mmproj")
+        let mtp = root.appendingPathComponent("next2.5-mtp-f16.gguf")
         FileManager.default.createFile(atPath: primary.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: shard.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: projector.path, contents: Data("GGUF".utf8))
+        FileManager.default.createFile(atPath: mtp.path, contents: Data("GGUF".utf8))
 
         let artifactsURL = GGUFImportSupport.writeArtifactsJSON(
             in: root,
             weightFiles: [primary, shard],
-            projector: projector
+            projector: projector,
+            mtp: mtp
         )
 
         let data = try Data(contentsOf: artifactsURL)
@@ -90,6 +120,8 @@ final class GGUFImportSupportTests: XCTestCase {
         XCTAssertEqual(payload["weightShards"] as? [String], [primary.lastPathComponent, shard.lastPathComponent])
         XCTAssertEqual(payload["mmproj"] as? String, projector.lastPathComponent)
         XCTAssertEqual(payload["mmprojChecked"] as? Bool, true)
+        XCTAssertEqual(payload["mtp"] as? String, mtp.lastPathComponent)
+        XCTAssertEqual(payload["mtpChecked"] as? Bool, true)
     }
 
     private func makeTemporaryDirectory() throws -> URL {

@@ -1,5 +1,8 @@
 // Logger.swift
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Simple async logger used to capture text messages in a file.
 /// Declared as an actor so calls from various tasks remain concurrency-safe.
@@ -88,12 +91,7 @@ actor Logger {
     }
 
     private func writeConsoleLine(_ message: String) {
-        guard let data = (message + "\n").data(using: .utf8) else { return }
-        do {
-            try FileHandle.standardError.write(contentsOf: data)
-        } catch {
-            fputs(message + "\n", stderr)
-        }
+        fputs(message + "\n", stderr)
         fflush(stderr)
     }
 }

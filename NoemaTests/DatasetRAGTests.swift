@@ -2,6 +2,12 @@ import XCTest
 @testable import Noema
 
 final class DatasetRAGTests: XCTestCase {
+    private struct StoredVectorFixture: Codable {
+        let text: String
+        let vector: [Float]
+        let source: String?
+    }
+
     func testUniqueRelativePathAddsSuffixForDuplicateBasenames() {
         let first = DatasetPathing.uniqueRelativePath("chapter.txt", existing: [])
         let second = DatasetPathing.uniqueRelativePath("chapter.txt", existing: [first])
@@ -38,18 +44,78 @@ final class DatasetRAGTests: XCTestCase {
         XCTAssertEqual(selected.map(\.payload), ["a1", "b1", "c1"])
     }
 
+    func testEnterpriseManifestIsInternalRelativePath() {
+        XCTAssertTrue(DatasetStorage.isInternalRelativePath(DatasetStorage.enterpriseManifestFilename))
+        XCTAssertTrue(DatasetStorage.isInternalRelativePath("./" + DatasetStorage.enterpriseManifestFilename))
+        XCTAssertFalse(DatasetStorage.isInternalRelativePath("handbook.pdf"))
+        XCTAssertFalse(DatasetStorage.isInternalRelativePath("nested/" + DatasetStorage.enterpriseManifestFilename))
+    }
+
+    func testStrippingInternalSectionsRemovesEnterpriseManifestSection() {
+        let text = """
+        <<<FILE: handbook.txt>>>
+        Vacation policy: 25 days.
+
+        <<<FILE: \(DatasetStorage.enterpriseManifestFilename)>>>
+        {"tenantID":"tenant-1","allowedRoleIDs":["admin"]}
+
+        <<<FILE: onboarding.txt>>>
+        Welcome to the company.
+        """
+
+        let stripped = DatasetSourceMarkers.strippingInternalSections(from: text)
+
+        XCTAssertTrue(stripped.contains("Vacation policy: 25 days."))
+        XCTAssertTrue(stripped.contains("Welcome to the company."))
+        XCTAssertTrue(stripped.contains("<<<FILE: handbook.txt>>>"))
+        XCTAssertFalse(stripped.contains(DatasetStorage.enterpriseManifestFilename))
+        XCTAssertFalse(stripped.contains("tenant-1"))
+        XCTAssertFalse(stripped.contains("allowedRoleIDs"))
+    }
+
+    func testStrippingInternalSectionsLeavesMarkerlessTextUntouched() {
+        let text = "Plain dataset text with no markers."
+        XCTAssertEqual(DatasetSourceMarkers.strippingInternalSections(from: text), text)
+    }
+
+    func testSourceMarkerRoundTrip() {
+        let marker = DatasetSourceMarkers.marker(forRelativePath: "docs/guide.md")
+        XCTAssertEqual(marker, "<<<FILE: docs/guide.md>>>")
+        XCTAssertEqual(DatasetSourceMarkers.sourcePath(fromLine: marker), "docs/guide.md")
+        XCTAssertNil(DatasetSourceMarkers.sourcePath(fromLine: "regular line"))
+        XCTAssertNil(DatasetSourceMarkers.sourcePath(fromLine: "<<<FILE: >>>"))
+    }
+
     func testDatasetTextReaderDecodesLatin1AndWindows1252() {
         let data = Data([0x63, 0x61, 0x66, 0xE9])
 
         XCTAssertEqual(DatasetTextReader.string(from: data), "café")
     }
 
+    func testEmbeddingTitlePrefersSourceMarkerOverDatasetTitle() {
+        let title = DatasetRetriever.titleForEmbedding(
+            source: "chapters/unit-1_intro.pdf",
+            datasetTitle: "Fallback Dataset"
+        )
+
+        XCTAssertEqual(title, "unit 1 intro")
+    }
+
+    func testEmbeddingTitleFallsBackToDatasetTitleWhenSourceMissing() {
+        let title = DatasetRetriever.titleForEmbedding(source: nil, datasetTitle: "Course Reader")
+
+        XCTAssertEqual(title, "Course Reader")
+    }
+
+    func testEmbeddingTitleReturnsNilWhenNoSourceOrDatasetTitleExists() {
+        XCTAssertNil(DatasetRetriever.titleForEmbedding(source: nil, datasetTitle: "   "))
+    }
+
     func testDatasetIndexIORequiresMetadataAndPositiveChunkCount() throws {
         let dir = try makeTempDirectory(prefix: "dataset-index-")
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let vectorsURL = DatasetIndexIO.vectorsURL(for: dir)
-        try Data("[]".utf8).write(to: vectorsURL)
+        try writeVectors(to: dir, dimension: EmbeddingModelCatalog.currentIndexFingerprint().dimension)
 
         XCTAssertFalse(DatasetIndexIO.hasValidIndex(at: dir))
 
@@ -58,6 +124,38 @@ final class DatasetRAGTests: XCTestCase {
 
         DatasetIndexIO.writeMetadata(DatasetIndexMetadata(chunkCount: 2), to: dir)
         XCTAssertTrue(DatasetIndexIO.hasValidIndex(at: dir))
+    }
+
+    func testDatasetIndexIOMarksLegacySchemaV2MetadataStaleWithoutDeletingArtifacts() throws {
+        let dir = try makeTempDirectory(prefix: "dataset-index-legacy-")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        try writeVectors(to: dir, dimension: EmbeddingModelCatalog.currentIndexFingerprint().dimension)
+        let legacyMetadata = """
+        {
+          "schemaVersion": 2,
+          "sourceLabelMode": "relativePath",
+          "chunkCount": 1,
+          "createdAt": 0
+        }
+        """
+        try Data(legacyMetadata.utf8).write(to: DatasetIndexIO.metadataURL(for: dir))
+
+        XCTAssertTrue(DatasetIndexIO.hasIndexArtifacts(at: dir))
+        XCTAssertFalse(DatasetIndexIO.hasValidIndex(at: dir))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: DatasetIndexIO.vectorsURL(for: dir).path))
+    }
+
+    func testDatasetIndexIORejectsVectorDimensionMismatch() throws {
+        let dir = try makeTempDirectory(prefix: "dataset-index-dim-")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fingerprint = EmbeddingModelCatalog.currentIndexFingerprint()
+        try writeVectors(to: dir, dimension: fingerprint.dimension + 1)
+        DatasetIndexIO.writeMetadata(DatasetIndexMetadata(chunkCount: 1, embeddingFingerprint: fingerprint), to: dir)
+
+        XCTAssertFalse(DatasetIndexIO.hasValidIndex(at: dir))
+        XCTAssertEqual(DatasetIndexIO.firstVectorDimension(at: dir), fingerprint.dimension + 1)
     }
 
     func testDatasetFileSupportTotalsIncludeAllSupportedFormats() {
@@ -73,10 +171,10 @@ final class DatasetRAGTests: XCTestCase {
     }
 
     func testRAGPackingReturnsAllRequestedChunksWhenBudgetAllows() async {
-        let chunks: [(text: String, source: String?)] = [
-            (String(repeating: "A", count: 40), "a.txt"),
-            (String(repeating: "B", count: 40), "b.txt"),
-            (String(repeating: "C", count: 40), "c.txt"),
+        let chunks: [(text: String, source: String?, score: Float?)] = [
+            (String(repeating: "A", count: 40), "a.txt", nil),
+            (String(repeating: "B", count: 40), "b.txt", nil),
+            (String(repeating: "C", count: 40), "c.txt", nil),
         ]
 
         let packed = await ChatVM.packRAGContext(
@@ -98,12 +196,12 @@ final class DatasetRAGTests: XCTestCase {
     }
 
     func testRAGPackingReducesToTwoChunksWhenBudgetOnlyFitsTwo() async {
-        let chunks: [(text: String, source: String?)] = [
-            (String(repeating: "A", count: 90), "a.txt"),
-            (String(repeating: "B", count: 90), "b.txt"),
-            (String(repeating: "C", count: 90), "c.txt"),
-            (String(repeating: "D", count: 90), "d.txt"),
-            (String(repeating: "E", count: 90), "e.txt"),
+        let chunks: [(text: String, source: String?, score: Float?)] = [
+            (String(repeating: "A", count: 90), "a.txt", nil),
+            (String(repeating: "B", count: 90), "b.txt", nil),
+            (String(repeating: "C", count: 90), "c.txt", nil),
+            (String(repeating: "D", count: 90), "d.txt", nil),
+            (String(repeating: "E", count: 90), "e.txt", nil),
         ]
 
         let packed = await ChatVM.packRAGContext(
@@ -128,7 +226,7 @@ final class DatasetRAGTests: XCTestCase {
     func testRAGPackingFallsBackToPartialTopChunkWhenNothingFitsWhole() async {
         let original = String(repeating: "A", count: 500)
         let packed = await ChatVM.packRAGContext(
-            chunks: [(text: original, source: "a.txt")],
+            chunks: [(text: original, source: "a.txt", score: nil)],
             requestedMaxChunks: 1,
             usablePromptTokens: 256,
             promptTokenCounter: { $0.count },
@@ -201,9 +299,9 @@ final class DatasetRAGTests: XCTestCase {
         let chunk = String(repeating: "A", count: 12_000)
         let packed = await ChatVM.packRAGContext(
             chunks: [
-                (chunk, "a.txt"),
-                (chunk, "b.txt"),
-                (chunk, "c.txt"),
+                (text: chunk, source: "a.txt", score: nil),
+                (text: chunk, source: "b.txt", score: nil),
+                (text: chunk, source: "c.txt", score: nil),
             ],
             requestedMaxChunks: 3,
             usablePromptTokens: ChatVM.promptBudget(for: 50_000).usablePromptTokens,
@@ -309,6 +407,16 @@ final class DatasetRAGTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(prefix + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func writeVectors(to dir: URL, dimension: Int) throws {
+        let fixture = StoredVectorFixture(
+            text: "fixture",
+            vector: Array(repeating: Float(0.1), count: dimension),
+            source: "fixture.txt"
+        )
+        let data = try JSONEncoder().encode([fixture])
+        try data.write(to: DatasetIndexIO.vectorsURL(for: dir))
     }
 
     private func documentsDirectory() -> URL {

@@ -4,6 +4,8 @@ import CoreGraphics
 import ImageIO
 #if canImport(MLXLLM)
 import MLXLLM
+#endif
+#if canImport(MLXLMCommon)
 import MLXLMCommon
 #endif
 #if canImport(MLXVLM) 
@@ -12,32 +14,6 @@ import MLXVLM
 #if canImport(MLX)
 import MLX
 #endif
-
-/*
- * MLXBridge Implementation Status:
- * 
- * ✅ MLX dependencies are properly imported and available
- * ✅ Compilation errors fixed
- * ✅ Real MLX API integration implemented using mlx-swift-examples patterns
- * ✅ ModelContainer and LLMModelFactory integration
- * ✅ Streaming text generation with MLXLMCommon.generate
- * ✅ TokenIterator-based streaming with proper token decoding
- * ✅ PLACEHOLDER LOGIC REMOVED - Now uses actual MLX inference
- * 
- * Implementation Details:
- * - Uses ModelContainer for model management
- * - Implements proper MLX GPU cache settings
- * - Supports streaming generation with token-by-token output via TokenIterator
- * - Handles different input types (plain text, messages, multimodal)
- * - Includes comprehensive error handling and logging
- * - Uses MLXLMCommon.generate() API with prompt, model, and tokenizer
- * 
- * Current State:
- * - Dependencies: MLXLLM, MLXLMCommon, and MLX are properly integrated
- * - Model Loading: Uses LLMModelFactory.shared.loadContainer()
- * - Text Generation: Uses MLXLMCommon.generate() with TokenIterator streaming
- * - VLM Support: Basic structure in place (needs VLM-specific implementation)
- */
 
 enum MLXBridgeError: Error, LocalizedError {
     case modelNotFound
@@ -253,9 +229,7 @@ enum MLXBridge {
         if #available(macOS 13.0, iOS 16.0, *) {
             let client = try await MLXTextClient(
                 modelDirectory: dir,
-                temperature: Float(settings?.temperature ?? 0.7),
-                repetitionPenalty: settings?.repetitionPenalty ?? 1.1,
-                topP: Float(settings?.topP ?? 0.95)
+                settings: settings
             )
             return AnyLLMClient(client)
         } else {
@@ -264,7 +238,7 @@ enum MLXBridge {
         }
     }
 
-    static func makeVLMClient(url: URL) async throws -> AnyLLMClient {
+    static func makeVLMClient(url: URL, settings: ModelSettings? = nil) async throws -> AnyLLMClient {
         let dir = directoryForMLX(url)
 
         print("[MLXBridge] makeVLMClient called with url: \(url.path)")
@@ -304,7 +278,7 @@ enum MLXBridge {
         }
 
         if #available(macOS 13.0, iOS 16.0, *) {
-            let client = try await MLXVLMClient(modelDirectory: dir)
+            let client = try await MLXVLMClient(modelDirectory: dir, settings: settings)
             return AnyLLMClient(client)
         } else {
             print("[MLXBridge] Platform version too old for VLM")
@@ -467,6 +441,80 @@ enum MLXBridge {
     }
 }
 
+// MARK: - Prompt form shared by the MLX clients
+
+/// Sendable intermediate between Noema's `ChatMessage` history and MLX's
+/// `Chat.Message` (which is not Sendable and only exists when MLX is linked).
+struct MLXChatTurn: Sendable, Equatable {
+    enum Role: String, Sendable {
+        case system
+        case user
+        case assistant
+    }
+
+    var role: Role
+    var content: String
+    var imagePaths: [String] = []
+}
+
+extension MLXBridge {
+    static let gpuCacheLimitBytes = 20 * 1024 * 1024
+
+    /// Folds a `ChatMessage` history into structured turns. Tool results have
+    /// no first-class role in most chat templates, so they are folded into a
+    /// user turn the model can read.
+    static func chatTurns(from messages: [ChatMessage]) -> [MLXChatTurn] {
+        messages.map { message in
+            switch message.role.lowercased() {
+            case "system":
+                return MLXChatTurn(role: .system, content: message.content)
+            case "assistant", "🤖":
+                return MLXChatTurn(role: .assistant, content: message.content)
+            case "tool":
+                return MLXChatTurn(role: .user, content: "Tool result:\n\(message.content)")
+            default:
+                return MLXChatTurn(role: .user, content: message.content)
+            }
+        }
+    }
+}
+
+#if canImport(MLXLMCommon)
+extension MLXBridge {
+    /// Maps Noema's sampling settings onto MLX generation parameters. Library
+    /// defaults are kept when no settings are available.
+    static func generateParameters(settings: ModelSettings?, maxOutputTokens: Int?) -> GenerateParameters {
+        var parameters = GenerateParameters()
+        if let settings {
+            parameters.temperature = Float(settings.temperature)
+            parameters.topP = Float(settings.topP)
+            parameters.topK = max(0, settings.topK)
+            parameters.minP = Float(settings.minP)
+            parameters.repetitionPenalty = settings.repetitionPenalty > 1.0 ? settings.repetitionPenalty : nil
+            parameters.repetitionContextSize = max(1, settings.repeatLastN)
+            parameters.presencePenalty = settings.presencePenalty != 0 ? settings.presencePenalty : nil
+            parameters.frequencyPenalty = settings.frequencyPenalty != 0 ? settings.frequencyPenalty : nil
+        }
+        parameters.maxTokens = maxOutputTokens
+        return parameters
+    }
+
+    static func chatMessages(from turns: [MLXChatTurn]) -> [Chat.Message] {
+        turns.map { turn in
+            let images: [UserInput.Image] = turn.imagePaths.map { .url(URL(fileURLWithPath: $0)) }
+            switch turn.role {
+            case .system:
+                return .system(turn.content, images: images)
+            case .assistant:
+                return .assistant(turn.content, images: images)
+            case .user:
+                return .user(turn.content, images: images)
+            }
+        }
+    }
+}
+#endif
+
 // MARK: - MLX Text Client Implementation
 
 @available(macOS 13.0, iOS 16.0, *)
@@ -475,21 +523,17 @@ public final class MLXTextClient: @unchecked Sendable {
     private var modelContainer: ModelContainer?
     #endif
     private let modelDirectory: URL
-    private let temperature: Float
-    private let repetitionPenalty: Float
-    private let topP: Float
+    private let settings: ModelSettings?
     private var streamTask: Task<Void, Never>? = nil
-    
-    public init(
+
+    // Internal because ModelSettings is an internal type; in-module callers
+    // construct clients via MLXBridge factories.
+    init(
         modelDirectory: URL,
-        temperature: Float = 0.7,
-        repetitionPenalty: Float = 1.1,
-        topP: Float = 0.95
+        settings: ModelSettings? = nil
     ) async throws {
         self.modelDirectory = modelDirectory
-        self.temperature = temperature
-        self.repetitionPenalty = repetitionPenalty
-        self.topP = topP
+        self.settings = settings
         try await load()
     }
     
@@ -527,10 +571,10 @@ public final class MLXTextClient: @unchecked Sendable {
                 // Set GPU cache limit for MLX only when GPU offload is supported
                 #if canImport(MLX)
                 if DeviceGPUInfo.supportsGPUOffload {
-                    MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+                    MLX.GPU.set(cacheLimit: MLXBridge.gpuCacheLimitBytes)
                 }
                 #endif
-                
+
                 // Create a model configuration pointing directly to the provided model directory
                 print("[MLXBridge] Creating configuration from directory: \(modelDirectory.path)")
                 let configuration = ModelConfiguration(directory: modelDirectory)
@@ -567,6 +611,14 @@ public final class MLXTextClient: @unchecked Sendable {
     }
 }
 
+/// Prompt form resolved from `LLMInput`. `.chat` lets the model's own chat
+/// template format the conversation exactly once; `.raw` is an
+/// already-formatted completion prompt that must NOT be re-templated.
+enum MLXPromptForm: Sendable, Equatable {
+    case chat([MLXChatTurn])
+    case raw(String)
+}
+
 extension MLXTextClient {
     public func textStream(from input: LLMInput) async throws -> AsyncThrowingStream<String, Error> {
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
@@ -574,34 +626,54 @@ extension MLXTextClient {
             throw MLXBridgeError.backendUnavailable
         }
 
-        // Extract prompt based on input type
-        let prompt: String
+        let form: MLXPromptForm
         switch input.content {
         case .plain(let text):
-            prompt = text
+            form = .raw(text)
         case .messages(let messages):
-            prompt = messages.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
+            form = .chat(MLXBridge.chatTurns(from: messages))
         case .multimodal(let text, let images):
             // Explicitly reject images for text-only MLX models to avoid misleading behavior
             if !images.isEmpty {
                 throw MLXBridgeError.imagesUnsupported
             }
-            prompt = text
+            form = .raw(text)
         case .multimodalMessages(let messages, let images):
             if !images.isEmpty {
                 throw MLXBridgeError.imagesUnsupported
             }
-            prompt = messages.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
+            form = .chat(MLXBridge.chatTurns(from: messages))
         }
 
-        let session = ChatSession(container)
+        let parameters = MLXBridge.generateParameters(
+            settings: settings,
+            maxOutputTokens: input.generationOptions.maxOutputTokens
+        )
+
         return AsyncThrowingStream<String, Error> { [weak self] continuation in
-            let inner = session.streamResponse(to: prompt)
             let task = Task {
                 do {
-                    for try await token in inner {
-                        if Task.isCancelled { break }
-                        continuation.yield(token)
+                    try await container.perform { (context: ModelContext) in
+                        let lmInput: LMInput
+                        switch form {
+                        case .chat(let turns):
+                            let userInput = UserInput(chat: MLXBridge.chatMessages(from: turns))
+                            lmInput = try await context.processor.prepare(input: userInput)
+                        case .raw(let text):
+                            let tokens = context.tokenizer.encode(text: text)
+                            lmInput = LMInput(tokens: MLXArray(tokens))
+                        }
+                        let stream = try MLXLMCommon.generate(
+                            input: lmInput,
+                            parameters: parameters,
+                            context: context
+                        )
+                        for await generation in stream {
+                            if Task.isCancelled { break }
+                            if let chunk = generation.chunk {
+                                continuation.yield(chunk)
+                            }
+                        }
                     }
                     continuation.finish()
                 } catch {
@@ -635,10 +707,14 @@ public final class MLXVLMClient: @unchecked Sendable {
     #endif
     private var modelTypeHint: String?
     private let modelDirectory: URL
+    private let settings: ModelSettings?
     private var streamTask: Task<Void, Never>? = nil
-    
-    public init(modelDirectory: URL) async throws {
+
+    // Internal because ModelSettings is an internal type; in-module callers
+    // construct clients via MLXBridge factories.
+    init(modelDirectory: URL, settings: ModelSettings? = nil) async throws {
         self.modelDirectory = modelDirectory
+        self.settings = settings
         try await load()
     }
     
@@ -684,7 +760,7 @@ public final class MLXVLMClient: @unchecked Sendable {
             // Set GPU cache limit for MLX only when GPU offload is supported
             #if canImport(MLX)
             if DeviceGPUInfo.supportsGPUOffload {
-                MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+                MLX.GPU.set(cacheLimit: MLXBridge.gpuCacheLimitBytes)
             }
             #endif
 
@@ -743,145 +819,103 @@ public final class MLXVLMClient: @unchecked Sendable {
 }
 
 extension MLXVLMClient {
+    /// MLX VLM currently supports a single image. Returns the first supported
+    /// image (resized to at most 448px on the long side, as in MLX examples),
+    /// or throws when only unsupported attachments were provided.
+    private static func preparedImagePath(from imagePaths: [String]) throws -> String? {
+        guard !imagePaths.isEmpty else { return nil }
+
+        let supportedImageExtensions: Set<String> = ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "heic", "heif"]
+        let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "webm", "mkv"]
+
+        guard let rawImagePath = imagePaths.first(where: { path in
+            supportedImageExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+        }) else {
+            if imagePaths.contains(where: { videoExtensions.contains(URL(fileURLWithPath: $0).pathExtension.lowercased()) }) {
+                throw NSError(domain: "Noema", code: -7001, userInfo: [NSLocalizedDescriptionKey: "Video attachments are not supported by the MLX VLM backend in this build."])
+            }
+            throw MLXBridgeError.imagesUnsupported
+        }
+
+        let inputURL = URL(fileURLWithPath: rawImagePath)
+        return (Self.resizeImageForVLM(inputURL, maxPixel: 448) ?? inputURL).path
+    }
+
+    /// Attaches the image to the last user turn so the model's chat template
+    /// places the image tokens inside the right message.
+    private static func attachImage(_ imagePath: String, to turns: [MLXChatTurn]) -> [MLXChatTurn] {
+        var result = turns
+        if let index = result.lastIndex(where: { $0.role == .user }) {
+            result[index].imagePaths.append(imagePath)
+        } else {
+            result.append(MLXChatTurn(role: .user, content: "", imagePaths: [imagePath]))
+        }
+        return result
+    }
+
     public func textStream(from input: LLMInput) async throws -> AsyncThrowingStream<String, Error> {
         #if canImport(MLXVLM) && canImport(MLXLMCommon)
         guard let container = modelContainer else {
             throw MLXBridgeError.backendUnavailable
         }
+
+        let form: MLXPromptForm
         switch input.content {
         case .plain(let text):
-            let session = ChatSession(container)
-            return AsyncThrowingStream<String, Error> { [weak self] continuation in
-                let inner = session.streamResponse(to: text)
-                let task = Task {
-                    do {
-                        for try await token in inner {
-                            if Task.isCancelled { break }
-                            continuation.yield(token)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                }
-                self?.streamTask = task
-                continuation.onTermination = { _ in task.cancel() }
-            }
+            form = .raw(text)
         case .messages(let messages):
-            let session = ChatSession(container)
-            let prompt = messages.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
-            return AsyncThrowingStream<String, Error> { [weak self] continuation in
-                let inner = session.streamResponse(to: prompt)
-                let task = Task {
-                    do {
-                        for try await token in inner {
-                            if Task.isCancelled { break }
-                            continuation.yield(token)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                }
-                self?.streamTask = task
-                continuation.onTermination = { _ in task.cancel() }
-            }
+            form = .chat(MLXBridge.chatTurns(from: messages))
         case .multimodal(let text, let imagePaths):
-            // Stream multimodal responses token-by-token instead of buffering the full answer.
-            return AsyncThrowingStream<String, Error> { [weak self] continuation in
-                let session = ChatSession(container)
-                let task = Task {
-                    do {
-                        // MLX VLM currently supports a single image. Choose the first supported image
-                        // and ignore videos or unsupported file types.
-                        let supportedImageExtensions: Set<String> = ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "heic", "heif"]
-                        let isVideoExt: (String) -> Bool = { ext in
-                            let v: Set<String> = ["mp4", "mov", "m4v", "avi", "webm", "mkv"]
-                            return v.contains(ext.lowercased())
-                        }
-
-                        func firstImagePath(from paths: [String]) -> String? {
-                            for p in paths {
-                                let ext = URL(fileURLWithPath: p).pathExtension.lowercased()
-                                if supportedImageExtensions.contains(ext) { return p }
-                            }
-                            return nil
-                        }
-
-                        guard let rawImagePath = firstImagePath(from: imagePaths) else {
-                            // No supported image found; if videos present, report unsupported
-                            if imagePaths.contains(where: { isVideoExt(URL(fileURLWithPath: $0).pathExtension) }) {
-                                throw NSError(domain: "Noema", code: -7001, userInfo: [NSLocalizedDescriptionKey: "Video attachments are not supported by the MLX VLM backend in this build."])
-                            }
-                            throw MLXBridgeError.imagesUnsupported
-                        }
-
-                        // Resize image to at most 448px on the long side (as in MLX examples)
-                        let inputURL = URL(fileURLWithPath: rawImagePath)
-                        let resizedURL = Self.resizeImageForVLM(inputURL, maxPixel: 448) ?? inputURL
-
-                        let inner = session.streamResponse(
-                            to: text,
-                            image: .url(resizedURL)
-                        )
-                        for try await token in inner {
-                            if Task.isCancelled { break }
-                            continuation.yield(token)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                }
-                self?.streamTask = task
-                continuation.onTermination = { _ in task.cancel() }
+            var turns = [MLXChatTurn(role: .user, content: text)]
+            if let imagePath = try Self.preparedImagePath(from: imagePaths) {
+                turns = Self.attachImage(imagePath, to: turns)
             }
+            form = .chat(turns)
         case .multimodalMessages(let messages, let imagePaths):
-            let text = messages.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
-            return AsyncThrowingStream<String, Error> { [weak self] continuation in
-                let session = ChatSession(container)
-                let task = Task {
-                    do {
-                        let supportedImageExtensions: Set<String> = ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "heic", "heif"]
-                        let isVideoExt: (String) -> Bool = { ext in
-                            let v: Set<String> = ["mp4", "mov", "m4v", "avi", "webm", "mkv"]
-                            return v.contains(ext.lowercased())
-                        }
-
-                        func firstImagePath(from paths: [String]) -> String? {
-                            for p in paths {
-                                let ext = URL(fileURLWithPath: p).pathExtension.lowercased()
-                                if supportedImageExtensions.contains(ext) { return p }
-                            }
-                            return nil
-                        }
-
-                        guard let rawImagePath = firstImagePath(from: imagePaths) else {
-                            if imagePaths.contains(where: { isVideoExt(URL(fileURLWithPath: $0).pathExtension) }) {
-                                throw NSError(domain: "Noema", code: -7001, userInfo: [NSLocalizedDescriptionKey: "Video attachments are not supported by the MLX VLM backend in this build."])
-                            }
-                            throw MLXBridgeError.imagesUnsupported
-                        }
-
-                        let inputURL = URL(fileURLWithPath: rawImagePath)
-                        let resizedURL = Self.resizeImageForVLM(inputURL, maxPixel: 448) ?? inputURL
-
-                        let inner = session.streamResponse(
-                            to: text,
-                            image: .url(resizedURL)
-                        )
-                        for try await token in inner {
-                            if Task.isCancelled { break }
-                            continuation.yield(token)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                }
-                self?.streamTask = task
-                continuation.onTermination = { _ in task.cancel() }
+            var turns = MLXBridge.chatTurns(from: messages)
+            if let imagePath = try Self.preparedImagePath(from: imagePaths) {
+                turns = Self.attachImage(imagePath, to: turns)
             }
+            form = .chat(turns)
+        }
+
+        let parameters = MLXBridge.generateParameters(
+            settings: settings,
+            maxOutputTokens: input.generationOptions.maxOutputTokens
+        )
+
+        return AsyncThrowingStream<String, Error> { [weak self] continuation in
+            let task = Task {
+                do {
+                    try await container.perform { (context: ModelContext) in
+                        let lmInput: LMInput
+                        switch form {
+                        case .chat(let turns):
+                            let userInput = UserInput(chat: MLXBridge.chatMessages(from: turns))
+                            lmInput = try await context.processor.prepare(input: userInput)
+                        case .raw(let text):
+                            let tokens = context.tokenizer.encode(text: text)
+                            lmInput = LMInput(tokens: MLXArray(tokens))
+                        }
+                        let stream = try MLXLMCommon.generate(
+                            input: lmInput,
+                            parameters: parameters,
+                            context: context
+                        )
+                        for await generation in stream {
+                            if Task.isCancelled { break }
+                            if let chunk = generation.chunk {
+                                continuation.yield(chunk)
+                            }
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            self?.streamTask = task
+            continuation.onTermination = { _ in task.cancel() }
         }
         #else
         return AsyncThrowingStream<String, Error> { continuation in

@@ -3,8 +3,7 @@ import Foundation
 import AVFoundation
 #endif
 
-@MainActor
-enum AppSound: Hashable {
+enum AppSound: Hashable, Sendable {
     case error
     case loadPress
     case loadSuccess
@@ -52,12 +51,31 @@ enum AppSoundPlayer {
 #if canImport(AVFoundation)
         guard !soundsMuted else { return }
 #if os(iOS)
-        // Use `.ambient` by default; switch to `.playback` when the user opts into silent-mode playback.
-        guard configureAudioSessionForEffects() else { return }
-#endif
+        // AVAudioSession setCategory / setActive must NOT be called on the main thread
+        // while the session is active — it can cause UI unresponsiveness. Move that work
+        // to a background queue and bounce back to main only for the actual playback.
+        let wantsSilentMode = playInSilentMode
+        DispatchQueue.global(qos: .userInitiated).async {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                let category: AVAudioSession.Category = wantsSilentMode ? .playback : .ambient
+                try session.setCategory(category, mode: .default, options: [.mixWithOthers])
+                try session.setActive(true, options: [])
+            } catch {
+                // If session setup fails, bail out silently.
+                return
+            }
+            Task { @MainActor in
+                guard let player = player(for: sound) else { return }
+                player.currentTime = 0
+                player.play()
+            }
+        }
+#else
         guard let player = player(for: sound) else { return }
         player.currentTime = 0
         player.play()
+#endif
 #endif
     }
 }
@@ -65,20 +83,6 @@ enum AppSoundPlayer {
 #if canImport(AVFoundation)
 @MainActor
 private extension AppSoundPlayer {
-#if os(iOS)
-    static func configureAudioSessionForEffects() -> Bool {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            let category: AVAudioSession.Category = playInSilentMode ? .playback : .ambient
-            try session.setCategory(category, mode: .default, options: [.mixWithOthers])
-            try session.setActive(true, options: [])
-            return true
-        } catch {
-            return false
-        }
-    }
-#endif
-
     static func player(for sound: AppSound) -> AVAudioPlayer? {
         if let existing = players[sound] {
             return existing

@@ -21,28 +21,9 @@ let package = Package(
             exclude: [
                 // previous vendored snapshot (kept for reference)
                 "upstream_b7634",
-                // Finder-style duplicate upstream directories; keep them out of
-                // the target so SwiftPM does not discover extra CLI main() files.
-                "upstream/common 2",
-                "upstream/ggml/cmake 2",
-                "upstream/ggml/include 2",
-                "upstream/ggml/src 2",
-                "upstream/tools/cli 2",
-                "upstream/tools/completion 2",
-                "upstream/tools/cvector-generator 2",
-                "upstream/tools/gguf-split 2",
-                "upstream/tools/llama-bench 2",
-                "upstream/tools/quantize 2",
-                "upstream/tools/rpc 2",
-                "upstream/tools/server 2",
-                "upstream/tools/tokenize 2",
-                "upstream/tools/tts 2",
-                "upstream/vendor/cpp-httplib 2",
-                "upstream/vendor/miniaudio 2",
-                "upstream/vendor/sheredom 2",
-                "upstream/vendor/stb 2",
                 // compile server.cpp only via bridge/server_embed.cpp inclusion
                 "upstream/tools/server/server.cpp",
+                "upstream/tools/server/main.cpp",
                 // exclude mtmd CLI entrypoints
                 "upstream/tools/mtmd/mtmd-cli.cpp",
                 "upstream/tools/mtmd/deprecation-warning.cpp",
@@ -64,6 +45,14 @@ let package = Package(
                 "upstream/tools/rpc",
                 "upstream/tools/tokenize",
                 "upstream/tools/tts",
+                // upstream UI generator has its own main(); ui.cpp/ui.h are
+                // generated once for this SwiftPM package and kept in-tree.
+                "upstream/tools/ui/embed.cpp",
+                // Keep the server's generated UI entry point, but exclude the
+                // web app sources that SwiftPM would otherwise scan as resources.
+                "upstream/tools/ui/src",
+                "upstream/tools/ui/static",
+                "upstream/tools/ui/tests",
                 // exclude backends we don't ship in the iOS loopback build
                 "upstream/ggml/src/ggml-webgpu",
                 "upstream/ggml/src/ggml-zendnn",
@@ -83,20 +72,17 @@ let package = Package(
                 "upstream/ggml/src/ggml-cpu/spacemit",
                 // Optional dependency; only built when enabled via CMake + headers present.
                 "upstream/ggml/src/ggml-cpu/kleidiai",
-                // Only build CPU arch backends we need (Apple arm64 + simulator x86_64).
-                "upstream/ggml/src/ggml-cpu/arch/loongarch",
-                "upstream/ggml/src/ggml-cpu/arch/powerpc",
-                "upstream/ggml/src/ggml-cpu/arch/riscv",
-                "upstream/ggml/src/ggml-cpu/arch/s390",
-                "upstream/ggml/src/ggml-cpu/arch/wasm",
+                // SwiftPM does not apply llama.cpp's per-architecture SIMD flags.
+                // Use the generic CPU path for package builds.
+                "upstream/ggml/src/ggml-cpu/arch",
                 // We embed the Metal shader source via bridge/ggml_metal_embed.cpp.
                 // Prevent SwiftPM/Xcode from trying to compile ggml-metal.metal directly.
                 "upstream/ggml/src/ggml-metal/ggml-metal.metal"
             ],
             publicHeadersPath: "include",
             cSettings: [
-                .define("GGML_VERSION", to: "\"0.9.11\""),
-                .define("GGML_COMMIT", to: "\"009a1133\""),
+                .define("GGML_VERSION", to: "\"0.14.0\""),
+                .define("GGML_COMMIT", to: "\"b9592\""),
                 .define("LLAMA_USE_HTTPLIB", to: "1"),
                 .define("LLAMA_SHARED", to: "1"),
                 .define("GGML_USE_CPU", to: "1"),
@@ -104,6 +90,7 @@ let package = Package(
                 .define("GGML_METAL_EMBED_LIBRARY", to: "1"),
                 .define("GGML_USE_ACCELERATE", to: "1"),
                 .define("GGML_BLAS_USE_ACCELERATE", to: "1"),
+                .define("GGML_CPU_GENERIC", to: "1"),
                 .define("ACCELERATE_NEW_LAPACK", to: "1"),
                 .define("ACCELERATE_LAPACK_ILP64", to: "1"),
                 .define("NOEMA_LLAMA_SERVER_TEST_HOOKS", .when(configuration: .debug)),
@@ -119,8 +106,8 @@ let package = Package(
                     "-fno-coverage-mapping"
                 ]),
                 .headerSearchPath("upstream"),
-                .headerSearchPath("upstream/src"),
                 .headerSearchPath("upstream/common"),
+                .headerSearchPath("upstream/src"),
                 .headerSearchPath("upstream/tools/server"),
                 .headerSearchPath("upstream/vendor"),
                 .headerSearchPath("upstream/vendor/cpp-httplib"),
@@ -132,11 +119,13 @@ let package = Package(
                 .headerSearchPath("upstream/ggml/include"),
                 .headerSearchPath("upstream/ggml/src"),
                 .headerSearchPath("upstream/ggml/src/ggml-cpu"),
-                .headerSearchPath("upstream/tools/mtmd")
+                .headerSearchPath("upstream/ggml/src/ggml-metal"),
+                .headerSearchPath("upstream/tools/mtmd"),
+                .headerSearchPath("upstream/tools/ui")
             ],
             cxxSettings: [
-                .define("GGML_VERSION", to: "\"0.9.11\""),
-                .define("GGML_COMMIT", to: "\"009a1133\""),
+                .define("GGML_VERSION", to: "\"0.14.0\""),
+                .define("GGML_COMMIT", to: "\"b9592\""),
                 .define("LLAMA_USE_HTTPLIB", to: "1"),
                 .define("LLAMA_SHARED", to: "1"),
                 .define("GGML_USE_CPU", to: "1"),
@@ -144,6 +133,7 @@ let package = Package(
                 .define("GGML_METAL_EMBED_LIBRARY", to: "1"),
                 .define("GGML_USE_ACCELERATE", to: "1"),
                 .define("GGML_BLAS_USE_ACCELERATE", to: "1"),
+                .define("GGML_CPU_GENERIC", to: "1"),
                 .define("ACCELERATE_NEW_LAPACK", to: "1"),
                 .define("ACCELERATE_LAPACK_ILP64", to: "1"),
                 .define("NOEMA_LLAMA_SERVER_TEST_HOOKS", .when(configuration: .debug)),
@@ -160,8 +150,8 @@ let package = Package(
                     "-fno-coverage-mapping"
                 ]),
                 .headerSearchPath("upstream"),
-                .headerSearchPath("upstream/src"),
                 .headerSearchPath("upstream/common"),
+                .headerSearchPath("upstream/src"),
                 .headerSearchPath("upstream/tools/server"),
                 .headerSearchPath("upstream/vendor"),
                 .headerSearchPath("upstream/vendor/cpp-httplib"),
@@ -173,13 +163,11 @@ let package = Package(
                 .headerSearchPath("upstream/ggml/include"),
                 .headerSearchPath("upstream/ggml/src"),
                 .headerSearchPath("upstream/ggml/src/ggml-cpu"),
-                .headerSearchPath("upstream/tools/mtmd")
+                .headerSearchPath("upstream/ggml/src/ggml-metal"),
+                .headerSearchPath("upstream/tools/mtmd"),
+                .headerSearchPath("upstream/tools/ui")
             ],
-            linkerSettings: [
-                // If Xcode reuses an already instrumented package object while coverage
-                // is enabled on the app scheme, make the package framework link resilient.
-                .unsafeFlags(["-fprofile-instr-generate"], .when(configuration: .debug))
-            ]
+            linkerSettings: []
         ),
         .testTarget(
             name: "NoemaLLamaServerTests",

@@ -20,6 +20,7 @@ struct VisionStoredPanel: View {
     @State private var selectedRemoteID: IdentifiableBackendID?
     @State private var showRemoteBackendForm = false
     @State private var showImporter = false
+    @State private var importNotice: String?
     @State private var pendingPickedURLs: [URL] = []
     @State private var showNameSheet = false
     @State private var datasetName: String = ""
@@ -100,15 +101,21 @@ struct VisionStoredPanel: View {
                       allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls):
-                let filtered = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) }
-                guard !filtered.isEmpty else { return }
-                pendingPickedURLs = filtered
-                datasetName = suggestName(from: filtered) ?? String(localized: "Imported Dataset")
+                let accepted = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) || TranscriptionMediaSupport.isSupported($0) }
+                guard !accepted.isEmpty else {
+                    // Everything picked was unsupported (e.g. CSV/TSV) — tell the user
+                    // instead of silently doing nothing.
+                    importNotice = DatasetDocumentSupport.skippedMessage(for: urls)
+                    return
+                }
+                pendingPickedURLs = accepted
+                datasetName = suggestName(from: accepted) ?? String(localized: "Imported Dataset")
                 showNameSheet = true
             case .failure:
                 break
             }
         }
+        .datasetImportNotice($importNotice)
         .sheet(isPresented: $showNameSheet) {
             DatasetImportNamePromptView(
                 datasetName: $datasetName,
@@ -117,6 +124,9 @@ struct VisionStoredPanel: View {
             )
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
+        }
+        .alert(item: $datasetManager.embedAlert) { info in
+            Alert(title: Text(info.message))
         }
         .confirmationDialog(
             String(localized: "Model doesn't support GPU offload"),
@@ -818,24 +828,9 @@ struct VisionStoredPanel: View {
         colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08)
     }
 
-    private func allowedUTTypes() -> [UTType] {
-        var types: [UTType] = [.pdf, .plainText, .epub, .commaSeparatedText]
-        types.append(.json)
-        if let markdown = UTType(filenameExtension: "md") {
-            types.append(markdown)
-        }
-        if let jsonl = UTType(filenameExtension: "jsonl") {
-            types.append(jsonl)
-        }
-        if let tsv = UTType(filenameExtension: "tsv") {
-            types.append(tsv)
-        }
-        return types
-    }
+    private func allowedUTTypes() -> [UTType] { DatasetDocumentSupport.allowedUTTypes() }
 
-    private func allowedExtensions() -> Set<String> {
-        ["pdf", "txt", "epub", "csv", "md", "json", "jsonl", "tsv"]
-    }
+    private func allowedExtensions() -> Set<String> { DatasetDocumentSupport.acceptedExtensions }
 
     private func suggestName(from urls: [URL]) -> String? {
         guard let first = urls.first else { return nil }
@@ -911,6 +906,9 @@ struct VisionStoredPanel: View {
                 break
             case .afm:
                 loadURL = InstalledModelsStore.baseDir(for: .afm, modelID: model.modelID)
+                try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
+            case .coreai:
+                loadURL = InstalledModelsStore.baseDir(for: .coreai, modelID: model.modelID)
                 try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
             }
 

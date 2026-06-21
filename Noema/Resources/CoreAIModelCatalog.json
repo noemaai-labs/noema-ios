@@ -1,0 +1,338 @@
+{
+  "version": 1,
+  "source": "https://github.com/apple/coreai-models",
+  "note": "Snapshot of apple/coreai-models model_registry.py. These are export recipes: running requires a side-loaded .aimodel exported with Apple's Core AI tooling (macOS, Xcode 27+).",
+  "models": [
+    {
+      "shortName": "qwen3-0.6b",
+      "hfId": "Qwen/Qwen3-0.6B",
+      "family": "qwen3",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 8192 },
+        { "platform": "iOS", "compression": "mixed_4bit_8bit", "computePrecision": "float16", "maxContextLength": 4096 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "qwen2.5-1.5b-instruct",
+      "hfId": "Qwen/Qwen2.5-1.5B-Instruct",
+      "family": "qwen2.5",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 32768 },
+        { "platform": "iOS", "compression": "4bit_weight_palettized_group8", "computePrecision": "float16", "maxContextLength": 4096 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "qwen3-4b",
+      "hfId": "Qwen/Qwen3-4B",
+      "family": "qwen3",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 40960 },
+        { "platform": "iOS", "compression": "mixed_4bit_8bit", "computePrecision": "float16", "maxContextLength": 4096 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "qwen3-8b",
+      "hfId": "Qwen/Qwen3-8B",
+      "family": "qwen3",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 40960 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "qwen3-coder-30b-a3b-instruct",
+      "hfId": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "family": "qwen3",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 262144 }
+      ],
+      "notes": "Mixture-of-Experts (A3B active)."
+    },
+    {
+      "shortName": "gemma3-4b-it",
+      "hfId": "google/gemma-3-4b-it",
+      "family": "gemma3",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "bfloat16", "maxContextLength": 131072 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "gemma3-12b-it",
+      "hfId": "google/gemma-3-12b-it",
+      "family": "gemma3",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "bfloat16", "maxContextLength": 131072 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "mistral-7b-instruct-v0.3",
+      "hfId": "mistralai/Mistral-7B-Instruct-v0.3",
+      "family": "mistral",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 8192 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "mixtral-8x7b-instruct-v0.1",
+      "hfId": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+      "family": "mixtral",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": 32768 }
+      ],
+      "notes": "Mixture-of-Experts (8x7B)."
+    },
+    {
+      "shortName": "gpt-oss-20b",
+      "hfId": "openai/gpt-oss-20b",
+      "family": "gpt-oss",
+      "type": "llm",
+      "task": "text-generation",
+      "platforms": ["macOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "none", "computePrecision": "bfloat16", "maxContextLength": 32768 }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "sd-1.5",
+      "hfId": "runwayml/stable-diffusion-v1-5",
+      "family": "stable-diffusion",
+      "type": "diffusion",
+      "task": "text-to-image",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "none", "computePrecision": "float16", "maxContextLength": null }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "sd-2.1",
+      "hfId": "sd2-community/stable-diffusion-2-1",
+      "family": "stable-diffusion",
+      "type": "diffusion",
+      "task": "text-to-image",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "none", "computePrecision": "float16", "maxContextLength": null }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "sd-3.5-medium",
+      "hfId": "stabilityai/stable-diffusion-3.5-medium",
+      "family": "stable-diffusion-3",
+      "type": "diffusion",
+      "task": "text-to-image",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "none", "computePrecision": "float16", "maxContextLength": null }
+      ],
+      "notes": null
+    },
+    {
+      "shortName": "flux2-klein-4b",
+      "hfId": "black-forest-labs/FLUX.2-klein-4B",
+      "family": "flux2",
+      "type": "diffusion",
+      "task": "text-to-image",
+      "platforms": ["macOS", "iOS"],
+      "variants": [
+        { "platform": "macOS", "compression": "4bit", "computePrecision": "float16", "maxContextLength": null }
+      ],
+      "notes": "4bit recommended; use --compression none for full precision."
+    },
+    {
+      "shortName": "clip-vit-b32",
+      "hfId": "openai/clip-vit-base-patch32",
+      "family": "clip",
+      "type": "utility",
+      "task": "embedding",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/clip/export.py"
+    },
+    {
+      "shortName": "clap-htsat",
+      "hfId": "laion/clap-htsat-unfused",
+      "family": "clap",
+      "type": "utility",
+      "task": "embedding",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/clap/export.py"
+    },
+    {
+      "shortName": "whisper-large-v3-turbo",
+      "hfId": "openai/whisper-large-v3-turbo",
+      "family": "whisper",
+      "type": "utility",
+      "task": "asr",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/whisper/export.py"
+    },
+    {
+      "shortName": "whisper-large-v3",
+      "hfId": "openai/whisper-large-v3",
+      "family": "whisper",
+      "type": "utility",
+      "task": "asr",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/whisper/export.py"
+    },
+    {
+      "shortName": "wav2vec2-base",
+      "hfId": "wav2vec2_asr_base_960h",
+      "family": "wav2vec2",
+      "type": "utility",
+      "task": "asr",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/wav2vec2/export.py"
+    },
+    {
+      "shortName": "yolos-base",
+      "hfId": "hustvl/yolos-base",
+      "family": "yolo",
+      "type": "utility",
+      "task": "detection",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/yolo/export.py"
+    },
+    {
+      "shortName": "yolos-tiny",
+      "hfId": "hustvl/yolos-tiny",
+      "family": "yolo",
+      "type": "utility",
+      "task": "detection",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/yolo/export.py"
+    },
+    {
+      "shortName": "efficient-sam-vitt",
+      "hfId": "efficient_sam_vitt",
+      "family": "efficient-sam",
+      "type": "utility",
+      "task": "segmentation",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/efficient-sam/export.py"
+    },
+    {
+      "shortName": "sam3",
+      "hfId": "facebook/sam3",
+      "family": "sam3",
+      "type": "utility",
+      "task": "segmentation",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/sam3/export.py"
+    },
+    {
+      "shortName": "depth-anything-3-small",
+      "hfId": "depth-anything/da3-small",
+      "family": "depth-anything",
+      "type": "utility",
+      "task": "depth",
+      "platforms": ["macOS"],
+      "variants": [],
+      "notes": "Export: models/depth-anything/export.py"
+    },
+    {
+      "shortName": "edsr-x2",
+      "hfId": "edsr_r16f64_x2",
+      "family": "edsr",
+      "type": "utility",
+      "task": "super-resolution",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/edsr/export.py"
+    },
+    {
+      "shortName": "roberta-base",
+      "hfId": "roberta-base",
+      "family": "roberta",
+      "type": "utility",
+      "task": "encoding",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/roberta/export.py"
+    },
+    {
+      "shortName": "t5-small",
+      "hfId": "google-t5/t5-small",
+      "family": "t5",
+      "type": "utility",
+      "task": "encoding",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/t5/export.py"
+    },
+    {
+      "shortName": "t5-base",
+      "hfId": "google-t5/t5-base",
+      "family": "t5",
+      "type": "utility",
+      "task": "encoding",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/t5/export.py"
+    },
+    {
+      "shortName": "t5-large",
+      "hfId": "google-t5/t5-large",
+      "family": "t5",
+      "type": "utility",
+      "task": "encoding",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/t5/export.py"
+    },
+    {
+      "shortName": "pvt-v2-b0",
+      "hfId": "pvt_v2_b0",
+      "family": "pvt",
+      "type": "utility",
+      "task": "classification",
+      "platforms": ["iOS", "macOS"],
+      "variants": [],
+      "notes": "Export: models/pvt/export.py"
+    }
+  ]
+}

@@ -89,6 +89,31 @@ final class ContextOverflowBannerTests: XCTestCase {
     }
 
     @MainActor
+    func testDismissActiveContextOverflowBannerOnlyClearsActiveSession() {
+        let vm = makeChatVMWithTwoSessions()
+        let sessionA = vm.sessions[0]
+        let sessionB = vm.sessions[1]
+
+        vm.activeSessionID = sessionA.id
+        vm.registerContextOverflowForTesting(
+            strategy: .rollingWindow,
+            promptTokens: 5_000,
+            contextTokens: 4_096
+        )
+        vm.activeSessionID = sessionB.id
+        vm.registerContextOverflowForTesting(
+            strategy: .truncateMiddle,
+            promptTokens: 6_000,
+            contextTokens: 4_096
+        )
+
+        vm.dismissActiveContextOverflowBanner()
+
+        XCTAssertNil(vm.contextOverflowBanner(for: sessionB.id))
+        XCTAssertEqual(vm.contextOverflowBanner(for: sessionA.id)?.strategy, .rollingWindow)
+    }
+
+    @MainActor
     private func makeChatVMWithTwoSessions() -> ChatVM {
         let vm = ChatVM()
         let sessionA = ChatVM.Session(

@@ -81,6 +81,7 @@ private let toolMetadataMap: [String: ToolMetadata] = [
     "noema.dataset.search": ToolMetadata(displayName: "Dataset Search", iconName: "doc.text.magnifyingglass"),
     "noema.code.analyze": ToolMetadata(displayName: "Code Analysis", iconName: "curlybraces"),
     "noema.math.calculate": ToolMetadata(displayName: "Calculator", iconName: "function"),
+    "noema.units.convert": ToolMetadata(displayName: "Unit Converter", iconName: "arrow.left.arrow.right"),
     "noema.image.analyze": ToolMetadata(displayName: "Image Analysis", iconName: "photo"),
     "noema.file.read": ToolMetadata(displayName: "File Reader", iconName: "doc"),
     "noema.system.info": ToolMetadata(displayName: "System Info", iconName: "info.circle"),
@@ -97,6 +98,10 @@ private func normalizeToolName(_ raw: String) -> String {
     if raw == "noema_python_execute" { return "noema.python.execute" }
     if raw == "noema.memory" { return "noema.memory" }
     if raw == "noema_memory" { return "noema.memory" }
+    if raw == "noema.math.calculate" { return "noema.math.calculate" }
+    if raw == "noema_math_calculate" { return "noema.math.calculate" }
+    if raw == "noema.units.convert" { return "noema.units.convert" }
+    if raw == "noema_units_convert" { return "noema.units.convert" }
     let lower = raw.lowercased()
     if lower == "web_search" || lower == "web.search" || lower == "websearch" || lower == "web-search" {
         return "noema.web.retrieve"
@@ -109,6 +114,14 @@ private func normalizeToolName(_ raw: String) -> String {
     if lower == "memory" || lower == "memory_tool" || lower == "memorytool"
         || lower == "persistent_memory" || lower == "persistent-memory" {
         return "noema.memory"
+    }
+    if lower == "calculator" || lower == "calculate" || lower == "math"
+        || lower == "math_calculate" || lower == "math.calculate" || lower == "math-calculate" {
+        return "noema.math.calculate"
+    }
+    if lower == "unit_converter" || lower == "unit-converter" || lower == "unitconverter"
+        || lower == "units_convert" || lower == "units.convert" || lower == "convert_units" {
+        return "noema.units.convert"
     }
     return raw
 }
@@ -486,9 +499,9 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
             requestStatus = normalizedRequestStatus(from: statusRaw)
             error = try container.decodeIfPresent(String.self, forKey: .error)
 
-            if let args = try container.decodeIfPresent([String: AnyCodable].self, forKey: .args) {
+            if let args = try? container.decode([String: AnyCodable].self, forKey: .args) {
                 self.args = args
-            } else if let args = try container.decodeIfPresent([String: AnyCodable].self, forKey: .arguments) {
+            } else if let args = try? container.decode([String: AnyCodable].self, forKey: .arguments) {
                 self.args = args
             } else if let argsString = try container.decodeIfPresent(String.self, forKey: .args)
                         ?? container.decodeIfPresent(String.self, forKey: .arguments),
@@ -604,6 +617,28 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
                 return nil
             }
         }
+
+        if ToolDryRunSupport.isEnabled {
+            let outString = ToolDryRunSupport.resultString(toolName: canonicalTool, arguments: clampedArgs)
+            await logger.log("[Tool] Dry-run recorded \(canonicalTool) with args: \(clampedArgs)")
+            if let sigData = try? JSONSerialization.data(withJSONObject: ["tool": canonicalTool, "args": clampedArgs], options: [.sortedKeys]),
+               let signature = String(data: sigData, encoding: .utf8) {
+                await ToolScanRegistry.shared.markDispatched(signature, for: messageIndex)
+            }
+            _ = upsertToolCall(
+                messageIndex: messageIndex,
+                chatVM: chatVM,
+                toolName: canonicalTool,
+                requestParams: displayParamsForExecution,
+                phase: .completed,
+                externalToolCallID: call.externalToolCallID,
+                result: outString,
+                error: nil
+            )
+            await ToolScanRegistry.shared.clearPlaceholder(placeholderSig, for: messageIndex)
+            return ("TOOL_RESULT: \(outString)", trailing.isEmpty ? nil : trailing)
+        }
+
         await logger.log("[Tool] Invoking \(canonicalTool) with args: \(clampedArgs)")
         let argsData = try JSONSerialization.data(withJSONObject: clampedArgs)
 
@@ -960,18 +995,23 @@ func interceptEmbeddedToolCallIfPresent(
             let lower = jsonString.lowercased()
             let looksLikeResultOnly = lower.contains("\"result\"") && !(lower.contains("\"tool_name\"") || lower.contains("\"name\"") || lower.contains("\"tool\""))
             if !looksLikeResultOnly {
+                // Qwen/Hermes models emit `<function=…><parameter=…>` inside <tool_call>
+                // instead of JSON. Convert it so it dispatches like any other call.
+                let candidateJSON = jsonString.contains("<function=")
+                    ? (xmlFunctionCallToJSON(jsonString) ?? jsonString)
+                    : jsonString
                 let before = String(textBuffer[..<start.lowerBound])
                 var after = String(textBuffer[end.upperBound...])
                 while after.first?.isWhitespace == true { after.removeFirst() }
                 if let result = await finalizeCandidate(
-                    jsonString: jsonString,
+                    jsonString: candidateJSON,
                     before: before,
                     after: after,
-                    logPrefix: "[Tool][Scan] Extracted candidate inside <tool_call>: \(jsonString.prefix(220))…"
+                    logPrefix: "[Tool][Scan] Extracted candidate inside <tool_call>: \(candidateJSON.prefix(220))…"
                 ) {
                     return result
                 } else {
-                    let trimmed = jsonString.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmed = candidateJSON.trimmingCharacters(in: .whitespacesAndNewlines)
                     let hasBraces = trimmed.contains("{") && trimmed.contains("}")
                     if hasBraces {
                         await logger.log("[Tool][Scan] JSON inside <tool_call> could not be parsed; leaving for fallback scan")
@@ -994,6 +1034,21 @@ func interceptEmbeddedToolCallIfPresent(
             // object after <tool_call> and dispatch immediately. This covers cases where
             // stop tokens cut the stream before </tool_call> is emitted.
             let tail = String(textBuffer[start.upperBound...])
+            // Qwen/Hermes XML form may also be cut before </tool_call>; convert and
+            // dispatch as soon as the function block itself is complete (</function>).
+            if tail.contains("<function="), tail.contains("</function>"),
+               let candidateJSON = xmlFunctionCallToJSON(tail) {
+                let before = String(textBuffer[..<start.lowerBound])
+                let after = tail.range(of: "</function>").map { String(tail[$0.upperBound...]) } ?? ""
+                if let result = await finalizeCandidate(
+                    jsonString: candidateJSON,
+                    before: before,
+                    after: after,
+                    logPrefix: "[Tool][Scan] Converted XML function call after open <tool_call>: \(candidateJSON.prefix(220))…"
+                ) {
+                    return result
+                }
+            }
             if let firstBrace = tail.firstIndex(of: "{"),
                let lastBrace = findMatchingBrace(in: tail, startingFrom: firstBrace) {
                 let candidate = String(tail[firstBrace...lastBrace])
@@ -1038,6 +1093,68 @@ func interceptEmbeddedToolCallIfPresent(
 
 
 @MainActor
+/// Converts a Qwen/Hermes-style XML function call into the canonical JSON shape
+/// `{"name": <fn>, "arguments": { ... }}` so it can flow through the normal JSON
+/// dispatch path. Returns nil if no `<function=...>` block is present.
+///
+/// The Qwen3.5 chat template emits tool calls as:
+///   <tool_call>
+///   <function=noema.web.retrieve>
+///   <parameter=count>
+///   3
+///   </parameter>
+///   <parameter=query>
+///   latest news
+///   </parameter>
+///   </function>
+///   </tool_call>
+/// which the JSON-oriented scanner otherwise scrubs without ever dispatching.
+private func xmlFunctionCallToJSON(_ body: String) -> String? {
+    // Coerce a raw `<parameter>` value into a JSON-friendly scalar so numeric/boolean
+    // arguments (e.g. `count`) survive as numbers instead of strings.
+    func coerceValue(_ s: String) -> Any {
+        if s == "true" { return true }
+        if s == "false" { return false }
+        if let i = Int(s) { return i }
+        if s.contains(where: { $0 == "." || $0 == "e" || $0 == "E" }), let d = Double(s) { return d }
+        return s
+    }
+
+    guard let fnRange = body.range(of: "<function=") else { return nil }
+    let afterFn = body[fnRange.upperBound...]
+    guard let nameEnd = afterFn.firstIndex(of: ">") else { return nil }
+    let name = String(afterFn[..<nameEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else { return nil }
+
+    var arguments: [String: Any] = [:]
+    var cursor = afterFn[afterFn.index(after: nameEnd)...]
+    while let paramOpen = cursor.range(of: "<parameter=") {
+        let afterParam = cursor[paramOpen.upperBound...]
+        guard let keyEnd = afterParam.firstIndex(of: ">") else { break }
+        let key = String(afterParam[..<keyEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let afterKey = afterParam[afterParam.index(after: keyEnd)...]
+        // The value runs until the closing </parameter>. If it's missing the stream
+        // was cut mid-parameter, so stop and use whatever complete params we have.
+        guard let close = afterKey.range(of: "</parameter>") else { break }
+        let valueString = String(afterKey[..<close.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty {
+            arguments[key] = coerceValue(valueString)
+        }
+        cursor = afterKey[close.upperBound...]
+    }
+
+    // Require either at least one parsed parameter or a fully-closed function block,
+    // so we don't dispatch on a half-streamed call.
+    guard !arguments.isEmpty || body.contains("</function>") else { return nil }
+
+    let payload: [String: Any] = ["name": name, "arguments": arguments]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+          let json = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    return json
+}
+
 private func dispatchParsedToolCallJSON(jsonString: String, messageIndex: Int? = nil, chatVM: ChatVM? = nil) async -> String? {
     // Clean wrappers and code fences, then extract the first complete JSON object
     func stripFencesAndTags(_ s: String) -> String {
@@ -1079,6 +1196,48 @@ private func dispatchParsedToolCallJSON(jsonString: String, messageIndex: Int? =
             i = s.index(after: i)
         }
         return out
+    }
+    func extractArgumentsObjectJSON(_ s: String) -> String? {
+        for key in ["\"arguments\"", "\"args\"", "arguments", "args", "'arguments'", "'args'"] {
+            guard let keyRange = s.range(of: key),
+                  let colon = s.range(of: ":", range: keyRange.upperBound..<s.endIndex)?.lowerBound else {
+                continue
+            }
+
+            var valueStart = s.index(after: colon)
+            while valueStart < s.endIndex, s[valueStart].isWhitespace {
+                valueStart = s.index(after: valueStart)
+            }
+            guard valueStart < s.endIndex else { continue }
+
+            if s[valueStart] == "{" {
+                let tail = String(s[valueStart...])
+                if let close = findMatchingBrace(in: tail, startingFrom: tail.startIndex) {
+                    return String(tail[tail.startIndex...close])
+                }
+            } else if s[valueStart] == "\"" {
+                var literal = "\""
+                var index = s.index(after: valueStart)
+                var escape = false
+                while index < s.endIndex {
+                    let char = s[index]
+                    literal.append(char)
+                    if escape {
+                        escape = false
+                    } else if char == "\\" {
+                        escape = true
+                    } else if char == "\"" {
+                        if let data = literal.data(using: .utf8),
+                           let decoded = try? JSONSerialization.jsonObject(with: data) as? String {
+                            return decoded
+                        }
+                        break
+                    }
+                    index = s.index(after: index)
+                }
+            }
+        }
+        return nil
     }
 
     let cleaned = stripFencesAndTags(jsonString)
@@ -1165,18 +1324,7 @@ private func dispatchParsedToolCallJSON(jsonString: String, messageIndex: Int? =
             return nil
         }
         func bestEffortArgsFromText(_ s: String) -> String? {
-            // Find the object after arguments/args key and return a balanced {...}
-            for key in ["\"arguments\"", "\"args\"", "arguments", "args", "'arguments'", "'args'"] {
-                if let keyRange = s.range(of: key),
-                   let colon = s.range(of: ":", range: keyRange.upperBound..<s.endIndex)?.lowerBound,
-                   let open = s[colon..<s.endIndex].firstIndex(of: "{") {
-                    let tail = String(s[open...])
-                    if let close = findMatchingBrace(in: tail, startingFrom: tail.startIndex) {
-                        return String(tail[tail.startIndex...close])
-                    }
-                }
-            }
-            return nil
+            extractArgumentsObjectJSON(s)
         }
         if let tn = bestEffortToolNameNoJSON(cleaned), let argsJSON = bestEffortArgsFromText(cleaned) {
             let canonical = normalizeToolName(tn)
@@ -1221,9 +1369,9 @@ private func dispatchParsedToolCallJSON(jsonString: String, messageIndex: Int? =
             } else {
                 self.tool_name = try container.decode(String.self, forKey: .tool)
             }
-            if let args = try container.decodeIfPresent([String: AnyCodable].self, forKey: .arguments) {
+            if let args = try? container.decode([String: AnyCodable].self, forKey: .arguments) {
                 self.arguments = args
-            } else if let args = try container.decodeIfPresent([String: AnyCodable].self, forKey: .args) {
+            } else if let args = try? container.decode([String: AnyCodable].self, forKey: .args) {
                 self.arguments = args
             } else if let argsString = try container.decodeIfPresent(String.self, forKey: .arguments) ?? container.decodeIfPresent(String.self, forKey: .args) {
                 // Some models serialize the arguments object as a JSON string; parse it
@@ -1342,18 +1490,7 @@ private func dispatchParsedToolCallJSON(jsonString: String, messageIndex: Int? =
         return nil
     }
     func bestEffortArgsJSON(_ s: String) -> String? {
-        // Find the object after arguments/args key and return a balanced {...}
-        for key in ["\"arguments\"", "\"args\"", "arguments", "args", "'arguments'", "'args'"] {
-            if let keyRange = s.range(of: key),
-               let colon = s.range(of: ":", range: keyRange.upperBound..<s.endIndex)?.lowerBound,
-               let open = s[colon..<s.endIndex].firstIndex(of: "{") {
-                let tail = String(s[open...])
-                if let close = findMatchingBrace(in: tail, startingFrom: tail.startIndex) {
-                    return String(tail[tail.startIndex...close])
-                }
-            }
-        }
-        return nil
+        extractArgumentsObjectJSON(s)
     }
     if let tn = bestEffortToolName(complete), let argsJSON = bestEffortArgsJSON(complete) {
         // Build normalized payload
@@ -1422,6 +1559,12 @@ private func extractToolName(from text: String) -> String? {
     if let tn = extractSingleQuotedValue(forKey: "tool_name", in: text) { return tn }
     if let n = extractSingleQuotedValue(forKey: "name", in: text) { return n }
     if let t = extractSingleQuotedValue(forKey: "tool", in: text) { return t }
+    // Qwen/Hermes XML form: <function=noema.web.retrieve>
+    if let fnRange = text.range(of: "<function="),
+       let nameEnd = text[fnRange.upperBound...].firstIndex(of: ">") {
+        let name = String(text[fnRange.upperBound..<nameEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty { return name }
+    }
     return nil
 }
 

@@ -38,9 +38,30 @@ final class NetworkBlockedURLProtocol: URLProtocol {
 
     override func stopLoading() {}
 }
+
+struct NetworkBlockedAttempt: Identifiable, Hashable {
+    let id: UUID
+    let urlString: String
+    let host: String
+    let blockedAt: Date
+
+    init(url: URL, blockedAt: Date = Date()) {
+        self.id = UUID()
+        self.urlString = url.absoluteString
+        self.host = url.host ?? url.absoluteString
+        self.blockedAt = blockedAt
+    }
+}
+
 enum NetworkKillSwitch {
     private static let enabledState = LockIsolated(false)
     private static let allowedLoopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
+    private static let blockedAttempts = LockIsolated<[NetworkBlockedAttempt]>([])
+    private static let maxBlockedAttempts = 25
+    /// HTTPS hosts exempt from the kill switch while an enterprise off-grid policy is
+    /// active — only the workspace policy server, so policy sync and revocation can still
+    /// reach a device that policy forced off-grid. Set by EnterprisePolicyManager.
+    private static let enterpriseAllowedHosts = LockIsolated<Set<String>>([])
 
     /// Weakly-held set of URLSession instances to cancel when the switch is enabled
     private static let trackedSessions = LockIsolated(NSHashTable<AnyObject>.weakObjects())
@@ -71,13 +92,32 @@ enum NetworkKillSwitch {
         return false
     }
 
+    /// True when `url` targets an HTTPS host on the enterprise policy-server allowlist.
+    static func isEnterpriseAllowed(url: URL?) -> Bool {
+        guard let scheme = url?.scheme?.lowercased(), scheme == "https",
+              let host = url?.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !host.isEmpty else {
+            return false
+        }
+        return enterpriseAllowedHosts.withValue { $0.contains(host) }
+    }
+
+    /// Replace the enterprise allowlist (empty set clears it). HTTPS only.
+    static func setEnterpriseAllowedHosts(_ hosts: Set<String>) {
+        enterpriseAllowedHosts.withMutableValue { $0 = Set(hosts.map { $0.lowercased() }) }
+    }
+
     static func shouldBlock(url: URL?) -> Bool {
         guard isEnabled else { return false }
         guard let scheme = url?.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
             return false
         }
-        return !isLoopback(url: url)
+        let blocked = !isLoopback(url: url) && !isEnterpriseAllowed(url: url)
+        if blocked, let url {
+            recordBlockedAttempt(url)
+        }
+        return blocked
     }
 
     static func shouldBlock(request: URLRequest) -> Bool {
@@ -87,6 +127,23 @@ enum NetworkKillSwitch {
     /// Register a session to be cancelled if off-grid is turned on while it's active.
     static func track(session: URLSession) {
         trackedSessions.withMutableValue { $0.add(session) }
+    }
+
+    static var recentBlockedAttempts: [NetworkBlockedAttempt] {
+        blockedAttempts.withValue { $0 }
+    }
+
+    static func clearBlockedAttempts() {
+        blockedAttempts.withMutableValue { $0.removeAll() }
+    }
+
+    static func wouldBlock(url: URL?, assumingEnabled: Bool = true) -> Bool {
+        guard assumingEnabled else { return false }
+        guard let scheme = url?.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return false
+        }
+        return !isLoopback(url: url) && !isEnterpriseAllowed(url: url)
     }
 
     /// Enable or disable the global kill switch.
@@ -126,6 +183,15 @@ enum NetworkKillSwitch {
             Task { LeapBundleDownloader.shared.cancelAll() }
         } else {
             URLProtocol.unregisterClass(NetworkBlockedURLProtocol.self)
+        }
+    }
+
+    private static func recordBlockedAttempt(_ url: URL) {
+        blockedAttempts.withMutableValue { attempts in
+            attempts.insert(NetworkBlockedAttempt(url: url), at: 0)
+            if attempts.count > maxBlockedAttempts {
+                attempts.removeLast(attempts.count - maxBlockedAttempts)
+            }
         }
     }
 }

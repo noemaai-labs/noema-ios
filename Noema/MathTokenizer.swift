@@ -3,8 +3,10 @@
 //  Noema
 //
 //  Splits text into text and LaTeX math segments.
-//  Supports inline ($...$, \(...\)) and block ($$...$$, \[...\]) math.
-//  Handles escaped dollars (\\$) so they are not treated as delimiters.
+//  Supports inline (\(...\), $...$) and block ($$...$$, \[...\]) math.
+//  Single $ is parsed as inline math only when it passes Pandoc-style delimiter
+//  rules and a currency guard (see dollarSpanIsMath), so amounts like
+//  "$70 million ... $20" stay literal instead of rendering as LaTeX.
 
 import Foundation
 
@@ -12,7 +14,7 @@ public enum MathToken: Equatable {
     case text(String)
     case inline(String)
     case block(String)
-    /// Represents an unterminated/incomplete LaTeX segment (e.g., unclosed $, $$, \(, or \[).
+    /// Represents an unterminated/incomplete LaTeX segment (e.g., unclosed $$, \(, or \[).
     /// Renderers should show this as plain red text without attempting LaTeX formatting.
     case incomplete(String)
 }
@@ -20,7 +22,7 @@ public enum MathToken: Equatable {
 public struct MathTokenizer {
     // MARK: - Minimal inline LaTeX heuristics (no $ delimiters)
     /// Splits a plain text run into `.text` and `.inline` tokens by recognizing
-    /// specific TeX macros even when they are not wrapped in `$...` or `\(...\)`.
+    /// specific TeX macros even when they are not wrapped in `\(...\)`.
     ///
     /// Currently supported:
     /// - `\frac{numerator}{denominator}` (ends the inline span at the closing brace
@@ -275,6 +277,33 @@ public struct MathTokenizer {
         return s
     }
 
+    /// Currency guard for single-`$` spans: decides whether the text between two
+    /// `$` delimiters reads as math (render as LaTeX) or as an amount/prose
+    /// (leave literal). Errs toward leaving number-led or multi-word content as
+    /// plain text, since `$5`, `$20`, and `$70 million` are far more common in
+    /// chat than bare-dollar math. Content carrying explicit TeX structure
+    /// (`\`, `^`, `_`, `{`, `}`) always counts as math.
+    static func dollarSpanIsMath(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return false }
+        // Unambiguous TeX structure → always math (e.g. \lambda, x^2, \mathbf{v}).
+        let structural: Set<Character> = ["\\", "^", "_", "{", "}"]
+        if s.contains(where: { structural.contains($0) }) { return true }
+        // Amounts/numbers (20, 1,000, 3.50, "70 million"): a leading digit reads
+        // as currency, not math.
+        if let first = s.first, first.isNumber { return false }
+        // A symbol/variable/expression needs at least one letter.
+        guard s.contains(where: { $0.isLetter }) else { return false }
+        // Multi-word plain prose ("the value") is not math unless it carries an
+        // arithmetic/relational operator ("a + b", "x = 5").
+        if s.contains(" ") {
+            let operators: Set<Character> = ["+", "-", "=", "*", "/", "<", ">", "|"]
+            return s.contains(where: { operators.contains($0) })
+        }
+        // Single symbolic token starting with a letter (A, x, pi, theta, …).
+        return true
+    }
+
     public static func tokenize(_ input: String) -> [MathToken] {
         guard !input.isEmpty else { return [] }
         var tokens: [MathToken] = []
@@ -303,7 +332,7 @@ public struct MathTokenizer {
         while cursor < end {
             let ch = input[cursor]
 
-            // Block $$ ... $$
+            // Block $$ ... $$  or inline $ ... $
             if ch == "$" && !isEscaped(cursor) {
                 let next = input.index(after: cursor)
                 if next < end && input[next] == "$" && !isEscaped(next) {
@@ -333,75 +362,42 @@ public struct MathTokenizer {
                         textStart = cursor
                         break
                     }
-                }
-            }
-
-            // Inline $ ... $
-            if ch == "$" && !isEscaped(cursor) {
-                func isAlphaNumeric(_ c: Character) -> Bool {
-                    c.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
-                }
-                func isDigit(_ c: Character) -> Bool {
-                    c.unicodeScalars.allSatisfy { CharacterSet.decimalDigits.contains($0) }
-                }
-
-                let prevChar: Character? = (cursor > input.startIndex) ? input[input.index(before: cursor)] : nil
-                let prevIsAlphaNum = prevChar.map { isAlphaNumeric($0) } ?? false
-                let nextIndex = input.index(after: cursor)
-
-                // Find matching closing "$"
-                var i = nextIndex
-                var close: String.Index?
-                while i < end {
-                    if input[i] == "$" && !isEscaped(i) { close = i; break }
-                    i = input.index(after: i)
-                }
-
-                guard let closingIndex = close else {
-                    // No closing "$" — treat as a literal dollar sign (likely currency)
-                    cursor = nextIndex
-                    continue
-                }
-
-                // Slice out the candidate LaTeX content for additional heuristics.
-                let contentRange = input.index(after: cursor)..<closingIndex
-                let rawContent = String(input[contentRange])
-                let trimmedContent = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                // If previous char is alphanumeric (e.g., "US$"), keep treating as literal.
-                if prevIsAlphaNum {
-                    cursor = nextIndex
-                    continue
-                }
-
-                let firstNonSpaceChar = trimmedContent.first
-                let beginsWithDigit = firstNonSpaceChar.map { isDigit($0) } ?? false
-
-                if beginsWithDigit {
-                    let containsMathOperator = rawContent.contains { "+-=×÷*/·^_%".contains($0) }
-                    let containsLatexCommand = rawContent.contains("\\")
-                    let hasInternalWhitespace = rawContent.contains { $0.isWhitespace }
-                    let alnumOnly = !trimmedContent.isEmpty && trimmedContent.allSatisfy { isAlphaNumeric($0) }
-                    let endsWithMathyChar: Bool = {
-                        guard let last = trimmedContent.last else { return false }
-                        if isDigit(last) { return true }
-                        let trailingSet: Set<Character> = [")", "]", "}", ",", ".", ":", ";", "%", "!"]
-                        return trailingSet.contains(last)
-                    }()
-
-                    let looksLikePlainCurrency = !containsMathOperator && !containsLatexCommand && !endsWithMathyChar && !(alnumOnly && !hasInternalWhitespace)
-                    if looksLikePlainCurrency {
-                        cursor = nextIndex
-                        continue
+                } else if next < end, !input[next].isWhitespace {
+                    // Inline single-$ math. Pandoc-style delimiter rules + currency
+                    // guard keep amounts like "$70 million ... $20" literal:
+                    //   • the opening `$` is followed by a non-space (checked above);
+                    //   • the next unescaped `$` on this line must close it, with a
+                    //     non-space immediately before it and no digit immediately
+                    //     after it;
+                    //   • the span content must read as math (dollarSpanIsMath).
+                    // Only the first `$` can close, so a stray `$` can't swallow
+                    // trailing text (e.g. "$70 million ... $20").
+                    var i = next
+                    var matched = false
+                    while i < end {
+                        let c = input[i]
+                        if c == "\n" || c == "\r" { break }
+                        if c == "$" && !isEscaped(i) {
+                            let beforeIdx = input.index(before: i)
+                            let afterIdx = input.index(after: i)
+                            let closerOK = !input[beforeIdx].isWhitespace
+                                && !(afterIdx < end && input[afterIdx].isNumber)
+                            if closerOK {
+                                let content = String(input[next..<i])
+                                if dollarSpanIsMath(content) {
+                                    flushText(upTo: cursor)
+                                    tokens.append(.inline(stripBoxing(content)))
+                                    cursor = input.index(after: i)
+                                    textStart = cursor
+                                    matched = true
+                                }
+                            }
+                            break
+                        }
+                        i = input.index(after: i)
                     }
+                    if matched { continue }
                 }
-
-                flushText(upTo: cursor)
-                let content = input[input.index(after: cursor)..<closingIndex]
-                tokens.append(.inline(stripBoxing(String(content))))
-                cursor = input.index(after: closingIndex)
-                textStart = cursor
-                continue
             }
 
             // Block \[ ... \] or inline \( ... \)

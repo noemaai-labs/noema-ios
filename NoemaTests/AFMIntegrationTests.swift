@@ -228,8 +228,27 @@ final class AFMIntegrationTests: XCTestCase {
         XCTAssertFalse(ToolAvailability.current(currentFormat: .afm).webSearch)
     }
 
-    func testAFMDefaultSettingsUseDefaultGuardrails() {
-        XCTAssertEqual(ModelSettings.default(for: .afm).afmGuardrails, .default)
+    func testAFMDefaultSettingsUsePermissiveGuardrails() {
+        XCTAssertEqual(ModelSettings.default(for: .afm).afmGuardrails, .permissiveContentTransformations)
+    }
+
+    func testAFMGuardrailsExposeSettingsLabels() {
+        XCTAssertEqual(AFMGuardrailsMode.default.titleKey, "Standard")
+        XCTAssertEqual(AFMGuardrailsMode.permissiveContentTransformations.titleKey, "Content Transformation")
+        XCTAssertEqual(
+            AFMGuardrailsMode.permissiveContentTransformations.detailKey,
+            "Allows Apple's permissive content-transformation guardrails for rewriting or transforming user-provided content."
+        )
+    }
+
+    func testAFMClientAlwaysResolvesToPermissiveGuardrails() {
+        // The guardrail is pinned to the most permissive option regardless of what
+        // (if anything) is persisted — including a stored `.default` from older builds.
+        var settings = ModelSettings.default(for: .afm)
+        settings.afmGuardrails = .default
+
+        XCTAssertEqual(AFMLLMClient.resolvedGuardrailsMode(from: settings), .permissiveContentTransformations)
+        XCTAssertEqual(AFMLLMClient.resolvedGuardrailsMode(from: nil), .permissiveContentTransformations)
     }
 
     func testAFMFixedContextNormalizationAlwaysReturns4096() {

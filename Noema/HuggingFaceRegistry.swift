@@ -77,6 +77,14 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
             var filters = ["coreml"]
             if let pipelineFilter { filters.append(pipelineFilter) }
             urlsToFetch = [makeURL(filters: filters, author: requiredAuthor)]
+        } else if format == .coreai {
+            // Core AI repos are tagged "coreai" and/or "aimodel". The HF API ANDs
+            // multiple filters, so fetch both tags separately and dedupe by id.
+            urlsToFetch = ["coreai", "aimodel"].map { tag in
+                var filters = [tag]
+                if let pipelineFilter { filters.append(pipelineFilter) }
+                return makeURL(filters: filters)
+            }
         } else {
             var filters: [String] = []
             if let pipelineFilter { filters.append(pipelineFilter) }
@@ -134,7 +142,13 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
                                 author: entry.author
                             ) else { continue }
                             let tags = entry.tags ?? []
-                            let forcedFormat: ModelFormat? = (format == .ane) ? .ane : nil
+                            let forcedFormat: ModelFormat? = {
+                                switch format {
+                                case .ane: return .ane
+                                case .coreai: return .coreai
+                                default: return nil
+                                }
+                            }()
                             let formats = Self.inferFormats(
                                 tags: tags,
                                 id: entry.modelId,
@@ -279,9 +293,53 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
             )
         }()
 
+        let mtpFile: QuantInfo.AuxiliaryFile? = {
+            let candidates = files.filter { file in
+                let lower = file.path.lowercased()
+                guard lower.hasSuffix(".gguf") || lower.hasSuffix(".gguf_file") else { return false }
+                guard !lower.contains("mmproj"), !lower.contains("projector"), !lower.contains("image_proj") else {
+                    return false
+                }
+                return lower.contains("mtp-") || lower.contains("-mtp") || lower.contains("nextn")
+            }
+            guard let match = candidates.sorted(by: { lhs, rhs in
+                let l = lhs.path.lowercased()
+                let r = rhs.path.lowercased()
+                let lScore = (l.contains("mtp-") || l.contains("-mtp") ? 2 : 0) + (l.contains("nextn") ? 1 : 0)
+                let rScore = (r.contains("mtp-") || r.contains("-mtp") ? 2 : 0) + (r.contains("nextn") ? 1 : 0)
+                if lScore != rScore { return lScore > rScore }
+                return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
+            }).first else {
+                return nil
+            }
+
+            let escapedRepo = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+            let encodedPath = match.path
+                .split(separator: "/", omittingEmptySubsequences: false)
+                .map { comp in
+                    String(comp).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String(comp)
+                }
+                .joined(separator: "/")
+            guard let url = URL(string: "https://huggingface.co/\(escapedRepo)/resolve/main/\(encodedPath)?download=1") else {
+                return nil
+            }
+
+            return QuantInfo.AuxiliaryFile(
+                path: match.path,
+                sizeBytes: match.size,
+                sha256: match.sha256,
+                downloadURL: url
+            )
+        }()
+
         if let importanceMatrix {
             for i in quants.indices where quants[i].format == .gguf && quants[i].isIQQuant {
                 quants[i] = quants[i].copying(importanceMatrix: .some(importanceMatrix))
+            }
+        }
+        if let mtpFile {
+            for i in quants.indices where quants[i].format == .gguf {
+                quants[i] = quants[i].copying(mtp: .some(mtpFile))
             }
         }
 
@@ -445,7 +503,7 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
         return cleaned.split(separator: " ").map { $0.capitalized }.joined(separator: " ")
     }
 
-    private static func inferFormats(
+    static func inferFormats(
         tags: [String],
         id: String,
         pipelineTag: String? = nil,
@@ -453,15 +511,15 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
     ) -> Set<ModelFormat> {
         var result: Set<ModelFormat> = []
         let lowerTags = tags.map { $0.lowercased() }
+        let lowerID = id.lowercased()
         if lowerTags.contains(where: { $0.contains("gguf") || $0.contains("ggml") }) {
             result.insert(.gguf)
         }
-        // Treat MLX explicitly tagged repositories as MLX, and also
-        // heuristically include well-known publishers who host MLX conversions.
-        // This mirrors Explore filtering behavior so MLX mode surfaces expected results.
+        // Treat MLX explicitly tagged repositories as MLX, and also include
+        // the canonical MLX conversion namespace. Do not infer MLX from
+        // GGUF-heavy publisher namespaces alone.
         if lowerTags.contains(where: { $0.contains("mlx") })
-            || id.hasPrefix("mlx-community/")
-            || id.hasPrefix("lmstudio-community/") {
+            || lowerID.hasPrefix("mlx-community/") {
             result.insert(.mlx)
         }
         if lowerTags.contains(where: { $0.contains("executorch") || $0.contains("pte") }) {
@@ -472,8 +530,12 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
                 || $0.contains("core-ml")
                 || $0.contains("mlmodel")
                 || $0.contains("ane")
-        }) || id.lowercased().contains("coreml") {
+        }) || lowerID.contains("coreml") {
             result.insert(.ane)
+        }
+        if lowerTags.contains(where: { $0 == "coreai" || $0 == "aimodel" })
+            || lowerID.contains("coreai") {
+            result.insert(.coreai)
         }
         if let forcedFormat {
             result.insert(forcedFormat)

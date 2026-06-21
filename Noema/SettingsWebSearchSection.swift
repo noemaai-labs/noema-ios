@@ -2,13 +2,21 @@
 import SwiftUI
 
 struct SettingsWebSearchSection: View {
+    var body: some View {
+        Section(header: Text("Search")) {
+            SettingsWebSearchContent()
+        }
+    }
+}
+
+struct SettingsWebSearchContent: View {
     @ObservedObject private var settings = SettingsStore.shared
     @AppStorage("isAdvancedMode") private var isAdvancedMode = false
     @State private var showInfo = false
     @FocusState private var customURLFocused: Bool
 
     var body: some View {
-        Section(header: Text("Search")) {
+        VStack(alignment: .leading, spacing: 0) {
             Toggle(isOn: $settings.webSearchEnabled) {
                 HStack(spacing: 8) {
                     Text("Web Search button")
@@ -25,9 +33,9 @@ struct SettingsWebSearchSection: View {
                     customURLFocused = false
                 }
             }
-            .onChange(of: isAdvancedMode) { isAdvanced in
-                if !isAdvanced { customURLFocused = false }
-            }
+        .onChange(of: isAdvancedMode) { _, isAdvanced in
+            if !isAdvanced { customURLFocused = false }
+        }
             .tint(.blue)
 
             if settings.webSearchEnabled {

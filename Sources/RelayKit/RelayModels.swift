@@ -99,6 +99,25 @@ public struct RelayEnvelope: Codable, Sendable {
 
 public protocol InferenceProvider: Sendable {
     func generateReply(for envelope: RelayEnvelope) async throws -> String
+
+    /// Streaming variant: produces the same final reply as `generateReply` but
+    /// invokes `onPartial` with the accumulated text as it is generated, so the
+    /// transport can surface incremental progress. Providers that cannot stream
+    /// fall back to the default implementation, which simply returns the full
+    /// reply once.
+    func generateReplyStreaming(
+        for envelope: RelayEnvelope,
+        onPartial: @Sendable @escaping (String) async -> Void
+    ) async throws -> String
+}
+
+public extension InferenceProvider {
+    func generateReplyStreaming(
+        for envelope: RelayEnvelope,
+        onPartial: @Sendable @escaping (String) async -> Void
+    ) async throws -> String {
+        try await generateReply(for: envelope)
+    }
 }
 
 public enum InferenceError: Error {

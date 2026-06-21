@@ -28,6 +28,16 @@ func configureSharedApplicationEnvironment() {
     let off = UserDefaults.standard.object(forKey: "offGrid") as? Bool ?? false
     NetworkKillSwitch.setEnabled(off)
 
+    // Export HF_ENDPOINT for dependencies (e.g. WhisperKit's Hub client) when a
+    // Hugging Face mirror/custom endpoint is configured.
+    HFEndpoint.applyEnvironment()
+
+    // Noema Teams: restore any cached enterprise policy (and its off-grid mapping)
+    // before the first chat can start, then refresh from the workspace server.
+    Task { @MainActor in
+        _ = EnterprisePolicyManager.shared
+    }
+
     // Prime RAM/device budget detection early so storage-tier overrides are ready.
     DeviceRAMInfo.primeCache()
 }

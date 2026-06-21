@@ -61,20 +61,6 @@ struct ContentView: View {
     }
 }
 
-private struct IndexingBannerContainer: View {
-    @EnvironmentObject var chatVM: ChatVM
-    @EnvironmentObject var datasetManager: DatasetManager
-    var body: some View {
-        VStack {
-            IndexingNotificationView(datasetManager: datasetManager)
-                .environmentObject(chatVM)
-                .padding(.top, 12)
-            Spacer()
-        }
-        .allowsHitTesting(true)
-    }
-}
-
 /// Splash screen shown at launch with the app logo and a spinner.
 private struct SplashView: View {
     var body: some View {
@@ -164,7 +150,7 @@ private struct MacSplashView: View {
     }
 }
 
-private struct MacOnboardingView: View {
+struct MacOnboardingView: View {
     @Binding var showOnboarding: Bool
     var complete: () -> Void
 

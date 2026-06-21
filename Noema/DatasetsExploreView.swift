@@ -20,6 +20,7 @@ struct DatasetsExploreView: View {
 
     // Import flow state
     @State private var showImporter = false
+    @State private var importNotice: String?
     @State private var pendingPickedURLs: [URL] = []
     @State private var showNameSheet = false
     @State private var datasetName: String = ""
@@ -51,16 +52,21 @@ struct DatasetsExploreView: View {
                       allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls):
-                // Filter out non-allowed just in case
-                let filtered = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) }
-                guard !filtered.isEmpty else { return }
-                pendingPickedURLs = filtered
-                datasetName = suggestName(from: filtered) ?? String(localized: "Imported Dataset")
+                let accepted = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) || TranscriptionMediaSupport.isSupported($0) }
+                guard !accepted.isEmpty else {
+                    // Everything picked was unsupported (e.g. CSV/TSV) — tell the user
+                    // instead of silently doing nothing.
+                    importNotice = DatasetDocumentSupport.skippedMessage(for: urls)
+                    return
+                }
+                pendingPickedURLs = accepted
+                datasetName = suggestName(from: accepted) ?? String(localized: "Imported Dataset")
                 showNameSheet = true
             case .failure:
                 break
             }
         }
+        .datasetImportNotice($importNotice)
         .sheet(isPresented: $showNameSheet) {
             DatasetImportNamePromptView(
                 datasetName: $datasetName,
@@ -91,6 +97,20 @@ struct DatasetsExploreView: View {
             }
         }
         .task { await vm.loadCurated() }
+        // Search requested from outside the view hierarchy (Siri / App Intents)
+        .onAppear { consumePendingExploreSearchIfNeeded() }
+        .onReceive(tabRouter.$pendingExploreSearch) { _ in
+            consumePendingExploreSearchIfNeeded()
+        }
+    }
+
+    /// Runs a search handed over by an App Intent once this view owns Explore.
+    private func consumePendingExploreSearchIfNeeded() {
+        DispatchQueue.main.async {
+            guard let query = tabRouter.consumePendingExploreSearch(for: .datasets) else { return }
+            vm.searchText = query
+            vm.triggerSearch()
+        }
     }
 
     @ViewBuilder
@@ -126,7 +146,7 @@ struct DatasetsExploreView: View {
                 VStack(alignment: .center, spacing: 48) {
                     if !datasetManager.datasets.isEmpty {
                         VStack(alignment: .leading, spacing: 24) {
-                            Text(LocalizedStringKey("Your Datasets"))
+                            Text(LocalizedStringKey("Datasets"))
                                 .font(FontTheme.heading(size: 24))
                                 .padding(.horizontal, 4)
 
@@ -427,12 +447,8 @@ struct DatasetsExploreView: View {
     }
 
     // MARK: - Import helpers
-    private func allowedExtensions() -> Set<String> { ["pdf", "epub", "txt"] }
-    private func allowedUTTypes() -> [UTType] {
-        var types: [UTType] = [.pdf, .plainText]
-        if let epub = UTType(filenameExtension: "epub") { types.append(epub) }
-        return types
-    }
+    private func allowedExtensions() -> Set<String> { DatasetDocumentSupport.acceptedExtensions }
+    private func allowedUTTypes() -> [UTType] { DatasetDocumentSupport.allowedUTTypes() }
     private func suggestName(from urls: [URL]) -> String? {
         // Prefer first PDF title metadata
         if let pdfURL = urls.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
@@ -475,6 +491,7 @@ private enum DatasetModalPresentation: Equatable {
 }
 
 struct DatasetsExploreView: View {
+    @EnvironmentObject var tabRouter: TabRouter
     @EnvironmentObject var downloadController: DownloadController
     @EnvironmentObject var datasetManager: DatasetManager
     @EnvironmentObject var walkthrough: GuidedWalkthroughManager
@@ -528,7 +545,7 @@ struct DatasetsExploreView: View {
                 VStack(alignment: .center, spacing: 48) { // Generous spacing
                     if !datasetManager.datasets.isEmpty {
                         VStack(alignment: .leading, spacing: 24) {
-                            Text(LocalizedStringKey("Your Datasets"))
+                            Text(LocalizedStringKey("Datasets"))
                                 .font(FontTheme.heading(size: 24))
                                 .padding(.horizontal, 4)
                             
@@ -587,6 +604,9 @@ struct DatasetsExploreView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .alert(item: $datasetManager.embedAlert) { info in
+            Alert(title: Text(info.message))
+        }
         .confirmationDialog(LocalizedStringKey("Start indexing now?"), isPresented: $askStartIndexing, titleVisibility: .visible) {
             Button(LocalizedStringKey("Start")) {
                 if let ds = datasetToIndex {
@@ -596,6 +616,9 @@ struct DatasetsExploreView: View {
             Button(LocalizedStringKey("Later"), role: .cancel) {}
         } message: {
             Text(LocalizedStringKey("We'll extract text and prepare embeddings. You can also start later from the dataset details."))
+        }
+        .alert(item: $datasetManager.embedAlert) { info in
+            Alert(title: Text(info.message))
         }
         .overlay(alignment: .center) { loadingOverlay }
         .overlay(alignment: .center) { if vm.isLoadingSearch { ProgressView() } }
@@ -608,6 +631,11 @@ struct DatasetsExploreView: View {
             chromeState.searchText = vm.searchText
             chromeState.isSearchVisible = true
             chromeState.searchSubmitAction = { vm.triggerSearch() }
+            consumePendingExploreSearchIfNeeded()
+        }
+        // Search requested from outside the view hierarchy (Siri / App Intents)
+        .onReceive(tabRouter.$pendingExploreSearch) { _ in
+            consumePendingExploreSearchIfNeeded()
         }
         .onChangeCompat(of: chromeState.searchText) { _, newValue in
             if vm.searchText != newValue {
@@ -658,6 +686,15 @@ struct DatasetsExploreView: View {
             }
             .buttonStyle(GlassButtonStyle.glass(isActive: false))
             .padding(24)
+        }
+    }
+
+    /// Runs a search handed over by an App Intent once this view owns Explore.
+    private func consumePendingExploreSearchIfNeeded() {
+        DispatchQueue.main.async {
+            guard let query = tabRouter.consumePendingExploreSearch(for: .datasets) else { return }
+            vm.searchText = query
+            vm.triggerSearch()
         }
     }
 
@@ -936,10 +973,20 @@ struct DatasetsExploreView: View {
         panel.canChooseFiles = true
         panel.title = String(localized: "Import Documents")
         if panel.runModal() == .OK {
-            let filtered = panel.urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) }
-            guard !filtered.isEmpty else { return }
-            pendingPickedURLs = filtered
-            datasetName = suggestName(from: filtered) ?? String(localized: "Imported Dataset")
+            let (accepted, rejected) = DatasetDocumentSupport.partition(panel.urls)
+            guard !accepted.isEmpty else {
+                // Everything picked was unsupported (e.g. CSV/TSV) — explain rather
+                // than silently doing nothing.
+                if let message = DatasetDocumentSupport.skippedMessage(for: rejected) {
+                    let alert = NSAlert()
+                    alert.messageText = String(localized: "Unsupported file type")
+                    alert.informativeText = message
+                    alert.runModal()
+                }
+                return
+            }
+            pendingPickedURLs = accepted
+            datasetName = suggestName(from: accepted) ?? String(localized: "Imported Dataset")
             showNameSheet = true
         }
     }
@@ -970,13 +1017,9 @@ struct DatasetsExploreView: View {
         Task { await vm.loadCurated() }
     }
 
-    private func allowedExtensions() -> Set<String> { ["pdf", "epub", "txt"] }
+    private func allowedExtensions() -> Set<String> { DatasetDocumentSupport.acceptedExtensions }
 
-    private func allowedUTTypes() -> [UTType] {
-        var types: [UTType] = [.pdf, .plainText]
-        if let epub = UTType(filenameExtension: "epub") { types.append(epub) }
-        return types
-    }
+    private func allowedUTTypes() -> [UTType] { DatasetDocumentSupport.allowedUTTypes() }
 
     private func suggestName(from urls: [URL]) -> String? {
         if let pdfURL = urls.first(where: { $0.pathExtension.lowercased() == "pdf" }) {

@@ -15,8 +15,15 @@
 "... and %@ more" = "... and %@ more";
 "320 MB • One-time download" = "320 MB • One-time download";
 "320 MB • One‑time download used for local dataset search" = "320 MB • One‑time download used for local dataset search";
+"640 MB • One-time download" = "640 MB • One-time download";
+"640 MB • One‑time download used for local dataset search" = "640 MB • One‑time download used for local dataset search";
+"Apple Silicon speed" = "Apple Silicon speed";
+"Core ML runtime" = "Core ML runtime";
+"Download Qwen3 Embedding 0.6B so Noema can index and search your datasets" = "Download Qwen3 Embedding 0.6B so Noema can index and search your datasets";
+"ExecuTorch runtime" = "ExecuTorch runtime";
+"Portable llama.cpp" = "Portable llama.cpp";
+"The embedding model is installed. Delete it to free ~640 MB." = "The embedding model is installed. Delete it to free ~640 MB.";
 "A larger context keeps more conversation history, but also uses more memory. Adjust it here." = "A larger context keeps more conversation history, but also uses more memory. Adjust it here.";
-"Active" = "Active";
 "Active Model" = "Active Model";
 "Active connection via %@" = "Active connection via %@";
 "Active experts per token: %@ of %@" = "Active experts per token: %1$@ of %2$@";
@@ -25,6 +32,7 @@
 "Add remote endpoint" = "Add remote endpoint";
 "Adjust appearance, privacy options, and network preferences here." = "Adjust appearance, privacy options, and network preferences here.";
 "Advanced" = "Advanced";
+"Available" = "Available";
 "Advanced Controls" = "Advanced Controls";
 "Allows models to use a privacy-preserving web search API when you tap the globe in chat. Default is ON. In Offline Only mode, the button is disabled." = "Allows models to use a privacy-preserving web search API when you tap the globe in chat. Default is ON. In Offline Only mode, the button is disabled.";
 "Analyzing context..." = "Analyzing context...";
@@ -41,7 +49,6 @@
 "Blocks all network traffic, model downloads, and cloud connections so everything stays on‑device." = "Blocks all network traffic, model downloads, and cloud connections so everything stays on‑device.";
 "Bluetooth Pairing" = "Bluetooth Pairing";
 "Browse community models and curated datasets to expand what Noema can do." = "Browse community models and curated datasets to expand what Noema can do.";
-"Browse curated datasets for retrieval" = "Browse curated datasets for retrieval";
 "CFBundleShortVersionString1.0" = "CFBundleShortVersionString1.0";
 "Cancel" = "Cancel";
 "Cancel Benchmark" = "Cancel Benchmark";
@@ -63,7 +70,6 @@
 "Connection Modes" = "Connection Modes";
 "Connection Status: %@" = "Connection Status: %@";
 "Container" = "Container";
-"Context Length" = "Context Length";
 "Context Length: 4096 tokens" = "Context Length: 4096 tokens";
 "Context length is under 5000 tokens. With images and multi-sequence decoding (n_seq_max=16), per-sequence memory can be too small, leading to a crash. Increase context to at least 8192 in Model Settings." = "Context length is under 5000 tokens. With images and multi-sequence decoding (n_seq_max=16), per-sequence memory can be too small, leading to a crash. Increase context to at least 8192 in Model Settings.";
 "Controls how many high‑scoring passages (chunks) can be injected into the prompt. Higher values increase recall but consume more context window and can slow responses. Typical range 3–6." = "Controls how many high‑scoring passages (chunks) can be injected into the prompt. Higher values increase recall but consume more context window and can slow responses. Typical range 3–6.";
@@ -71,7 +77,6 @@
 "Couldn’t load the recommended model right now." = "Couldn’t load the recommended model right now.";
 "Creativity: %@. Low values focus responses; high values add variety." = "Creativity: %@. Low values focus responses; high values add variety.";
 "Dark" = "Dark";
-"Dataset" = "Dataset";
 "Processing Prompt" = "Processing Prompt";
 "Dataset indexing in progress..." = "Dataset indexing in progress...";
 "Dataset ready to use" = "Dataset ready to use";
@@ -90,7 +95,6 @@
 "Download a small embedding model so Noema can index and search your datasets" = "Download a small embedding model so Noema can index and search your datasets";
 "Downloaded datasets need on-device embedding. Give it a few minutes after download finishes." = "Downloaded datasets need on-device embedding. Give it a few minutes after download finishes.";
 "Downloaded models and datasets live here so you can manage them offline." = "Downloaded models and datasets live here so you can manage them offline.";
-"Downloading…" = "Downloading…";
 "Draft tokens: %@" = "Draft tokens: %@";
 "Draft window: %@" = "Draft window: %@";
 "EPUB viewing not supported on this platform" = "EPUB viewing not supported on this platform";
@@ -109,17 +113,17 @@
 "Failed to load README" = "Failed to load README";
 "Failed: %@" = "Failed: %@";
 "Fastest option on this device: SLM (Leap) models." = "Fastest option on this device: SLM (Leap) models.";
-"Field requirements will depend on your specific backend deployment." = "Field requirements will depend on your specific backend deployment.";
 "Files" = "Files";
+"Photos" = "Photos";
 "First, enable fast dataset search" = "First, enable fast dataset search";
 "First-time GGUF load takes longer" = "First-time GGUF load takes longer";
 "First-time download from HuggingFace" = "First-time download from HuggingFace";
 "First‑time setup: download the Qwen‑1.7B model and embeddings.\nWi‑Fi recommended." = "First‑time setup: download the Qwen‑1.7B model and embeddings.\nWi‑Fi recommended.";
+"First‑time setup: download the Qwen 3.5 2B Q3_K_M model and embeddings.\nWi‑Fi recommended." = "First‑time setup: download the Qwen 3.5 2B Q3_K_M model and embeddings.\nWi‑Fi recommended.";
 "For best performance, please plug in your phone until this completes." = "For best performance, please plug in your phone until this completes.";
 "Force Local Network" = "Force Local Network";
 "Forces chat traffic through the last LAN host even if Wi‑Fi names don't match yet." = "Forces chat traffic through the last LAN host even if Wi‑Fi names don't match yet.";
 "Formatted view unavailable" = "Formatted view unavailable";
-"Found unsupported: %@ …" = "Found unsupported: %@ …";
 "Frequency penalty: %@" = "Frequency penalty: %@";
 "GGUF models are the most compatible option. Use the format switch to explore the other builds when you need them." = "GGUF models are the most compatible option. Use the format switch to explore the other builds when you need them.";
 "GGUF works everywhere. MLX targets Apple Silicon speed. SLM focuses on responsiveness on any device." = "GGUF works everywhere. MLX targets Apple Silicon speed. SLM focuses on responsiveness on any device.";
@@ -130,6 +134,7 @@
 "High context lengths use more memory" = "High context lengths use more memory";
 "High-quality embedding model for local RAG" = "High-quality embedding model for local RAG";
 "Host ID: %@" = "Host ID: %@";
+"Host Device ID" = "Host Device ID";
 "How it works" = "How it works";
 "I'm New to Local LLMs, Guide Me" = "I'm New to Local LLMs, Guide Me";
 "If enabled, the app will attempt to load models even when they likely exceed your device's memory budget. This can cause the app to terminate." = "If enabled, the app will attempt to load models even when they likely exceed your device's memory budget. This can cause the app to terminate.";
@@ -186,14 +191,11 @@
 "No datasets found. Try different keywords." = "No datasets found. Try different keywords.";
 "No datasets imported yet." = "No datasets imported yet.";
 "No datasets yet" = "No datasets yet";
-"No files listed for this dataset." = "No files listed for this dataset.";
 "No model >" = "No model >";
 "No model loaded" = "No model loaded";
 "No models available. Add downloads or remote connections in Stored to configure the relay." = "No models available. Add downloads or remote connections in Stored to configure the relay.";
-"No models cached yet. Open the backend to refresh its catalog." = "No models cached yet. Open the backend to refresh its catalog.";
 "No models found for '%@'" = "No models found for '%@'";
 "No models loaded right now. We'll spin one up when a request arrives." = "No models loaded right now. We'll spin one up when a request arrives.";
-"No models match your search." = "No models match your search.";
 "No models yet" = "No models yet";
 "No parameters" = "No parameters";
 "No quant files available" = "No quant files available";
@@ -207,7 +209,6 @@
 "K Cache Quantization" = "K Cache Quantization";
 "V Cache Quantization" = "V Cache Quantization";
 "Favorite Limit Reached" = "Favorite Limit Reached";
-"Overview" = "Overview";
 "Sampling" = "Sampling";
 "Speculative Decoding" = "Speculative Decoding";
 "Benchmark" = "Benchmark";
@@ -282,11 +283,9 @@
 "%.2fs" = "%.2fs";
 "Noema" = "Noema";
 "Noema REST API — /api/v0/* for model catalog & operations" = "Noema REST API — /api/v0/* for model catalog & operations";
-"Noema Relay" = "Noema Relay";
 "Noema Server" = "Noema Server";
 "Noema attempts to gauge available memory to prevent models from exceeding device limits. These checks may occasionally miss risky situations and allow a model to crash your app, or they may be overly conservative and block a model that could have run fine." = "Noema attempts to gauge available memory to prevent models from exceeding device limits. These checks may occasionally miss risky situations and allow a model to crash your app, or they may be overly conservative and block a model that could have run fine.";
 "Noema could not find a projector in the repository. If the model advertises vision, ensure the mmproj file is present in the same folder as the weights." = "Noema could not find a projector in the repository. If the model advertises vision, ensure the mmproj file is present in the same folder as the weights.";
-"Noema has been reset. The embedding model remains installed." = "Noema has been reset. The embedding model remains installed.";
 "Nomic Embed Text v1.5 (Q4_K_M)" = "Nomic Embed Text v1.5 (Q4_K_M)";
 "None" = "None";
 "Not found" = "Not found";
@@ -316,7 +315,6 @@
 "Qwen 3 1.7B GGUF (Q3_K_M) gives you a dependable starting point. Delete it anytime if you need space." = "Qwen 3 1.7B GGUF (Q3_K_M) gives you a dependable starting point. Delete it anytime if you need space.";
 "RAG embeds normalized paragraphs from your PDFs and EPUBs. On each question, the most relevant chunks are retrieved and added to the prompt. Images are ignored." = "RAG embeds normalized paragraphs from your PDFs and EPUBs. On each question, the most relevant chunks are retrieved and added to the prompt. Images are ignored.";
 "RAM Safety Checks" = "RAM Safety Checks";
-"RAM information for this device will be added in a future update." = "RAM information for this device will be added in a future update.";
 "REST Endpoints" = "REST Endpoints";
 "Reachable at" = "Reachable at";
 "Ready for Use" = "Ready for Use";
@@ -327,7 +325,6 @@
 "Relay Server Running" = "Relay Server Running";
 "Relay Sources" = "Relay Sources";
 "Remaining: %@" = "Remaining: %@";
-"Remember:" = "Remember:";
 "Remote Backends" = "Remote Backends";
 "Remote endpoint is offline. This model can't be found at this time." = "Remote endpoint is offline. This model can't be found at this time.";
 "Remote timeout: %@s" = "Remote timeout: %@s";
@@ -352,15 +349,12 @@
 "Sharing relay payload with nearby devices…" = "Sharing relay payload with nearby devices…";
 "Shows the last server response." = "Shows the last server response.";
 "Signal" = "Signal";
-"Similarity Threshold" = "Similarity Threshold";
 "Simple" = "Simple";
 "Smooth loops and phrase echo by balancing repetition controls." = "Smooth loops and phrase echo by balancing repetition controls.";
 "Smooth loops and repeated phrases by tuning repetition controls." = "Smooth loops and repeated phrases by tuning repetition controls.";
 "Some models do not provide the system prompts needed for Noema to detect and configure them properly. These models may be unusable until they include appropriate metadata or support." = "Some models do not provide the system prompts needed for Noema to detect and configure them properly. These models may be unusable until they include appropriate metadata or support.";
 "Source unavailable. Check storage or network settings." = "Source unavailable. Check storage or network settings.";
-"Source: %@" = "Source: %@";
 "Specify identifiers for models that are not listed by the server. Leave blank to rely on the server's catalog." = "Specify identifiers for models that are not listed by the server. Leave blank to rely on the server's catalog.";
-"Specify your model identifiers, or reload your custom models later." = "Specify your model identifiers, or reload your custom models later.";
 "Speed up with a smaller helper model." = "Speed up with a smaller helper model.";
 "Start by installing one model. Then add a dataset (like an open textbook) so the AI can answer with grounded knowledge." = "Start by installing one model. Then add a dataset (like an open textbook) so the AI can answer with grounded knowledge.";
 "Start the relay to automatically share the latest payload with nearby devices." = "Start the relay to automatically share the latest payload with nearby devices.";
@@ -369,45 +363,30 @@
 "Status" = "Status";
 "Stay close to your Mac" = "Stay close to your Mac";
 "Stop Using Dataset" = "Stop Using Dataset";
-"Streaming" = "Streaming";
 "Streaming response…" = "Streaming response…";
 "Supported Endpoints" = "Supported Endpoints";
 "Supported formats: PDF, EPUB, TXT, MD, JSON, JSONL, CSV, TSV" = "Supported formats: PDF, EPUB, TXT, MD, JSON, JSONL, CSV, TSV";
 "Swap between the new stacked chat panel and the classic tab bar layout." = "Swap between the new stacked chat panel and the classic tab bar layout.";
-"Swipe left to remove the embedding model from this device." = "Swipe left to remove the embedding model from this device.";
 "Switch the selector to MLX for Apple Silicon‑optimized builds that excel at speed." = "Switch the selector to MLX for Apple Silicon‑optimized builds that excel at speed.";
 "Switch to Raw to inspect the original response." = "Switch to Raw to inspect the original response.";
 "System" = "System";
-"Tap to load" = "Tap to load";
-"Temperature" = "Temperature";
 "Testing" = "Testing";
-"The app memory usage budget is an estimate based on your device's total RAM and typical iOS memory management. The actual available memory may vary depending on system load, other running apps, and iOS memory pressure. Models that exceed this budget may cause the app to be terminated by iOS." = "The app memory usage budget is an estimate based on your device's total RAM and typical iOS memory management. The actual available memory may vary depending on system load, other running apps, and iOS memory pressure. Models that exceed this budget may cause the app to be terminated by iOS.";
-"The embedding model is installed. Delete it to free ~320 MB." = "The embedding model is installed. Delete it to free ~320 MB.";
 "The relay listens to the %@ container for new conversations and responds with your selected provider." = "The relay listens to the %@ container for new conversations and responds with your selected provider.";
 "The tool returned data that can't be formatted. Switch to Raw to inspect the original response." = "The tool returned data that can't be formatted. Switch to Raw to inspect the original response.";
 "These options stay in simple mode for clarity. Let’s cover the essentials." = "These options stay in simple mode for clarity. Let’s cover the essentials.";
 "Think of Noema as a simple way to run AI on your device. To get useful answers, you pair a local model with datasets (like open textbooks). We’ll guide you through the first setup." = "Think of Noema as a simple way to run AI on your device. To get useful answers, you pair a local model with datasets (like open textbooks). We’ll guide you through the first setup.";
 "This app bundles llama.cpp; we keep this in sync with upstream b‑releases." = "This app bundles llama.cpp; we keep this in sync with upstream b‑releases.";
-"This backend is unavailable. Remove it or pick another option." = "This backend is unavailable. Remove it or pick another option.";
 "This chat stays private—responses are generated on your device after you load a model." = "This chat stays private—responses are generated on your device after you load a model.";
 "This configuration exceeds the current RAM safety guard, so benchmarking is disabled." = "This configuration exceeds the current RAM safety guard, so benchmarking is disabled.";
 "This dataset is taking a while to load, still working…" = "This dataset is taking a while to load, still working…";
-"This dataset's files are not currently supported for document retrieval." = "This dataset's files are not currently supported for document retrieval.";
 "This device doesn't support GPU offload." = "This device doesn't support GPU offload.";
 "This device doesn't support GPU offload; GGUF models will run on the CPU and generation speed will be significantly slower." = "This device doesn't support GPU offload; GGUF models will run on the CPU and generation speed will be significantly slower.";
 "This model doesn't support GPU offload and generation speed will be significantly slower. Consider switching to an MLX model." = "This model doesn't support GPU offload and generation speed will be significantly slower. Consider switching to an MLX model.";
 "This model doesn't support GPU offload and generation speed will be significantly slower. Fastest option on this device: use an SLM (Leap) model." = "This model doesn't support GPU offload and generation speed will be significantly slower. Fastest option on this device: use an SLM (Leap) model.";
-"This model doesn't support GPU offload and may run slowly. Consider an MLX model." = "This model doesn't support GPU offload and may run slowly. Consider an MLX model.";
-"This model doesn't support GPU offload and may run slowly. Fastest option: use an SLM model." = "This model doesn't support GPU offload and may run slowly. Fastest option: use an SLM model.";
-"This permanently removes every chat conversation. This action cannot be undone." = "This permanently removes every chat conversation. This action cannot be undone.";
-"This textbook appears to be available only as a web page. Noema can't import it as a dataset." = "This textbook appears to be available only as a web page. Noema can't import it as a dataset.";
 "Tool calling isn't perfect. Although Noema implements many methods of detecting and instructing models to use tools, not all LLMs will follow instructions and some might not call them correctly or at all. Tool calling heavily depends on model pre-training and will get better as time passes." = "Tool calling isn't perfect. Although Noema implements many methods of detecting and instructing models to use tools, not all LLMs will follow instructions and some might not call them correctly or at all. Tool calling heavily depends on model pre-training and will get better as time passes.";
-"Tools" = "Tools";
 "Top-k: %@" = "Top-k: %@";
-"Top-p" = "Top-p";
 "Top-p: %@" = "Top-p: %@";
 "Try again" = "Try again";
-"Try another dataset if these formats aren't available." = "Try another dataset if these formats aren't available.";
 "Try the Qwen 3 1.7B GGUF (Q3_K_M) build below. It's a good starting point and you can delete it anytime." = "Try the Qwen 3 1.7B GGUF (Q3_K_M) build below. It's a good starting point and you can delete it anytime.";
 "Unable to load image" = "Unable to load image";
 "Unknown error" = "Unknown error";
@@ -429,8 +408,6 @@
 "Waiting for tool response…" = "Waiting for tool response…";
 "We'll extract text and prepare embeddings. You can also start later from the dataset details." = "We'll extract text and prepare embeddings. You can also start later from the dataset details.";
 "We'll route new conversations through %@ even if Wi‑Fi names differ. You can switch back by reloading the backend." = "We'll route new conversations through %@ even if Wi‑Fi names differ. You can switch back by reloading the backend.";
-"We'll try remote models in priority order for this long before moving to the next option." = "We'll try remote models in priority order for this long before moving to the next option.";
-"We'll try this saved identifier even though it's not in the latest catalog." = "We'll try this saved identifier even though it's not in the latest catalog.";
 "Web Search Tool Calls" = "Web Search Tool Calls";
 "Web Search button" = "Web Search button";
 "Web search is included" = "Web search is included";
@@ -438,7 +415,6 @@
 "Welcome to Noema" = "Welcome to Noema";
 "Welcome to Noema for Mac" = "Welcome to Noema for Mac";
 "What is Noema?" = "What is Noema?";
-"When connecting from another device, point the base URL to your computer (for example http://192.168.0.10:11434) and start Ollama with `OLLAMA_HOST=0.0.0.0` so it accepts remote clients." = "When connecting from another device, point the base URL to your computer (for example http://192.168.0.10:11434) and start Ollama with `OLLAMA_HOST=0.0.0.0` so it accepts remote clients.";
 "When enabled, pressing eject on iOS tells this Mac to unload the active relay model." = "When enabled, pressing eject on iOS tells this Mac to unload the active relay model.";
 "When enabled, you will be asked to choose parameters every time a model loads." = "When enabled, you will be asked to choose parameters every time a model loads.";
 "Wi-Fi: %@" = "Wi-Fi: %@";
@@ -454,10 +430,6 @@
 "You’re ready to explore. Download models, add datasets, and start chatting." = "You’re ready to explore. Download models, add datasets, and start chatting.";
 "minutes" = "minutes";
 "•" = "•";
-"• Close other applications to free up RAM" = "• Close other applications to free up RAM";
-"• Embedding happens locally on your device" = "• Embedding happens locally on your device";
-"• Larger datasets take exponentially more time" = "• Larger datasets take exponentially more time";
-"• You can pause and resume downloads if needed" = "• You can pause and resume downloads if needed";
 "…and %@ more parameter%@" = "…and %1$@ more parameter%2$@";
 "⚠️ " = "⚠️ ";
 "General" = "General";
@@ -482,7 +454,6 @@
 
 "Language" = "Language";
 "Startup" = "Startup";
-"Search models" = "Search models";
 "SLM Models - Liquid AI" = "SLM Models - Liquid AI";
 "Import" = "Import";
 "Import GGUF" = "Import GGUF";
@@ -491,9 +462,7 @@
 "Switching between GGUF/MLX modes" = "Switching between GGUF/MLX modes";
 "Switching between GGUF/SLM modes" = "Switching between GGUF/SLM modes";
 "Vision-capable model" = "Vision-capable model";
-"All" = "All";
 "Text" = "Text";
-"Vision" = "Vision";
 "Continue" = "Continue";
 "Try bullet" = "Try:\n• Different keywords (e.g., 'gemma-3' instead of 'gemma 3')\n• %@\n• Adjusting the text/vision filter\n• Checking your search filters";
 "Select one or more .gguf files. For vision models, also select the projector .gguf (files containing ‘mmproj’ or ‘projector’). Files will be copied into your local model library." = "Select one or more .gguf files. For vision models, also select the projector .gguf (files containing ‘mmproj’ or ‘projector’). Files will be copied into your local model library.";
@@ -515,9 +484,6 @@
 "Override the app language. Defaults to the device language on first launch." = "Override the app language. Defaults to the device language on first launch.";
 "Reopen Onboarding" = "Reopen Onboarding";
 "Join Early Testers" = "Join Early Testers";
-"Contact Support" = "Contact Support";
-"Write a Review" = "Write a Review";
-"Notes & Issues" = "Notes & Issues";
 "Delete All Chats" = "Delete All Chats";
 "Reset App Data" = "Reset App Data";
 "This permanently removes every chat conversation. This action cannot be undone." = "This permanently removes every chat conversation. This action cannot be undone.";
@@ -527,7 +493,6 @@
 "Failed to Delete Embedding Model" = "Failed to Delete Embedding Model";
 "About RAM Usage" = "About RAM Usage";
 "The app memory usage budget is an estimate based on your device's total RAM and typical iOS memory management. The actual available memory may vary depending on system load, other running apps, and iOS memory pressure. Models that exceed this budget may cause the app to be terminated by iOS." = "The app memory usage budget is an estimate based on your device's total RAM and typical iOS memory management. The actual available memory may vary depending on system load, other running apps, and iOS memory pressure. Models that exceed this budget may cause the app to be terminated by iOS.";
-"Max Chunks" = "Max Chunks";
 "Similarity Threshold" = "Similarity Threshold";
 "Delete Embedding Model" = "Delete Embedding Model";
 "The embedding model is installed. Delete it to free ~320 MB." = "The embedding model is installed. Delete it to free ~320 MB.";
@@ -536,11 +501,6 @@
 "Installing…" = "Installing…";
 "Download Embedding Model" = "Download Embedding Model";
 "Custom Backend" = "Custom Backend";
-"Backend" = "Backend";
-"Endpoint Type" = "Endpoint Type";
-"Endpoints" = "Endpoints";
-"Authentication" = "Authentication";
-"Model Identifiers" = "Model Identifiers";
 "CloudKit container identifier" = "CloudKit container identifier";
 "Host device ID" = "Host device ID";
 "Base URL" = "Base URL";
@@ -574,7 +534,6 @@
 "Quant" = "Quant";
 "Size ↑" = "Size ↑";
 "Size ↓" = "Size ↓";
-"Ready" = "Ready";
 "Open" = "Open";
 "Retry download" = "Retry download";
 "Vision-capable" = "Vision-capable";
@@ -601,7 +560,6 @@
 "Peak RAM Usage" = "Peak RAM Usage";
 "Dataset Size" = "Dataset Size";
 "Performance Note" = "Performance Note";
-"Recommendation" = "Recommendation";
 "Remember:" = "Remember:";
 "• Close other applications to free up RAM" = "• Close other applications to free up RAM";
 "• Embedding happens locally on your device" = "• Embedding happens locally on your device";
@@ -720,6 +678,7 @@
 "Found unsupported: %@ …" = "Found unsupported: %@ …";
 "This textbook appears to be available only as a web page. Noema can't import it as a dataset." = "This textbook appears to be available only as a web page. Noema can't import it as a dataset.";
 "Download complete" = "Download complete";
+"%@ finished downloading in the background." = "%@ finished downloading in the background.";
 "Downloading…" = "Downloading…";
 "No compatible files found for retrieval. Supported formats: %@" = "No compatible files found for retrieval. Supported formats: %@";
 "No internet connection." = "No internet connection.";
@@ -738,7 +697,6 @@
 
 /* Mac chat quick-load menu */
 "Open Model Library" = "Open Model Library";
-"Favorites" = "Favorites";
 "Recent" = "Recent";
 
 /* Noema Relay – status messages */
@@ -827,7 +785,6 @@
 "Response generated." = "Response generated.";
 
 /* Tabs & accessibility labels */
-"Stored" = "Stored";
 "Web Search" = "Web Search";
 "Python" = "Python";
 "Open Stored" = "Open Stored";
@@ -1001,7 +958,9 @@
 "Checking embedding model…" = "Checking embedding model…";
 "Downloading embedding model…" = "Downloading embedding model…";
 "Warming up embedding model…" = "Warming up embedding model…";
+"Priming first embedding pass…" = "Priming first embedding pass…";
 "Preparing chunks" = "Preparing chunks";
+"Embedding chunk %d of %d…" = "Embedding chunk %d of %d…";
 "Embedding complete" = "Embedding complete";
 "Failed to download embedding model: %@" = "Failed to download embedding model: %@";
 "Failed to initialize" = "Failed to initialize";
@@ -1018,8 +977,6 @@
 "Stop" = "Stop";
 "Proceed" = "Proceed";
 "Proceed on battery power?" = "Proceed on battery power?";
-"Extracting" = "Extracting";
-"Compressing" = "Compressing";
 "Failed" = "Failed";
 "Memory" = "Memory";
 "Persistent Memory" = "Persistent Memory";
@@ -1089,3 +1046,2295 @@
 "Configured context" = "Configured context";
 "Reserved for response" = "Reserved for response";
 "Usable prompt budget" = "Usable prompt budget";
+"Change Embedding Model" = "Change Embedding Model";
+"Dataset search quality and indexing" = "Dataset search quality and indexing";
+"Embedding Models" = "Embedding Models";
+"Changing the active embedding model marks existing dataset indexes for rebuild. Existing vectors stay on disk until you rebuild or delete the dataset." = "Changing the active embedding model marks existing dataset indexes for rebuild. Existing vectors stay on disk until you rebuild or delete the dataset.";
+"Change Embedding Model?" = "Change Embedding Model?";
+"Change Model" = "Change Model";
+"Use %@ for future dataset search? Existing dataset indexes will need to be rebuilt." = "Use %@ for future dataset search? Existing dataset indexes will need to be rebuilt.";
+"Compatibility default for local dataset search." = "Compatibility default for local dataset search.";
+"Recommended multilingual embedding model for most devices." = "Recommended multilingual embedding model for most devices.";
+"Higher-quality multilingual retrieval for Macs and high-RAM devices." = "Higher-quality multilingual retrieval for Macs and high-RAM devices.";
+"Multilingual hybrid retrieval model; visible for tracking, disabled until runtime parity is validated." = "Multilingual hybrid retrieval model; visible for tracking, disabled until runtime parity is validated.";
+"Small multilingual E5 model; disabled until llama.cpp parity is validated." = "Small multilingual E5 model; disabled until llama.cpp parity is validated.";
+"On-device-focused embedding model; requires accepting Google usage terms before files can be downloaded." = "On-device-focused embedding model; requires accepting Google usage terms before files can be downloaded.";
+"Multilingual task-adapter model; non-commercial license and runtime support need a separate integration." = "Multilingual task-adapter model; non-commercial license and runtime support need a separate integration.";
+"Apache 2.0" = "Apache 2.0";
+"MIT" = "MIT";
+"Gemma terms" = "Gemma terms";
+"CC BY-NC 4.0" = "CC BY-NC 4.0";
+"Runtime validation pending" = "Runtime validation pending";
+"License acceptance required" = "License acceptance required";
+"Non-commercial license" = "Non-commercial license";
+"Use Model" = "Use Model";
+"Not available in this build" = "Not available in this build";
+"Search embedding models" = "Search embedding models";
+"No embedding models found for '%@'" = "No embedding models found for '%@'";
+"Search Whisper models" = "Search Whisper models";
+"No Whisper models found for '%@'" = "No Whisper models found for '%@'";
+"Details" = "Details";
+"Vector Dimension" = "Vector Dimension";
+"Pooling" = "Pooling";
+"Normalized" = "Normalized";
+"Runtime Context" = "Runtime Context";
+"Query Template" = "Query Template";
+"Document Template" = "Document Template";
+"Embedding Advanced" = "Embedding Advanced";
+"Template Revision" = "Template Revision";
+"Artifact ID" = "Artifact ID";
+"Artifact File" = "Artifact File";
+"Runtime" = "Runtime";
+"Max Input Tokens" = "Max Input Tokens";
+"Change and Rebuild Now" = "Change and Rebuild Now";
+"Change Later" = "Change Later";
+"Use %@ for future dataset search? Existing dataset indexes will need to be rebuilt. You can rebuild them now or later." = "Use %@ for future dataset search? Existing dataset indexes will need to be rebuilt. You can rebuild them now or later.";
+"Mean" = "Mean";
+"CLS" = "CLS";
+"Last Token" = "Last Token";
+"Model Default" = "Model Default";
+"Active embedding model is missing" = "Active embedding model is missing";
+"%@ is selected as active but its files are not installed. Download it again or pick a different model." = "%@ is selected as active but its files are not installed. Download it again or pick a different model.";
+"%d dim" = "%d dim";
+"ctx %d" = "ctx %d";
+"In Use" = "In Use";
+"Downloading %d%%" = "Downloading %d%%";
+"Paused" = "Paused";
+"Gated" = "Gated";
+"Unsupported" = "Unsupported";
+"Delete Embedding Model?" = "Delete Embedding Model?";
+"This model is currently active. Deleting will remove %@ from this device and switch the active model to %@. Existing dataset indexes will need to be rebuilt." = "This model is currently active. Deleting will remove %@ from this device and switch the active model to %@. Existing dataset indexes will need to be rebuilt.";
+"This model is currently active. Deleting will remove %@ from this device and leave no active embedding model — you will need to download one before using dataset search." = "This model is currently active. Deleting will remove %@ from this device and leave no active embedding model — you will need to download one before using dataset search.";
+"Delete this embedding model from this device? This removes %@." = "Delete this embedding model from this device? This removes %@.";
+"mean pool" = "mean pool";
+"CLS pool" = "CLS pool";
+"last-token pool" = "last-token pool";
+"default pool" = "default pool";
+"%@/s" = "%@/s";
+"About Noema" = "About Noema";
+"Advanced Options" = "Advanced Options";
+"App Preferences" = "App Preferences";
+"Appearance, language, sound, and system prompt." = "Appearance, language, sound, and system prompt.";
+"Block network, downloads and cloud connections." = "Block network, downloads and cloud connections.";
+"CPU Rendering Only" = "CPU Rendering Only";
+"Chat & Data" = "Chat & Data";
+"Chat image cleanup and local data behavior." = "Chat image cleanup and local data behavior.";
+"Device Overview" = "Device Overview";
+"Enable privacy-preserving web search from chat." = "Enable privacy-preserving web search from chat.";
+"Load models even if they may exceed your device's memory budget." = "Load models even if they may exceed your device's memory budget.";
+"Manage remote defaults" = "Manage remote defaults";
+"Max chunks and similarity threshold." = "Max chunks and similarity threshold.";
+"Memories persist across conversations on this device." = "Memories persist across conversations on this device.";
+"Memory budget: %@ (conservative)" = "Memory budget: %@ (conservative)";
+"Not installed" = "Not installed";
+"Remove incomplete downloads, stale resume data, and temporary files without deleting installed models or datasets." = "Remove incomplete downloads, stale resume data, and temporary files without deleting installed models or datasets.";
+"Retrieval Settings" = "Retrieval Settings";
+"Startup Preferences" = "Startup Preferences";
+"Write and run Python code in a sandbox." = "Write and run Python code in a sandbox.";
+"%d model hidden from Stored." = "%d model hidden from Stored.";
+"%d models hidden from Stored." = "%d models hidden from Stored.";
+"%d remote default configured." = "%d remote default configured.";
+"%d remote defaults configured." = "%d remote defaults configured.";
+"Apple Speech" = "Apple Speech";
+"Audio-language model" = "Audio-language model";
+"Audio" = "Audio";
+"Video" = "Video";
+"Speech recognition permission is required to transcribe media." = "Speech recognition permission is required to transcribe media.";
+"Speech recognition is unavailable for %@." = "Speech recognition is unavailable for %@.";
+"On-device transcription is unavailable for %@." = "On-device transcription is unavailable for %@.";
+"Apple Speech could not start transcription for %@. Try another ASR locale, or turn off on-device transcription only when Off-grid Mode is disabled." = "Apple Speech could not start transcription for %@. Try another ASR locale, or turn off on-device transcription only when Off-grid Mode is disabled.";
+"No speech was recognized in this media." = "No speech was recognized in this media.";
+"Transcription is not supported on this platform." = "Transcription is not supported on this platform.";
+"Transcribed media attached." = "Transcribed media attached.";
+"Use the attached transcript to answer." = "Use the attached transcript to answer.";
+"This media format is not supported for transcription." = "This media format is not supported for transcription.";
+"Microphone permission is required to record audio." = "Microphone permission is required to record audio.";
+"%@ Transcript" = "%@ Transcript";
+"Transcribe" = "Transcribe";
+"Ready to transcribe" = "Ready to transcribe";
+"Transcribing..." = "Transcribing...";
+"Transcript ready" = "Transcript ready";
+"Transcription failed" = "Transcription failed";
+"Save transcript" = "Save transcript";
+"Save transcript to Stored" = "Save transcript to Stored";
+"Attach" = "Attach";
+"Stop Recording" = "Stop Recording";
+"Record Audio" = "Record Audio";
+"Attach Audio/Video" = "Attach Audio/Video";
+"Recording" = "Recording";
+"Record a voice note for transcription." = "Record a voice note for transcription.";
+"Import media and transcribe it locally when available." = "Import media and transcribe it locally when available.";
+"Transcription Engine" = "Transcription Engine";
+"ASR Locale" = "ASR Locale";
+"Leave blank to use the current system language for Apple Speech transcription." = "Leave blank to use the current system language for Apple Speech transcription.";
+"On-device transcription only" = "On-device transcription only";
+"Off-grid Mode requires on-device transcription." = "Off-grid Mode requires on-device transcription.";
+"When enabled, Noema blocks Apple Speech from using network recognition." = "When enabled, Noema blocks Apple Speech from using network recognition.";
+"Auto-transcribe attachments" = "Auto-transcribe attachments";
+"Start transcription automatically after attaching audio or video." = "Start transcription automatically after attaching audio or video.";
+"Fast, low-accuracy multilingual baseline. Good for real-time drafts." = "Fast, low-accuracy multilingual baseline. Good for real-time drafts.";
+"English-only variant. Lower WER than multilingual tiny on English audio." = "English-only variant. Lower WER than multilingual tiny on English audio.";
+"Solid multilingual tradeoff between speed and accuracy." = "Solid multilingual tradeoff between speed and accuracy.";
+"Noticeably more accurate than base; still comfortable on phones." = "Noticeably more accurate than base; still comfortable on phones.";
+"Strong multilingual accuracy. Best suited for macOS and high-RAM iPads." = "Strong multilingual accuracy. Best suited for macOS and high-RAM iPads.";
+"Near-large-v3 quality at roughly 4x real-time. Recommended for Macs." = "Near-large-v3 quality at roughly 4x real-time. Recommended for Macs.";
+"WhisperKit downloads a Core ML package on first use; use the button below to prefetch." = "WhisperKit downloads a Core ML package on first use; use the button below to prefetch.";
+"whisper.cpp loads a ggml .bin file. Download before going offline." = "whisper.cpp loads a ggml .bin file. Download before going offline.";
+"No WhisperKit artifact is available for this model." = "No WhisperKit artifact is available for this model.";
+"WhisperKit is not linked in this build." = "WhisperKit is not linked in this build.";
+"Local Whisper" = "Local Whisper";
+"Speech & ASR" = "Speech & ASR";
+"Transcription engine, locale, Whisper, and remote ASR." = "Transcription engine, locale, Whisper, and remote ASR.";
+"No local Whisper runtime is available in this build." = "No local Whisper runtime is available in this build.";
+"What is ASR Locale?" = "What is ASR Locale?";
+"What is on-device transcription only?" = "What is on-device transcription only?";
+"Whisper Runtime" = "Whisper Runtime";
+"Configure a remote endpoint to enable this engine." = "Configure a remote endpoint to enable this engine.";
+"Remote Audio Endpoint" = "Remote Audio Endpoint";
+"Use Remote ASR" = "Use Remote ASR";
+"Send Test Request" = "Send Test Request";
+"Prepare Model" = "Prepare Model";
+"Multilingual" = "Multilingual";
+"English only" = "English only";
+"Summarize this transcript." = "Summarize this transcript.";
+"Ask about %@: " = "Ask about %@: ";
+"Pick a Whisper model in Settings before transcribing." = "Pick a Whisper model in Settings before transcribing.";
+"Failed to load Whisper model: %@" = "Failed to load Whisper model: %@";
+"Download a Whisper model in Settings → Whisper Model before transcribing." = "Download a Whisper model in Settings → Whisper Model before transcribing.";
+"Transcribing" = "Transcribing";
+"Transcribed" = "Transcribed";
+"%@ is unavailable." = "%@ is unavailable.";
+"%@ is unavailable. %@" = "%@ is unavailable. %@";
+"Choose another transcription engine in Settings." = "Choose another transcription engine in Settings.";
+"Media could not be transcribed: %@" = "Media could not be transcribed: %@";
+"Some media could not be transcribed: %@" = "Some media could not be transcribed: %@";
+"%d more media files failed." = "%d more media files failed.";
+"Saving..." = "Saving...";
+"Saved to Stored" = "Saved to Stored";
+"Transcript save failed: %@" = "Transcript save failed: %@";
+"Stored is unavailable." = "Stored is unavailable.";
+"No transcript was saved." = "No transcript was saved.";
+"On-device" = "On-device";
+"Network allowed" = "Network allowed";
+"Remote" = "Remote";
+"Engine: %@" = "Engine: %@";
+"Locale: %@" = "Locale: %@";
+"Model: %@" = "Model: %@";
+"Mode: %@" = "Mode: %@";
+"Source: %@" = "Source: %@";
+"Created: %@" = "Created: %@";
+"Timestamps: %@" = "Timestamps: %@";
+"Edited transcript" = "Edited transcript";
+"Transcription complete" = "Transcription complete";
+"Recording started" = "Recording started";
+"Recording stopped" = "Recording stopped";
+"Voice Note %@.m4a" = "Voice Note %@.m4a";
+"Saved to %@" = "Saved to %@";
+"Extract action items" = "Extract action items";
+"Create study notes" = "Create study notes";
+"Find decisions" = "Find decisions";
+"Make timeline" = "Make timeline";
+"Draft follow-up" = "Draft follow-up";
+"Open ASR Settings" = "Open ASR Settings";
+"Choose Locale" = "Choose Locale";
+"Download Whisper Model" = "Download Whisper Model";
+"Configure Endpoint" = "Configure Endpoint";
+"Source title" = "Source title";
+"Transcript view" = "Transcript view";
+"Full Text" = "Full Text";
+"Segments" = "Segments";
+"Save to Stored" = "Save to Stored";
+"Save to existing dataset" = "Save to existing dataset";
+"Act" = "Act";
+"Review Transcript" = "Review Transcript";
+"Close" = "Close";
+"Choose Dataset" = "Choose Dataset";
+"No Stored datasets" = "No Stored datasets";
+"Create a Stored dataset first, then save transcripts into it." = "Create a Stored dataset first, then save transcripts into it.";
+"Review" = "Review";
+"More" = "More";
+"Remove unsaved transcript?" = "Remove unsaved transcript?";
+"This transcript has not been sent or saved yet." = "This transcript has not been sent or saved yet.";
+"Upload media for remote transcription?" = "Upload media for remote transcription?";
+"Upload and Transcribe" = "Upload and Transcribe";
+"Remote ASR sends the selected media to your configured audio-language endpoint. Use it only with endpoints you trust." = "Remote ASR sends the selected media to your configured audio-language endpoint. Use it only with endpoints you trust.";
+"Confirm remote ASR upload before transcribing this media." = "Confirm remote ASR upload before transcribing this media.";
+"Media transcription progress" = "Media transcription progress";
+"Imported" = "Imported";
+"Support Models" = "Support Models";
+"Speech / ASR" = "Speech / ASR";
+"Embeddings" = "Embeddings";
+"Not Downloaded" = "Not Downloaded";
+"Incomplete Download" = "Incomplete Download";
+"Manage" = "Manage";
+"Repair" = "Repair";
+"Downloading" = "Downloading";
+"Incomplete download. Repair and download again." = "Incomplete download. Repair and download again.";
+"Whisper model download failed. Try again." = "Whisper model download failed. Try again.";
+"Whisper model download is incomplete. Repair and download it in Settings before transcribing." = "Whisper model download is incomplete. Repair and download it in Settings before transcribing.";
+"Download a Whisper model in Settings before transcribing." = "Download a Whisper model in Settings before transcribing.";
+"This media is too long for whisper.cpp's memory-safe decoder. Trim it or use Apple Speech/WhisperKit, then retry." = "This media is too long for whisper.cpp's memory-safe decoder. Trim it or use Apple Speech/WhisperKit, then retry.";
+"Noema did not change this model's saved settings. Adjust Model Settings manually if you want to try a smaller context or different runtime options." = "Noema did not change this model's saved settings. Adjust Model Settings manually if you want to try a smaller context or different runtime options.";
+"Previous model did not finish loading. Noema did not change its saved settings; adjust Model Settings manually before trying again." = "Previous model did not finish loading. Noema did not change its saved settings; adjust Model Settings manually before trying again.";
+"Add a Wallet signer URL in Settings before signing passes." = "Add a Wallet signer URL in Settings before signing passes.";
+"The Wallet signer URL is not valid." = "The Wallet signer URL is not valid.";
+"Add a Wallet signer token in Settings before signing passes." = "Add a Wallet signer token in Settings before signing passes.";
+"Wallet pass signing is unavailable offline. Your draft has been saved locally." = "Wallet pass signing is unavailable offline. Your draft has been saved locally.";
+"The Wallet signer rejected the saved token." = "The Wallet signer rejected the saved token.";
+"This looks like a duplicate of a pass already in Wallet. You can update the existing pass instead." = "This looks like a duplicate of a pass already in Wallet. You can update the existing pass instead.";
+"The Wallet signer returned an invalid response." = "The Wallet signer returned an invalid response.";
+"Trip pass generated from captured boarding pass" = "Trip pass generated from captured boarding pass";
+"Route" = "Route";
+"Generated from a user-confirmed scan." = "Generated from a user-confirmed scan.";
+"This device cannot add passes to Wallet." = "This device cannot add passes to Wallet.";
+"No active window is available to present Wallet." = "No active window is available to present Wallet.";
+"Wallet passes are available on iOS." = "Wallet passes are available on iOS.";
+"No readable image was available." = "No readable image was available.";
+"No barcode or text could be read from this pass." = "No barcode or text could be read from this pass.";
+"Passenger name is required." = "Passenger name is required.";
+"Origin is required." = "Origin is required.";
+"Destination is required." = "Destination is required.";
+"Flight or service number is required." = "Flight or service number is required.";
+"Departure time is required." = "Departure time is required.";
+"Origin and destination cannot be the same." = "Origin and destination cannot be the same.";
+"No barcode was detected. Review each field before adding this pass." = "No barcode was detected. Review each field before adding this pass.";
+"Barcode and printed text disagree. Confirm the correct value before adding this pass." = "Barcode and printed text disagree. Confirm the correct value before adding this pass.";
+"Air" = "Air";
+"Train" = "Train";
+"Boat" = "Boat";
+"Generic" = "Generic";
+"Carrier" = "Carrier";
+"Flight / Service" = "Flight / Service";
+"Terminal / Platform" = "Terminal / Platform";
+"Booking Code" = "Booking Code";
+"Scan Pass" = "Scan Pass";
+"Pass Scanner" = "Pass Scanner";
+"Draft Saved" = "Draft Saved";
+"Your pass draft has been saved." = "Your pass draft has been saved.";
+"Saved to Pass Scanner drafts on this device." = "Saved to Pass Scanner drafts on this device.";
+"Document scanning is not available on this device. Import a photo instead." = "Document scanning is not available on this device. Import a photo instead.";
+"Couldn’t load the selected image." = "Couldn’t load the selected image.";
+"Fix the required fields before adding this pass to Wallet." = "Fix the required fields before adding this pass to Wallet.";
+"Scan or Import a Pass" = "Scan or Import a Pass";
+"Noema reads each pass with your selected local vision model, using barcode and text evidence to prepare a draft for review." = "Noema reads each pass with your selected local vision model, using barcode and text evidence to prepare a draft for review.";
+"Saved drafts stay in Pass Scanner on this device." = "Saved drafts stay in Pass Scanner on this device.";
+"Model Thinking" = "Model Thinking";
+"Greatly increases scan time." = "Greatly increases scan time.";
+"Scan with Camera" = "Scan with Camera";
+"Import Photo" = "Import Photo";
+"Reading pass…" = "Reading pass…";
+"Saved Drafts" = "Saved Drafts";
+"Saved Draft" = "Saved Draft";
+"Open saved draft" = "Open saved draft";
+"Delete Saved Pass" = "Delete Saved Pass";
+"This permanently removes the saved Wallet pass draft and any stored scan image. This action cannot be undone." = "This permanently removes the saved Wallet pass draft and any stored scan image. This action cannot be undone.";
+"Delete All Saved Passes" = "Delete All Saved Passes";
+"This permanently removes every saved Wallet pass draft and any stored scan images. This action cannot be undone." = "This permanently removes every saved Wallet pass draft and any stored scan images. This action cannot be undone.";
+"No saved Wallet passes" = "No saved Wallet passes";
+"%d saved Wallet passes" = "%d saved Wallet passes";
+"%@ - saved %@" = "%@ - saved %@";
+"Confidence: %d%%" = "Confidence: %d%%";
+"Transport" = "Transport";
+"Theme Color" = "Theme Color";
+"Save Draft" = "Save Draft";
+"Add to Wallet" = "Add to Wallet";
+"Board" = "Board";
+"Depart" = "Depart";
+"Wallet Passes" = "Wallet Passes";
+"Signer URL" = "Signer URL";
+"Token stored in Keychain" = "Token stored in Keychain";
+"Signer token" = "Signer token";
+"Save Signer Token" = "Save Signer Token";
+"Remove Signer Token" = "Remove Signer Token";
+"Keep scans with drafts" = "Keep scans with drafts";
+"Allow remote extraction fallback" = "Allow remote extraction fallback";
+"Warning Sensitivity" = "Warning Sensitivity";
+"Relaxed" = "Relaxed";
+"Balanced" = "Balanced";
+"Strict" = "Strict";
+"Pass extraction runs on device. Signing sends only the confirmed draft JSON to your configured signer service." = "Pass extraction runs on device. Signing sends only the confirmed draft JSON to your configured signer service.";
+"Signer, retention, and pass warning settings." = "Signer, retention, and pass warning settings.";
+"Extract trip details and add a confirmed pass to Wallet." = "Extract trip details and add a confirmed pass to Wallet.";
+"Bus" = "Bus";
+"Wallet signer failed with status %d." = "Wallet signer failed with status %d.";
+"Scanning and editing work offline. Adding to Wallet is the final online signing step." = "Scanning and editing work offline. Adding to Wallet is the final online signing step.";
+"Wallet signing needs your configured online signer. This draft is saved locally until you go online." = "Wallet signing needs your configured online signer. This draft is saved locally until you go online.";
+"The next step goes online to sign the confirmed draft. Noema sends draft JSON, not the scan image." = "The next step goes online to sign the confirmed draft. Noema sends draft JSON, not the scan image.";
+"Sign Online & Add" = "Sign Online & Add";
+"Off-grid Mode is on, so Wallet signing is disabled. Turn off Off-grid Mode and connect to the internet to add this pass." = "Off-grid Mode is on, so Wallet signing is disabled. Turn off Off-grid Mode and connect to the internet to add this pass.";
+"Internet is required to sign and add this pass to Wallet. Noema sends only the confirmed draft JSON to its signer, not the scan image." = "Internet is required to sign and add this pass to Wallet. Noema sends only the confirmed draft JSON to its signer, not the scan image.";
+"Internet Required" = "Internet Required";
+"Wallet pass signing requires internet access. Turn off Off-grid Mode and connect to the internet before signing. Your draft has been saved locally." = "Wallet pass signing requires internet access. Turn off Off-grid Mode and connect to the internet before signing. Your draft has been saved locally.";
+"Wallet signing requires internet access and uses Noema’s hosted signer automatically." = "Wallet signing requires internet access and uses Noema’s hosted signer automatically.";
+"Pass extraction runs on device with the selected local vision model. Adding the pass to Wallet requires internet access for Noema’s signer and sends only the confirmed draft JSON, not the scan image." = "Pass extraction runs on device with the selected local vision model. Adding the pass to Wallet requires internet access for Noema’s signer and sends only the confirmed draft JSON, not the scan image.";
+"Pass extraction runs on device. The final Wallet step requires going online to your configured signer service and sends only the confirmed draft JSON." = "Pass extraction runs on device. The final Wallet step requires going online to your configured signer service and sends only the confirmed draft JSON.";
+"Wallet signing uses Noema’s hosted signer automatically." = "Wallet signing uses Noema’s hosted signer automatically.";
+"Pass extraction runs on device. The final Wallet step goes online to Noema’s signer and sends only the confirmed draft JSON, not the scan image." = "Pass extraction runs on device. The final Wallet step goes online to Noema’s signer and sends only the confirmed draft JSON, not the scan image.";
+"Extraction model, hosted signing, retention, and warning settings." = "Extraction model, hosted signing, retention, and warning settings.";
+"Choose the local vision model used to read tickets." = "Choose the local vision model used to read tickets.";
+"Whisper Model Catalog" = "Whisper Model Catalog";
+"Choose the local speech model used for on-device transcription." = "Choose the local speech model used for on-device transcription.";
+"Wallet signing needs Noema’s online signer. This draft is saved locally until you go online." = "Wallet signing needs Noema’s online signer. This draft is saved locally until you go online.";
+"This device cannot verify Noema’s Wallet signer." = "This device cannot verify Noema’s Wallet signer.";
+"The Wallet signer request is missing its draft payload." = "The Wallet signer request is missing its draft payload.";
+"Noema’s Wallet signer could not verify this device." = "Noema’s Wallet signer could not verify this device.";
+"Select a pass extraction model in Settings before scanning passes." = "Select a pass extraction model in Settings before scanning passes.";
+"The selected pass extraction model is missing. Choose another vision model in Settings." = "The selected pass extraction model is missing. Choose another vision model in Settings.";
+"The selected pass extraction model cannot read images. Choose a local vision model." = "The selected pass extraction model cannot read images. Choose a local vision model.";
+"The pass extraction model did not return readable structured data." = "The pass extraction model did not return readable structured data.";
+"Vision extraction and barcode/OCR evidence disagree. Confirm this field before adding the pass." = "Vision extraction and barcode/OCR evidence disagree. Confirm this field before adding the pass.";
+"Selected extraction model is missing" = "Selected extraction model is missing";
+"Install a local vision model before scanning passes." = "Install a local vision model before scanning passes.";
+"Downloaded Vision Models" = "Downloaded Vision Models";
+"Pass Scanner uses this model to read tickets and returns structured fields for review." = "Pass Scanner uses this model to read tickets and returns structured fields for review.";
+"Download one of these from Explore, then return here to select it." = "Download one of these from Explore, then return here to select it.";
+"Pass Extraction Model" = "Pass Extraction Model";
+"Extraction Model" = "Extraction Model";
+"Pass extraction requires a selected local vision model. The final Wallet step goes online to Noema’s signer and sends only the confirmed draft JSON, not the scan image." = "Pass extraction requires a selected local vision model. The final Wallet step goes online to Noema’s signer and sends only the confirmed draft JSON, not the scan image.";
+"Required" = "Required";
+"Missing" = "Missing";
+"Show Raw Output" = "Show Raw Output";
+"Raw Model Output" = "Raw Model Output";
+"No raw model output is available." = "No raw model output is available.";
+"Pass Type" = "Pass Type";
+"Custom Background" = "Custom Background";
+"Boarding or departure time is required." = "Boarding or departure time is required.";
+"No .pte program found for ET model." = "No .pte program found for ET model.";
+"The ET model program is not usable: %@" = "The ET model program is not usable: %@";
+"Tokenizer file not found for ET model." = "Tokenizer file not found for ET model.";
+"The ET tokenizer is not usable: %@" = "The ET tokenizer is not usable: %@";
+"Tap Repair to download the missing ET tokenizer files from %@." = "Tap Repair to download the missing ET tokenizer files from %@.";
+"Tap Repair to download the missing ET tokenizer files, or reinstall the model if repair is unavailable." = "Tap Repair to download the missing ET tokenizer files, or reinstall the model if repair is unavailable.";
+"ET model files are incomplete." = "ET model files are incomplete.";
+"file is missing" = "file is missing";
+"file is empty" = "file is empty";
+"file is a Git LFS pointer, not the tokenizer content" = "file is a Git LFS pointer, not the tokenizer content";
+"file is a Git LFS pointer, not the ExecuTorch program content" = "file is a Git LFS pointer, not the ExecuTorch program content";
+"tokenizer.json is not valid JSON" = "tokenizer.json is not valid JSON";
+"Repair is unavailable for this ET model. Reinstall it from Explore." = "Repair is unavailable for this ET model. Reinstall it from Explore.";
+"Repair finished. Load the ET model again." = "Repair finished. Load the ET model again.";
+
+"Speed up generation with a helper model or Multi-Token Prediction." = "Speed up generation with a helper model or Multi-Token Prediction.";
+
+"Speculative Mode" = "Speculative Mode";
+
+"Multi-Token Prediction" = "Multi-Token Prediction";
+
+"MTP draft tokens: %@" = "MTP draft tokens: %@";
+
+"No MTP head was found for this GGUF. Add a bundled MTP GGUF or an mtp companion file next to the weights." = "No MTP head was found for this GGUF. Add a bundled MTP GGUF or an mtp companion file next to the weights.";
+
+"MTP is unavailable for this model. Choose another GGUF with an MTP head or bundled MTP weights. Helper-model speculative decoding is still available." = "MTP is unavailable for this model. Choose another GGUF with an MTP head or bundled MTP weights. Helper-model speculative decoding is still available.";
+
+"On · n=%d" = "On · n=%d";
+
+"MTP" = "MTP";
+
+
+/* Runtime diagnostics */
+"Runtime Information" = "Runtime Information";
+"Sampling Parameters" = "Sampling Parameters";
+"No local model loaded" = "No local model loaded";
+"Quantization" = "Quantization";
+"Path" = "Path";
+"Repeat Last N" = "Repeat Last N";
+"Presence Penalty" = "Presence Penalty";
+"Frequency Penalty" = "Frequency Penalty";
+"Default" = "Default";
+"Context" = "Context";
+"CPU Threads" = "CPU Threads";
+"Auto" = "Auto";
+"GPU Layers" = "GPU Layers";
+"Prompt Cache" = "Prompt Cache";
+"Draft Information" = "Draft Information";
+"MTP Draft Tokens" = "MTP Draft Tokens";
+"Draft Strategy" = "Draft Strategy";
+"Draft Value" = "Draft Value";
+"MTP Support" = "MTP Support";
+"MTP Source" = "MTP Source";
+"Draft Diagnostics" = "Draft Diagnostics";
+"Draft Generated" = "Draft Generated";
+"Draft Accepted" = "Draft Accepted";
+"Acceptance" = "Acceptance";
+"Predicted Speed" = "Predicted Speed";
+"Prompt Speed" = "Prompt Speed";
+"Prompt Tokens" = "Prompt Tokens";
+"Output Tokens" = "Output Tokens";
+"No response diagnostics yet" = "No response diagnostics yet";
+"Endpoint" = "Endpoint";
+"Request Mode" = "Request Mode";
+"Finish Reason" = "Finish Reason";
+"Output Characters" = "Output Characters";
+"Server Launch" = "Server Launch";
+"Port" = "Port";
+"Draft Model" = "Draft Model";
+"Embedded MTP head or none" = "Embedded MTP head or none";
+"Server Arguments" = "Server Arguments";
+"No server launch recorded" = "No server launch recorded";
+"MTP sidecar and embedded head" = "MTP sidecar and embedded head";
+"MTP sidecar" = "MTP sidecar";
+"Embedded MTP head" = "Embedded MTP head";
+"Draft Tokens" = "Draft Tokens";
+"Draft Window" = "Draft Window";
+"Refresh" = "Refresh";
+"Draft acceptance" = "Draft acceptance";
+"%.1f%% accepted" = "%.1f%% accepted";
+"On · %.0f%%" = "On · %.0f%%";
+"Download Bytes Main" = "Main";
+"Download Bytes Total" = "Total";
+"Download Status Queued" = "Queued";
+"Download Status Scheduled" = "Scheduled";
+"Download Status Preparing" = "Preparing";
+"Download Status Downloading" = "Downloading";
+"Download Status Paused" = "Paused";
+"Download Status Waiting" = "Waiting for connection";
+"Download Status Retrying" = "Retrying";
+"Download Status Verifying" = "Verifying";
+"Download Status Finalizing" = "Finalizing";
+"Download Status Completed" = "Completed";
+"Download Status Failed" = "Failed";
+"Download Status Cancelled" = "Cancelled";
+"Resume Download" = "Resume Download";
+"Pause Download" = "Pause Download";
+"Schedule Download" = "Schedule Download";
+"Starts overnight on Wi-Fi while charging." = "Starts overnight on Wi-Fi while charging.";
+"Cancel Download" = "Cancel Download";
+
+
+/* Localization sync */
+"  %@" = "  %@";
+"  %@%" = "  %@%";
+"%@ -> %@" = "%@ -> %@";
+"%@ parts" = "%@ parts";
+"%@. %@" = "%@. %@";
+"%@ms" = "%@ms";
+"1" = "1";
+"100% · ~88m 88s" = "100% · ~88m 88s";
+"AFM currently unavailable" = "AFM currently unavailable";
+"Allows models to write and execute Python code for calculations, data processing, and analysis. Execution is sandboxed with a 30-second timeout." = "Allows models to write and execute Python code for calculations, data processing, and analysis. Execution is sandboxed with a 30-second timeout.";
+"Apple Foundation Model is hidden. You can re-enable it in Settings." = "Apple Foundation Model is hidden. You can re-enable it in Settings.";
+"Apple Foundation Models only support a 4096-token context in Noema." = "Apple Foundation Models only support a 4096-token context in Noema.";
+"Code Execution" = "Code Execution";
+"Critical" = "Critical";
+"Derived from model title" = "Derived from model title";
+"Device fit" = "Device fit";
+"Downloads continue on iPhone and iPad while Noema remains available in the background. Force-quitting the app stops automatic resume." = "Downloads continue on iPhone and iPad while Noema remains available in the background. Force-quitting the app stops automatic resume.";
+"Errors" = "Errors";
+"ET Models - ExecuTorch" = "ET Models - ExecuTorch";
+"ExecuTorch backend selection is automatic in this build. The runtime uses the delegates embedded in the model program." = "ExecuTorch backend selection is automatic in this build. The runtime uses the delegates embedded in the model program.";
+"Exit code: %@" = "Exit code: %@";
+"Fair" = "Fair";
+"Fastest option on this device: ET models." = "Fastest option on this device: ET models.";
+"Featured" = "Featured";
+"Fits on your device" = "Fits on your device";
+"GGUF works everywhere. MLX targets Apple Silicon speed. ET focuses on responsiveness on any device." = "GGUF works everywhere. MLX targets Apple Silicon speed. ET focuses on responsiveness on any device.";
+"Hidden Models" = "Hidden Models";
+"https://host/v1/audio/transcriptions" = "https://host/v1/audio/transcriptions";
+"ID: %@" = "ID: %@";
+"Leave blank to use the current system language. Use \"auto\" to pick the best supported locale for your language." = "Leave blank to use the current system language. Use \"auto\" to pick the best supported locale for your language.";
+"Loaded" = "Loaded";
+"Loading" = "Loading";
+"Lower values let the MTP head draft more tokens before bailing (more speculation, lower per-token acceptance). 0.75 is the conservative llama.cpp default." = "Lower values let the MTP head draft more tokens before bailing (more speculation, lower per-token acceptance). 0.75 is the conservative llama.cpp default.";
+"Message" = "Message";
+"Noema posts the media file to this endpoint using the OpenAI /v1/audio/transcriptions schema. The server must accept multipart/form-data with model, language, response_format, and file fields." = "Noema posts the media file to this endpoint using the OpenAI /v1/audio/transcriptions schema. The server must accept multipart/form-data with model, language, response_format, and file fields.";
+"Nominal" = "Nominal";
+"Only a partial excerpt of the top chunk fit in the prompt budget." = "Only a partial excerpt of the top chunk fit in the prompt budget.";
+"Pick the ET format when you want ultra-responsive models that run well anywhere." = "Pick the ET format when you want ultra-responsive models that run well anywhere.";
+"Python Code Execution" = "Python Code Execution";
+"Qwen 3.5 2B GGUF gives you a dependable starting point. Delete it anytime if you need space." = "Qwen 3.5 2B GGUF gives you a dependable starting point. Delete it anytime if you need space.";
+"Raw Response" = "Raw Response";
+"RETRIEVAL" = "RETRIEVAL";
+"Select which Apple processing units Core ML can use for this model." = "Select which Apple processing units Core ML can use for this model.";
+"Serious" = "Serious";
+"Start indexing now?" = "Start indexing now?";
+"Start with a reliable Qwen 3.5 2B build. It balances capability with a small download size." = "Start with a reliable Qwen 3.5 2B build. It balances capability with a small download size.";
+"Thermal Stage" = "Thermal Stage";
+"This model doesn't support GPU offload and generation speed will be significantly slower. Fastest option on this device: use an ET model." = "This model doesn't support GPU offload and generation speed will be significantly slower. Fastest option on this device: use an ET model.";
+"This model doesn't support GPU offload and may run slowly. Fastest option: use an ET model." = "This model doesn't support GPU offload and may run slowly. Fastest option: use an ET model.";
+"This will remove the dataset and its embeddings from this device." = "This will remove the dataset and its embeddings from this device.";
+"TIMED OUT" = "TIMED OUT";
+"Top-k, top-p, and repetition penalties are not available for ET runtime in this build." = "Top-k, top-p, and repetition penalties are not available for ET runtime in this build.";
+"Try the Qwen 3.5 2B GGUF build below. It's a good starting point and you can delete it anytime." = "Try the Qwen 3.5 2B GGUF build below. It's a good starting point and you can delete it anytime.";
+"What is Python Code Execution?" = "What is Python Code Execution?";
+"When enabled and armed via the + menu in chat, the model can write and run Python code to help answer your questions. Code runs in a sandboxed environment: no network access, no file access outside a temporary directory, and a 30-second timeout." = "When enabled and armed via the + menu in chat, the model can write and run Python code to help answer your questions. Code runs in a sandboxed environment: no network access, no file access outside a temporary directory, and a 30-second timeout.";
+"whisper-1" = "whisper-1";
+"·" = "·";
+
+/* Runtime diagnostics */
+"Runtime Diagnostics" = "Runtime Diagnostics";
+"Verify model, memory, tools, privacy, and retrieval state." = "Verify model, memory, tools, privacy, and retrieval state.";
+"Open Runtime Diagnostics" = "Open Runtime Diagnostics";
+"Runtime Readiness" = "Runtime Readiness";
+"Chat Input" = "Chat Input";
+"Current Model" = "Current Model";
+"Format" = "Format";
+"Local Runtime" = "Local Runtime";
+"Working Set" = "Working Set";
+"Loopback Server" = "Loopback Server";
+"Last Start" = "Last Start";
+"Images" = "Images";
+"Load Error" = "Load Error";
+"Run Checks" = "Run Checks";
+"Last Checked" = "Last Checked";
+"Remote: %@" = "Remote: %@";
+"Local llama.cpp loopback" = "Local llama.cpp loopback";
+"Local MLX" = "Local MLX";
+"Local ExecuTorch" = "Local ExecuTorch";
+"Local CML" = "Local CML";
+"Fits" = "Fits";
+"Over Budget" = "Over Budget";
+"Not running" = "Not running";
+"Port %d, loading %d%%" = "Port %d, loading %d%%";
+"Port %d, ready" = "Port %d, ready";
+"Enabled, %d draft tokens" = "Enabled, %d draft tokens";
+"Speculation: %@" = "Speculation: %@";
+"No active dataset" = "No active dataset";
+"Local only" = "Local only";
+
+/* Runtime diagnostics export */
+"Diagnostics Export" = "Diagnostics Export";
+"Generate Load Receipt" = "Generate Load Receipt";
+"Share Diagnostics JSON" = "Share Diagnostics JSON";
+"Receipt File" = "Receipt File";
+"Export Error" = "Export Error";
+"MTP Validation" = "MTP Validation";
+"Model Supports MTP" = "Model Supports MTP";
+"MTP Setting" = "MTP Setting";
+"Draft Source" = "Draft Source";
+"GGUF only" = "GGUF only";
+"Sidecar and embedded head" = "Sidecar and embedded head";
+"Sidecar" = "Sidecar";
+"Embedded Head" = "Embedded Head";
+"Inactive" = "Inactive";
+"No device budget available" = "No device budget available";
+"Likely over memory budget" = "Likely over memory budget";
+"Borderline context" = "Borderline context";
+"Comfortable context" = "Comfortable context";
+"Tool Store" = "Tool Store";
+"Open Tool Store" = "Open Tool Store";
+"%d of 3 tools ready" = "%d of 3 tools ready";
+"Web" = "Web";
+"Tool Permissions" = "Tool Permissions";
+"Chat Session" = "Chat Session";
+"Web Armed" = "Web Armed";
+"Python Armed" = "Python Armed";
+"Readiness" = "Readiness";
+"Tool Tests" = "Tool Tests";
+"Run Python Check" = "Run Python Check";
+"Checking Python runtime..." = "Checking Python runtime...";
+"Tool Context" = "Tool Context";
+"Loaded Model" = "Loaded Model";
+"Supported" = "Supported";
+"Saved Memories" = "Saved Memories";
+"Enable, arm, and test local tools from one place." = "Enable, arm, and test local tools from one place.";
+"Disabled in Settings" = "Disabled in Settings";
+"Off-Grid blocks network tools" = "Off-Grid blocks network tools";
+"Dataset retrieval is active" = "Dataset retrieval is active";
+"Unavailable for local MLX" = "Unavailable for local MLX";
+"Unavailable for Apple Foundation Models" = "Unavailable for Apple Foundation Models";
+"Loaded model lacks tool calling" = "Loaded model lacks tool calling";
+"Arm from Tool Store or chat" = "Arm from Tool Store or chat";
+"Exit %d · %@" = "Exit %d · %@";
+"No output" = "No output";
+"Prompt Cache Manager" = "Prompt Cache Manager";
+"Cache File" = "Cache File";
+"Cache Size" = "Cache Size";
+"Clear Prompt Cache" = "Clear Prompt Cache";
+"No explicit cache file" = "No explicit cache file";
+"Not created yet" = "Not created yet";
+"No prompt cache file is configured." = "No prompt cache file is configured.";
+"Prompt cache cleared." = "Prompt cache cleared.";
+"Prompt cache has not been created yet." = "Prompt cache has not been created yet.";
+
+"Model Metadata" = "Model Metadata";
+
+"Open Model Metadata" = "Open Model Metadata";
+
+"No GGUF models installed" = "No GGUF models installed";
+
+"%d GGUF models installed" = "%d GGUF models installed";
+
+
+"Install a local model to inspect architecture, context, tokenizer, vision, MoE, and MTP metadata." = "Install a local model to inspect architecture, context, tokenizer, vision, MoE, and MTP metadata.";
+
+"Inspect local architecture, tokenizer, vision, MoE, and MTP metadata." = "Inspect local architecture, tokenizer, vision, MoE, and MTP metadata.";
+
+"Inspect Model" = "Inspect Model";
+
+"Metadata Inspector" = "Metadata Inspector";
+
+"Detailed Header Scan" = "Detailed Header Scan";
+
+"Display Name" = "Display Name";
+
+"Training Context" = "Training Context";
+
+"Tokenizer & Template" = "Tokenizer & Template";
+
+"Managed by backend" = "Managed by backend";
+
+"Embedded in GGUF" = "Embedded in GGUF";
+
+"Present" = "Present";
+
+"Vision Projector" = "Vision Projector";
+
+"Tool Hints" = "Tool Hints";
+
+"MoE Model" = "MoE Model";
+
+"Experts" = "Experts";
+
+"MoE Layers" = "MoE Layers";
+
+"Hidden Size" = "Hidden Size";
+
+"Feed Forward Size" = "Feed Forward Size";
+
+"Sidecars" = "Sidecars";
+
+"MTP Draft Model" = "MTP Draft Model";
+
+"Install Folder" = "Install Folder";
+
+"Merged in GGUF" = "Merged in GGUF";
+
+"Marked multimodal" = "Marked multimodal";
+
+"Not detected" = "Not detected";
+
+"Dense" = "Dense";
+
+"Metadata Export" = "Metadata Export";
+
+"Generate Metadata JSON" = "Generate Metadata JSON";
+
+"Share Metadata JSON" = "Share Metadata JSON";
+
+"Export File" = "Export File";
+
+"Runtime Presets" = "Runtime Presets";
+
+"Battery Saver" = "Battery Saver";
+
+"Max Speed" = "Max Speed";
+
+"Max Context" = "Max Context";
+
+"Vision Heavy" = "Vision Heavy";
+
+"Tool Heavy" = "Tool Heavy";
+
+"Lower memory" = "Lower memory";
+
+"Everyday chat" = "Everyday chat";
+
+"Fast first tokens" = "Fast first tokens";
+
+"Long documents" = "Long documents";
+
+"Images and OCR" = "Images and OCR";
+
+"Tools and RAG" = "Tools and RAG";
+
+"Max Context (Aggressive)" = "Max Context (Aggressive)";
+
+"Longest context" = "Longest context";
+
+"Saved preset" = "Saved preset";
+
+"Delete Preset" = "Delete Preset";
+
+"Save current settings as a preset" = "Save current settings as a preset";
+
+"Save Preset" = "Save Preset";
+
+"Preset name" = "Preset name";
+
+"Name this preset to reuse these runtime settings on any model later." = "Name this preset to reuse these runtime settings on any model later.";
+
+"Your saved preset. Long-press it above to delete." = "Your saved preset. Long-press it above to delete.";
+
+"Show generation diagnostics" = "Show generation diagnostics";
+
+"Show tokens, speed and total time under each answer, and absolute token counts on the context gauge." = "Show tokens, speed and total time under each answer, and absolute token counts on the context gauge.";
+
+"Generation Diagnostics" = "Generation Diagnostics";
+
+"%.2fs total" = "%.2fs total";
+
+"Context used: %lld of %lld tokens (%d%%)" = "Context used: %lld of %lld tokens (%d%%)";
+
+"Scales context to your device — about 4K, or up to 8K for small models with memory to spare — with fewer CPU threads and a compact q8_0 KV cache. Lowest memory and power use." = "Scales context to your device — about 4K, or up to 8K for small models with memory to spare — with fewer CPU threads and a compact q8_0 KV cache. Lowest memory and power use.";
+
+"Around 8K context with flash attention and a q8_0 KV cache for the fastest token generation with minimal memory." = "Around 8K context with flash attention and a q8_0 KV cache for the fastest token generation with minimal memory.";
+
+"Stretches context to the largest the device allows, keeping a full-precision KV cache and only switching to a compact q8_0 cache when needed to fit. Stops once the model's full context fits." = "Stretches context to the largest the device allows, keeping a full-precision KV cache and only switching to a compact q8_0 cache when needed to fit. Stops once the model's full context fits.";
+
+"Pushes context to the absolute maximum the device can hold: enables flash attention and a heavily quantized KV cache (Q4 keys, IQ4_NL values) when required. Slower, but fits the longest documents." = "Pushes context to the absolute maximum the device can hold: enables flash attention and a heavily quantized KV cache (Q4 keys, IQ4_NL values) when required. Slower, but fits the longest documents.";
+
+"Model Doctor" = "Model Doctor";
+
+"Open Model Doctor" = "Open Model Doctor";
+
+"Install a local model to run checks" = "Install a local model to run checks";
+
+"%d models checked" = "%d models checked";
+
+"Ready" = "Ready";
+
+"Warnings" = "Warnings";
+
+"Blocked" = "Blocked";
+
+"No local models installed" = "No local models installed";
+
+"Install a local model to run file, memory, template, sidecar, tool, vision, and speculative decoding checks." = "Install a local model to run file, memory, template, sidecar, tool, vision, and speculative decoding checks.";
+
+"Model" = "Model";
+
+"Check Model" = "Check Model";
+
+"Compatibility Report" = "Compatibility Report";
+
+"Overall" = "Overall";
+
+"Needs attention" = "Needs attention";
+
+"Runtime Path" = "Runtime Path";
+
+"Load State" = "Load State";
+
+"Loaded now" = "Loaded now";
+
+"Not loaded" = "Not loaded";
+
+"Run Model Doctor" = "Run Model Doctor";
+
+"Recommendations" = "Recommendations";
+
+"No immediate action needed" = "No immediate action needed";
+
+"Checks" = "Checks";
+
+"Runtime Budget" = "Runtime Budget";
+
+"Estimated Working Set" = "Estimated Working Set";
+
+"Safe Context" = "Safe Context";
+
+"KV Cache" = "KV Cache";
+
+"Doctor Export" = "Doctor Export";
+
+"Generate Doctor JSON" = "Generate Doctor JSON";
+
+"Share Doctor JSON" = "Share Doctor JSON";
+
+"%d tokens" = "%d tokens";
+
+"Budget unknown" = "Budget unknown";
+
+"Detected" = "Detected";
+
+"Text only" = "Text only";
+
+"Projector missing" = "Projector missing";
+
+"Enabled but missing" = "Enabled but missing";
+
+"llama.cpp loopback" = "llama.cpp loopback";
+
+"MLX runtime" = "MLX runtime";
+
+"Unknown" = "Unknown";
+
+"Repair or reinstall this model because the expected local file is missing." = "Repair or reinstall this model because the expected local file is missing.";
+
+"Lower context to %@ tokens or use a smaller quant before loading." = "Lower context to %@ tokens or use a smaller quant before loading.";
+
+"Try a smaller quant or disable memory-heavy options before loading." = "Try a smaller quant or disable memory-heavy options before loading.";
+
+"The current context is above the safe estimate; try %@ tokens." = "The current context is above the safe estimate; try %@ tokens.";
+
+"Pair a compatible projector GGUF before using image input with this model." = "Pair a compatible projector GGUF before using image input with this model.";
+
+"Add or select a chat template if replies look poorly formatted." = "Add or select a chat template if replies look poorly formatted.";
+
+"Use the Tool Store test before relying on automatic tool calls." = "Use the Tool Store test before relying on automatic tool calls.";
+
+"Disable MTP or install the matching draft head before loading." = "Disable MTP or install the matching draft head before loading.";
+
+"Install a matching MTP draft head if you want speculative decoding." = "Install a matching MTP draft head if you want speculative decoding.";
+
+"Consider the Balanced or Max Speed preset if you want faster GGUF generation." = "Consider the Balanced or Max Speed preset if you want faster GGUF generation.";
+
+"Run compatibility checks for local files, memory, templates, sidecars, tools, vision, and MTP." = "Run compatibility checks for local files, memory, templates, sidecars, tools, vision, and MTP.";
+
+"Storage Advisor" = "Storage Advisor";
+
+"Open Storage Advisor" = "Open Storage Advisor";
+
+"%@ across %d models" = "%@ across %d models";
+
+"Storage" = "Storage";
+
+"Duplicates" = "Duplicates";
+
+"Install local models to see storage totals, duplicate families, stale models, and cleanup candidates." = "Install local models to see storage totals, duplicate families, stale models, and cleanup candidates.";
+
+"Storage Overview" = "Storage Overview";
+
+"Installed Models" = "Installed Models";
+
+"Visible Models" = "Visible Models";
+
+"Total Model Storage" = "Total Model Storage";
+
+"Largest Model" = "Largest Model";
+
+"Cleanup Candidates" = "Cleanup Candidates";
+
+"No cleanup candidates" = "No cleanup candidates";
+
+"Duplicate Families" = "Duplicate Families";
+
+"No duplicate families" = "No duplicate families";
+
+"Storage Export" = "Storage Export";
+
+"Generate Storage JSON" = "Generate Storage JSON";
+
+"Share Storage JSON" = "Share Storage JSON";
+
+"%d installs · %@ · %@" = "%d installs · %@ · %@";
+
+"Hidden model" = "Hidden model";
+
+"Never loaded" = "Never loaded";
+
+"Unused for %d days" = "Unused for %d days";
+
+"Large model" = "Large model";
+
+"Medium model" = "Medium model";
+
+"Currently loaded" = "Currently loaded";
+
+"Find large, stale, hidden, and duplicate local model installs before cleanup." = "Find large, stale, hidden, and duplicate local model installs before cleanup.";
+
+"Speculative Wizard" = "Speculative Wizard";
+
+"Open Speculative Wizard" = "Open Speculative Wizard";
+
+"Install GGUF models to compare draft options" = "Install GGUF models to compare draft options";
+
+"%d GGUF models can be evaluated" = "%d GGUF models can be evaluated";
+
+"Helpers" = "Helpers";
+
+"Install a GGUF model to choose between MTP, helper-model speculation, or leaving speculation off." = "Install a GGUF model to choose between MTP, helper-model speculation, or leaving speculation off.";
+
+"Target Model" = "Target Model";
+
+"Recommendation" = "Recommendation";
+
+"Best Option" = "Best Option";
+
+"Apply Recommendation" = "Apply Recommendation";
+
+"Draft Candidates" = "Draft Candidates";
+
+"MTP Draft Head" = "MTP Draft Head";
+
+"Helper Models" = "Helper Models";
+
+"No smaller same-family helper installed" = "No smaller same-family helper installed";
+
+"Current Settings" = "Current Settings";
+
+"MTP Min Draft Tokens" = "MTP Min Draft Tokens";
+
+"MTP Draft P-Min" = "MTP Draft P-Min";
+
+"Speculative Export" = "Speculative Export";
+
+"Generate Speculative JSON" = "Generate Speculative JSON";
+
+"Share Speculative JSON" = "Share Speculative JSON";
+
+"Speculative settings updated" = "Speculative settings updated";
+
+"Use MTP" = "Use MTP";
+
+"This model has an embedded or sidecar draft head, so MTP is the lowest-friction option." = "This model has an embedded or sidecar draft head, so MTP is the lowest-friction option.";
+
+"Use Helper Model" = "Use Helper Model";
+
+"No MTP head was found, but a smaller same-family GGUF can draft tokens." = "No MTP head was found, but a smaller same-family GGUF can draft tokens.";
+
+"Leave Off" = "Leave Off";
+
+"No compatible MTP head or smaller helper model is installed for this target." = "No compatible MTP head or smaller helper model is installed for this target.";
+
+"Choose MTP or helper-model drafting for installed GGUF models." = "Choose MTP or helper-model drafting for installed GGUF models.";
+
+"GGUF" = "GGUF";
+
+"Runtime Timeline" = "Runtime Timeline";
+"Open Runtime Timeline" = "Open Runtime Timeline";
+"Loopback" = "Loopback";
+"Loading %d%%" = "Loading %d%%";
+"Live Runtime" = "Live Runtime";
+"Last Response" = "Last Response";
+"Refresh Timeline" = "Refresh Timeline";
+"Timeline Export" = "Timeline Export";
+"Generate Timeline JSON" = "Generate Timeline JSON";
+"Share Timeline JSON" = "Share Timeline JSON";
+"Remote Session" = "Remote Session";
+"Active" = "Active";
+"Model Selected" = "Model Selected";
+"Stored" = "Stored";
+"Load Configuration" = "Load Configuration";
+"Prepared" = "Prepared";
+"Loopback Launch" = "Loopback Launch";
+"Bridge Arguments" = "Bridge Arguments";
+"%d args" = "%d args";
+"Readiness Probe" = "Readiness Probe";
+"%d ms" = "%d ms";
+"Prompt cache disabled" = "Prompt cache disabled";
+"Prompt cache enabled without a file path" = "Prompt cache enabled without a file path";
+"Prompt Processing" = "Prompt Processing";
+"Generation Stream" = "Generation Stream";
+"Complete" = "Complete";
+"Speculation" = "Speculation";
+"Measured" = "Measured";
+"Tools And Retrieval" = "Tools And Retrieval";
+"Dataset Context" = "Dataset Context";
+"Not indexed" = "Not indexed";
+"RAG" = "RAG";
+"No response recorded" = "No response recorded";
+"Tools enabled" = "Tools enabled";
+"Tools off" = "Tools off";
+"Images enabled" = "Images enabled";
+"Images off" = "Images off";
+"Retrieval enabled" = "Retrieval enabled";
+"Retrieval off" = "Retrieval off";
+"%d GPU layers" = "%d GPU layers";
+"KV offload on" = "KV offload on";
+"KV offload off" = "KV offload off";
+"Flash Attention on" = "Flash Attention on";
+"Flash Attention off" = "Flash Attention off";
+"Port %d" = "Port %d";
+"No timing metadata" = "No timing metadata";
+"%d prompt tokens" = "%d prompt tokens";
+"Unknown prompt tokens" = "Unknown prompt tokens";
+"Unknown rate" = "Unknown rate";
+"%d output tokens" = "%d output tokens";
+"%d output characters" = "%d output characters";
+"%d drafted, %d accepted, %.0f%% acceptance" = "%d drafted, %d accepted, %.0f%% acceptance";
+"Trace load, loopback, prompt, generation, tools, retrieval, and speculation events." = "Trace load, loopback, prompt, generation, tools, retrieval, and speculation events.";
+
+"MTP Dashboard" = "MTP Dashboard";
+"Open MTP Dashboard" = "Open MTP Dashboard";
+"Installed" = "Installed";
+"Configured" = "Configured";
+"Running" = "Running";
+"No MTP-capable GGUF models detected" = "No MTP-capable GGUF models detected";
+"%d MTP-capable models installed" = "%d MTP-capable models installed";
+"MTP Acceptance" = "MTP Acceptance";
+"Accepted Tokens" = "Accepted Tokens";
+"Acceptance Rate" = "Acceptance Rate";
+"Speed Delta" = "Speed Delta";
+"Current MTP Run" = "Current MTP Run";
+"Running Mode" = "Running Mode";
+"Prompt Rate" = "Prompt Rate";
+"Generation Rate" = "Generation Rate";
+"Refresh MTP Metrics" = "Refresh MTP Metrics";
+"MTP Guidance" = "MTP Guidance";
+"Installed MTP Models" = "Installed MTP Models";
+"MTP Export" = "MTP Export";
+"Generate MTP JSON" = "Generate MTP JSON";
+"Share MTP JSON" = "Share MTP JSON";
+"%.0f%%" = "%.0f%%";
+"No accepted drafts" = "No accepted drafts";
+"+%d accepted, %d rejected" = "+%d accepted, %d rejected";
+"MTP off" = "MTP off";
+"Run a GGUF prompt with MTP enabled to collect acceptance metrics." = "Run a GGUF prompt with MTP enabled to collect acceptance metrics.";
+"Use the Speculative Wizard if you need help choosing MTP or a helper model." = "Use the Speculative Wizard if you need help choosing MTP or a helper model.";
+"The backend returned draft counts without an acceptance rate." = "The backend returned draft counts without an acceptance rate.";
+"Acceptance is strong; MTP is likely helping this model." = "Acceptance is strong; MTP is likely helping this model.";
+"Acceptance is mixed; compare against a non-MTP benchmark before keeping it on." = "Acceptance is mixed; compare against a non-MTP benchmark before keeping it on.";
+"Acceptance is low; disable MTP or try a better-matched draft head." = "Acceptance is low; disable MTP or try a better-matched draft head.";
+"Review draft-token acceptance, speed hints, and MTP-capable installed models." = "Review draft-token acceptance, speed hints, and MTP-capable installed models.";
+
+"Loopback Health" = "Loopback Health";
+"Open Loopback Health" = "Open Loopback Health";
+"Bridge" = "Bridge";
+"Probe" = "Probe";
+"Loopback server is not running" = "Loopback server is not running";
+"Server Status" = "Server Status";
+"Bridge State" = "Bridge State";
+"Loopback Port" = "Loopback Port";
+"Load Progress" = "Load Progress";
+"HTTP Probe" = "HTTP Probe";
+"Health Endpoint" = "Health Endpoint";
+"Probe URL" = "Probe URL";
+"HTTP Status" = "HTTP Status";
+"Latency" = "Latency";
+"Checking Health" = "Checking Health";
+"Check Health" = "Check Health";
+"Last Start Diagnostics" = "Last Start Diagnostics";
+"Code" = "Code";
+"HTTP Ready" = "HTTP Ready";
+"Last HTTP Status" = "Last HTTP Status";
+"Elapsed" = "Elapsed";
+"No start diagnostics recorded" = "No start diagnostics recorded";
+"Start Options" = "Start Options";
+"GGUF File" = "GGUF File";
+"Projector File" = "Projector File";
+"MTP File" = "MTP File";
+"Speculative Type" = "Speculative Type";
+"Argument Count" = "Argument Count";
+"No start options recorded" = "No start options recorded";
+"Health Export" = "Health Export";
+"Generate Health JSON" = "Generate Health JSON";
+"Share Health JSON" = "Share Health JSON";
+"Checking" = "Checking";
+"Not checked" = "Not checked";
+"HTTP %d" = "HTTP %d";
+"Unreachable" = "Unreachable";
+"Check the embedded llama.cpp server port, HTTP health, load progress, and start diagnostics." = "Check the embedded llama.cpp server port, HTTP health, load progress, and start diagnostics.";
+
+"Runtime Fixes" = "Runtime Fixes";
+"Open Runtime Fixes" = "Open Runtime Fixes";
+"Issue" = "Issue";
+"Fixes" = "Fixes";
+"Review safe setting changes for the last loopback failure" = "Review safe setting changes for the last loopback failure";
+"Load a local model to see recovery options" = "Load a local model to see recovery options";
+"Prepare lower-risk settings before the next load" = "Prepare lower-risk settings before the next load";
+"Failure Snapshot" = "Failure Snapshot";
+"Current Context" = "Current Context";
+"Start Diagnostic" = "Start Diagnostic";
+"Recommended Fixes" = "Recommended Fixes";
+"No automatic fixes are available for the current state." = "No automatic fixes are available for the current state.";
+"Manual Checklist" = "Manual Checklist";
+"Load or select a local model first." = "Load or select a local model first.";
+"No load error recorded" = "No load error recorded";
+"Use Safe Context" = "Use Safe Context";
+"Set context to %d tokens." = "Set context to %d tokens.";
+"Halve Context" = "Halve Context";
+"Reduce context to %d tokens for the next load." = "Reduce context to %d tokens for the next load.";
+"Disable Flash Attention" = "Disable Flash Attention";
+"Use the safer attention path for the next load." = "Use the safer attention path for the next load.";
+"Disable KV Offload" = "Disable KV Offload";
+"Keep KV cache on CPU if GPU memory is unstable." = "Keep KV cache on CPU if GPU memory is unstable.";
+"Reset KV Quantization" = "Reset KV Quantization";
+"Return K/V cache quantization to F16." = "Return K/V cache quantization to F16.";
+"Memory pressure detected; apply a smaller context before retrying." = "Memory pressure detected; apply a smaller context before retrying.";
+"After applying a fix, unload and load the model again." = "After applying a fix, unload and load the model again.";
+"If health still fails, open Loopback Health and export diagnostics." = "If health still fails, open Loopback Health and export diagnostics.";
+"Applied: %@" = "Applied: %@";
+"Apply Fix" = "Apply Fix";
+"Apply safer context, Flash Attention, KV offload, and cache settings after loopback failures." = "Apply safer context, Flash Attention, KV offload, and cache settings after loopback failures.";
+
+"Unload Verifier" = "Unload Verifier";
+"Open Unload Verifier" = "Open Unload Verifier";
+"Ready to verify unload for %@" = "Ready to verify unload for %@";
+"A non-local session is active" = "A non-local session is active";
+"No local model is loaded" = "No local model is loaded";
+"Current Runtime" = "Current Runtime";
+"Chat Runtime" = "Chat Runtime";
+"Current Footprint" = "Current Footprint";
+"Verification" = "Verification";
+"Verifying Unload" = "Verifying Unload";
+"Run Unload Verification" = "Run Unload Verification";
+"Load a local model before running unload verification." = "Load a local model before running unload verification.";
+"This unloads the current local model and measures memory before, immediately after, and after teardown settles." = "This unloads the current local model and measures memory before, immediately after, and after teardown settles.";
+"Last Verification" = "Last Verification";
+"Model Before Unload" = "Model Before Unload";
+"Started" = "Started";
+"Before" = "Before";
+"After" = "After";
+"Settled" = "Settled";
+"Freed" = "Freed";
+"Port Before" = "Port Before";
+"Port After" = "Port After";
+"Bridge After" = "Bridge After";
+"Unload Export" = "Unload Export";
+"Generate Unload JSON" = "Generate Unload JSON";
+"Share Unload JSON" = "Share Unload JSON";
+"Memory Returned" = "Memory Returned";
+"Partially Cleared" = "Partially Cleared";
+"Still Retained" = "Still Retained";
+"%@ retained" = "%@ retained";
+"Non-local session" = "Non-local session";
+"Confirm local model teardown, loopback shutdown, and memory return after ejecting a model." = "Confirm local model teardown, loopback shutdown, and memory return after ejecting a model.";
+
+"Load Receipt" = "Load Receipt";
+"Open Load Receipt" = "Open Load Receipt";
+"%@ load settings and bridge arguments" = "%@ load settings and bridge arguments";
+"%@ remote session receipt" = "%@ remote session receipt";
+"Last loopback start options are available" = "Last loopback start options are available";
+"No model load has been recorded" = "No model load has been recorded";
+"Template" = "Template";
+"Receipt Summary" = "Receipt Summary";
+"Prompt Template" = "Prompt Template";
+"Generated" = "Generated";
+"Local Model" = "Local Model";
+"File" = "File";
+"Runtime Settings" = "Runtime Settings";
+"KV Quantization" = "KV Quantization";
+"Memory Map" = "Memory Map";
+"Warmup" = "Warmup";
+"Skipped" = "Skipped";
+"All prompts" = "All prompts";
+"System prompts" = "System prompts";
+"MTP · %d draft tokens" = "MTP · %d draft tokens";
+"Helper model" = "Helper model";
+"Memory Estimate" = "Memory Estimate";
+"RAM Budget" = "RAM Budget";
+"Fit Status" = "Fit Status";
+"Fits budget" = "Fits budget";
+"Exceeds budget" = "Exceeds budget";
+"Loopback Start" = "Loopback Start";
+"No loopback start options recorded" = "No loopback start options recorded";
+"Start Diagnostics" = "Start Diagnostics";
+"Receipt Export" = "Receipt Export";
+"Generate Receipt JSON" = "Generate Receipt JSON";
+"Share Receipt JSON" = "Share Receipt JSON";
+"Recorded" = "Recorded";
+"Local" = "Local";
+"Review bridge arguments, prompt template source, runtime settings, memory estimate, and readiness diagnostics." = "Review bridge arguments, prompt template source, runtime settings, memory estimate, and readiness diagnostics.";
+
+"Privacy Flight Recorder" = "Privacy Flight Recorder";
+"Open Privacy Flight Recorder" = "Open Privacy Flight Recorder";
+"Off-grid" = "Off-grid";
+"Allowed" = "Allowed";
+"Network paths are blocked by Off-grid Mode" = "Network paths are blocked by Off-grid Mode";
+"Remote runtime is active" = "Remote runtime is active";
+"Current runtime is local" = "Current runtime is local";
+"Review local, remote, and tool privacy state" = "Review local, remote, and tool privacy state";
+"Flight Summary" = "Flight Summary";
+"Privacy Mode" = "Privacy Mode";
+"Standard" = "Standard";
+"Network Kill Switch" = "Network Kill Switch";
+"Active Runtime" = "Active Runtime";
+"Active Dataset" = "Active Dataset";
+"Checked" = "Checked";
+"Local Surfaces" = "Local Surfaces";
+"Local Model Execution" = "Local Model Execution";
+"Dataset Retrieval" = "Dataset Retrieval";
+"Python Sandbox" = "Python Sandbox";
+"Network-Capable Surfaces" = "Network-Capable Surfaces";
+"Downloads and Explore" = "Downloads and Explore";
+"Wallet Signing" = "Wallet Signing";
+"No remote session is active" = "No remote session is active";
+"Privacy Export" = "Privacy Export";
+"Generate Privacy JSON" = "Generate Privacy JSON";
+"Share Privacy JSON" = "Share Privacy JSON";
+"None configured" = "None configured";
+"%d configured" = "%d configured";
+"Local, remote, network, and tool-state receipt." = "Local, remote, network, and tool-state receipt.";
+"Review local, remote, network, and tool-state privacy receipts." = "Review local, remote, network, and tool-state privacy receipts.";
+
+"RAG Inspector" = "RAG Inspector";
+"Open RAG Inspector" = "Open RAG Inspector";
+"%@ ready for retrieval inspection" = "%@ ready for retrieval inspection";
+"Dataset" = "Dataset";
+"Score" = "Score";
+"N/A" = "N/A";
+"Full Content" = "Full Content";
+"Chunk Retrieval" = "Chunk Retrieval";
+"Deciding" = "Deciding";
+"Retrieval Run" = "Retrieval Run";
+"Latest Retrieval" = "Latest Retrieval";
+"Waiting" = "Waiting";
+"Captured" = "Captured";
+"Index State" = "Index State";
+"Stage" = "Stage";
+"Method" = "Method";
+"Decision" = "Decision";
+"Trimmed Chunks" = "Trimmed Chunks";
+"Partial Chunk" = "Partial Chunk";
+"Context Budget" = "Context Budget";
+"Configured Context" = "Configured Context";
+"Reserved Response" = "Reserved Response";
+"Last Refreshed" = "Last Refreshed";
+"Query" = "Query";
+"User Prompt" = "User Prompt";
+"No captured query" = "No captured query";
+"Assistant Preview" = "Assistant Preview";
+"No assistant response captured" = "No assistant response captured";
+"Retrieved Chunks" = "Retrieved Chunks";
+"No chunks captured yet" = "No chunks captured yet";
+"Injected Context" = "Injected Context";
+"Characters" = "Characters";
+"Preview" = "Preview";
+"No injected context captured" = "No injected context captured";
+"Copy Injected Context" = "Copy Injected Context";
+"Max Chunks" = "Max Chunks";
+"Dataset Status" = "Dataset Status";
+"Inspector Export" = "Inspector Export";
+"Generate RAG Report" = "Generate RAG Report";
+"Share RAG JSON" = "Share RAG JSON";
+"Report File" = "Report File";
+"No Dataset" = "No Dataset";
+"Needs Reindex" = "Needs Reindex";
+"Indexed" = "Indexed";
+"Idle" = "Idle";
+"Chosen" = "Chosen";
+"Injected" = "Injected";
+"Extracting" = "Extracting";
+"Compressing" = "Compressing";
+"Injected context copied" = "Injected context copied";
+"Copy is unavailable on this platform" = "Copy is unavailable on this platform";
+"Chunk %d" = "Chunk %d";
+"Inspect retrieved chunks, scores, trimming, citations, and injected context for the latest dataset answer." = "Inspect retrieved chunks, scores, trimming, citations, and injected context for the latest dataset answer.";
+
+"Model Recommendations" = "Model Recommendations";
+"Open Model Recommendations" = "Open Model Recommendations";
+"Benchmarked" = "Benchmarked";
+"Fastest" = "Fastest";
+"Efficient" = "Efficient";
+"%@ is currently the best measured fit." = "%@ is currently the best measured fit.";
+"Install models to rank them on this device." = "Install models to rank them on this device.";
+"Run benchmarks from model settings to unlock measured rankings." = "Run benchmarks from model settings to unlock measured rankings.";
+"Install local models and run benchmarks to see recommendations ranked for this device." = "Install local models and run benchmarks to see recommendations ranked for this device.";
+"Recommendation Overview" = "Recommendation Overview";
+"Benchmarked Models" = "Benchmarked Models";
+"Fastest Model" = "Fastest Model";
+"Most Efficient" = "Most Efficient";
+"Refresh Rankings" = "Refresh Rankings";
+"Recommended Models" = "Recommended Models";
+"No benchmark data yet" = "No benchmark data yet";
+"Open a model's settings and run Benchmark. Results stay on this device and will rank models here." = "Open a model's settings and run Benchmark. Results stay on this device and will rank models here.";
+"Measured Results" = "Measured Results";
+"Unmeasured Models" = "Unmeasured Models";
+"Every installed model has a benchmark" = "Every installed model has a benchmark";
+"Recommendation Export" = "Recommendation Export";
+"Generate Recommendations JSON" = "Generate Recommendations JSON";
+"Share Recommendations JSON" = "Share Recommendations JSON";
+"%.1f tok/s generation" = "%.1f tok/s generation";
+"%.2fs first token" = "%.2fs first token";
+"No data" = "No data";
+"Fast Local" = "Fast Local";
+"Prompt" = "Prompt";
+"First" = "First";
+"Rank installed models by benchmark speed, latency, memory, and fit on this device." = "Rank installed models by benchmark speed, latency, memory, and fit on this device.";
+
+"Auto-Tuner" = "Auto-Tuner";
+"Open Auto-Tuner" = "Open Auto-Tuner";
+"Tunable" = "Tunable";
+"Safe Plans" = "Safe Plans";
+"Install local models to generate runtime tuning plans." = "Install local models to generate runtime tuning plans.";
+"Every tunable model has a safe runtime plan." = "Every tunable model has a safe runtime plan.";
+"%d models need review before applying runtime plans." = "%d models need review before applying runtime plans.";
+"Tuning Objective" = "Tuning Objective";
+"Battery" = "Battery";
+"Speed" = "Speed";
+"Balanced tuning favors stable memory use with enough context for everyday chat." = "Balanced tuning favors stable memory use with enough context for everyday chat.";
+"Battery tuning lowers threads, context, and warm residency for cooler runs." = "Battery tuning lowers threads, context, and warm residency for cooler runs.";
+"Speed tuning favors GPU offload, warm loads, Flash Attention, and low first-token latency." = "Speed tuning favors GPU offload, warm loads, Flash Attention, and low first-token latency.";
+"Context tuning maximizes safe context while using compact KV cache settings for GGUF models." = "Context tuning maximizes safe context while using compact KV cache settings for GGUF models.";
+"Auto-Tune Overview" = "Auto-Tune Overview";
+"Tunable Models" = "Tunable Models";
+"Safe Runtime Plans" = "Safe Runtime Plans";
+"Need Review" = "Need Review";
+"Runtime Plans" = "Runtime Plans";
+"Bulk Actions" = "Bulk Actions";
+"Apply Safe Runtime Plans" = "Apply Safe Runtime Plans";
+"Auto-Tuner changes saved model settings only. It does not load or unload models. Run benchmarks afterward to replace estimates with measured data." = "Auto-Tuner changes saved model settings only. It does not load or unload models. Run benchmarks afterward to replace estimates with measured data.";
+"Applied runtime plan for %@." = "Applied runtime plan for %@.";
+"Applied %d safe runtime plans." = "Applied %d safe runtime plans.";
+"Safe to apply" = "Safe to apply";
+"Review memory budget" = "Review memory budget";
+"No benchmark yet" = "No benchmark yet";
+"%.1f tok/s measured" = "%.1f tok/s measured";
+"No budget" = "No budget";
+"Context %@ · Estimate %@ · Budget %@" = "Context %@ · Estimate %@ · Budget %@";
+"Threads" = "Threads";
+"Apply Runtime Plan" = "Apply Runtime Plan";
+"Generate device-aware runtime plans for context, threads, GPU offload, KV cache, and warm loading." = "Generate device-aware runtime plans for context, threads, GPU offload, KV cache, and warm loading.";
+
+"Chat Template Preview" = "Chat Template Preview";
+"Rendered Prompt" = "Rendered Prompt";
+"Stop Tokens" = "Stop Tokens";
+"No explicit stop tokens detected for this template." = "No explicit stop tokens detected for this template.";
+"Using the model's configured chat template." = "Using the model's configured chat template.";
+"Using Noema's detected default template for this model family." = "Using Noema's detected default template for this model family.";
+"You are Noema, a private offline assistant." = "You are Noema, a private offline assistant.";
+"Summarize this note in two concise bullets." = "Summarize this note in two concise bullets.";
+"- Key fact: Noema keeps private data local.\n- Next step: cite the active dataset when possible." = "- Key fact: Noema keeps private data local.\n- Next step: cite the active dataset when possible.";
+"Now answer with citations if available." = "Now answer with citations if available.";
+"No preview could be generated for this template." = "No preview could be generated for this template.";
+"Preview truncated." = "Preview truncated.";
+
+"Settings Search" = "Settings Search";
+"Search settings" = "Search settings";
+"Clear Settings Search" = "Clear Settings Search";
+"Search model, runtime, privacy, tool, download, and data settings." = "Search model, runtime, privacy, tool, download, and data settings.";
+"No matching settings" = "No matching settings";
+"Inspect active model, memory, prompt cache, and runtime state." = "Inspect active model, memory, prompt cache, and runtime state.";
+"Review load, prompt, tool, and generation phases." = "Review load, prompt, tool, and generation phases.";
+"Generate device-aware context, thread, GPU, and KV cache plans." = "Generate device-aware context, thread, GPU, and KV cache plans.";
+"Rank installed models by measured speed, latency, and memory." = "Rank installed models by measured speed, latency, and memory.";
+"Inspect architecture, tokenizer, chat template, vision, MoE, and MTP." = "Inspect architecture, tokenizer, chat template, vision, MoE, and MTP.";
+"Run compatibility checks for local model files and runtime options." = "Run compatibility checks for local model files and runtime options.";
+"Find large, stale, hidden, and duplicate local model installs." = "Find large, stale, hidden, and duplicate local model installs.";
+"Compare MTP and helper draft model options." = "Compare MTP and helper draft model options.";
+"Track draft tokens, accepted tokens, and speculative speed." = "Track draft tokens, accepted tokens, and speculative speed.";
+"Review bridge arguments, template source, and readiness details." = "Review bridge arguments, template source, and readiness details.";
+"Check local llama.cpp server port, health, and diagnostics." = "Check local llama.cpp server port, health, and diagnostics.";
+"Apply suggested fixes for memory and loopback launch failures." = "Apply suggested fixes for memory and loopback launch failures.";
+"Confirm memory returns after ejecting a model." = "Confirm memory returns after ejecting a model.";
+"Enable, disable, and test local tools." = "Enable, disable, and test local tools.";
+"Inspect retrieved chunks, scores, citations, and injected context." = "Inspect retrieved chunks, scores, citations, and injected context.";
+"Manage the local embedding model used for retrieval." = "Manage the local embedding model used for retrieval.";
+"Choose what model or backend Noema loads first." = "Choose what model or backend Noema loads first.";
+"Tune max chunks and similarity threshold." = "Tune max chunks and similarity threshold.";
+"Review persistent on-device memories." = "Review persistent on-device memories.";
+"Audit local, network, tool, and remote activity." = "Audit local, network, tool, and remote activity.";
+"Review privacy-sensitive controls and app guarantees." = "Review privacy-sensitive controls and app guarantees.";
+"Change appearance, haptics, language, and general behavior." = "Change appearance, haptics, language, and general behavior.";
+"Configure local dictation and transcription behavior." = "Configure local dictation and transcription behavior.";
+"Choose and manage local speech models." = "Choose and manage local speech models.";
+"Configure a remote audio model endpoint." = "Configure a remote audio model endpoint.";
+"Restore models hidden from Stored." = "Restore models hidden from Stored.";
+"Open app notes, limitations, and support information." = "Open app notes, limitations, and support information.";
+"Configure boarding pass scanning and draft handling." = "Configure boarding pass scanning and draft handling.";
+"Choose the local model used for travel document extraction." = "Choose the local model used for travel document extraction.";
+"Whisper Model" = "Whisper Model";
+
+"Loading model" = "Loading model";
+"Preparing runtime" = "Preparing runtime";
+"Model selected" = "Model selected";
+"Remote ready" = "Remote ready";
+"Connected backend" = "Connected backend";
+"Select a model to start chatting." = "Select a model to start chatting.";
+"Runtime status: %@, %@" = "Runtime status: %@, %@";
+
+"%@ ctx" = "%@ ctx";
+"~%@ load" = "~%@ load";
+"~%@ over budget" = "~%@ over budget";
+"Live Memory Pressure" = "Live Memory Pressure";
+"Selected Model Margin" = "Selected Model Margin";
+"Memory Pressure" = "Memory Pressure";
+"%@ used, %@ available" = "%@ used, %@ available";
+"%@ headroom" = "%@ headroom";
+"%@ over" = "%@ over";
+"Comfortable" = "Comfortable";
+"Elevated" = "Elevated";
+"High" = "High";
+"Template Source Diff" = "Template Source Diff";
+"Same kind" = "Same kind";
+"Different kind" = "Different kind";
+"Curated" = "Curated";
+"Family Default" = "Family Default";
+"Kind: %@" = "Kind: %@";
+"No explicit template; PromptBuilder will use the detected model family." = "No explicit template; PromptBuilder will use the detected model family.";
+"Model Dependencies" = "Model Dependencies";
+"Open Model Dependencies" = "Open Model Dependencies";
+"No local models installed." = "No local models installed.";
+"Weights, tokenizers, templates, projectors, and draft heads are mapped." = "Weights, tokenizers, templates, projectors, and draft heads are mapped.";
+"%d missing runtime dependencies" = "%d missing runtime dependencies";
+"Dependency Graph" = "Dependency Graph";
+"No matching models" = "No matching models";
+"Installed Model Dependencies" = "Installed Model Dependencies";
+"Optional" = "Optional";
+"Warning" = "Warning";
+"Tokenizer" = "Tokenizer";
+"Configuration" = "Configuration";
+"Chat Template" = "Chat Template";
+"Projector" = "Projector";
+"Artifacts Manifest" = "Artifacts Manifest";
+"Managed by Apple Foundation Models" = "Managed by Apple Foundation Models";
+"Built into GGUF or backend" = "Built into GGUF or backend";
+"Family default" = "Family default";
+"Text-only" = "Text-only";
+"Map weights to tokenizer, config, projector, and MTP sidecar files." = "Map weights to tokenizer, config, projector, and MTP sidecar files.";
+"Map installed weights to tokenizer, config, projector, MTP, and artifact sidecars." = "Map installed weights to tokenizer, config, projector, MTP, and artifact sidecars.";
+"Generate Developer Bundle" = "Generate Developer Bundle";
+"Share Developer Bundle" = "Share Developer Bundle";
+"Developer Bundle File" = "Developer Bundle File";
+"Developer Bundle Error" = "Developer Bundle Error";
+"This export excludes chat transcripts and document contents." = "This export excludes chat transcripts and document contents.";
+"This export includes redacted recent logs and excludes chat transcripts and document contents." = "This export includes redacted recent logs and excludes chat transcripts and document contents.";
+"%d of 5 tools ready" = "%d of 5 tools ready";
+"Math" = "Math";
+"Units" = "Units";
+"Always On" = "Always On";
+"Run Calculator Check" = "Run Calculator Check";
+"Checking calculator..." = "Checking calculator...";
+"Run Unit Conversion Check" = "Run Unit Conversion Check";
+"Checking unit conversion..." = "Checking unit conversion...";
+"Calculator check passed." = "Calculator check passed.";
+"Unit conversion check passed." = "Unit conversion check passed.";
+"Calculator" = "Calculator";
+"Unit Converter" = "Unit Converter";
+"Local deterministic" = "Local deterministic";
+"Dry Run" = "Dry Run";
+"Dry-Run Tools" = "Dry-Run Tools";
+"Tool Execution" = "Tool Execution";
+"Tool call was recorded but not executed." = "Tool call was recorded but not executed.";
+"User Supplied" = "User Supplied";
+"Trusted" = "Trusted";
+"Needs Review" = "Needs Review";
+"Conflicting" = "Conflicting";
+"Source Reliability" = "Source Reliability";
+"Reliability Label" = "Reliability Label";
+"Reliability" = "Reliability";
+"No reliability label has been set for this dataset." = "No reliability label has been set for this dataset.";
+"Imported or authored by you. Treat as local context, not independently verified." = "Imported or authored by you. Treat as local context, not independently verified.";
+"Marked as a trusted source for grounded answers." = "Marked as a trusted source for grounded answers.";
+"Review source quality before relying on answers." = "Review source quality before relying on answers.";
+"Contains sources that may disagree. Ask Noema to compare evidence." = "Contains sources that may disagree. Ask Noema to compare evidence.";
+"Review Memory Saves" = "Review Memory Saves";
+"%d pending review" = "%d pending review";
+"Memory Review Inbox" = "Memory Review Inbox";
+"Review model-proposed memories before saving them." = "Review model-proposed memories before saving them.";
+"Created by Memory Tool" = "Created by Memory Tool";
+"Reject" = "Reject";
+"Approve" = "Approve";
+"Memory save queued for review." = "Memory save queued for review.";
+"Memory review item not found." = "Memory review item not found.";
+"All Chats" = "All Chats";
+"Current Project" = "Current Project";
+"Temporary" = "Temporary";
+"Memory Scope" = "Memory Scope";
+"Expiry Date" = "Expiry Date";
+"Expired" = "Expired";
+"Expires %@" = "Expires %@";
+"Helper Pairing Lab" = "Helper Pairing Lab";
+"Install a smaller same-family GGUF to unlock helper pairing." = "Install a smaller same-family GGUF to unlock helper pairing.";
+"Draft Helper" = "Draft Helper";
+"Selected Helper" = "Selected Helper";
+"Target Family" = "Target Family";
+"Helper Size" = "Helper Size";
+"Size Ratio" = "Size Ratio";
+"Pairing Fit" = "Pairing Fit";
+"Apply Selected Helper" = "Apply Selected Helper";
+"Helper model pairing updated" = "Helper model pairing updated";
+"Same family" = "Same family";
+"%.0f%% of target" = "%.0f%% of target";
+"Same family, close enough to draft useful tokens" = "Same family, close enough to draft useful tokens";
+"Same family, lightweight helper" = "Same family, lightweight helper";
+"Same family, but may save less memory" = "Same family, but may save less memory";
+"Same-family helper candidate" = "Same-family helper candidate";
+"Offline Leaderboard" = "Offline Leaderboard";
+"No measured models yet" = "No measured models yet";
+"Best Overall" = "Best Overall";
+"Fastest Generation" = "Fastest Generation";
+"Fastest First Token" = "Fastest First Token";
+"Lowest Memory" = "Lowest Memory";
+"Best GGUF" = "Best GGUF";
+"Best Tool Model" = "Best Tool Model";
+"Best Vision Model" = "Best Vision Model";
+"%.0f score" = "%.0f score";
+"Off-Grid Proof Drill" = "Off-Grid Proof Drill";
+"Run Proof Drill" = "Run Proof Drill";
+"Run the drill to verify external network paths are blocked while loopback and local paths remain available." = "Run the drill to verify external network paths are blocked while loopback and local paths remain available.";
+"Recent Blocked Attempts" = "Recent Blocked Attempts";
+"No blocked network attempts recorded" = "No blocked network attempts recorded";
+"Clear Blocked Attempts" = "Clear Blocked Attempts";
+"Would block in Off-grid" = "Would block in Off-grid";
+"Web Search Endpoint" = "Web Search Endpoint";
+"Model Download Endpoint" = "Model Download Endpoint";
+"Remote Backend Endpoint" = "Remote Backend Endpoint";
+"Wallet Signer Endpoint" = "Wallet Signer Endpoint";
+"Loopback Runtime Endpoint" = "Loopback Runtime Endpoint";
+"Local File Path" = "Local File Path";
+"External HTTP(S)" = "External HTTP(S)";
+"LAN HTTP(S)" = "LAN HTTP(S)";
+"Loopback allowed" = "Loopback allowed";
+"Not a network request" = "Not a network request";
+"Repair Queue" = "Repair Queue";
+"Repairing Models..." = "Repairing Models...";
+"Repair All Models" = "Repair All Models";
+"Runs path rehoming, stale partial download cleanup, and queues downloads for resolvable missing artifacts." = "Runs path rehoming, stale partial download cleanup, and queues downloads for resolvable missing artifacts.";
+"Candidates" = "Candidates";
+"Maintenance repaired %d artifacts, completed %d installs, removed %d stale files." = "Maintenance repaired %d artifacts, completed %d installs, removed %d stale files.";
+"All Models" = "All Models";
+"No missing dependencies after maintenance." = "No missing dependencies after maintenance.";
+"Manual import; add missing files next to the model weights." = "Manual import; add missing files next to the model weights.";
+"System-managed model; no repair needed." = "System-managed model; no repair needed.";
+"No matching quant found in the model registry." = "No matching quant found in the model registry.";
+"Queued repair download for %d runtime issues." = "Queued repair download for %d runtime issues.";
+"Could not read model registry: %@" = "Could not read model registry: %@";
+"Queued" = "Queued";
+"Dataset Health" = "Dataset Health";
+"Open Dataset Health" = "Open Dataset Health";
+"Issues" = "Issues";
+"Rebuildable" = "Rebuildable";
+"Refresh Health Checks" = "Refresh Health Checks";
+"Rebuild Stale Indexes" = "Rebuild Stale Indexes";
+"No local datasets installed." = "No local datasets installed.";
+"Indexes, files, and embedding metadata look healthy." = "Indexes, files, and embedding metadata look healthy.";
+"%d dataset health issues found" = "%d dataset health issues found";
+"No matching datasets" = "No matching datasets";
+"Dataset Checks" = "Dataset Checks";
+"Healthy" = "Healthy";
+"Index metadata, vectors, and source files are consistent." = "Index metadata, vectors, and source files are consistent.";
+"Chunks" = "Chunks";
+"Schema" = "Schema";
+"Vector Dim" = "Vector Dim";
+"Indexing" = "Indexing";
+"Indexing Failed" = "Indexing Failed";
+"The latest indexing run failed." = "The latest indexing run failed.";
+"Indexer Failure Reported" = "Indexer Failure Reported";
+"Stale Embedding Index" = "Stale Embedding Index";
+"Existing vectors do not match the active embedding model or current index schema." = "Existing vectors do not match the active embedding model or current index schema.";
+"Not Indexed" = "Not Indexed";
+"Build an embedding index before using semantic retrieval." = "Build an embedding index before using semantic retrieval.";
+"No Supported Source Files" = "No Supported Source Files";
+"Add PDF, EPUB, text, Markdown, JSON, CSV, or TSV files." = "Add PDF, EPUB, text, Markdown, JSON, CSV, or TSV files.";
+"Unsupported Files Present" = "Unsupported Files Present";
+"%d files will be skipped by the indexer." = "%d files will be skipped by the indexer.";
+"Files Skipped During Indexing" = "Files Skipped During Indexing";
+"%d supported files were skipped in the latest report." = "%d supported files were skipped in the latest report.";
+"Empty Extracted Files" = "Empty Extracted Files";
+"%d files produced no retrievable text." = "%d files produced no retrievable text.";
+"Old Index Schema" = "Old Index Schema";
+"Schema %@ should be rebuilt to %@." = "Schema %@ should be rebuilt to %@.";
+"Embedding Model Changed" = "Embedding Model Changed";
+"Vectors were built with a different embedding model." = "Vectors were built with a different embedding model.";
+"Vector Dimension Mismatch" = "Vector Dimension Mismatch";
+"Vectors are %d dimensions; active embedding model expects %d." = "Vectors are %d dimensions; active embedding model expects %d.";
+"Check indexing, skipped files, stale vectors, and rebuildable datasets." = "Check indexing, skipped files, stale vectors, and rebuildable datasets.";
+"Check stale vectors, skipped files, unsupported sources, and failed indexing reports." = "Check stale vectors, skipped files, unsupported sources, and failed indexing reports.";
+"%@ / %@ used" = "%@ / %@ used";
+"History" = "History";
+"Reserve" = "Reserve";
+"Context budget: %@ of %@ used" = "Context budget: %@ of %@ used";
+
+"Allow All Tools" = "Allow All Tools";
+"Block Chat Tools" = "Block Chat Tools";
+"0 of 3 allowed" = "0 of 3 allowed";
+"Chat tools: 0 of 3 allowed" = "Chat tools: 0 of 3 allowed";
+
+"Retrieval Mode" = "Retrieval Mode";
+"Focused" = "Focused";
+"Broad" = "Broad";
+
+"Bookmarked" = "Bookmarked";
+"Bookmark Message" = "Bookmark Message";
+"Remove Bookmark" = "Remove Bookmark";
+
+"Bookmarks" = "Bookmarks";
+"Empty message" = "Empty message";
+"New chat" = "New chat";
+
+"Search chats" = "Search chats";
+"Clear Chat Search" = "Clear Chat Search";
+"Chat Recall" = "Chat Recall";
+"No matching messages" = "No matching messages";
+"Chat search result" = "Chat search result";
+
+"Private Scratchpad" = "Private Scratchpad";
+"Notes for this chat" = "Notes for this chat";
+"Clear Scratchpad" = "Clear Scratchpad";
+"Chat Instructions" = "Chat Instructions";
+"Instructions for this chat" = "Instructions for this chat";
+"Clear Instructions" = "Clear Instructions";
+"Set" = "Set";
+"Inherited" = "Inherited";
+
+"Chat Mode" = "Chat Mode";
+"General Chat" = "General Chat";
+"Research Mode" = "Research Mode";
+"Study Mode" = "Study Mode";
+"Code Mode" = "Code Mode";
+"Meeting Prep Mode" = "Meeting Prep Mode";
+"Travel Mode" = "Travel Mode";
+"Medical Notes Mode" = "Medical Notes Mode";
+"Legal Reading Mode" = "Legal Reading Mode";
+"Creative Drafting Mode" = "Creative Drafting Mode";
+"Chat Controls" = "Chat Controls";
+"Answer Style" = "Answer Style";
+"Natural Style" = "Natural Style";
+"Terse" = "Terse";
+"Cited" = "Cited";
+"Step-by-step" = "Step-by-step";
+"Socratic" = "Socratic";
+"Executive Brief" = "Executive Brief";
+"Table-first" = "Table-first";
+"Tool requested" = "Tool requested";
+"Tool running" = "Tool running";
+"Tool completed" = "Tool completed";
+"Tool failed" = "Tool failed";
+"Tool result" = "Tool result";
+"Tool error" = "Tool error";
+"Export Pack" = "Export Pack";
+"Markdown Note" = "Markdown Note";
+"Clean conversation note" = "Clean conversation note";
+"PDF Document" = "PDF Document";
+"Paginated conversation copy" = "Paginated conversation copy";
+"DOCX Document" = "DOCX Document";
+"Word-compatible conversation package" = "Word-compatible conversation package";
+"Citations JSON" = "Citations JSON";
+"Source metadata for cited answers" = "Source metadata for cited answers";
+"Prompt Receipt" = "Prompt Receipt";
+"Model, settings, dataset, and prompt fingerprint" = "Model, settings, dataset, and prompt fingerprint";
+"Replay JSON" = "Replay JSON";
+"Prompt, output, timings, tools, and citations" = "Prompt, output, timings, tools, and citations";
+"Export file unavailable" = "Export file unavailable";
+"No messages" = "No messages";
+"Assistant" = "Assistant";
+"User" = "User";
+"Unknown Source" = "Unknown Source";
+"n/a" = "n/a";
+"Follow-ups" = "Follow-ups";
+"Show sources" = "Show sources";
+"Show the exact source passages." = "Show the exact source passages.";
+"Compare evidence" = "Compare evidence";
+"Compare the cited sources." = "Compare the cited sources.";
+"Dataset gaps" = "Dataset gaps";
+"What did the dataset not answer?" = "What did the dataset not answer?";
+"Cited summary" = "Cited summary";
+"Give me a cited summary." = "Give me a cited summary.";
+"Find contradictions" = "Find contradictions";
+"Find contradictions in the dataset." = "Find contradictions in the dataset.";
+"Edge cases" = "Edge cases";
+"Explain the edge cases." = "Explain the edge cases.";
+"Write tests" = "Write tests";
+"Write tests for this." = "Write tests for this.";
+"Open questions" = "Open questions";
+"Extract open questions." = "Extract open questions.";
+"3 bullets" = "3 bullets";
+"Summarize the answer in 3 bullets." = "Summarize the answer in 3 bullets.";
+"Next question" = "Next question";
+"What should I ask next?" = "What should I ask next?";
+"Checklist" = "Checklist";
+"Create a checklist from this." = "Create a checklist from this.";
+"Branch" = "Branch";
+"Branch Conversation" = "Branch Conversation";
+"Branch: %@" = "Branch: %@";
+"Regenerate" = "Regenerate";
+"Regenerate Response" = "Regenerate Response";
+"Try Model" = "Try Model";
+"Ask with Another Model" = "Ask with Another Model";
+"Compare: %@" = "Compare: %@";
+"Pin" = "Pin";
+"Pin to Scratchpad" = "Pin to Scratchpad";
+"Pinned to Scratchpad" = "Pinned to Scratchpad";
+"Pinned %@ message" = "Pinned %@ message";
+"Audit" = "Audit";
+"Audit Answer" = "Audit Answer";
+"Audit the previous answer for unsupported claims, missing caveats, possible errors, and places where the evidence is weak." = "Audit the previous answer for unsupported claims, missing caveats, possible errors, and places where the evidence is weak.";
+"Tool" = "Tool";
+"Pin Result" = "Pin Result";
+"Pinned Result" = "Pinned Result";
+"Repair Tool Call" = "Repair Tool Call";
+"Pinned %@ result" = "Pinned %@ result";
+"Repair this failed tool call. Explain what likely went wrong, propose corrected arguments, and rerun the tool only if it is safe and useful.\n\n%@" = "Repair this failed tool call. Explain what likely went wrong, propose corrected arguments, and rerun the tool only if it is safe and useful.\n\n%@";
+"Preparing image" = "Preparing image";
+"Size unknown" = "Size unknown";
+"%@ · %@ img tok" = "%@ · %@ img tok";
+"Image preflight: %@, %@." = "Image preflight: %@, %@.";
+"Context Plan" = "Context Plan";
+"Prompt window" = "Prompt window";
+"%@ of %@ estimated" = "%@ of %@ estimated";
+"Kept" = "Kept";
+"At risk" = "At risk";
+"Older messages marked at risk are the first candidates for summarizing or dropping when the prompt gets too large." = "Older messages marked at risk are the first candidates for summarizing or dropping when the prompt gets too large.";
+"Messages" = "Messages";
+"No conversation messages" = "No conversation messages";
+
+"Snapshot Receipt" = "Snapshot Receipt";
+"Chat Snapshot" = "Chat Snapshot";
+"Share Snapshot" = "Share Snapshot";
+"Message Count" = "Message Count";
+"System Prompt Fingerprint" = "System Prompt Fingerprint";
+"Settings Summary" = "Settings Summary";
+"No dataset" = "No dataset";
+"Created" = "Created";
+"%d evidence items" = "%d evidence items";
+"Evidence" = "Evidence";
+"Evidence Summary" = "Evidence Summary";
+"Citations" = "Citations";
+"Tool Calls" = "Tool Calls";
+"Web Results" = "Web Results";
+"Attachments" = "Attachments";
+"Retrieval Decision" = "Retrieval Decision";
+"Retrieved Context" = "Retrieved Context";
+"Injected Tokens" = "Injected Tokens";
+"Prompt Budget" = "Prompt Budget";
+"Parameters" = "Parameters";
+"No source" = "No source";
+"No result" = "No result";
+"Engine" = "Engine";
+"URL" = "URL";
+"No Evidence" = "No Evidence";
+"Audit Evidence" = "Audit Evidence";
+"Streaming Controls" = "Streaming Controls";
+"Stop After Paragraph" = "Stop After Paragraph";
+"Will stop after paragraph" = "Will stop after paragraph";
+"Local Only" = "Local Only";
+"Remote Answer" = "Remote Answer";
+"Network-Assisted Answer" = "Network-Assisted Answer";
+"Local-Only Answer" = "Local-Only Answer";
+"Noema chat" = "Noema chat";
+"Noema Stored dataset" = "Noema Stored dataset";
+"Tool Compatibility" = "Tool Compatibility";
+"Local GGUF" = "Local GGUF";
+"Best local tool path when the model supports function calling." = "Best local tool path when the model supports function calling.";
+"ExecuTorch SLM" = "ExecuTorch SLM";
+"Local bundle path with tool calling enabled by Noema." = "Local bundle path with tool calling enabled by Noema.";
+"Remote tools are sent as OpenAI-style function specs." = "Remote tools are sent as OpenAI-style function specs.";
+"Depends on the selected provider model's tool support." = "Depends on the selected provider model's tool support.";
+"Uses the OpenAI-compatible fallback when tools are requested." = "Uses the OpenAI-compatible fallback when tools are requested.";
+"Requires an Ollama model that emits tool calls." = "Requires an Ollama model that emits tool calls.";
+"Runs tools through the paired Mac or LAN relay session." = "Runs tools through the paired Mac or LAN relay session.";
+"CloudKit relay transport uses the same remote tool contract." = "CloudKit relay transport uses the same remote tool contract.";
+"Conditional" = "Conditional";
+"Not Available" = "Not Available";
+"%d possible memory conflicts" = "%d possible memory conflicts";
+"Possible Conflict" = "Possible Conflict";
+"May contradict \"%@\"" = "May contradict \"%@\"";
+"Opposite wording on a similar topic" = "Opposite wording on a similar topic";
+"Preference or avoidance may conflict" = "Preference or avoidance may conflict";
+"Review both memories before saving." = "Review both memories before saving.";
+"%d of 4 allowed" = "%d of 4 allowed";
+"Chat tools: %d of 4 allowed" = "Chat tools: %d of 4 allowed";
+"Local Note" = "Local Note";
+"Save Markdown Note" = "Save Markdown Note";
+"Share Saved Note" = "Share Saved Note";
+"Note File" = "Note File";
+"Save the conversation as a local Markdown note." = "Save the conversation as a local Markdown note.";
+"Noema Chat" = "Noema Chat";
+"Compact Chat Mode" = "Compact Chat Mode";
+"Context used: %d%%" = "Context used: %d%%";
+"Model Only" = "Model Only";
+"Model-only answer. No sources were attached." = "Model-only answer. No sources were attached.";
+"Notebook Output" = "Notebook Output";
+"Navigate" = "Navigate";
+"%d artifact(s)" = "%d artifact(s)";
+"Charts" = "Charts";
+"Tables" = "Tables";
+"Generated Files" = "Generated Files";
+"Execution Log" = "Execution Log";
+"Preview truncated or unavailable" = "Preview truncated or unavailable";
+
+"Model Alias" = "Model Alias";
+"Apply Alias" = "Apply Alias";
+"Clear Alias" = "Clear Alias";
+
+/* Model provenance */
+"Provenance" = "Provenance";
+"Disk Use" = "Disk Use";
+"Last Used" = "Last Used";
+"Checksum" = "Checksum";
+"Local Path" = "Local Path";
+"Install Root" = "Install Root";
+"Layers" = "Layers";
+"MoE" = "MoE";
+"No alias" = "No alias";
+"No checksum" = "No checksum";
+"Multimodal" = "Multimodal";
+"Tool Capable" = "Tool Capable";
+"Favorite" = "Favorite";
+"%d active" = "%d active";
+"%d MoE layers" = "%d MoE layers";
+"Update Status" = "Update Status";
+"Checking for model updates..." = "Checking for model updates...";
+"Check for Updates" = "Check for Updates";
+"Current" = "Current";
+"Update available" = "Update available";
+"Installed quant no longer listed" = "Installed quant no longer listed";
+"Unable to compare" = "Unable to compare";
+"Update check failed: %@" = "Update check failed: %@";
+"Checksum changed" = "Checksum changed";
+"Size changed" = "Size changed";
+"Primary file changed" = "Primary file changed";
+"File parts changed" = "File parts changed";
+
+/* Model license warnings */
+"Review License Before Downloading" = "Review License Before Downloading";
+"Download Anyway" = "Download Anyway";
+"The license label for %@ is %@. Confirm that your use is allowed before downloading." = "The license label for %@ is %@. Confirm that your use is allowed before downloading.";
+"No clear license was found for %@. Confirm that your use is allowed before downloading." = "No clear license was found for %@. Confirm that your use is allowed before downloading.";
+"Review the %@ license for %@ before downloading." = "Review the %@ license for %@ before downloading.";
+"Review this model's license before downloading." = "Review this model's license before downloading.";
+"No clear license was found for this model." = "No clear license was found for this model.";
+"Review this model's license terms." = "Review this model's license terms.";
+"Permissive license" = "Permissive license";
+
+/* Offline Explore cache */
+"No offline Explore cache is available for this model." = "No offline Explore cache is available for this model.";
+"Previously Viewed" = "Previously Viewed";
+"Offline Explore Cache" = "Offline Explore Cache";
+"Cached from previous Explore visits. Model cards and README files stay on this device." = "Cached from previous Explore visits. Model cards and README files stay on this device.";
+"Available offline" = "Available offline";
+"Offline cache" = "Offline cache";
+
+/* Curated model notes */
+"Curated Notes" = "Curated Notes";
+"Apple Foundation Models" = "Apple Foundation Models";
+"System models are private and fast when available, but only expose the fixed Apple runtime and context window." = "System models are private and fast when available, but only expose the fixed Apple runtime and context window.";
+"Qwen family" = "Qwen family";
+"Qwen models are strong general assistants with good coding and multilingual coverage; prefer recent instruct builds for chat." = "Qwen models are strong general assistants with good coding and multilingual coverage; prefer recent instruct builds for chat.";
+"Llama family" = "Llama family";
+"Llama models are widely supported by GGUF tooling and make good default chat models when the quant fits your device." = "Llama models are widely supported by GGUF tooling and make good default chat models when the quant fits your device.";
+"Gemma family" = "Gemma family";
+"Gemma models are compact and capable; check the repository notes for the recommended prompt template and license terms." = "Gemma models are compact and capable; check the repository notes for the recommended prompt template and license terms.";
+"Mistral family" = "Mistral family";
+"Mistral-family models often run efficiently at small sizes; Mixtral variants may need extra RAM because they use MoE routing." = "Mistral-family models often run efficiently at small sizes; Mixtral variants may need extra RAM because they use MoE routing.";
+"DeepSeek family" = "DeepSeek family";
+"DeepSeek models are useful for reasoning and coding; choose smaller distilled builds when memory is tight." = "DeepSeek models are useful for reasoning and coding; choose smaller distilled builds when memory is tight.";
+"Phi family" = "Phi family";
+"Phi models are tuned for compact devices and quick responses, but quality varies strongly by task and quantization." = "Phi models are tuned for compact devices and quick responses, but quality varies strongly by task and quantization.";
+
+/* Model collections */
+"Model Collections" = "Model Collections";
+"Tiny Fast" = "Tiny Fast";
+"Coding" = "Coding";
+"Tool-capable" = "Tool-capable";
+"Recommended Tasks" = "Recommended Tasks";
+"General chat" = "General chat";
+"Tool use" = "Tool use";
+"Quick local tasks" = "Quick local tasks";
+
+/* Download plan preview */
+"Download Plan" = "Download Plan";
+"Expanded" = "Expanded";
+"Collapsed" = "Collapsed";
+"Config" = "Config";
+"iMatrix" = "iMatrix";
+"Processor" = "Processor";
+"Params" = "Params";
+"Install-time check" = "Install-time check";
+"Some sidecars are checked during install." = "Some sidecars are checked during install.";
+"%d more install items" = "%d more install items";
+"%d known files" = "%d known files";
+"%@ · %@ · %d unknown sizes" = "%@ · %@ · %d unknown sizes";
+"Install checks" = "Install checks";
+"Selected quant" = "Selected quant";
+"Quant Comparison" = "Quant Comparison";
+"Best quality" = "Best quality";
+"Smallest" = "Smallest";
+"Quality" = "Quality";
+"RAM" = "RAM";
+"Low" = "Low";
+"Behavior" = "Behavior";
+"Expert routed" = "Expert routed";
+"Expert-aware estimate" = "Expert-aware estimate";
+"MoE Guidance" = "MoE Guidance";
+"MoE models route each token through a subset of expert feed-forward networks. They can improve quality at a given active compute level, but expert weights still affect disk use and memory planning." = "MoE models route each token through a subset of expert feed-forward networks. They can improve quality at a given active compute level, but expert weights still affect disk use and memory planning.";
+"Routing" = "Routing";
+"Sparse activation" = "Sparse activation";
+"Start with a balanced quant on memory-limited devices; raising active experts can increase RAM use and latency." = "Start with a balanced quant on memory-limited devices; raising active experts can increase RAM use and latency.";
+
+/* Device fit badges */
+"Works on this device" = "Works on this device";
+"Works here" = "Works here";
+"Measured tight" = "Measured tight";
+"Measured slow" = "Measured slow";
+"Likely works" = "Likely works";
+"Tight fit" = "Tight fit";
+"May not fit" = "May not fit";
+"Model works on this device" = "Model works on this device";
+"Model may be tight on this device" = "Model may be tight on this device";
+"Model may not work well on this device" = "Model may not work well on this device";
+"Benchmarked on this device: %@ · %@ · %@ peak memory." = "Benchmarked on this device: %@ · %@ · %@ peak memory.";
+"Estimated for this device: %@ working set against %@ memory budget." = "Estimated for this device: %@ working set against %@ memory budget.";
+
+/* Local vs remote startup routing */
+"No startup route" = "No startup route";
+"Local route" = "Local route";
+"Remote route" = "Remote route";
+"Local, then remote" = "Local, then remote";
+"Remote, then local" = "Remote, then local";
+"Route blocked" = "Route blocked";
+"Pick a local or remote default so Noema knows where to start." = "Pick a local or remote default so Noema knows where to start.";
+"Off-Grid is on, so remote defaults are skipped and the local model stays first." = "Off-Grid is on, so remote defaults are skipped and the local model stays first.";
+"Off-Grid is on and no local default is selected, so startup will not use remote compute." = "Off-Grid is on and no local default is selected, so startup will not use remote compute.";
+"Startup stays on device unless you manually choose a remote backend." = "Startup stays on device unless you manually choose a remote backend.";
+"Startup uses the selected remote backend and needs network access." = "Startup uses the selected remote backend and needs network access.";
+"Your local default is tried first; remote is a fallback if local loading fails." = "Your local default is tried first; remote is a fallback if local loading fails.";
+"Your remote default is tried first; local is a fallback if the network or backend fails." = "Your remote default is tried first; local is a fallback if the network or backend fails.";
+"The local GGUF is large, so remote fallback is useful when memory or battery is tight." = "The local GGUF is large, so remote fallback is useful when memory or battery is tight.";
+"Low Power Mode favors the efficient local model before remote networking." = "Low Power Mode favors the efficient local model before remote networking.";
+
+/* Remote prompt redaction */
+"Redact sensitive data before remote handoff" = "Redact sensitive data before remote handoff";
+"When enabled, Noema replaces detected emails, phone numbers, payment cards, addresses, IDs, API keys, and passwords before sending a prompt to a remote backend." = "When enabled, Noema replaces detected emails, phone numbers, payment cards, addresses, IDs, API keys, and passwords before sending a prompt to a remote backend.";
+
+/* Feature privacy labels */
+"Feature Privacy Labels" = "Feature Privacy Labels";
+"Local sandbox" = "Local sandbox";
+"Optional network" = "Optional network";
+"Local model chat" = "Local model chat";
+"Prompts and tokens stay on this device when a local model is selected." = "Prompts and tokens stay on this device when a local model is selected.";
+"Dataset retrieval" = "Dataset retrieval";
+"Imported documents and embeddings stay on device." = "Imported documents and embeddings stay on device.";
+"Saved memories are stored locally and require explicit tool permission in chat." = "Saved memories are stored locally and require explicit tool permission in chat.";
+"Memory tools are disabled." = "Memory tools are disabled.";
+"Python runs in a local sandbox without network access." = "Python runs in a local sandbox without network access.";
+"Python tools are disabled." = "Python tools are disabled.";
+"Web search can contact the network only when enabled and armed in chat." = "Web search can contact the network only when enabled and armed in chat.";
+"Web search is disabled." = "Web search is disabled.";
+"Off-grid blocks web search and records blocked attempts." = "Off-grid blocks web search and records blocked attempts.";
+"Remote backends" = "Remote backends";
+"Remote prompts can leave the device when you choose a remote backend." = "Remote prompts can leave the device when you choose a remote backend.";
+"Remote prompts can leave the device; sensitive-data redaction is enabled." = "Remote prompts can leave the device; sensitive-data redaction is enabled.";
+"Off-grid blocks remote backend traffic." = "Off-grid blocks remote backend traffic.";
+"Off-grid blocks Explore, downloads, and external model catalog calls." = "Off-grid blocks Explore, downloads, and external model catalog calls.";
+"Explore and downloads contact external model catalogs only when used." = "Explore and downloads contact external model catalogs only when used.";
+
+/* AFM guardrail mode */
+"Guardrail Mode" = "Guardrail Mode";
+"Content Transformation" = "Content Transformation";
+"Uses Apple's default AFM guardrails for general chat." = "Uses Apple's default AFM guardrails for general chat.";
+"Allows Apple's permissive content-transformation guardrails for rewriting or transforming user-provided content." = "Allows Apple's permissive content-transformation guardrails for rewriting or transforming user-provided content.";
+"Apple manages AFM safety behavior; choose the guardrail mode that matches this model's task." = "Apple manages AFM safety behavior; choose the guardrail mode that matches this model's task.";
+
+/* Model unload verification */
+"Memory returned" = "Memory returned";
+"Memory unchanged" = "Memory unchanged";
+"Memory increased" = "Memory increased";
+"Memory unavailable" = "Memory unavailable";
+"Last Unload Verification" = "Last Unload Verification";
+"%@ · %@ released" = "%@ · %@ released";
+
+/* Generation power adaptation */
+"Power Adaptation" = "Power Adaptation";
+"No adaptation" = "No adaptation";
+"Low Power Mode" = "Low Power Mode";
+"Serious thermal state" = "Serious thermal state";
+"Critical thermal state" = "Critical thermal state";
+"%@ - threads %@ to %@ - context %@ to %@" = "%@ - threads %@ to %@ - context %@ to %@";
+"Latency %@ - max %@ ms" = "Latency %@ - max %@ ms";
+"Summarize %@ with citations." = "Summarize %@ with citations.";
+"What are the most important open questions in %@?" = "What are the most important open questions in %@?";
+"Make a study guide from %@." = "Make a study guide from %@.";
+
+// MARK: - Noema Teams (Enterprise)
+"Enterprise" = "Enterprise";
+"Connect to company" = "Connect to company";
+"Company code" = "Company code";
+"Work email" = "Work email";
+"Your administrator shares the company code. We'll email you a verification code." = "Your administrator shares the company code. We'll email you a verification code.";
+"Connect" = "Connect";
+"Contacting your workspace…" = "Contacting your workspace…";
+"Check your email" = "Check your email";
+"Verification code" = "Verification code";
+"We sent a 6-digit code to %@." = "We sent a 6-digit code to %@.";
+"Verify" = "Verify";
+"Waiting for admin approval" = "Waiting for admin approval";
+"An administrator needs to approve your request. You can leave this screen — Noema connects automatically once approved." = "An administrator needs to approve your request. You can leave this screen — Noema connects automatically once approved.";
+"Cancel request" = "Cancel request";
+"Workspace" = "Workspace";
+"Company" = "Company";
+"Signed in as" = "Signed in as";
+"Roles" = "Roles";
+"Policy" = "Policy";
+"Last sync" = "Last sync";
+"Device ID" = "Device ID";
+"What your roles allow" = "What your roles allow";
+"Model formats" = "Model formats";
+"Off-grid mode is required by your organization" = "Off-grid mode is required by your organization";
+"Company datasets" = "Company datasets";
+"No datasets are shared with your roles yet." = "No datasets are shared with your roles yet.";
+"Refresh policy" = "Refresh policy";
+"Disconnect" = "Disconnect";
+"Disconnect from this workspace?" = "Disconnect from this workspace?";
+"Company datasets are removed from this device and your organization's policy no longer applies." = "Company datasets are removed from this device and your organization's policy no longer applies.";
+"Policy expired — Noema keeps enforcing the last policy and will sync when the workspace is reachable." = "Policy expired — Noema keeps enforcing the last policy and will sync when the workspace is reachable.";
+"This device's access was revoked by your organization. Company datasets were removed." = "This device's access was revoked by your organization. Company datasets were removed.";
+"The last policy from your workspace couldn't be trusted. Restrictions stay active; company datasets are unavailable." = "The last policy from your workspace couldn't be trusted. Restrictions stay active; company datasets are unavailable.";
+"Restricted" = "Restricted";
+"Connecting…" = "Connecting…";
+"Awaiting email verification" = "Awaiting email verification";
+"Pending admin approval" = "Pending admin approval";
+"Connected — policy active" = "Connected — policy active";
+"Connected — policy expired" = "Connected — policy expired";
+"Device access revoked" = "Device access revoked";
+"Policy could not be verified" = "Policy could not be verified";
+"Required by your organization's policy. Only your workspace's policy server can be reached." = "Required by your organization's policy. Only your workspace's policy server can be reached.";
+"Blocked by your organization's policy." = "Blocked by your organization's policy.";
+"Remote inference is disabled by your organization's policy." = "Remote inference is disabled by your organization's policy.";
+"This remote backend is not allowed by your organization's policy." = "This remote backend is not allowed by your organization's policy.";
+"Your workspace session is no longer valid." = "Your workspace session is no longer valid.";
+"This device's access was revoked by your organization." = "This device's access was revoked by your organization.";
+"Could not reach your organization's workspace server." = "Could not reach your organization's workspace server.";
+"The workspace server sent an unexpected response." = "The workspace server sent an unexpected response.";
+"Your access request was declined by an administrator." = "Your access request was declined by an administrator.";
+
+// MARK: - Noema Teams datasets
+"Adding to Stored…" = "Adding to Stored…";
+"In Stored" = "In Stored";
+"Remove from this device" = "Remove from this device";
+"Couldn't load the file preview." = "Couldn't load the file preview.";
+
+// MARK: - Noema Teams governance
+"Managed by your organization" = "Managed by your organization";
+"Your organization limits Explore to these approved models." = "Your organization limits Explore to these approved models.";
+"No models are approved for your roles yet." = "No models are approved for your roles yet.";
+"Couldn't load this model's details." = "Couldn't load this model's details.";
+"Locked" = "Locked";
+"Locked by your organization's policy" = "Locked by your organization's policy";
+"Keep company datasets" = "Keep company datasets";
+"Remove company datasets" = "Remove company datasets";
+"Leave & delete company data" = "Leave & delete company data";
+"You can keep saved company datasets on this device as personal datasets, or remove them now." = "You can keep saved company datasets on this device as personal datasets, or remove them now.";
+"Your organization uses Full Noema Control: all company datasets on this device are deleted when you leave." = "Your organization uses Full Noema Control: all company datasets on this device are deleted when you leave.";
+
+"Up to date" = "Up to date";
+"Revoked" = "Revoked";
+"Invalid" = "Invalid";
+
+/* Private Cloud Compute routing */
+"Private Cloud" = "Private Cloud";
+"Answered with Apple Private Cloud Compute" = "Answered with Apple Private Cloud Compute";
+"Every reply runs on Apple's Private Cloud Compute — same privacy guarantees, larger context and deeper reasoning. Falls back to on-device automatically when offline or the daily limit is reached." = "Every reply runs on Apple's Private Cloud Compute — same privacy guarantees, larger context and deeper reasoning. Falls back to on-device automatically when offline or the daily limit is reached.";
+"Replies run on-device and hand off mid-answer to Private Cloud Compute only when more capability is needed. The conversation is shared with Apple's secure cloud only when that happens. Requires iOS 27." = "Replies run on-device and hand off mid-answer to Private Cloud Compute only when more capability is needed. The conversation is shared with Apple's secure cloud only when that happens. Requires iOS 27.";
+"Keeps every reply fully on-device. Private Cloud Compute is never used." = "Keeps every reply fully on-device. Private Cloud Compute is never used.";
+
+"Preparing %d datasets" = "Preparing %d datasets";
+"%d datasets" = "%d datasets";
+
+"Paused — return to Noema to continue" = "Paused — return to Noema to continue";
+"Keep Noema open while embedding — locking the screen pauses progress." = "Keep Noema open while embedding — locking the screen pauses progress.";
+
+"Open Noema to continue" = "Open Noema to continue";
+
+"You can leave Noema during this step — embedding hasn't started yet." = "You can leave Noema during this step — embedding hasn't started yet.";
+
+/* Hugging Face endpoint / mirror settings */
+"Model Sources" = "Model Sources";
+"Hugging Face Endpoint" = "Hugging Face Endpoint";
+"Official (huggingface.co)" = "Official (huggingface.co)";
+"HF-Mirror (hf-mirror.com)" = "HF-Mirror (hf-mirror.com)";
+"Custom Endpoint" = "Custom Endpoint";
+"Using custom endpoint: %@" = "Using custom endpoint: %@";
+"Enter an https:// URL with no path. Until then, huggingface.co is used." = "Enter an https:// URL with no path. Until then, huggingface.co is used.";
+"Model search and downloads use this endpoint. Choose HF-Mirror if huggingface.co is blocked or slow in your region. Applies to new downloads." = "Model search and downloads use this endpoint. Choose HF-Mirror if huggingface.co is blocked or slow in your region. Applies to new downloads.";
+
+"Switch model" = "Switch model";
+
+/* Localization additions (Enes feedback batch) */
+"More options" = "More options";
+"FITS" = "FITS";
+"TIGHT FIT" = "TIGHT FIT";
+"DOESN'T FIT" = "DOESN'T FIT";
+"Diagnostics" = "Diagnostics";
+"Diagnostics & Tools" = "Diagnostics & Tools";
+"Runtime health, model inspection & tuning" = "Runtime health, model inspection & tuning";
+"Runtime health, model inspection, tuning, and data tools." = "Runtime health, model inspection, tuning, and data tools.";
+"Using embedded Python runtime." = "Using embedded Python runtime.";
+"Haptics" = "Haptics";
+"Mute Sound Effects" = "Mute Sound Effects";
+"Play Sound Effects in Silent Mode" = "Play Sound Effects in Silent Mode";
+"%1$@, size %2$@ GB" = "%1$@, size %2$@ GB";
+
+/* Model-settings + chat localization additions (Enes batch 2) */
+"Unload Model" = "Unload Model";
+"Stop generating" = "Stop generating";
+"Hide Model" = "Hide Model";
+"Draft generated" = "Draft generated";
+"This format manages runtime optimizations automatically." = "This format manages runtime optimizations automatically.";
+"Choose how this model uses Apple's Private Cloud Compute." = "Choose how this model uses Apple's Private Cloud Compute.";
+"MTP draft probability floor: %@" = "MTP draft probability floor: %@";
+"MTP min draft tokens: %@" = "MTP min draft tokens: %@";
+"%d experts" = "%d experts";
+"Import Complete" = "Import Complete";
+"Unsupported file type" = "Unsupported file type";
+"Skipped %@. Supported formats: PDF, EPUB, TXT, Markdown and JSON." = "Skipped %@. Supported formats: PDF, EPUB, TXT, Markdown and JSON.";
+"Skipped %@ and %lld more. Supported formats: PDF, EPUB, TXT, Markdown and JSON." = "Skipped %@ and %lld more. Supported formats: PDF, EPUB, TXT, Markdown and JSON.";
+"Imported 1 model. Find it in the Stored tab." = "Imported 1 model. Find it in the Stored tab.";
+"Imported %lld models. Find them in the Stored tab." = "Imported %lld models. Find them in the Stored tab.";
+"Imported %@. Find it in the Stored tab." = "Imported %@. Find it in the Stored tab.";
+"No GGUF model files found in selection." = "No GGUF model files found in selection.";
+"Import failed: Permission denied for %@. Please allow access when prompted or move the files to a readable location." = "Import failed: Permission denied for %@. Please allow access when prompted or move the files to a readable location.";
+"Import failed: %@" = "Import failed: %@";
+"Selected path is not a directory." = "Selected path is not a directory.";
+"Import failed: Permission denied for %@. Please allow access when prompted or move the model folder to a readable location." = "Import failed: Permission denied for %@. Please allow access when prompted or move the model folder to a readable location.";
+"No MLX model files were found in the selected folder. Make sure you pick the folder that contains config.json and the .safetensors weights." = "No MLX model files were found in the selected folder. Make sure you pick the folder that contains config.json and the .safetensors weights.";
+
+/* === Reasoning panel, generation stats, runtime presets & speculative decoding (2026-06) === */
+"Thinking…" = "Thinking…";
+"Hide" = "Hide";
+"Waiting for thoughts..." = "Waiting for thoughts...";
+"Reasoning complete" = "Reasoning complete";
+"Reasoning interrupted" = "Reasoning interrupted";
+"Reasoning complete. Show reasoning." = "Reasoning complete. Show reasoning.";
+"Reasoning interrupted. Show partial reasoning." = "Reasoning interrupted. Show partial reasoning.";
+"%lld tokens" = "%lld tokens";
+"%.2fs TFT" = "%.2fs TFT";
+"Custom" = "Custom";
+"Manual settings that don't match a preset. Tap a preset above to start from a known baseline." = "Manual settings that don't match a preset. Tap a preset above to start from a known baseline.";
+"Around 4K context, fewer CPU threads, and a compact q8_0 KV cache. Lowest memory and power use." = "Around 4K context, fewer CPU threads, and a compact q8_0 KV cache. Lowest memory and power use.";
+"Around 8K context with full GPU offload and an f16 KV cache. The everyday default." = "Around 8K context with full GPU offload and an f16 KV cache. The everyday default.";
+"Around 8K context with flash attention and an f16 KV cache for the fastest token generation." = "Around 8K context with flash attention and an f16 KV cache for the fastest token generation.";
+"Stretches context to the largest the device allows and uses a compact q8_0 KV cache so long documents still fit in memory." = "Stretches context to the largest the device allows and uses a compact q8_0 KV cache so long documents still fit in memory.";
+"Around 12K context with flash attention, tuned for image and OCR workloads." = "Around 12K context with flash attention, tuned for image and OCR workloads.";
+"Around 16K context with flash attention and prompt caching, tuned for tools and RAG." = "Around 16K context with flash attention and prompt caching, tuned for tools and RAG.";
+"With draft model: %@ combined" = "With draft model: %@ combined";
+"Draft tokens — the helper model proposes this many tokens in one batch. The target model then verifies them in a single pass and keeps the leading run it agrees with before the helper drafts the next batch. Higher values speculate further ahead but waste more work when a guess is rejected." = "Draft tokens — the helper model proposes this many tokens in one batch. The target model then verifies them in a single pass and keeps the leading run it agrees with before the helper drafts the next batch. Higher values speculate further ahead but waste more work when a guess is rejected.";
+"Draft window — the furthest the helper model may run ahead of the target. The two models work in parallel up to this many tokens, so a larger window allows more overlap but discards more work when the target rejects a draft." = "Draft window — the furthest the helper model may run ahead of the target. The two models work in parallel up to this many tokens, so a larger window allows more overlap but discards more work when the target rejects a draft.";
+
+/* Localization sync 2026-06-18 — previously-untranslated UI strings. */
+"%@ (unavailable)" = "%@ (unavailable)";
+"%@ left" = "%@ left";
+"%d file(s) were empty after extraction." = "%d file(s) were empty after extraction.";
+"%d file(s) were skipped during indexing." = "%d file(s) were skipped during indexing.";
+"%d of 4 on" = "%d of 4 on";
+"A First Course in Linear Algebra is an introductory textbook aimed at college-level sophomores and juniors." = "A First Course in Linear Algebra is an introductory textbook aimed at college-level sophomores and juniors.";
+"Access ending…" = "Access ending…";
+"Add Remote" = "Add Remote";
+"Add Remote Endpoint" = "Add Remote Endpoint";
+"Add a remote inference endpoint" = "Add a remote inference endpoint";
+"All saved memories fit within the current model's context budget." = "All saved memories fit within the current model's context budget.";
+"Apple Foundation Model is not ready yet. Try again in a moment." = "Apple Foundation Model is not ready yet. Try again in a moment.";
+"Apple Foundation Models are not supported on this device." = "Apple Foundation Models are not supported on this device.";
+"Apple Intelligence is turned off. Enable Apple Intelligence to use AFM." = "Apple Intelligence is turned off. Enable Apple Intelligence to use AFM.";
+"Apply" = "Apply";
+"Audio conversion failed: %@" = "Audio conversion failed: %@";
+"Balanced eases your %@ threshold down to %@, so more passages qualify." = "Balanced eases your %@ threshold down to %@, so more passages qualify.";
+"Boarding" = "Boarding";
+"Broad eases your %@ threshold down to %@ for the widest net." = "Broad eases your %@ threshold down to %@ for the widest net.";
+"Cancel reload" = "Cancel reload";
+"Cancel remote load" = "Cancel remote load";
+"Chat History" = "Chat History";
+"Choose a model (⌘L)" = "Choose a model (⌘L)";
+"Chunk Token Limit" = "Chunk Token Limit";
+"Close pinned answer" = "Close pinned answer";
+"CloudKit Container" = "CloudKit Container";
+"Collapse tool and context details" = "Collapse tool and context details";
+"Completions Endpoint" = "Completions Endpoint";
+"Connection Status" = "Connection Status";
+"Connection details" = "Connection details";
+"Connection via %@" = "Connection via %@";
+"Copy" = "Copy";
+"Copy LaTeX" = "Copy LaTeX";
+"Copy local URL" = "Copy local URL";
+"Copy message" = "Copy message";
+"Core AI couldn't load inference function '%@': %@" = "Core AI couldn't load inference function '%@': %@";
+"Core AI engine is not loaded." = "Core AI engine is not loaded.";
+"Core AI inference function '%@' failed to load." = "Core AI inference function '%@' failed to load.";
+"Core AI inference function failed to load." = "Core AI inference function failed to load.";
+"Core AI model has no function named '%@'." = "Core AI model has no function named '%@'.";
+"Core AI models require iOS 27 / macOS 27 or later." = "Core AI models require iOS 27 / macOS 27 or later.";
+"Core AI runtime" = "Core AI runtime";
+"Create study notes from this transcript." = "Create study notes from this transcript.";
+"Current model cannot preload memories within its context budget." = "Current model cannot preload memories within its context budget.";
+"Current model preloads %d of %d memories." = "Current model preloads %d of %d memories.";
+"Delete chat %@?" = "Delete chat %@?";
+"Delete model" = "Delete model";
+"Departure" = "Departure";
+"Destination" = "Destination";
+"Disable Python" = "Disable Python";
+"Dismiss context warning" = "Dismiss context warning";
+"Downloads" = "Downloads";
+"Draft a follow-up based on this transcript." = "Draft a follow-up based on this transcript.";
+"Edit" = "Edit";
+"Edit Remote Endpoint" = "Edit Remote Endpoint";
+"Eject active model" = "Eject active model";
+"Enable Python" = "Enable Python";
+"Enable dataset search" = "Enable dataset search";
+"Endpoint responded. Returned %d characters." = "Endpoint responded. Returned %d characters.";
+"Endpoint returned no transcript (expected for silent sample)." = "Endpoint returned no transcript (expected for silent sample).";
+"Enter a valid URL first." = "Enter a valid URL first.";
+"Expand tool and context details" = "Expand tool and context details";
+"Extract action items from this transcript." = "Extract action items from this transcript.";
+"Failed to extract audio: %@" = "Failed to extract audio: %@";
+"Find the decisions in this transcript." = "Find the decisions in this transcript.";
+"Focused keeps your full threshold — passages must score at least %@." = "Focused keeps your full threshold — passages must score at least %@.";
+"Foundation Models framework is unavailable in this build." = "Foundation Models framework is unavailable in this build.";
+"Gate" = "Gate";
+"Gemma 3 4B is a lightweight multimodal model developed by Google that accepts both text and images as input and generates text responses. Despite its relatively small size, it supports a 128K token context window, multilingual capability across more than 140 languages, and is designed to run efficiently on local hardware such as laptops and desktops." = "Gemma 3 4B is a lightweight multimodal model developed by Google that accepts both text and images as input and generates text responses. Despite its relatively small size, it supports a 128K token context window, multilingual capability across more than 140 languages, and is designed to run efficiently on local hardware such as laptops and desktops.";
+"Gemma 4 is a family of open multimodal models from Google DeepMind designed for strong reasoning, coding, and long-context tasks, with support for text and image input across the lineup and audio on the smaller variants. It comes in several sizes and architectures, including efficient dense models and a Mixture-of-Experts option, making it suitable for everything from on-device use on laptops and phones to more demanding workstation deployments." = "Gemma 4 is a family of open multimodal models from Google DeepMind designed for strong reasoning, coding, and long-context tasks, with support for text and image input across the lineup and audio on the smaller variants. It comes in several sizes and architectures, including efficient dense models and a Mixture-of-Experts option, making it suitable for everything from on-device use on laptops and phones to more demanding workstation deployments.";
+"Granite-4.0-H-Tiny is a 7-billion-parameter long-context instruction-tuned language model developed by IBM as part of the Granite 4.0 family. It is designed for enterprise-oriented applications such as conversational assistants, retrieval-augmented generation, coding tasks, and tool-calling workflows, while supporting multilingual interaction and contexts up to 128K tokens." = "Granite-4.0-H-Tiny is a 7-billion-parameter long-context instruction-tuned language model developed by IBM as part of the Granite 4.0 family. It is designed for enterprise-oriented applications such as conversational assistants, retrieval-augmented generation, coding tasks, and tool-calling workflows, while supporting multilingual interaction and contexts up to 128K tokens.";
+"How can I help you today?" = "How can I help you today?";
+"Import Documents" = "Import Documents";
+"Install a smaller same-family GGUF to enable" = "Install a smaller same-family GGUF to enable";
+"Introductory linear algebra textbook." = "Introductory linear algebra textbook.";
+"LAN Base" = "LAN Base";
+"LAN Chat" = "LAN Chat";
+"LAN Models" = "LAN Models";
+"LAN Responses" = "LAN Responses";
+"LFM2.5-1.2B-Thinking is a compact reasoning-focused language model from Liquid AI designed for efficient on-device inference, built on the LFM2 architecture with additional pre-training and reinforcement learning. The release is optimized for local runtimes, allowing the roughly 1.2-billion-parameter model to run on consumer hardware while retaining strong reasoning and conversational capabilities." = "LFM2.5-1.2B-Thinking is a compact reasoning-focused language model from Liquid AI designed for efficient on-device inference, built on the LFM2 architecture with additional pre-training and reinforcement learning. The release is optimized for local runtimes, allowing the roughly 1.2-billion-parameter model to run on consumer hardware while retaining strong reasoning and conversational capabilities.";
+"Last activity %@" = "Last activity %@";
+"Local Core AI" = "Local Core AI";
+"Local models only" = "Local models only";
+"Logs" = "Logs";
+"Mac Relay" = "Mac Relay";
+"Make a timeline from this transcript." = "Make a timeline from this transcript.";
+"Max %@" = "Max %@";
+"Mins" = "Mins";
+"Model import isn’t available on tvOS." = "Model import isn’t available on tvOS.";
+"Model likely exceeds memory budget. Lower context size or use a smaller quant/model." = "Model likely exceeds memory budget. Lower context size or use a smaller quant/model.";
+"Model settings" = "Model settings";
+"New Chat" = "New Chat";
+"Next" = "Next";
+"No compatible files found. Supported: %@" = "No compatible files found. Supported: %@";
+"No model" = "No model";
+"Not Ready" = "Not Ready";
+"Not available for this model" = "Not available for this model";
+"Not set" = "Not set";
+"Notes" = "Notes";
+"On-device Apple Foundation language model." = "On-device Apple Foundation language model.";
+"Open Details" = "Open Details";
+"Open Relay Console…" = "Open Relay Console…";
+"Open quick actions for tools and attachments." = "Open quick actions for tools and attachments.";
+"Origin" = "Origin";
+"Passenger" = "Passenger";
+"Pin message" = "Pin message";
+"Platform" = "Platform";
+"Python Code Execution is turned off in Settings." = "Python Code Execution is turned off in Settings.";
+"Python can't be used while a dataset is active or indexing." = "Python can't be used while a dataset is active or indexing.";
+"Python is currently unavailable." = "Python is currently unavailable.";
+"Python is currently unreliable with MLX models due to MLX limitations." = "Python is currently unreliable with MLX models due to MLX limitations.";
+"Quant: %@" = "Quant: %@";
+"Quit Noema" = "Quit Noema";
+"Qwen 3.5 is a new multimodal model family from Qwen designed for text, images, video, reasoning, coding, and agent-style tool use, with support for both thinking and non-thinking modes. The 2B variant shown here is a compact version intended especially for prototyping, local use, fine-tuning, and efficient deployment, while still offering a very large native context window and strong multilingual coverage." = "Qwen 3.5 is a new multimodal model family from Qwen designed for text, images, video, reasoning, coding, and agent-style tool use, with support for both thinking and non-thinking modes. The 2B variant shown here is a compact version intended especially for prototyping, local use, fine-tuning, and efficient deployment, while still offering a very large native context window and strong multilingual coverage.";
+"Qwen3-1.7B is a compact language model in Alibaba's Qwen3 family, designed to balance strong reasoning, instruction following, and multilingual performance within a lightweight 1.7 billion parameter size. It supports both deliberate reasoning for harder tasks and faster general conversation, making it a versatile small model for local use, research, and everyday AI applications." = "Qwen3-1.7B is a compact language model in Alibaba's Qwen3 family, designed to balance strong reasoning, instruction following, and multilingual performance within a lightweight 1.7 billion parameter size. It supports both deliberate reasoning for harder tasks and faster general conversation, making it a versatile small model for local use, research, and everyday AI applications.";
+"RUNNING" = "RUNNING";
+"Rebuild Required" = "Rebuild Required";
+"Reconnect by %@" = "Reconnect by %@";
+"Refreshed %@" = "Refreshed %@";
+"Relay Wi‑Fi: %@" = "Relay Wi‑Fi: %@";
+"Reload models" = "Reload models";
+"Remote model %@ connected via %@" = "Remote model %@ connected via %@";
+"STOPPED" = "STOPPED";
+"Save Changes" = "Save Changes";
+"Scanning nearby devices. Move closer to your Mac if you don't see it yet." = "Scanning nearby devices. Move closer to your Mac if you don't see it yet.";
+"Seat" = "Seat";
+"See details" = "See details";
+"Send" = "Send";
+"Send Anyway" = "Send Anyway";
+"Sending test request…" = "Sending test request…";
+"Show chat tray" = "Show chat tray";
+"Shows details about the context window." = "Shows details about the context window.";
+"Size unavailable" = "Size unavailable";
+"Skip" = "Skip";
+"Skip llama.cpp Warmup" = "Skip llama.cpp Warmup";
+"Starting" = "Starting";
+"Switching between GGUF/ET modes" = "Switching between GGUF/ET modes";
+"Terminal" = "Terminal";
+"The Core AI framework is unavailable in this build (requires Xcode 27+)." = "The Core AI framework is unavailable in this build (requires Xcode 27+).";
+"The Core AI model bundle is invalid or incomplete. Delete the model and download it again." = "The Core AI model bundle is invalid or incomplete. Delete the model and download it again.";
+"The media file has no audio track." = "The media file has no audio track.";
+"The model could not be loaded." = "The model could not be loaded.";
+"The prompt (%lld tokens) doesn't fit this Core AI model's context window (%lld tokens). Start a new chat or shorten the message." = "The prompt (%lld tokens) doesn't fit this Core AI model's context window (%lld tokens). Start a new chat or shorten the message.";
+"This Core AI model folder is missing a tokenizer.json required for text generation." = "This Core AI model folder is missing a tokenizer.json required for text generation.";
+"This Mac cannot offload GGUF models to the GPU. Expect slower generation speeds. ET models remain the fastest option here." = "This Mac cannot offload GGUF models to the GPU. Expect slower generation speeds. ET models remain the fastest option here.";
+"This dataset has an older or incomplete index. Rebuild it before using retrieval." = "This dataset has an older or incomplete index. Rebuild it before using retrieval.";
+"This device doesn't support GPU offload; GGUF models will run on the CPU and generation speed will be significantly slower.\nFastest option on this device: ET models." = "This device doesn't support GPU offload; GGUF models will run on the CPU and generation speed will be significantly slower.\nFastest option on this device: ET models.";
+"This model does not support function calling; Python requires it." = "This model does not support function calling; Python requires it.";
+"Token streaming enabled" = "Token streaming enabled";
+"Tool Call Details" = "Tool Call Details";
+"Unknown size" = "Unknown size";
+"Unload" = "Unload";
+"Unload model" = "Unload model";
+"Using" = "Using";
+"View in Chat" = "View in Chat";
+"Web search is disabled for Apple Foundation Models because their context budget cannot reliably accommodate tool input." = "Web search is disabled for Apple Foundation Models because their context budget cannot reliably accommodate tool input.";
+"Whisper transcription failed: %@" = "Whisper transcription failed: %@";
+"Your organization's Noema Teams subscription has ended." = "Your organization's Noema Teams subscription has ended.";
+"exposed" = "exposed";
+"the loaded model" = "the loaded model";
+"whisper.cpp is not linked in this build." = "whisper.cpp is not linked in this build.";
+"whisper.cpp transcription failed: %@" = "whisper.cpp transcription failed: %@";
+"Select one or more .gguf files. For vision models, also select the projector .gguf (files containing 'mmproj' or 'projector'). Files will be copied into your local model library." = "Select one or more .gguf files. For vision models, also select the projector .gguf (files containing 'mmproj' or 'projector'). Files will be copied into your local model library.";
+"Completed" = "Completed";

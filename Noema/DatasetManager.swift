@@ -1,16 +1,37 @@
 // DatasetManager.swift
 import Foundation
 import SwiftUI
-// Live Activities removed
 
 @MainActor
 final class DatasetManager: ObservableObject {
+    static var makeTranscriptionBackend: (TranscriptionEngineID) throws -> any TranscriptionBackend = {
+        try TranscriptionBackendFactory.makeBackend(for: $0)
+    }
+
     @Published private(set) var datasets: [LocalDataset] = []
     @AppStorage("selectedDatasetID") private var selectedDatasetID: String = ""
     @AppStorage("embeddedDatasetIDs") private var embeddedDatasetIDsRaw: String = ""
     @Published var indexingDatasetID: String?
     struct AlertItem: Identifiable { let id = UUID(); let message: String }
+    enum MediaImportProgressState: Equatable {
+        case pending
+        case transcribing
+        case succeeded
+        case failed(String)
+    }
+    struct MediaImportProgressItem: Identifiable, Equatable {
+        let id: UUID
+        let filename: String
+        var state: MediaImportProgressState
+
+        init(filename: String, state: MediaImportProgressState = .pending) {
+            self.id = UUID()
+            self.filename = filename
+            self.state = state
+        }
+    }
     @Published var embedAlert: AlertItem?
+    @Published var mediaImportProgressItems: [MediaImportProgressItem] = []
     @Published var processingStatus: [String: DatasetProcessingStatus] = [:]
     @AppStorage("indexingDatasetIDPersisted") private var persistedIndexingDatasetID: String = ""
 
@@ -26,22 +47,23 @@ final class DatasetManager: ObservableObject {
     private func updateProcessingStatus(_ status: DatasetProcessingStatus, for id: String) {
         let now = Date()
         let last = lastStatusByID[id]
+        let normalizedStatus = Self.normalizedStatusForForwardProgress(previous: last, incoming: status)
         let lastTime = lastStatusUpdateAt[id] ?? .distantPast
         let minInterval: TimeInterval = 0.2 // 5 fps update cadence is sufficient for progress UI
 
         // Only publish if stage changed or progress advanced by at least 1% or enough time elapsed
-        let stageChanged = last?.stage != status.stage
-        let transitionedToCompleted = (last?.stage != .completed) && (status.stage == .completed)
-        let progressDelta = Swift.abs((last?.progress ?? -1.0) - status.progress)
+        let stageChanged = last?.stage != normalizedStatus.stage
+        let transitionedToCompleted = (last?.stage != .completed) && (normalizedStatus.stage == .completed)
+        let progressDelta = Swift.abs((last?.progress ?? -1.0) - normalizedStatus.progress)
         let timeElapsed = now.timeIntervalSince(lastTime)
         if stageChanged || progressDelta >= 0.01 || timeElapsed >= minInterval {
-            processingStatus[id] = status
-            lastStatusByID[id] = status
+            processingStatus[id] = normalizedStatus
+            lastStatusByID[id] = normalizedStatus
             lastStatusUpdateAt[id] = now
             if transitionedToCompleted {
                 Haptics.success()
             }
-            if status.stage == .failed, status.message == String(localized: "Stopped", locale: LocalizationManager.preferredLocale()) {
+            if normalizedStatus.stage == .failed, normalizedStatus.message == String(localized: "Stopped", locale: LocalizationManager.preferredLocale()) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                     self?.processingStatus[id] = nil
                     self?.lastStatusByID[id] = nil
@@ -49,6 +71,28 @@ final class DatasetManager: ObservableObject {
                 }
             }
         }
+    }
+
+    static func normalizedStatusForForwardProgress(
+        previous: DatasetProcessingStatus?,
+        incoming: DatasetProcessingStatus
+    ) -> DatasetProcessingStatus {
+        guard let previous, previous.stage == incoming.stage else {
+            return incoming
+        }
+        guard incoming.stage != .completed, incoming.stage != .failed else {
+            return incoming
+        }
+        let clampedProgress = max(previous.progress, incoming.progress)
+        guard clampedProgress != incoming.progress else {
+            return incoming
+        }
+        return DatasetProcessingStatus(
+            stage: incoming.stage,
+            progress: clampedProgress,
+            message: incoming.message,
+            etaSeconds: incoming.etaSeconds
+        )
     }
 
     init() {
@@ -60,6 +104,29 @@ final class DatasetManager: ObservableObject {
             Task { await logger.log("[DatasetManager] Clearing persisted indexing ID on launch: \(persistedIndexingDatasetID)") }
             persistedIndexingDatasetID = ""
         }
+        NotificationCenter.default.addObserver(
+            forName: .enterpriseDatasetsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            // Pull the Sendable payload out of the (non-Sendable) Notification before
+            // hopping into MainActor isolation.
+            let downloaded = note.userInfo?["downloadedDatasetIDs"] as? [String] ?? []
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.reloadFromDisk()
+                // Newly downloaded enterprise datasets enter the same post-download
+                // pipeline as any other dataset (indexing/embedding).
+                for datasetID in downloaded {
+                    self.handleDatasetDownloadCompleted(datasetID: datasetID)
+                }
+            }
+        }
+        #if os(iOS) && canImport(ActivityKit)
+        // Mirror dataset preparation onto the system Live Activity
+        // (lock screen + Dynamic Island).
+        DatasetLiveActivityController.shared.bind(to: self)
+        #endif
     }
 
     func bind(downloadController: DownloadController) {
@@ -90,6 +157,7 @@ final class DatasetManager: ObservableObject {
                                     let ownerName = owner.lastPathComponent
                                     if ownerName == "OTL" { return "Open Textbook Library" }
                                     if ownerName == "Imported" { return "Imported" }
+                                    if ownerName == EnterpriseDatasetStore.ownerDirectoryName { return "Enterprise" }
                                     return "Hugging Face"
                                 }()
                                 let displayName: String = {
@@ -120,6 +188,15 @@ final class DatasetManager: ObservableObject {
                 }
             }
         }
+        // Noema Teams policy: enterprise datasets are only listed for permitted roles;
+        // personal datasets are never affected.
+        found.removeAll { !EnterprisePolicyGate.allowsDataset(datasetID: $0.datasetID) }
+        if !selectedDatasetID.isEmpty,
+           selectedDatasetID.hasPrefix("\(EnterpriseDatasetStore.ownerDirectoryName)/"),
+           !EnterprisePolicyGate.allowsDataset(datasetID: selectedDatasetID) {
+            selectedDatasetID = ""
+            UserDefaults.standard.set("", forKey: "selectedDatasetID")
+        }
         // Compute new status and publish all changes on the next runloop tick
         // to avoid nested SwiftUI view updates warnings.
         let embedded = Set(embeddedDatasetIDsRaw.split(separator: ",").map(String.init))
@@ -142,6 +219,7 @@ final class DatasetManager: ObservableObject {
             self.datasets = found
             self.processingStatus = computedStatus
             self.lastStatusByID = computedStatus
+            self.scheduleSpotlightDatasetNameIndex()
 
             if let current = self.indexingDatasetID {
                 let stillIndexing = self.datasets.contains { $0.datasetID == current && !$0.isIndexed }
@@ -154,6 +232,20 @@ final class DatasetManager: ObservableObject {
 
         // Do not auto-index here; indexing is started explicitly after download
         // or via a user action in dataset settings.
+    }
+
+    private func scheduleSpotlightDatasetNameIndex() {
+        let records = datasets.map { dataset in
+            let trimmedName = dataset.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = trimmedName.isEmpty ? dataset.datasetID : trimmedName
+            return NoemaSpotlightIndexRecord(
+                uniqueIdentifier: NoemaSpotlightIndexingService.datasetIdentifier(for: dataset.datasetID),
+                title: title,
+                contentDescription: String(localized: "Noema Stored dataset"),
+                keywords: ["Noema", "dataset", dataset.source]
+            )
+        }
+        NoemaSpotlightIndexingService.shared.scheduleDatasetNameIndex(records: records)
     }
 
     private func directorySize(at url: URL) throws -> Int64 {
@@ -200,6 +292,10 @@ final class DatasetManager: ObservableObject {
     }
 
     func select(_ ds: LocalDataset?) {
+        if let ds, !EnterprisePolicyGate.allowsDataset(datasetID: ds.datasetID) {
+            Task { await logger.log("[DatasetManager] select blocked by enterprise policy: \(ds.datasetID)") }
+            return
+        }
         let nextID = ds?.datasetID ?? ""
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -443,6 +539,32 @@ final class DatasetManager: ObservableObject {
         indexingTasks[ds.datasetID] = t
     }
 
+    func rebuildDatasetsNeedingReindex() async {
+        reloadFromDisk()
+        let staleIDs = datasets.filter(\.requiresReindex).map(\.datasetID)
+        guard !staleIDs.isEmpty else { return }
+
+        Task { await logger.log("[DatasetManager] Rebuilding \(staleIDs.count) dataset(s) that need reindexing") }
+        for datasetID in staleIDs {
+            if Task.isCancelled { break }
+            reloadFromDisk()
+            guard let dataset = datasets.first(where: { $0.datasetID == datasetID }),
+                  dataset.requiresReindex else {
+                continue
+            }
+            if indexingTasks[datasetID] != nil {
+                Task { await logger.log("[DatasetManager] Skipping rebuild for \(datasetID) because indexing is already running") }
+                continue
+            }
+
+            startEmbeddingForID(datasetID)
+            while indexingTasks[datasetID] != nil {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        reloadFromDisk()
+    }
+
     // Public API: background start indexing after a download completes
     public func startIndexing(dataset: LocalDataset) {
         if indexingTasks[dataset.datasetID] != nil { return }
@@ -518,14 +640,18 @@ final class DatasetManager: ObservableObject {
 
     // MARK: - Import from Files
 
-    /// Import local documents (PDF/EPUB/TXT) from Files into a new dataset under `Documents/LocalLLMDatasets/Imported/<name>`.
+    /// Import local documents (PDF/EPUB/TXT) and transcribable media from Files into a new dataset under `Documents/LocalLLMDatasets/Imported/<name>`.
     /// - Returns: The created `LocalDataset` if successful, otherwise nil.
     @discardableResult
     func importDocuments(from urls: [URL], suggestedName: String?) async -> LocalDataset? {
         // Filter allowed extensions
         let allowedExts: Set<String> = ["pdf", "epub", "txt", "md", "json", "jsonl", "csv", "tsv"]
-        let picked = urls.filter { allowedExts.contains($0.pathExtension.lowercased()) }
+        let picked = urls.filter {
+            allowedExts.contains($0.pathExtension.lowercased()) || TranscriptionMediaSupport.isSupported($0)
+        }
         guard !picked.isEmpty else { return nil }
+        let documentPicked = picked.filter { allowedExts.contains($0.pathExtension.lowercased()) }
+        let mediaPicked = picked.filter { TranscriptionMediaSupport.isSupported($0) }
 
         // Pick a dataset name
         let defaultName: String = {
@@ -553,7 +679,7 @@ final class DatasetManager: ObservableObject {
 
             var didCopy = false
             var usedRelativePaths = Set<String>()
-            for url in picked {
+            for url in documentPicked {
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                 do {
@@ -570,17 +696,119 @@ final class DatasetManager: ObservableObject {
 
             let titleURL = DatasetIndexIO.titleURL(for: destDir)
             try? defaultName.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8)?.write(to: titleURL)
-            return didCopy
+            return didCopy || !mediaPicked.isEmpty
         }.value
 
         guard copiedAny else { return nil }
 
+        var didTranscribeMedia = false
+        var mediaTranscriptionFailures: [String] = []
+        mediaImportProgressItems = mediaPicked.map { MediaImportProgressItem(filename: $0.lastPathComponent) }
+        if !mediaPicked.isEmpty {
+            let mediaTranscriptDir = destDir.appendingPathComponent("Media Transcripts", isDirectory: true)
+            let metadataDir = DatasetIndexIO.transcriptMetadataDirectoryURL(for: destDir)
+            try? FileManager.default.createDirectory(at: mediaTranscriptDir, withIntermediateDirectories: true)
+            try? FileManager.default.createDirectory(at: metadataDir, withIntermediateDirectories: true)
+            let offGrid = UserDefaults.standard.object(forKey: "offGrid") as? Bool ?? false
+            let options = TranscriptionSettings.requestOptions(offGrid: offGrid)
+
+            do {
+                let backend: any TranscriptionBackend = try Self.makeTranscriptionBackend(TranscriptionSettings.selectedEngineID)
+                for mediaURL in mediaPicked {
+                    let scoped = mediaURL.startAccessingSecurityScopedResource()
+                    defer { if scoped { mediaURL.stopAccessingSecurityScopedResource() } }
+                    Self.updateMediaImportProgress(filename: mediaURL.lastPathComponent, state: .transcribing, items: &mediaImportProgressItems)
+                    do {
+                        let rawArtifact = try await backend.transcribe(
+                            mediaURL: mediaURL,
+                            originalFilename: mediaURL.lastPathComponent,
+                            options: options,
+                            onEvent: { _ in }
+                        )
+                        let artifact = rawArtifact.withProvenance(engineID: TranscriptionSettings.selectedEngineID, options: options)
+                        let safeBase = mediaURL.deletingPathExtension().lastPathComponent
+                            .replacingOccurrences(of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
+                            .trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+                        let base = safeBase.isEmpty ? artifact.id.uuidString : safeBase
+                        let textURL = mediaTranscriptDir.appendingPathComponent(base + ".transcript.txt")
+                        let jsonURL = metadataDir.appendingPathComponent(base + ".transcript.json")
+                        try artifact.exportText.data(using: .utf8)?.write(to: textURL, options: [.atomic])
+                        let encoder = JSONEncoder()
+                        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                        encoder.dateEncodingStrategy = .iso8601
+                        try encoder.encode(artifact).write(to: jsonURL, options: [.atomic])
+                        didTranscribeMedia = true
+                        Self.updateMediaImportProgress(filename: mediaURL.lastPathComponent, state: .succeeded, items: &mediaImportProgressItems)
+                    } catch {
+                        mediaTranscriptionFailures.append(Self.mediaImportFailureLine(filename: mediaURL.lastPathComponent, error: error))
+                        Self.updateMediaImportProgress(filename: mediaURL.lastPathComponent, state: .failed(error.localizedDescription), items: &mediaImportProgressItems)
+                    }
+                }
+            } catch {
+                for mediaURL in mediaPicked {
+                    mediaTranscriptionFailures.append(Self.mediaImportFailureLine(filename: mediaURL.lastPathComponent, error: error))
+                    Self.updateMediaImportProgress(filename: mediaURL.lastPathComponent, state: .failed(error.localizedDescription), items: &mediaImportProgressItems)
+                }
+            }
+        }
+
+        guard !documentPicked.isEmpty || didTranscribeMedia else {
+            if !mediaTranscriptionFailures.isEmpty {
+                embedAlert = AlertItem(message: String.localizedStringWithFormat(
+                    String(localized: "Media could not be transcribed: %@"),
+                    Self.mediaImportFailureSummary(mediaTranscriptionFailures)
+                ))
+            }
+            return nil
+        }
+
         // Refresh in-memory list and return the created dataset
         reloadFromDisk()
+        if !mediaTranscriptionFailures.isEmpty {
+            embedAlert = AlertItem(message: String.localizedStringWithFormat(
+                String(localized: "Some media could not be transcribed: %@"),
+                Self.mediaImportFailureSummary(mediaTranscriptionFailures)
+            ))
+        }
         if let ds = datasets.first(where: { $0.datasetID == datasetID }) {
             return ds
         }
-        return nil
+        let size = (try? directorySize(at: destDir)) ?? 0
+        let sizeMB = Double(size) / 1_048_576.0
+        let attrs = try? FileManager.default.attributesOfItem(atPath: destDir.path)
+        let created = attrs?[.creationDate] as? Date ?? Date()
+        return LocalDataset(
+            datasetID: datasetID,
+            name: defaultName,
+            url: destDir,
+            sizeMB: sizeMB,
+            source: "Imported",
+            downloadDate: created,
+            lastUsedDate: nil,
+            isSelected: selectedDatasetID == datasetID,
+            isIndexed: DatasetIndexIO.hasValidIndex(at: destDir),
+            requiresReindex: DatasetIndexIO.hasIndexArtifacts(at: destDir) && !DatasetIndexIO.hasValidIndex(at: destDir)
+        )
+    }
+
+    private static func mediaImportFailureLine(filename: String, error: Error) -> String {
+        "\(filename): \(error.localizedDescription)"
+    }
+
+    private static func updateMediaImportProgress(filename: String, state: MediaImportProgressState, items: inout [MediaImportProgressItem]) {
+        guard let index = items.firstIndex(where: { $0.filename == filename }) else { return }
+        items[index].state = state
+    }
+
+    private static func mediaImportFailureSummary(_ failures: [String]) -> String {
+        var lines = failures.prefix(3).map(\.self)
+        if failures.count > lines.count {
+            lines.append(String.localizedStringWithFormat(
+                String(localized: "%d more media files failed."),
+                failures.count - lines.count
+            ))
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Helpers
@@ -644,9 +872,27 @@ struct DatasetRow: View {
                     .font(FontTheme.body)
                     .fontWeight(.medium)
                     .foregroundStyle(AppTheme.text)
-                Text(dataset.source)
-                    .font(FontTheme.caption)
-                    .foregroundStyle(AppTheme.secondaryText)
+
+                HStack(spacing: 6) {
+                    if dataset.source == "Enterprise" {
+                        // Governed company dataset: distinct badge instead of a plain source label.
+                        HStack(spacing: 4) {
+                            Image(systemName: "building.2.fill")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(LocalizedStringKey("Company"))
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .foregroundStyle(Color.indigo)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.indigo.opacity(0.13), in: Capsule())
+                    } else {
+                        Text(dataset.source)
+                    }
+                }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .padding(.top, 2)
             }
             Spacer()
             statusView
@@ -677,45 +923,44 @@ struct DatasetRow: View {
         let isProcessing = indexing || (status != nil && status?.stage != .completed)
         VStack(alignment: .trailing, spacing: 4) {
             Text(localizedFileSizeString(bytes: Int64(dataset.sizeMB * 1_048_576.0), locale: locale))
-                .font(FontTheme.caption)
+                .font(.system(size: 11, weight: .regular, design: .monospaced))
                 .foregroundStyle(AppTheme.secondaryText)
             
             if isProcessing, let s = status {
                 HStack(spacing: 6) {
                     ZStack {
-                        Circle().stroke(Color.gray.opacity(0.3), lineWidth: 3).frame(width: 16, height: 16)
+                        Circle().stroke(Color.gray.opacity(0.3), lineWidth: 3).frame(width: 14, height: 14)
                         Circle()
                             .trim(from: 0, to: CGFloat(max(0, min(1, s.progress))))
                             .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                             .rotationEffect(.degrees(-90))
-                            .frame(width: 16, height: 16)
+                            .frame(width: 14, height: 14)
                     }
                     Text("\(Int(s.progress * 100))%")
-                        .font(FontTheme.caption)
-                        .monospacedDigit()
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(AppTheme.secondaryText)
                 }
                 
                 Text(stageLabel(s.stage))
-                    .font(FontTheme.caption)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(AppTheme.secondaryText)
                 if let m = s.message, !m.isEmpty {
                     Text(m)
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(AppTheme.tertiaryText)
                         .lineLimit(1)
                 }
             } else if modelManager.activeDataset?.datasetID == dataset.datasetID {
                 HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill")
+                    Image(systemName: "checkmark")
                     Text("Active")
                 }
-                .font(FontTheme.caption)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .background(Color.accentColor.opacity(0.1))
-                .clipShape(Capsule())
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
             }
         }
     }

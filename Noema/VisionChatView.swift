@@ -171,7 +171,7 @@ struct ChatView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     ForEach(messagesForDisplay) { msg in
-                        MessageView(msg: msg)
+                        StreamingAwareMessageView(msg: msg, store: vm.streamingStore)
                             .id(msg.id)
                     }
                 }

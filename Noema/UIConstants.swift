@@ -209,9 +209,8 @@ struct FontTheme {
     static var caption: Font { caption(size: 12) }
 
     static func heading(size: CGFloat) -> Font {
-        // System Serif to approximate "Canela" or "Didone" style
-        // Using serif design .serif for a more elegant look
-        .system(size: size, weight: .medium, design: .serif)
+        // System Sans-serif for an industrial minimalist look
+        .system(size: size, weight: .semibold, design: .default)
     }
     
     static func body(size: CGFloat) -> Font {

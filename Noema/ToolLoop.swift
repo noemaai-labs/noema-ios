@@ -55,14 +55,22 @@ public final class ToolLoop {
         let hasWebSearch = tools.contains(where: { $0.function.name == "noema.web.retrieve" }) && WebToolGate.isAvailable()
         let hasPython = tools.contains(where: { $0.function.name == "noema.python.execute" }) && PythonToolGate.isAvailable()
         let hasMemory = tools.contains(where: { $0.function.name == "noema.memory" }) && MemoryToolGate.isAvailable()
+        let hasCalculator = tools.contains(where: { $0.function.name == "noema.math.calculate" })
+        let hasUnitConverter = tools.contains(where: { $0.function.name == "noema.units.convert" })
 
-        if !tools.isEmpty && (hasWebSearch || hasPython || hasMemory) {
-            let alreadyMentionsTools = sys.contains("noema.web.retrieve") || sys.contains("noema.python.execute") || sys.contains("noema.memory") || sys.contains("<tool_call>") || sys.contains("TOOL_CALL:")
+        if !tools.isEmpty && (hasWebSearch || hasPython || hasMemory || hasCalculator || hasUnitConverter) {
+            let alreadyMentionsTools = sys.contains("noema.web.retrieve") || sys.contains("noema.python.execute") || sys.contains("noema.memory") || sys.contains("noema.math.calculate") || sys.contains("noema.units.convert") || sys.contains("<tool_call>") || sys.contains("TOOL_CALL:")
             if !alreadyMentionsTools {
                 var toolGuidance = "\n\n## TOOLS (ARMED)\n"
 
                 if hasWebSearch {
                     toolGuidance += "Use the web search tool `noema.web.retrieve` ONLY when the question requires fresh/current information. Otherwise, answer directly without calling tools.\n"
+                }
+                if hasCalculator {
+                    toolGuidance += "Use the calculator tool `noema.math.calculate` for quick deterministic arithmetic or single-expression math. Prefer it over Python for simple calculations.\n"
+                }
+                if hasUnitConverter {
+                    toolGuidance += "Use the unit conversion tool `noema.units.convert` for deterministic conversions between common length, mass, temperature, volume, time, data-size, and speed units.\n"
                 }
                 if hasPython {
                     toolGuidance += "Use the Python tool `noema.python.execute` when code execution would help answer the question. USE IT FOR: math calculations, numerical analysis, statistical computations, data processing, text manipulation, algorithms, physics/chemistry/engineering problems, plotting/visualization, or any STEM-related task. Always use print() to produce output. Code runs sandboxed: 30s timeout, no network access, no file I/O outside temp. If a question involves numbers, formulas, or computational work, prefer using Python over manual calculation.\n"
@@ -74,6 +82,12 @@ public final class ToolLoop {
                 toolGuidance += "\nExact formats you may use (no extra prose when calling):\n"
                 if hasWebSearch {
                     toolGuidance += "- JSON: {\"tool_name\": \"noema.web.retrieve\", \"arguments\": {\"query\": \"...\", \"count\": 3, \"safesearch\": \"moderate\"}}\n"
+                }
+                if hasCalculator {
+                    toolGuidance += "- JSON: {\"tool_name\": \"noema.math.calculate\", \"arguments\": {\"expression\": \"sqrt(144) + 3 * 2\"}}\n"
+                }
+                if hasUnitConverter {
+                    toolGuidance += "- JSON: {\"tool_name\": \"noema.units.convert\", \"arguments\": {\"value\": 10, \"from_unit\": \"km\", \"to_unit\": \"mi\"}}\n"
                 }
                 if hasPython {
                     toolGuidance += "- JSON: {\"tool_name\": \"noema.python.execute\", \"arguments\": {\"code\": \"print(2+2)\"}}\n"
@@ -88,6 +102,12 @@ public final class ToolLoop {
                 }
                 if hasPython {
                     toolGuidance += " Treat returned Python results as authoritative for the computation you executed."
+                }
+                if hasCalculator {
+                    toolGuidance += " Treat returned calculator results as authoritative for the expression you evaluated."
+                }
+                if hasUnitConverter {
+                    toolGuidance += " Treat returned conversion results as authoritative for the requested unit conversion."
                 }
 
                 sys += toolGuidance
@@ -120,7 +140,7 @@ public final class ToolLoop {
                     do {
                         // Execute on main actor with JSON string to avoid sending non-Sendable across actors
                         let argsJSON = toolCall.function.arguments
-                        let result = try await registry.executeToolJSON(name: toolCall.function.name, argumentsJSON: argsJSON)
+                        let result = try await executeToolJSON(name: toolCall.function.name, argumentsJSON: argsJSON)
                         
                         let toolMessage = ToolChatMessage.tool(result: result, callId: toolCall.id)
                         messages.append(toolMessage)
@@ -149,7 +169,7 @@ public final class ToolLoop {
                         let callId = UUID().uuidString
                         let call = ToolCall(id: callId, name: toolCall.name, arguments: json)
                         messages[messages.count - 1] = ToolChatMessage.assistant("", toolCalls: [call])
-                        let result = try await registry.executeToolJSON(name: toolCall.name, argumentsJSON: json)
+                        let result = try await executeToolJSON(name: toolCall.name, argumentsJSON: json)
                         let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
                         messages.append(toolMessage)
                         continue
@@ -172,7 +192,7 @@ public final class ToolLoop {
                         let callId = UUID().uuidString
                         let call = ToolCall(id: callId, name: toolCall.tool_name, arguments: json)
                         messages[messages.count - 1] = ToolChatMessage.assistant("", toolCalls: [call])
-                        let result = try await registry.executeToolJSON(name: toolCall.tool_name, argumentsJSON: json)
+                        let result = try await executeToolJSON(name: toolCall.tool_name, argumentsJSON: json)
                         let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
                         messages.append(toolMessage)
                         continue
@@ -195,7 +215,7 @@ public final class ToolLoop {
                         let callId = UUID().uuidString
                         let call = ToolCall(id: callId, name: name, arguments: json)
                         messages[messages.count - 1] = ToolChatMessage.assistant("", toolCalls: [call])
-                        let result = try await registry.executeToolJSON(name: name, argumentsJSON: json)
+                        let result = try await executeToolJSON(name: name, argumentsJSON: json)
                         let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
                         messages.append(toolMessage)
                         continue
@@ -252,7 +272,7 @@ public final class ToolLoop {
                         let callId = UUID().uuidString
                         let call = ToolCall(id: callId, name: toolCall.name, arguments: json)
                         messages[messages.count - 1] = ToolChatMessage.assistant("", toolCalls: [call])
-                        let result = try await registry.executeToolJSON(name: toolCall.name, argumentsJSON: json)
+                        let result = try await executeToolJSON(name: toolCall.name, argumentsJSON: json)
                         let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
                         messages.append(toolMessage)
                         continue
@@ -279,7 +299,7 @@ public final class ToolLoop {
                     let callId = UUID().uuidString
                     let call = ToolCall(id: callId, name: toolCall.tool_name, arguments: json)
                     messages[messages.count - 1] = ToolChatMessage.assistant("", toolCalls: [call])
-                    let result = try await registry.executeToolJSON(name: toolCall.tool_name, argumentsJSON: json)
+                    let result = try await executeToolJSON(name: toolCall.tool_name, argumentsJSON: json)
 
                     // Append tool result so the model can continue
                     let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
@@ -306,7 +326,7 @@ public final class ToolLoop {
                     let callId = UUID().uuidString
                     let call = ToolCall(id: callId, name: name, arguments: json)
                     messages[messages.count - 1] = ToolChatMessage.assistant("", toolCalls: [call])
-                    let result = try await registry.executeToolJSON(name: name, argumentsJSON: json)
+                    let result = try await executeToolJSON(name: name, argumentsJSON: json)
 
                     // Append tool result so the model can continue
                     let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
@@ -359,7 +379,7 @@ public final class ToolLoop {
                 for call in calls where allowedNameSet.contains(call.function.name) {
                     do {
                         let argsJSON = call.function.arguments
-                        let result = try await registry.executeToolJSON(name: call.function.name, argumentsJSON: argsJSON)
+                        let result = try await executeToolJSON(name: call.function.name, argumentsJSON: argsJSON)
                         // Represent as assistant tool_calls then the tool result
                         let assistantMessage = ToolChatMessage.assistant("", toolCalls: [call])
                         let toolMessage = ToolChatMessage.tool(result: result, callId: call.id)
@@ -511,7 +531,7 @@ public final class ToolLoop {
                         content: preservedText,
                         toolCalls: [call]
                     )
-                    let result = try await registry.executeToolJSON(name: toolCall.name, argumentsJSON: json)
+                    let result = try await executeToolJSON(name: toolCall.name, argumentsJSON: json)
                     let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
                     messages.append(contentsOf: [assistantMessage, toolMessage])
 
@@ -556,7 +576,7 @@ public final class ToolLoop {
                         content: preservedText,
                         toolCalls: [call]
                     )
-                    let result = try await registry.executeToolJSON(name: toolCall.tool_name, argumentsJSON: json)
+                    let result = try await executeToolJSON(name: toolCall.tool_name, argumentsJSON: json)
                     let toolMessage = ToolChatMessage.tool(result: result, callId: callId)
                     messages.append(contentsOf: [assistantMessage, toolMessage])
 
@@ -579,6 +599,21 @@ public final class ToolLoop {
     }
     
     // MARK: - Helper Methods
+
+    private func executeToolJSON(name: String, argumentsJSON: String) async throws -> String {
+        if ToolDryRunSupport.isEnabled {
+            let arguments: [String: Any]
+            if let data = argumentsJSON.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                arguments = object
+            } else {
+                arguments = [:]
+            }
+            await logger.log("[ToolLoop] Dry-run recorded \(name)")
+            return ToolDryRunSupport.resultString(toolName: name, arguments: arguments)
+        }
+        return try await registry.executeToolJSON(name: name, argumentsJSON: argumentsJSON)
+    }
     
     private func activeSystemPrompt(from existing: String?) -> String {
         // Resolve through centralized resolver to include current tool guidance.
@@ -804,6 +839,8 @@ public final class ToolLoop {
 
         ### WHEN TO USE TOOLS:
         - Use web search for current information, recent events, latest news, or facts that may have changed.
+        - Use calculator for quick deterministic arithmetic or single-expression math.
+        - Use unit conversion for deterministic common-unit conversions.
         - Use Python for calculations, statistics, parsing, transformations, algorithms, or other computational work.
         - If a tool would clearly improve accuracy, use it instead of guessing.
         
@@ -888,6 +925,30 @@ public final class ToolLoop {
                 - The runtime is sandboxed: 30s timeout, no network access, no file access outside a temp directory
                 
                 """
+            } else if tool.function.name == "noema.math.calculate" {
+                instructions += """
+                **Example Usage:**
+                <tool_call>
+                {"name": "noema.math.calculate", "arguments": {"expression": "sqrt(144) + 3 * 2"}}
+                </tool_call>
+                
+                **Notes:**
+                - Use for quick deterministic arithmetic, constants, and common math functions
+                - Trigonometric functions use radians
+                
+                """
+            } else if tool.function.name == "noema.units.convert" {
+                instructions += """
+                **Example Usage:**
+                <tool_call>
+                {"name": "noema.units.convert", "arguments": {"value": 10, "from_unit": "km", "to_unit": "mi"}}
+                </tool_call>
+                
+                **Notes:**
+                - Use source and target units from the same family
+                - Supports length, mass, temperature, volume, time, data-size, and speed units
+                
+                """
             }
         }
         
@@ -902,6 +963,7 @@ public final class ToolLoop {
         - Be concise and relevant in your final response
         - Use the tool results to enhance your answer with current/accurate information
         - Treat web search results as authoritative for current-information queries
+        - Treat calculator and unit-conversion outputs as authoritative for the requested expression or conversion
         - Treat Python outputs as authoritative for the computation you executed
         - If multiple search results are returned, synthesize the most relevant information
         - Always maintain a helpful and professional tone

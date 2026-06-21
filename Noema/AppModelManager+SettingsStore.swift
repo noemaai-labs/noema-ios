@@ -275,6 +275,18 @@ enum ModelSettingsStore {
         }
     }
 
+    static func remove(modelID: String, quantLabel: String, canonicalPath: String?) {
+        let modelKey = entryKey(modelID: modelID, quantLabel: quantLabel)
+        var entries = loadEntries()
+        let before = entries.count
+        entries.removeAll { entry in
+            entryKey(modelID: entry.modelID, quantLabel: entry.quantLabel) == modelKey
+                || (canonicalPath != nil && entry.canonicalPath == canonicalPath)
+        }
+        guard entries.count != before else { return }
+        save(entries: entries)
+    }
+
     private static func entryKey(modelID: String, quantLabel: String) -> String {
         modelID + "|" + quantLabel
     }

@@ -73,7 +73,11 @@ public final class CloudKitRelay: @unchecked Sendable {
         let predicate = NSPredicate(format: "conversationIDString == %@", uuidString)
         let query = CKQuery(recordType: "Conversation", predicate: predicate)
         do {
-            let (matchResults, _) = try await db.records(matching: query)
+            // This runs on a sub-second poll, so only pull the one field we
+            // decode and cap to a single record to minimize latency/payload.
+            let (matchResults, _) = try await db.records(matching: query,
+                                                         desiredKeys: ["conversationData"],
+                                                         resultsLimit: 1)
             if let (_, result) = matchResults.first {
                 let record = try result.get()
                 guard let data = record["conversationData"] as? Data else { return nil }
@@ -105,7 +109,7 @@ public final class CloudKitRelay: @unchecked Sendable {
         startFallbackPolls()
     }
 
-    public func handleRemoteNotification(_ userInfo: [AnyHashable: Any]) async {
+    public func handleRemoteNotification() async {
         log("Received CloudKit push notification; triggering poll")
         await requestPoll(reason: "push")
     }
@@ -211,7 +215,16 @@ public final class CloudKitRelay: @unchecked Sendable {
             envelope = try await updateStatus(.processing, for: record, database: database)
 
             let processingEnvelope = envelope
-            let reply = try await provider.generateReply(for: processingEnvelope)
+            // Stream incremental progress back to the client so the Cloud Relay
+            // UI fills in as tokens are produced instead of staying frozen until
+            // the whole reply lands. Partial writes are throttled and best-effort.
+            let partialWriter = PartialReplyWriter(record: record,
+                                                   database: database,
+                                                   base: processingEnvelope)
+            let reply = try await provider.generateReplyStreaming(for: processingEnvelope) { partial in
+                await partialWriter.write(partial: partial)
+            }
+            await partialWriter.seal()
             let visibleReply = RelayMessage.visibleText(from: reply)
             let responseText = visibleReply.isEmpty ? reply : visibleReply
             let response = RelayMessage(
@@ -238,7 +251,13 @@ public final class CloudKitRelay: @unchecked Sendable {
                 var seenIdentifiers = Set(baseMessages.map { $0.id })
                 seenIdentifiers.insert(response.id)
 
-                suffixMessages = latestEnvelope.messages.filter { !seenIdentifiers.contains($0.id) }
+                // Only genuinely new *inbound* turns (e.g. a user message that
+                // arrived mid-generation) count as a suffix. Streaming partial
+                // assistant writes share the record and must not be re-appended
+                // after the final reply.
+                suffixMessages = latestEnvelope.messages.filter {
+                    !seenIdentifiers.contains($0.id) && $0.role.lowercased() != "assistant"
+                }
                 if !suffixMessages.isEmpty {
                     mergedMessages.append(contentsOf: suffixMessages)
                 }
@@ -471,5 +490,77 @@ public final class CloudKitRelay: @unchecked Sendable {
                 if message.contains("conversation") { return true }
                 return message.contains("'conversation'")
             }
+    }
+}
+
+/// Serializes and throttles incremental "assistant is typing" writes for a
+/// single conversation while the host generates a reply. Each write replaces
+/// the conversation's last assistant message with the latest accumulated text.
+/// Writes are best-effort: conflicts (the optimistic save retry of the final
+/// reply, or another partial) are tolerated and simply skipped.
+private actor PartialReplyWriter {
+    private var record: CKRecord
+    private let database: CKDatabase
+    private let base: RelayEnvelope
+    private let conversationID: UUID
+    private let throttle: TimeInterval
+    private let encoder = JSONEncoder()
+    private var lastWrite = Date.distantPast
+    private var lastLength = 0
+    private var sealed = false
+
+    init(record: CKRecord, database: CKDatabase, base: RelayEnvelope, throttle: TimeInterval = 1.0) {
+        self.record = record
+        self.database = database
+        self.base = base
+        self.conversationID = base.conversationID
+        self.throttle = throttle
+    }
+
+    /// Stop accepting partials. Called right before the authoritative final
+    /// write so a late partial can't revert the conversation to "processing".
+    func seal() { sealed = true }
+
+    func write(partial: String) async {
+        guard !sealed else { return }
+        let length = partial.count
+        guard length > lastLength else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastWrite) >= throttle else { return }
+        lastWrite = now
+        lastLength = length
+
+        let visible = RelayMessage.visibleText(from: partial)
+        let assistant = RelayMessage(conversationID: conversationID,
+                                     role: "assistant",
+                                     text: visible,
+                                     fullText: partial)
+        let envelope = RelayEnvelope(
+            conversationID: conversationID,
+            messages: base.messages + [assistant],
+            needsResponse: true,
+            parameters: base.parameters,
+            status: .processing,
+            statusUpdatedAt: now,
+            errorMessage: nil
+        )
+        guard let data = try? encoder.encode(envelope) else { return }
+        record["conversationData"] = data as CKRecordValue
+        record["lastUpdated"] = now as CKRecordValue
+        record["needsResponse"] = NSNumber(value: 1)
+        record["status"] = RelayStatus.processing.rawValue as CKRecordValue
+        record["conversationIDString"] = conversationID.uuidString as CKRecordValue
+        record["statusUpdatedAt"] = now as CKRecordValue
+        do {
+            record = try await database.save(record)
+        } catch let error as CKError where error.code == .serverRecordChanged {
+            // Another writer advanced the record; adopt the server copy so the
+            // next partial builds on the latest change tag.
+            if let server = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
+                record = server
+            }
+        } catch {
+            // Best-effort streaming; drop this partial silently.
+        }
     }
 }

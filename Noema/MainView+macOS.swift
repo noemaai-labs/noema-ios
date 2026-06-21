@@ -22,6 +22,7 @@ struct MainView: View {
     @State private var hoveredTab: MainTab?
     @StateObject private var macModalPresenter = MacModalPresenter()
     @StateObject private var macChatChrome = MacChatChromeState()
+    @StateObject private var backgroundUnloadController = BackgroundModelUnloadController()
     @State private var didAutoLoad = false
 
     private let mainGuideSteps: Set<GuidedWalkthroughManager.Step> = [
@@ -70,19 +71,34 @@ struct MainView: View {
             }
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .background {
+            switch phase {
+            case .active:
+                backgroundUnloadController.cancelPendingUnload()
+            case .inactive:
+                backgroundUnloadController.scheduleIfNeeded(
+                    sceneState: .inactive,
+                    chatVM: chatVM,
+                    modelManager: modelManager
+                )
+            case .background:
                 persistRollingThoughts()
-                if !chatVM.isStreaming {
-                    Task { await chatVM.unload() }
-                }
+                backgroundUnloadController.scheduleIfNeeded(
+                    sceneState: .background,
+                    chatVM: chatVM,
+                    modelManager: modelManager
+                )
+            @unknown default:
+                break
             }
         }
     }
 
+    // Extremely quiet, narrow icon rail: navigation should never compete with
+    // the conversation or the chat list for attention.
     private var sidebar: some View {
-        VStack(spacing: 16) {
-            VStack(spacing: 12) {
-                sidebarButton(for: .chat, systemImage: "message.fill", help: String(localized: "Chat"))
+        VStack(spacing: 14) {
+            VStack(spacing: 6) {
+                sidebarButton(for: .chat, systemImage: "message", help: String(localized: "Chat"))
                     .guideHighlight(.chatSidebarButton)
                 sidebarButton(for: .stored, systemImage: "externaldrive", help: String(localized: "Stored"))
 
@@ -93,7 +109,7 @@ struct MainView: View {
 
             sidebarDivider
 
-            VStack(spacing: 12) {
+            VStack(spacing: 6) {
                 sidebarButton(for: .relay, systemImage: "bolt.horizontal", help: String(localized: "Mac Relay"))
             }
 
@@ -130,20 +146,20 @@ struct MainView: View {
         } label: {
             Image(systemName: systemImage)
                 .symbolRenderingMode(.hierarchical)
-                .font(.system(size: 20, weight: .medium)) // Slightly lighter weight
+                .font(.system(size: 16, weight: .medium))
                 .frame(width: SidebarMetrics.iconSize, height: SidebarMetrics.iconSize)
-                .foregroundStyle(isSelected ? Color.primary : Color.secondary) // High contrast selection
+                .foregroundStyle(isSelected ? Color.primary : Color.secondary.opacity(0.8))
                 .padding(SidebarMetrics.buttonPadding)
                 .frame(width: SidebarMetrics.buttonSize, height: SidebarMetrics.buttonSize)
                 .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .fill(
                             isSelected
-                                ? Color.primary.opacity(0.1) // Subtle selection background
+                                ? Color.primary.opacity(0.08)
                                 : Color.primary.opacity(isHovered ? 0.04 : 0)
                         )
                 )
-                .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(.plain)
@@ -154,10 +170,10 @@ struct MainView: View {
     }
 
     private enum SidebarMetrics {
-        static let horizontalInset: CGFloat = 16 // Slightly wider
-        static let verticalInset: CGFloat = 32 // More top padding
-        static let iconSize: CGFloat = 20
-        static let buttonPadding: CGFloat = 12
+        static let horizontalInset: CGFloat = 10
+        static let verticalInset: CGFloat = 24
+        static let iconSize: CGFloat = 18
+        static let buttonPadding: CGFloat = 9
         static let buttonSize: CGFloat = iconSize + (buttonPadding * 2)
         static let width: CGFloat = (horizontalInset * 2) + buttonSize
     }

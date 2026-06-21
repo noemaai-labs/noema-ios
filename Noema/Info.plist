@@ -20,6 +20,10 @@
         <string>Allow Noema to capture a photo for your chat attachment.</string>
         <key>NSPhotoLibraryUsageDescription</key>
         <string>Allow Noema to show your recent photos when attaching images.</string>
+        <key>NSMicrophoneUsageDescription</key>
+        <string>Allow Noema to record audio so it can be transcribed locally when available.</string>
+        <key>NSSpeechRecognitionUsageDescription</key>
+        <string>Allow Noema to transcribe audio and video attachments into text.</string>
         <key>NSBluetoothAlwaysUsageDescription</key>
         <string>Noema uses Bluetooth to share relay setup details with your other devices.</string>
         <key>NSBluetoothPeripheralUsageDescription</key>

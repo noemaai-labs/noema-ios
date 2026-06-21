@@ -7,6 +7,7 @@ final class LocalizationManager: ObservableObject {
         "en",
         "ar",
         "zh-Hans",
+        "es",
         "fr",
         "de",
         "hi",

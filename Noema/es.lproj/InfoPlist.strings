@@ -1,0 +1,5 @@
+/* Auto-generated localization file for Info.plist */
+"NSMicrophoneUsageDescription" = "Permita que Noema grabe audio para poder transcribirlo localmente cuando esté disponible.";
+"NSSpeechRecognitionUsageDescription" = "Permita que Noema transcriba archivos adjuntos de audio y video a texto.";
+"NSBluetoothAlwaysUsageDescription" = "Noema utiliza Bluetooth para compartir detalles de configuración del relé con sus otros dispositivos.";
+"NSBluetoothPeripheralUsageDescription" = "Noema utiliza Bluetooth para compartir detalles de configuración del relé con sus otros dispositivos.";

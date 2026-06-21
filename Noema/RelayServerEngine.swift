@@ -324,7 +324,19 @@ actor RelayServerEngine {
     }
 
     func generateReply(for envelope: RelayEnvelope) async throws -> String {
-        var cloudMetadata = RequestMetadata(
+        try await produceReply(for: envelope, onPartial: nil)
+    }
+
+    /// Streaming entry point used by the Cloud Relay transport. Behaves like
+    /// `generateReply` but invokes `onPartial` with the accumulated text as it
+    /// is produced (local models only; remote/catalog responses arrive whole).
+    func streamReply(for envelope: RelayEnvelope,
+                     onPartial: @Sendable @escaping (String) -> Void) async throws -> String {
+        try await produceReply(for: envelope, onPartial: onPartial)
+    }
+
+    private func recordCloudClient(from envelope: RelayEnvelope) {
+        let cloudMetadata = RequestMetadata(
             clientAddress: nil,
             origin: nil,
             userAgent: nil,
@@ -338,24 +350,58 @@ actor RelayServerEngine {
         if [cloudMetadata.clientID, cloudMetadata.clientName, cloudMetadata.clientModel, cloudMetadata.clientPlatform, cloudMetadata.clientSSID].contains(where: { trimmedNonEmpty($0) != nil }) {
             recordConnectedClient(from: cloudMetadata)
         }
+    }
+
+    private func produceReply(for envelope: RelayEnvelope,
+                              onPartial: (@Sendable (String) -> Void)?) async throws -> String {
+        recordCloudClient(from: envelope)
         if let action = envelope.parameters["relayAction"], action == "catalog" {
             return try catalogResponseJSON()
         }
-        guard let id = activeModelID,
-              let descriptor = descriptors[id] else {
+        // Honor the model the client selected (sent via parameters["model"]).
+        // Fall back to the host's active model only when none was requested or
+        // the requested one is unknown.
+        let requestedModel = envelope.parameters["model"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let descriptor: RelayModelDescriptor
+        if let requestedModel, !requestedModel.isEmpty, let resolved = self.descriptor(for: requestedModel) {
+            descriptor = resolved
+        } else if let id = activeModelID, let resolved = descriptors[id] {
+            descriptor = resolved
+        } else {
             throw InferenceError.notConfigured
         }
         switch descriptor.kind {
         case .local:
-            let entry = try await loadLocalClient(for: descriptor)
+            var entry = try await loadLocalClient(for: descriptor)
             let messages = envelope.messages.map { ChatMessage(role: $0.role, content: $0.text) }
             let input = LLMInput(.messages(messages))
-            return try await entry.client.text(from: input)
+            var accumulated = ""
+            let yield: ((String) -> Void)?
+            if let onPartial {
+                yield = { chunk in
+                    accumulated += chunk
+                    onPartial(accumulated)
+                }
+            } else {
+                yield = nil
+            }
+            let (text, _, _) = try await collectText(
+                entry: &entry,
+                modelID: descriptor.id,
+                input: input,
+                parameters: NormalizedParameters(),
+                yield: yield
+            )
+            entry.lastUsed = Date()
+            updateEntry(entry, for: descriptor.id)
+            return text
         case .remote(let backend, let remoteModel):
-            return try await generateRemoteReply(backend: backend,
-                                                 descriptor: descriptor,
-                                                 remoteModel: remoteModel,
-                                                 envelope: envelope)
+            let text = try await generateRemoteReply(backend: backend,
+                                                     descriptor: descriptor,
+                                                     remoteModel: remoteModel,
+                                                     envelope: envelope)
+            onPartial?(text)
+            return text
         }
     }
 
@@ -374,6 +420,7 @@ actor RelayServerEngine {
             let promptTokens = estimateTokens(for: request.messages)
             let (text, finishReason, tokenCount) = try await collectText(
                 entry: &entry,
+                modelID: descriptor.id,
                 input: input,
                 parameters: request.parameters,
                 yield: nil
@@ -472,6 +519,7 @@ actor RelayServerEngine {
                     do {
                         let (text, finishReason, completionTokens) = try await self.collectText(
                             entry: &entry,
+                            modelID: descriptor.id,
                             input: input,
                             parameters: request.parameters,
                             yield: { chunk in
@@ -690,8 +738,10 @@ actor RelayServerEngine {
                 return Int(clamped)
             }
             let threads = descriptor.settings.map { settings -> Int in
-                let requested = settings.cpuThreads > 0 ? settings.cpuThreads : ProcessInfo.processInfo.activeProcessorCount
-                return max(1, requested)
+                let requested = settings.cpuThreads > 0 ? settings.cpuThreads : ModelSettings.recommendedInferenceThreadCount
+                // Hard-clamp so inference always leaves a core for the UI, even for
+                // older persisted settings that requested every processor.
+                return min(max(1, requested), ModelSettings.maxInferenceThreadCount)
             }
             // Pass explicit projector when available so remote worker uses the intended mmproj
             let explicitMMProj = ProjectorLocator.projectorPath(alongside: model.url)
@@ -715,6 +765,8 @@ actor RelayServerEngine {
             throw InferenceError.other("Apple Core ML models are not supported by relay")
         case .afm:
             throw InferenceError.other("Apple Foundation Models are not supported by relay")
+        case .coreai:
+            throw InferenceError.other("Core AI models are not supported by relay")
         }
 
         var entry = LoadedClient(client: client, descriptor: descriptor, lastUsed: Date(), evictionTask: nil)
@@ -731,6 +783,7 @@ actor RelayServerEngine {
     private func applyEnvironmentVariables(from settings: ModelSettings?) {
         guard let settings else {
             unsetenv("LLAMA_CONTEXT_SIZE")
+            unsetenv("LLAMA_CONTEXT_SHIFT")
             unsetenv("LLAMA_N_GPU_LAYERS")
             unsetenv("LLAMA_THREADS")
             unsetenv("LLAMA_THREADS_BATCH")
@@ -748,6 +801,10 @@ actor RelayServerEngine {
         }
 
         setenv("LLAMA_CONTEXT_SIZE", String(Int(settings.contextLength)), 1)
+        // Relay serves remote clients: always allow context shifting so their
+        // long generations keep going, regardless of the local chat strategy
+        // (the env is process-global and ChatVM may have set it to 0).
+        setenv("LLAMA_CONTEXT_SHIFT", "1", 1)
 
         let supportsOffload = DeviceGPUInfo.supportsGPUOffload
         let gpuLayers: Int
@@ -760,8 +817,9 @@ actor RelayServerEngine {
         }
         setenv("LLAMA_N_GPU_LAYERS", String(gpuLayers), 1)
 
-        let threads = settings.cpuThreads > 0 ? settings.cpuThreads : ProcessInfo.processInfo.activeProcessorCount
-        let clampedThreads = max(1, threads)
+        let threads = settings.cpuThreads > 0 ? settings.cpuThreads : ModelSettings.recommendedInferenceThreadCount
+        // Hard-clamp so inference always leaves a core free for the UI.
+        let clampedThreads = min(max(1, threads), ModelSettings.maxInferenceThreadCount)
         setenv("LLAMA_THREADS", String(clampedThreads), 1)
         setenv("LLAMA_THREADS_BATCH", String(clampedThreads), 1)
         // Backward-compat: a few builds key off GGML_* env vars
@@ -837,6 +895,15 @@ actor RelayServerEngine {
            let temperature = Double(temperatureString) {
             body["temperature"] = temperature
         }
+        if let topPString = envelope.parameters["top_p"], let topP = Double(topPString) {
+            body["top_p"] = topP
+        }
+        if let topKString = envelope.parameters["top_k"], let topK = Int(topKString) {
+            body["top_k"] = topK
+        }
+        if let stopString = envelope.parameters["stop"], !stopString.isEmpty {
+            body["stop"] = stopString.split(separator: ",").map(String.init)
+        }
         let data = try JSONSerialization.data(withJSONObject: body, options: [])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -888,9 +955,22 @@ actor RelayServerEngine {
             "messages": messages,
             "stream": false
         ]
+        var ollamaOptions: [String: Any] = [:]
         if let temperatureString = envelope.parameters["temperature"],
            let temperature = Double(temperatureString) {
-            body["options"] = ["temperature": temperature]
+            ollamaOptions["temperature"] = temperature
+        }
+        if let topPString = envelope.parameters["top_p"], let topP = Double(topPString) {
+            ollamaOptions["top_p"] = topP
+        }
+        if let topKString = envelope.parameters["top_k"], let topK = Int(topKString) {
+            ollamaOptions["top_k"] = topK
+        }
+        if let stopString = envelope.parameters["stop"], !stopString.isEmpty {
+            ollamaOptions["stop"] = stopString.split(separator: ",").map(String.init)
+        }
+        if !ollamaOptions.isEmpty {
+            body["options"] = ollamaOptions
         }
         let data = try JSONSerialization.data(withJSONObject: body, options: [])
         var request = URLRequest(url: url)
@@ -1018,14 +1098,22 @@ actor RelayServerEngine {
     }
 
     private func collectText(entry: inout LoadedClient,
+                              modelID: String,
                               input: LLMInput,
                               parameters: NormalizedParameters,
                               yield: ((String) -> Void)?) async throws -> (String, String, Int) {
+        // Serialize generations per model: a single llama.cpp context is not
+        // safe to drive from two concurrent requests. Other models (and all
+        // non-generation actor work) remain free while one request generates.
+        await acquireGenerationSlot(modelID)
+        defer { releaseGenerationSlot(modelID) }
+
         let stream = try await entry.client.textStream(from: input)
         var buffer = ""
         var finishReason = "stop"
         var tokenCount = 0
         let stopSequences = parameters.stop
+        let maxTokens = parameters.maxTokens
         var shouldCancel = false
 
         do {
@@ -1036,6 +1124,11 @@ actor RelayServerEngine {
                 if let match = stopSequences.first(where: { buffer.hasSuffix($0) }) {
                     buffer.removeLast(match.count)
                     finishReason = "stop"
+                    shouldCancel = true
+                    break
+                }
+                if let maxTokens, maxTokens > 0, tokenCount >= maxTokens {
+                    finishReason = "length"
                     shouldCancel = true
                     break
                 }
@@ -1051,6 +1144,40 @@ actor RelayServerEngine {
 
         let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
         return (trimmed, finishReason, tokenCount)
+    }
+
+    // MARK: - Per-model generation serialization
+
+    private var busyModels: Set<String> = []
+    private var generationWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var pendingEvictions: [String: String] = [:]
+
+    private func acquireGenerationSlot(_ id: String) async {
+        if !busyModels.contains(id) {
+            busyModels.insert(id)
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            generationWaiters[id, default: []].append(cont)
+        }
+    }
+
+    private func releaseGenerationSlot(_ id: String) {
+        if var waiters = generationWaiters[id], !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            generationWaiters[id] = waiters.isEmpty ? nil : waiters
+            // The resumed waiter inherits the busy slot; keep busyModels set.
+            next.resume()
+            return
+        }
+        busyModels.remove(id)
+        if let reason = pendingEvictions.removeValue(forKey: id) {
+            Task { await self.evictLoadedModel(id: id, reason: reason) }
+        }
+    }
+
+    private func isModelBusy(_ id: String) -> Bool {
+        busyModels.contains(id)
     }
 
     private func updateAfterStreaming(entry: LoadedClient, id: String) {
@@ -1075,6 +1202,15 @@ actor RelayServerEngine {
     }
 
     private func evictLoadedModel(id: String, reason: String) async {
+        // Never pull a model out from under an active generation. Defer the
+        // eviction; releaseGenerationSlot() will retry once the model is idle.
+        if isModelBusy(id) {
+            pendingEvictions[id] = reason
+            RelayLog.record(category: "RelayServerEngine",
+                            message: "Deferring eviction of \(id) until active generation completes (\(reason))",
+                            suppressConsole: true)
+            return
+        }
         guard let entry = localClients.removeValue(forKey: id) else { return }
         entry.evictionTask?.cancel()
         await entry.client.unloadAndWait()
@@ -1084,8 +1220,13 @@ actor RelayServerEngine {
 
     private func unloadOtherClients(keeping keepID: String) {
         // Unload only non-pinned (JIT) models; preserve manually loaded models
+        // and any model currently servicing a request.
         let otherIDs = localClients.keys.filter { $0 != keepID && !pinnedModelIDs.contains($0) }
         for id in otherIDs {
+            if isModelBusy(id) {
+                pendingEvictions[id] = "JIT policy (deferred: model busy)"
+                continue
+            }
             if let entry = localClients.removeValue(forKey: id) {
                 entry.evictionTask?.cancel()
                 Task { await entry.client.unloadAndWait() }

@@ -1,6 +1,119 @@
 import Foundation
 import ImageIO
 import CoreGraphics
+
+/// Renders chat turns for ExecuTorch runners using the model family's own
+/// template instead of a hardcoded ChatML wrapper. The ET runner keeps its KV
+/// cache across `generate` calls, so each call carries only the NEW turn:
+/// system prompt and BOS markers belong to the first turn after a (re)load.
+struct ETTurnFormatter: Sendable {
+    let kind: PromptBuilder.TemplateKind
+
+    init(template: String?, modelNameHint: String) {
+        self.kind = PromptBuilder.detect(template: template, family: ModelKind.detect(id: modelNameHint))
+    }
+
+    init(kind: PromptBuilder.TemplateKind) {
+        self.kind = kind
+    }
+
+    func renderTurn(
+        userText: String,
+        systemPrompt: String?,
+        isFirstTurn: Bool,
+        toolResult: String? = nil
+    ) -> String {
+        let trimmedSystem = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let system: String? = (isFirstTurn && trimmedSystem?.isEmpty == false) ? trimmedSystem : nil
+
+        switch kind {
+        case .chatml, .qwen35, .internlm, .yi, .chatmlWithStartOfText:
+            var out = ""
+            if isFirstTurn, kind == .chatmlWithStartOfText || kind == .yi {
+                out += "<|startoftext|>"
+            }
+            if let system {
+                out += "<|im_start|>system\n\(system)<|im_end|>\n"
+            }
+            if let toolResult {
+                out += "<|im_start|>user\n<tool_response>\n\(toolResult)\n</tool_response><|im_end|>\n"
+            }
+            out += "<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
+            return out
+        case .llama3:
+            var out = isFirstTurn ? "<|begin_of_text|>" : ""
+            if let system {
+                out += "<|start_header_id|>system<|end_header_id|>\n\n\(system)<|eot_id|>"
+            }
+            if let toolResult {
+                out += "<|start_header_id|>user<|end_header_id|>\n\nTool result:\n\(toolResult)<|eot_id|>"
+            }
+            out += "<|start_header_id|>user<|end_header_id|>\n\n\(userText)<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            return out
+        case .gemmaTurn:
+            // Gemma has no system role; fold it into the first user turn.
+            var body = userText
+            if let toolResult {
+                body = "Tool result:\n\(toolResult)\n\n" + body
+            }
+            if let system {
+                body = system + "\n\n" + body
+            }
+            let bos = isFirstTurn ? "<bos>" : ""
+            return "\(bos)<start_of_turn>user\n\(body)<end_of_turn>\n<start_of_turn>model\n"
+        case .inst:
+            var body = userText
+            if let toolResult {
+                body = "Tool result:\n\(toolResult)\n\n" + body
+            }
+            if let system {
+                return "<s>[INST] <<SYS>>\n\(system)\n<</SYS>>\n\n\(body) [/INST]"
+            }
+            return "\(isFirstTurn ? "<s>" : "")[INST] \(body) [/INST]"
+        case .phi:
+            var out = ""
+            if let system {
+                out += "<|system|>\n\(system)\n"
+            }
+            if let toolResult {
+                out += "<|user|>\nTool result:\n\(toolResult)\n"
+            }
+            out += "<|user|>\n\(userText)\n<|assistant|>\n"
+            return out
+        case .deepseek:
+            var out = ""
+            if let system {
+                out += system + "\n\n"
+            }
+            if let toolResult {
+                out += "Tool result:\n\(toolResult)\n\n"
+            }
+            out += "<｜User｜>\(userText)<｜Assistant｜>"
+            return out
+        case .alpaca:
+            var out = ""
+            if let system {
+                out += system + "\n\n"
+            }
+            if let toolResult {
+                out += "Tool result:\n\(toolResult)\n\n"
+            }
+            out += "### Instruction:\n\(userText)\n\n### Response:\n"
+            return out
+        case .vicuna, .none:
+            var out = ""
+            if let system {
+                out += "System:\n\(system)\n\n"
+            }
+            if let toolResult {
+                out += "Tool result:\n\(toolResult)\n\n"
+            }
+            out += "User:\n\(userText)\nAssistant:\n"
+            return out
+        }
+    }
+}
+
 #if os(iOS) && canImport(ExecuTorch) && canImport(ExecuTorchLLM)
 import ExecuTorch
 import ExecuTorchLLM
@@ -24,12 +137,20 @@ final actor ExecuTorchLLMClient {
     private var systemPrompt: String? = nil
     private var resolvedRuntimeBackends: [String] = []
     private var resolvedRuntimeMethod: String? = nil
+    private let turnFormatter: ETTurnFormatter
+    /// The runner's KV cache persists across generate calls; the first turn
+    /// after load/reset carries the system prompt and BOS markers.
+    private var hasCompletedFirstTurn = false
 
     init(modelPath: String, tokenizerPath: String, isVision: Bool, settings: ModelSettings) {
         self.modelPath = modelPath
         self.tokenizerPath = tokenizerPath
         self.isVision = isVision
         self.settings = settings
+        self.turnFormatter = ETTurnFormatter(
+            template: settings.promptTemplate,
+            modelNameHint: URL(fileURLWithPath: modelPath).lastPathComponent
+        )
     }
 
     func load() async throws {
@@ -68,6 +189,7 @@ final actor ExecuTorchLLMClient {
         textRunner = nil
         multimodalRunner = nil
         state = .idle
+        hasCompletedFirstTurn = false
     }
 
     func cancelActive() {
@@ -80,6 +202,7 @@ final actor ExecuTorchLLMClient {
     func resetConversation() {
         textRunner?.reset()
         multimodalRunner?.reset()
+        hasCompletedFirstTurn = false
     }
 
     func hardResetConversation() {
@@ -100,7 +223,9 @@ final actor ExecuTorchLLMClient {
         let payload = try PreparedPayload(
             input: input,
             isVision: isVision,
-            systemPrompt: systemPrompt
+            formatter: turnFormatter,
+            systemPrompt: systemPrompt,
+            isFirstTurn: !hasCompletedFirstTurn
         )
 
         return AsyncThrowingStream { continuation in
@@ -239,6 +364,7 @@ final actor ExecuTorchLLMClient {
             }
         }
 
+        hasCompletedFirstTurn = true
         activeGenerationTask = nil
     }
 
@@ -360,48 +486,58 @@ private enum PreparedPayload {
     case text(String)
     case multimodal([MultimodalInput])
 
-    init(input: LLMInput, isVision: Bool, systemPrompt: String?) throws {
+    init(
+        input: LLMInput,
+        isVision: Bool,
+        formatter: ETTurnFormatter,
+        systemPrompt: String?,
+        isFirstTurn: Bool
+    ) throws {
+        // The chat flow sends only the NEW turn (latest user message, plus a
+        // tool-result message in post-tool continuations); earlier turns live
+        // in the runner's persistent KV cache.
+        func renderedTurn(from messages: [ChatMessage]) -> String {
+            let userText = messages.last(where: { $0.role.lowercased() == "user" })?.content
+                ?? messages.last?.content
+                ?? ""
+            let toolResult = messages.last(where: { $0.role.lowercased() == "tool" })?.content
+            return formatter.renderTurn(
+                userText: userText,
+                systemPrompt: systemPrompt,
+                isFirstTurn: isFirstTurn,
+                toolResult: toolResult
+            )
+        }
+
+        func multimodalItems(prompt: String, imagePaths: [String]) throws -> [MultimodalInput] {
+            var items: [MultimodalInput] = [MultimodalInput(prompt)]
+            for imagePath in imagePaths {
+                let image = try ETImageDecoder.decodeImage(fromPath: imagePath)
+                items.append(MultimodalInput(image))
+            }
+            return items
+        }
+
         switch input.content {
         case .plain(let text):
-            self = .text(Self.applySystemPrompt(text: text, systemPrompt: systemPrompt))
+            self = .text(formatter.renderTurn(userText: text, systemPrompt: systemPrompt, isFirstTurn: isFirstTurn))
         case .messages(let messages):
-            let rendered = messages
-                .map { "\($0.role): \($0.content)" }
-                .joined(separator: "\n")
-            self = .text(Self.applySystemPrompt(text: rendered, systemPrompt: systemPrompt))
+            self = .text(renderedTurn(from: messages))
         case .multimodal(let text, let imagePaths):
-            let prompt = Self.applySystemPrompt(text: text, systemPrompt: systemPrompt)
+            let prompt = formatter.renderTurn(userText: text, systemPrompt: systemPrompt, isFirstTurn: isFirstTurn)
             guard isVision else {
                 self = .text(prompt)
                 return
             }
-            var items: [MultimodalInput] = [MultimodalInput(prompt)]
-            for imagePath in imagePaths {
-                let image = try ETImageDecoder.decodeImage(fromPath: imagePath)
-                items.append(MultimodalInput(image))
-            }
-            self = .multimodal(items)
+            self = .multimodal(try multimodalItems(prompt: prompt, imagePaths: imagePaths))
         case .multimodalMessages(let messages, let imagePaths):
-            let rendered = messages
-                .map { "\($0.role): \($0.content)" }
-                .joined(separator: "\n")
-            let prompt = Self.applySystemPrompt(text: rendered, systemPrompt: systemPrompt)
+            let prompt = renderedTurn(from: messages)
             guard isVision else {
                 self = .text(prompt)
                 return
             }
-            var items: [MultimodalInput] = [MultimodalInput(prompt)]
-            for imagePath in imagePaths {
-                let image = try ETImageDecoder.decodeImage(fromPath: imagePath)
-                items.append(MultimodalInput(image))
-            }
-            self = .multimodal(items)
+            self = .multimodal(try multimodalItems(prompt: prompt, imagePaths: imagePaths))
         }
-    }
-
-    private static func applySystemPrompt(text: String, systemPrompt: String?) -> String {
-        guard let systemPrompt, !systemPrompt.isEmpty else { return text }
-        return "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(text)<|im_end|>\n<|im_start|>assistant\n"
     }
 }
 

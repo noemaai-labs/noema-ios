@@ -7,7 +7,7 @@ struct TopNotificationStack<Manager: ModelLoadingManaging>: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            IndexingNotificationView(datasetManager: datasetManager)
+            EmbeddingLiveActivityView(datasetManager: datasetManager)
             ModelLoadingNotificationView(modelManager: modelManager, loadingTracker: loadingTracker)
         }
     }

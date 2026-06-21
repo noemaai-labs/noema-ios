@@ -21,7 +21,7 @@ enum SystemPreset: String, CaseIterable, Identifiable {
 
     - Use mathematical notation only when the user asks a math or technical question, or when symbols meaningfully increase precision.
     - When you do use math, format it with LaTeX delimiters:
-      - Inline: $...$
+      - Inline: \\(...\\)
       - Display (for multi-step work or standalone equations): $$...$$ with blank lines before and after.
     - Do not mention "LaTeX," "formatting," or these rules in your answer unless the user explicitly asks about formatting.
     - Avoid boxed styling such as \\boxed{}, \\fbox{}, \\colorbox{}, or \\

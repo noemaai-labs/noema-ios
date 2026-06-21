@@ -51,6 +51,38 @@ final class ModelSettingsStoreTests: XCTestCase {
         XCTAssertNil(decoded.systemPromptOverride)
     }
 
+    func testLegacySpeculativeDecodingSettingsDecodeAsHelperMode() throws {
+        let json = #"{"helperModelID":"draft-model","mode":"max","value":32}"#
+
+        let decoded = try JSONDecoder().decode(
+            ModelSettings.SpeculativeDecodingSettings.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(decoded.selection, .helperDraftModel)
+        XCTAssertEqual(decoded.helperModelID, "draft-model")
+        XCTAssertEqual(decoded.mode, .max)
+        XCTAssertEqual(decoded.value, 32)
+        XCTAssertEqual(decoded.mtpDraftNMax, 2)
+    }
+
+    func testMTPModePersistsAndClampsDraftTokenCount() throws {
+        var settings = ModelSettings.SpeculativeDecodingSettings()
+        settings.selection = .mtp
+        settings.mtpDraftNMax = 9
+
+        let encoded = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(
+            ModelSettings.SpeculativeDecodingSettings.self,
+            from: encoded
+        )
+
+        XCTAssertEqual(decoded.selection, .mtp)
+        XCTAssertTrue(decoded.mtpEnabled)
+        XCTAssertEqual(decoded.mtpDraftNMax, 9)
+        XCTAssertEqual(decoded.resolvedMTPDraftNMax, 6)
+    }
+
     func testBlankSystemPromptOverrideNormalizesBackToGlobal() {
         var settings = ModelSettings.default(for: .gguf)
         settings.systemPromptMode = .override

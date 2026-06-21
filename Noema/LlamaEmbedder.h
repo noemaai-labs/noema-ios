@@ -6,7 +6,9 @@ NS_ASSUME_NONNULL_BEGIN
 @interface LlamaEmbedder : NSObject
 - (instancetype)initWithModelPath:(NSString *)modelPath
                           threads:(int)threads
-                       nGpuLayers:(int)nGpuLayers;
+                       nGpuLayers:(int)nGpuLayers
+                    contextLength:(int)contextLength
+                       poolingType:(int)poolingType;
 
 - (BOOL)isReady;
 - (int)dimension;
@@ -16,5 +18,4 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 NS_ASSUME_NONNULL_END
-
 

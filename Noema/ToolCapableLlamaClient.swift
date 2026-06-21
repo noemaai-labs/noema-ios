@@ -199,7 +199,9 @@ public final class ToolCapableLlamaClient: ToolCapableLLM, @unchecked Sendable {
             python: tools?.contains(where: { $0.function.name == "noema.python.execute" }) == true
                 && PythonToolGate.isAvailable(currentFormat: .gguf),
             memory: tools?.contains(where: { $0.function.name == "noema.memory" }) == true
-                && MemoryToolGate.isAvailable(currentFormat: .gguf)
+                && MemoryToolGate.isAvailable(currentFormat: .gguf),
+            calculator: tools?.contains(where: { $0.function.name == "noema.math.calculate" }) == true,
+            unitConverter: tools?.contains(where: { $0.function.name == "noema.units.convert" }) == true
         )
         var systemContent: String = SystemPromptResolver.general(
             currentFormat: .gguf,
@@ -214,6 +216,8 @@ public final class ToolCapableLlamaClient: ToolCapableLLM, @unchecked Sendable {
             let usage = """
             Use tools only when they would materially improve the answer; otherwise answer directly.
             - Use `noema.web.retrieve` for fresh/current information.
+            - Use `noema.math.calculate` for quick deterministic arithmetic or single-expression math.
+            - Use `noema.units.convert` for deterministic unit conversions.
             - Use `noema.python.execute` for calculations, data processing, parsing, algorithms, or other computational work.
             - Use `noema.memory` for durable, cross-conversation facts such as stable user preferences or recurring project constraints.
 
@@ -229,7 +233,8 @@ public final class ToolCapableLlamaClient: ToolCapableLLM, @unchecked Sendable {
             5) Make exactly ONE tool call, then wait for the result.
             6) You may mention tools inside <think>, but finish reasoning and close the tag before emitting the <tool_call> tag or JSON object that actually triggers the call.
             7) Do NOT use code fences (```); emit only the JSON or the <tool_call> wrapper. Do not mix formats.
-            8) For Python, always send runnable Python 3 and use print() for output.
+            8) Prefer calculator or unit conversion for simple math/conversion tasks; use Python for multi-step computation, data processing, or code-friendly analysis.
+            9) For Python, always send runnable Python 3 and use print() for output.
 
             Available tools:
             """ + catalog

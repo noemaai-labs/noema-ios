@@ -60,6 +60,32 @@ enum ContextOverflowStrategy: String, CaseIterable, Identifiable {
             return "Memory quality no longer improves because generation is stopped once the limit is reached."
         }
     }
+
+    /// Short label for the in-chat status pill.
+    var pillTitleKey: String {
+        switch self {
+        case .truncateMiddle:
+            return "Context full · middle trimmed"
+        case .rollingWindow:
+            return "Context full · oldest trimmed"
+        case .stopAtLimit:
+            return "Context limit reached"
+        }
+    }
+
+    var pillSymbolName: String {
+        switch self {
+        case .truncateMiddle:
+            return "scissors"
+        case .rollingWindow:
+            return "arrow.triangle.2.circlepath"
+        case .stopAtLimit:
+            return "exclamationmark.octagon.fill"
+        }
+    }
+
+    /// Trimming strategies are informational; stop-at-limit is a hard stop.
+    var isHardStop: Bool { self == .stopAtLimit }
 }
 
 enum ChatAttachmentCleanupPolicy: String, CaseIterable, Identifiable {
@@ -110,10 +136,17 @@ final class SettingsModel: ObservableObject {
     }
     @AppStorage("offGrid") var offGrid = false
     @AppStorage("hapticsEnabled") var hapticsEnabled = true
+    @AppStorage("compactChatModeEnabled") var compactChatModeEnabled = false
     @AppStorage("muteSoundEffects") var muteSoundEffects = false
     @AppStorage("playSoundEffectsInSilentMode") var playSoundEffectsInSilentMode = false
     @AppStorage("appearance") var appearance = "system" // light, dark, system
     @AppStorage("verboseLogging") var verboseLogging = false
+    /// When on (and Advanced mode is enabled), each answer shows a generation-stats
+    /// footer (tokens, tok/s, time-to-first-token, total duration) and the context
+    /// gauge announces absolute token counts. Lives in the Diagnostics section.
+    @AppStorage("showGenerationDiagnostics") var showGenerationDiagnostics = true {
+        didSet { objectWillChange.send() }
+    }
     @AppStorage("huggingFaceToken") var huggingFaceToken = ""
     @AppStorage("bypassRAMCheck") var bypassRAMCheck = false
 #if os(visionOS)
@@ -122,10 +155,28 @@ final class SettingsModel: ObservableObject {
     // System preset removed; default system behavior is always used
     @AppStorage("ragMaxChunks") var ragMaxChunks = 5
     @AppStorage("ragMinScore") var ragMinScore: Double = 0.5
+    @AppStorage("ragRetrievalMode") var ragRetrievalModeRaw = DatasetRetrievalMode.defaultValue.rawValue
     @AppStorage("contextOverflowStrategy") var contextOverflowStrategyRaw = ContextOverflowStrategy.defaultValue.rawValue
     @AppStorage(ChatAttachmentCleanupPolicy.storageKey) var chatAttachmentCleanupPolicyRaw = ChatAttachmentCleanupPolicy.defaultValue.rawValue
     @AppStorage(ChatSendBehavior.storageKey) var chatSendBehaviorRaw = ChatSendBehavior.defaultValue.rawValue
+    @AppStorage(TranscriptionSettings.onDeviceOnlyKey) var asrOnDeviceOnly = true
+    @AppStorage(TranscriptionSettings.localeIdentifierKey) var asrLocaleIdentifier = ""
+    @AppStorage(TranscriptionSettings.autoTranscribeAttachmentsKey) var asrAutoTranscribeAttachments = false
+    @AppStorage(TranscriptionSettings.engineIDKey) var asrEngineIDRaw = TranscriptionEngineID.appleSpeech.rawValue
+    @AppStorage(TranscriptionSettings.includeTimestampsInPromptKey) var asrIncludeTimestamps = false
     @AppStorage(SystemPreset.customSystemPromptIntroKey) var customSystemPromptIntro = SystemPreset.defaultEditableIntro
+#if os(iOS)
+    @AppStorage(PassScannerSettings.signerBaseURLKey) var walletPassSignerBaseURL = ""
+    @AppStorage(PassScannerSettings.keepScansWithDraftsKey) var walletPassKeepScansWithDrafts = false
+    @AppStorage(PassScannerSettings.remoteFallbackAllowedKey) var walletPassRemoteFallbackAllowed = false
+    @AppStorage(PassScannerSettings.warningSensitivityKey) var walletPassWarningSensitivity = "balanced"
+    @AppStorage(PassExtractionModelCatalog.activeModelPathKey) var walletPassActiveExtractionModelPath = ""
+    @AppStorage(PassExtractionModelCatalog.activeModelIDKey) var walletPassActiveExtractionModelID = ""
+    @AppStorage(PassExtractionModelCatalog.activeModelQuantKey) var walletPassActiveExtractionModelQuant = ""
+    @AppStorage(PassExtractionModelCatalog.activeModelFormatKey) var walletPassActiveExtractionModelFormat = ""
+    @AppStorage(PassExtractionModelCatalog.activeModelNameKey) var walletPassActiveExtractionModelName = ""
+    @AppStorage(PassExtractionModelCatalog.extractionThinkingEnabledKey) var walletPassExtractionThinkingEnabled = false
+#endif
 
     // MCPs removed
 
@@ -149,10 +200,12 @@ final class SettingsModel: ObservableObject {
         isAdvancedMode = false
         offGrid = false
         hapticsEnabled = true
+        compactChatModeEnabled = false
         muteSoundEffects = false
         playSoundEffectsInSilentMode = false
         appearance = "system"
         verboseLogging = false
+        showGenerationDiagnostics = true
         huggingFaceToken = ""
         bypassRAMCheck = false
 #if os(visionOS)
@@ -160,10 +213,24 @@ final class SettingsModel: ObservableObject {
 #endif
         ragMaxChunks = 5
         ragMinScore = 0.5
+        ragRetrievalModeRaw = DatasetRetrievalMode.defaultValue.rawValue
         contextOverflowStrategyRaw = ContextOverflowStrategy.defaultValue.rawValue
         chatAttachmentCleanupPolicyRaw = ChatAttachmentCleanupPolicy.defaultValue.rawValue
         chatSendBehaviorRaw = ChatSendBehavior.defaultValue.rawValue
         customSystemPromptIntro = SystemPreset.defaultEditableIntro
+#if os(iOS)
+        walletPassSignerBaseURL = ""
+        walletPassKeepScansWithDrafts = false
+        walletPassRemoteFallbackAllowed = false
+        walletPassWarningSensitivity = "balanced"
+        walletPassActiveExtractionModelPath = ""
+        walletPassActiveExtractionModelID = ""
+        walletPassActiveExtractionModelQuant = ""
+        walletPassActiveExtractionModelFormat = ""
+        walletPassActiveExtractionModelName = ""
+        walletPassExtractionThinkingEnabled = false
+        _ = try? PassSigningCredentialStore.removeToken()
+#endif
         StartupPreferencesStore.save(StartupPreferences())
     }
 }
@@ -171,7 +238,12 @@ final class SettingsModel: ObservableObject {
 struct SettingsView: View {
     @StateObject private var settings = SettingsModel()
     @ObservedObject private var webSettings = SettingsStore.shared
+    @ObservedObject private var memoryStore = MemoryStore.shared
+#if os(iOS)
+    @ObservedObject private var boardingPassDraftStore = BoardingPassDraftStore.shared
+#endif
     @EnvironmentObject var chatVM: ChatVM
+    @EnvironmentObject var tabRouter: TabRouter
     @EnvironmentObject var modelManager: AppModelManager
     @EnvironmentObject var datasetManager: DatasetManager
     @EnvironmentObject var downloadController: DownloadController
@@ -182,6 +254,9 @@ struct SettingsView: View {
 #if canImport(UIKit)
     @State private var showOnboarding = false
 #endif
+#if os(macOS)
+    @State private var showMacOnboarding = false
+#endif
     @State private var showLogs = false
     @State private var shareLogs = false
     @State private var showChatsCleared = false
@@ -190,24 +265,131 @@ struct SettingsView: View {
     @State private var confirmResetSystemPrompt = false
     @State private var showResetComplete = false
     @State private var isResettingAppData = false
+    @State private var showMemoryInfo = false
+    @State private var showPythonInfo = false
     @State private var showRAMInfo = false
+    @State private var showASRLocaleInfo = false
+    @State private var showOnDeviceTranscriptionInfo = false
     @State private var showChunksInfo = false
     @State private var showSimilarityInfo = false
     @State private var estimateModelPath: String = ""
     @State private var embedAvailable = FileManager.default.fileExists(atPath: EmbeddingModel.modelURL.path)
+    @State private var showEmbeddingModels = false
     @State private var showEmbedDeleteError = false
     @State private var embedDeleteErrorMessage = ""
     @State private var isCleaningDownloadLeftovers = false
     @State private var showDownloadCleanupResult = false
     @State private var downloadCleanupResultMessage = ""
     @State private var startupPreferences = StartupPreferencesStore.load()
+    @State private var settingsDestination: SettingsDestination?
     @State private var showWebSearchInfo = false
+#if os(iOS)
+    @State private var walletPassSignerToken = ""
+    @State private var walletPassTokenStored = false
+    @State private var confirmDeleteWalletPassDrafts = false
+    @FocusState private var walletPassTokenFocused: Bool
+#endif
     @State private var selectedLanguageCode: String = UserDefaults.standard.string(forKey: "appLanguageCode") ?? LocalizationManager.detectSystemLanguage()
+    @FocusState private var customSearchURLFocused: Bool
     @FocusState private var systemPromptFocused: Bool
-    private let llamaCppBuild = "0.9.11 (009a1133)"
-    private let appVersion = "2.0"
+    private let llamaCppBuild = "b9592 (0.14.0, ac4cdde)"
+    private let appVersion = "2.3"
+    @ObservedObject private var enterpriseManager = EnterprisePolicyManager.shared
     private enum ScrollTarget: Hashable {
         case offGrid
+    }
+
+    private enum SettingsDestination: String, Hashable, Identifiable {
+        case startupPreferences
+        case manageMemories
+        case appPreferences
+        case embeddingModel
+        case privacy
+        case privacyFlight
+        case ragInspector
+        case runtimeDiagnostics
+        case runtimeTimeline
+        case mtpDashboard
+        case loadReceipt
+        case loopbackHealth
+        case runtimeFixes
+        case unloadVerifier
+        case toolStore
+        case datasetHealth
+        case modelMetadata
+        case modelDependencies
+        case autoTuner
+        case modelDoctor
+        case storageAdvisor
+        case modelRecommendations
+        case speculativeWizard
+        case diagnosticsHub
+        case loopbackServer
+        case modelInternals
+        case speculativeDecoding
+        case speechASR
+#if os(iOS)
+        case walletPasses
+        case passExtractionModel
+#endif
+        case retrievalSettings
+        case hiddenModels
+        case remoteAudioEndpoint
+        case notesIssues
+        case whisperModelCatalog
+        case enterprise
+
+        var id: String { rawValue }
+
+        var titleKey: LocalizedStringKey {
+            switch self {
+            case .startupPreferences: return "Startup Preferences"
+            case .manageMemories: return "Manage Memories"
+            case .appPreferences: return "App Preferences"
+            case .embeddingModel: return "Embedding Models"
+            case .privacy: return "Privacy"
+            case .privacyFlight: return "Privacy Flight Recorder"
+            case .ragInspector: return "RAG Inspector"
+            case .runtimeDiagnostics: return "Runtime Diagnostics"
+            case .runtimeTimeline: return "Runtime Timeline"
+            case .mtpDashboard: return "MTP Dashboard"
+            case .loadReceipt: return "Load Receipt"
+            case .loopbackHealth: return "Loopback Health"
+            case .runtimeFixes: return "Runtime Fixes"
+            case .unloadVerifier: return "Unload Verifier"
+            case .toolStore: return "Tool Store"
+            case .datasetHealth: return "Dataset Health"
+            case .modelMetadata: return "Model Metadata"
+            case .modelDependencies: return "Model Dependencies"
+            case .autoTuner: return "Auto-Tuner"
+            case .modelDoctor: return "Model Doctor"
+            case .storageAdvisor: return "Storage Advisor"
+            case .modelRecommendations: return "Model Recommendations"
+            case .speculativeWizard: return "Speculative Wizard"
+            case .diagnosticsHub: return "Diagnostics & Tools"
+            case .loopbackServer: return "Loopback Server"
+            case .modelInternals: return "Model Internals"
+            case .speculativeDecoding: return "Speculative Decoding"
+            case .speechASR: return "Speech & ASR"
+#if os(iOS)
+            case .walletPasses: return "Wallet Passes"
+            case .passExtractionModel: return "Pass Extraction Model"
+#endif
+            case .retrievalSettings: return "Retrieval Settings"
+            case .hiddenModels: return "Hidden Models"
+            case .remoteAudioEndpoint: return "Remote Audio Endpoint"
+            case .notesIssues: return "Notes & Issues"
+            case .whisperModelCatalog: return "Whisper Model"
+            case .enterprise: return "Enterprise"
+            }
+        }
+    }
+
+    private var currentWhisperEngineID: TranscriptionEngineID {
+        let selected = TranscriptionSettings.selectedEngineID
+        return selected.isLocalWhisper
+            ? selected
+            : TranscriptionBackendFactory.preferredLocalWhisperEngineID()
     }
 
     var body: some View {
@@ -217,10 +399,26 @@ struct SettingsView: View {
                 .onAppear {
                     refreshEmbeddingAvailability()
                     refreshStartupPreferences()
+#if os(iOS)
+                    loadWalletPassTokenState()
+#endif
                 }
 #if canImport(UIKit)
                 .fullScreenCover(isPresented: $showOnboarding) {
                     OnboardingView(showOnboarding: $showOnboarding)
+                }
+#endif
+#if os(macOS)
+                .sheet(isPresented: $showMacOnboarding) {
+                    MacOnboardingView(showOnboarding: $showMacOnboarding) {
+                        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+                    }
+                    .environmentObject(tabRouter)
+                    .environmentObject(chatVM)
+                    .environmentObject(modelManager)
+                    .environmentObject(datasetManager)
+                    .environmentObject(downloadController)
+                    .environmentObject(walkthrough)
                 }
 #endif
                 .onReceive(modelManager.$downloadedModels) { _ in
@@ -236,18 +434,50 @@ struct SettingsView: View {
                         refreshEmbeddingAvailability()
                     }
                 }
-                .onChange(of: embedInstaller.state) { newValue in
+                .onChange(of: embedInstaller.state) { _, newValue in
                     // When installation completes, warm up the backend for snappier first use
                     if newValue == .ready {
                         Task { await EmbeddingModel.shared.warmUp() }
                     }
                 }
-                .onChange(of: localizationManager.locale) { _ in
+                .onChange(of: localizationManager.locale) { _, _ in
                     selectedLanguageCode = currentLanguageCode
                 }
+#if os(macOS)
+                .sheet(isPresented: $showLogs) {
+                    macSettingsSheet(title: "Logs", onClose: { showLogs = false }) {
+                        LogViewerView(url: Logger.shared.logFileURL)
+                    }
+                }
+                .sheet(isPresented: $showEmbeddingModels) {
+                    EmbeddingModelsView()
+                        .environmentObject(downloadController)
+                        .environmentObject(datasetManager)
+                }
+                .sheet(item: $settingsDestination) { destination in
+                    if destination == .embeddingModel || destination == .whisperModelCatalog || destination == .remoteAudioEndpoint {
+                        settingsDestinationView(destination)
+                            .environmentObject(downloadController)
+                            .environmentObject(datasetManager)
+                    } else {
+                        macSettingsSheet(title: destination.titleKey, onClose: { settingsDestination = nil }) {
+                            settingsDestinationView(destination)
+                                .environmentObject(downloadController)
+                                .environmentObject(datasetManager)
+                        }
+                    }
+                }
+#else
                 .navigationDestination(isPresented: $showLogs) {
                     LogViewerView(url: Logger.shared.logFileURL)
                 }
+                .navigationDestination(isPresented: $showEmbeddingModels) {
+                    EmbeddingModelsView()
+                }
+                .navigationDestination(item: $settingsDestination) { destination in
+                    settingsDestinationView(destination)
+                }
+#endif
                 .sheet(isPresented: $shareLogs) {
                     ShareLink(item: Logger.shared.logFileURL) {
                         Text(LocalizedStringKey("Share Logs"))
@@ -260,6 +490,16 @@ struct SettingsView: View {
                     Button(LocalizedStringKey("OK"), role: .cancel) {}
                 } message: {
                     Text(LocalizedStringKey("Noema has been reset. The embedding model remains installed."))
+                }
+                .alert(LocalizedStringKey("Persistent Memory"), isPresented: $showMemoryInfo) {
+                    Button(LocalizedStringKey("OK"), role: .cancel) { }
+                } message: {
+                    Text(LocalizedStringKey("When enabled, models can save durable facts like stable preferences or recurring project constraints to on-device memory that persists across conversations."))
+                }
+                .alert(LocalizedStringKey("Python Code Execution"), isPresented: $showPythonInfo) {
+                    Button(LocalizedStringKey("OK"), role: .cancel) { }
+                } message: {
+                    Text(LocalizedStringKey("When enabled and armed via the + menu in chat, the model can write and run Python code to help answer your questions. Code runs in a sandboxed environment: no network access, no file access outside a temporary directory, and a 30-second timeout."))
                 }
                 .confirmationDialog(LocalizedStringKey("Delete All Chats"), isPresented: $confirmClearChats, titleVisibility: .visible) {
                     Button(LocalizedStringKey("Delete All Chats"), role: .destructive) {
@@ -297,12 +537,12 @@ struct SettingsView: View {
                 .alert(LocalizedStringKey("Max Chunks"), isPresented: $showChunksInfo) {
                     Button(LocalizedStringKey("OK"), role: .cancel) {}
                 } message: {
-                    Text(LocalizedStringKey("Controls how many high‑scoring passages (chunks) can be injected into the prompt. Higher values increase recall but consume more context window and can slow responses. Typical range 3–6."))
+                    Text(LocalizedStringKey("A “chunk” is a short passage pulled from your dataset. This sets the maximum number that can be added to the prompt — the retriever returns up to this many, using fewer only when little matches your question. Higher values improve recall but use more of the context window and can slow responses. Typical range 3–6."))
                 }
                 .alert(LocalizedStringKey("Similarity Threshold"), isPresented: $showSimilarityInfo) {
                     Button(LocalizedStringKey("OK"), role: .cancel) {}
                 } message: {
-                    Text(LocalizedStringKey("Minimum cosine similarity a passage must have to be considered relevant. Lower = more passages (higher recall, more noise). Higher = fewer, more precise passages. Try 0.2–0.4 for broad questions; 0.5–0.7 for precise lookups."))
+                    Text(LocalizedStringKey("How closely a passage must match your question (by cosine similarity) to be preferred. Lower = more passages (higher recall, more noise). Higher = fewer, more precise passages. The Retrieval Mode nudges this floor automatically — Broad loosens it, Focused keeps it strict. Try 0.2–0.4 for broad questions; 0.5–0.7 for precise lookups."))
                 }
                 .alert(LocalizedStringKey("Failed to Delete Embedding Model"), isPresented: $showEmbedDeleteError) {
                     Button(LocalizedStringKey("OK"), role: .cancel) {}
@@ -325,7 +565,8 @@ struct SettingsView: View {
 #if os(macOS)
         macSettingsView
 #else
-        settingsFormView
+        // iOS and visionOS share the card/navigation settings layout.
+        settingsiPhoneView
 #endif
     }
 
@@ -350,22 +591,32 @@ struct SettingsView: View {
                     .listRowBackground(Color.yellow.opacity(0.1))
                 }
                 modeSection
+                enterpriseSection
                 ramSection
+                if settings.isAdvancedMode {
+                    diagnosticsHubSection
+                }
                 startupSection
                 if !modelManager.hiddenModels.isEmpty {
                     hiddenModelsSection
                 }
                 ramBypassSection
                 SettingsWebSearchSection()
+                SettingsHuggingFaceSection()
                 SettingsMemorySection()
                 SettingsPythonSection()
                 offGridSection
+#if os(iOS)
+                walletPassSection
+#endif
                 generalSection
                 earlyTestersSection
                 embeddingSection
                 if settings.isAdvancedMode {
                     advancedSection
                 }
+                speechASRSection
+                privacyFlightSection
                 privacySection
                 aboutSection
                 llamaCppSection
@@ -377,7 +628,7 @@ struct SettingsView: View {
             .scrollDismissesKeyboard(.interactively)
 #endif
             .guideHighlight(.settingsForm)
-            .onChange(of: walkthrough.step) { step in
+            .onChange(of: walkthrough.step) { _, step in
                 guard step == .settingsHighlights else { return }
                 DispatchQueue.main.async {
                     withAnimation(.easeInOut) {
@@ -396,6 +647,1553 @@ struct SettingsView: View {
             }
     }
 
+#if os(macOS)
+    @ViewBuilder
+    private func macSettingsSheet<Content: View>(
+        title: LocalizedStringKey,
+        onClose: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 16) {
+                Text(title)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(AppTheme.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel(LocalizedStringKey("Close"))
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 10)
+
+            content()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(AppTheme.windowBackground.ignoresSafeArea())
+        .frame(minWidth: 560, minHeight: 520)
+    }
+#endif
+
+#if os(macOS)
+    @ViewBuilder
+    private func settingsDestinationView(_ destination: SettingsDestination) -> some View {
+        switch destination {
+        case .startupPreferences:
+            settingsDetailForm(LocalizedStringKey("Startup Preferences")) {
+                Section {
+                    startupSettingsContent
+                }
+            }
+        case .manageMemories:
+            MemoryManagementView()
+        case .appPreferences:
+            settingsDetailForm(LocalizedStringKey("App Preferences")) {
+                Section {
+                    generalContent
+                }
+            }
+        case .embeddingModel:
+            EmbeddingModelsView()
+        case .privacy:
+            settingsDetailForm(LocalizedStringKey("Privacy")) {
+                Section {
+                    privacyContent
+                }
+            }
+        case .privacyFlight:
+            PrivacyFlightRecorderView()
+        case .ragInspector:
+            RAGInspectorView()
+        case .runtimeDiagnostics:
+            RuntimeDiagnosticsView()
+        case .runtimeTimeline:
+            RuntimeTimelineView()
+        case .mtpDashboard:
+            MTPAcceptanceDashboardView()
+        case .loadReceipt:
+            ModelLoadReceiptView()
+        case .loopbackHealth:
+            LoopbackServerHealthView()
+        case .runtimeFixes:
+            LoopbackRemediationView()
+        case .unloadVerifier:
+            ModelUnloadVerificationView()
+        case .toolStore:
+            ToolStoreView()
+        case .datasetHealth:
+            DatasetHealthDashboardView()
+        case .modelMetadata:
+            ModelMetadataInspectorView()
+        case .modelDependencies:
+            ModelDependencyGraphView()
+        case .autoTuner:
+            ModelAutoTunerView()
+        case .modelDoctor:
+            ModelDoctorView()
+        case .storageAdvisor:
+            ModelStorageAdvisorView()
+        case .modelRecommendations:
+            ModelBenchmarkRecommendationsView()
+        case .speculativeWizard:
+            SpeculativeDecodingWizardView()
+        case .diagnosticsHub:
+            DiagnosticsHubView()
+        case .loopbackServer:
+            LoopbackServerHubView()
+        case .modelInternals:
+            ModelInternalsHubView()
+        case .speculativeDecoding:
+            SpeculativeDecodingHubView()
+        case .speechASR:
+            settingsDetailForm(LocalizedStringKey("Speech & ASR")) {
+                Section {
+                    transcriptionSettingsContent
+                }
+            }
+#if os(iOS)
+        case .walletPasses:
+            settingsDetailForm(LocalizedStringKey("Wallet Passes")) {
+                walletPassSection
+            }
+        case .passExtractionModel:
+            PassExtractionModelsView()
+#endif
+        case .retrievalSettings:
+            settingsDetailForm(LocalizedStringKey("Retrieval Settings")) {
+                Section {
+                    advancedRetrievalContent
+                }
+            }
+        case .hiddenModels:
+            settingsDetailForm(LocalizedStringKey("Hidden Models")) {
+                Section {
+                    hiddenModelsContent
+                }
+            }
+        case .remoteAudioEndpoint:
+            AudioLMRemoteEndpointView()
+        case .notesIssues:
+            DisclaimerView()
+        case .whisperModelCatalog:
+            WhisperModelsView(engineID: currentWhisperEngineID)
+        case .enterprise:
+            EnterpriseSettingsView()
+        }
+    }
+
+    @ViewBuilder
+    private func settingsDetailForm<Content: View>(_ title: LocalizedStringKey,
+                                                   @ViewBuilder content: () -> Content) -> some View {
+        Form {
+            content()
+        }
+#if !os(macOS)
+        .navigationTitle(title)
+#endif
+    }
+#endif
+
+#if os(iOS) || os(visionOS)
+    @ViewBuilder
+    private func settingsDestinationView(_ destination: SettingsDestination) -> some View {
+        switch destination {
+        case .startupPreferences:
+            settingsDetailForm(LocalizedStringKey("Startup Preferences")) {
+                Section {
+                    startupSettingsContent
+                }
+            }
+        case .manageMemories:
+            MemoryManagementView()
+        case .appPreferences:
+            settingsDetailForm(LocalizedStringKey("App Preferences")) {
+                Section {
+                    generalContent
+                }
+            }
+        case .embeddingModel:
+            EmbeddingModelsView()
+        case .privacy:
+            settingsDetailForm(LocalizedStringKey("Privacy")) {
+                Section {
+                    privacyContent
+                }
+            }
+        case .privacyFlight:
+            PrivacyFlightRecorderView()
+        case .ragInspector:
+            RAGInspectorView()
+        case .runtimeDiagnostics:
+            RuntimeDiagnosticsView()
+        case .runtimeTimeline:
+            RuntimeTimelineView()
+        case .mtpDashboard:
+            MTPAcceptanceDashboardView()
+        case .loadReceipt:
+            ModelLoadReceiptView()
+        case .loopbackHealth:
+            LoopbackServerHealthView()
+        case .runtimeFixes:
+            LoopbackRemediationView()
+        case .unloadVerifier:
+            ModelUnloadVerificationView()
+        case .toolStore:
+            ToolStoreView()
+        case .datasetHealth:
+            DatasetHealthDashboardView()
+        case .modelMetadata:
+            ModelMetadataInspectorView()
+        case .modelDependencies:
+            ModelDependencyGraphView()
+        case .autoTuner:
+            ModelAutoTunerView()
+        case .modelDoctor:
+            ModelDoctorView()
+        case .storageAdvisor:
+            ModelStorageAdvisorView()
+        case .modelRecommendations:
+            ModelBenchmarkRecommendationsView()
+        case .speculativeWizard:
+            SpeculativeDecodingWizardView()
+        case .diagnosticsHub:
+            DiagnosticsHubView()
+        case .loopbackServer:
+            LoopbackServerHubView()
+        case .modelInternals:
+            ModelInternalsHubView()
+        case .speculativeDecoding:
+            SpeculativeDecodingHubView()
+        case .speechASR:
+            settingsDetailForm(LocalizedStringKey("Speech & ASR")) {
+                Section {
+                    transcriptionSettingsContent
+                }
+            }
+#if os(iOS)
+        case .walletPasses:
+            settingsDetailForm(LocalizedStringKey("Wallet Passes")) {
+                walletPassSection
+            }
+        case .passExtractionModel:
+            PassExtractionModelsView()
+#endif
+        case .retrievalSettings:
+            settingsDetailForm(LocalizedStringKey("Retrieval Settings")) {
+                Section {
+                    advancedRetrievalContent
+                }
+            }
+        case .hiddenModels:
+            settingsDetailForm(LocalizedStringKey("Hidden Models")) {
+                Section {
+                    hiddenModelsContent
+                }
+            }
+        case .remoteAudioEndpoint:
+            AudioLMRemoteEndpointView()
+        case .notesIssues:
+            DisclaimerView()
+        case .whisperModelCatalog:
+            WhisperModelsView(engineID: currentWhisperEngineID)
+        case .enterprise:
+            EnterpriseSettingsView()
+        }
+    }
+
+    @ViewBuilder
+    private func settingsDetailForm<Content: View>(_ title: LocalizedStringKey,
+                                                   @ViewBuilder content: () -> Content) -> some View {
+        Form {
+            content()
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+#if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+#endif
+    }
+
+    private var settingsiPhoneView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 22) {
+                    modeSettingsHeader
+
+                    if !DeviceGPUInfo.supportsGPUOffload {
+                        iPhoneNoticeCard(
+                            title: String(localized: "CPU Rendering Only", locale: localizationManager.locale),
+                            message: String(localized: "This device doesn't support GPU offload; GGUF models will run on the CPU and generation speed will be significantly slower.\nFastest option on this device: ET models.", locale: localizationManager.locale)
+                        )
+                    }
+
+                    iPhoneSettingsSection(title: Text("Device Overview")) {
+                        deviceOverviewCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Enterprise")) {
+                        enterpriseOverviewCard
+                    }
+
+                    if settings.isAdvancedMode {
+                        iPhoneSettingsSection(title: Text("Diagnostics")) {
+                            diagnosticsOverviewCard
+                        }
+                    }
+
+                    iPhoneSettingsSection(title: Text("Startup")) {
+                        startupOverviewCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Memory")) {
+                        memoryOverviewCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Code Execution")) {
+                        codeExecutionCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Search")) {
+                        searchOverviewCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Model Sources")) {
+                        modelSourcesCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Chat & Data")) {
+                        chatAndDataCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("About & Support")) {
+                        aboutSupportCard
+                    }
+
+                    iPhoneSettingsSection(title: Text("Advanced Options")) {
+                        advancedOptionsCard
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        SettingsSectionLabel(title: Text("About Noema"))
+                        aboutNoemaCard
+                        Text("This app bundles llama.cpp; we keep this in sync with upstream b‑releases.")
+                            .font(.system(size: 14))
+                            .foregroundStyle(Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 2)
+                    }
+
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 24)
+            }
+            .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+            .guideHighlight(.settingsForm)
+#if os(iOS)
+            .scrollDismissesKeyboard(.interactively)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    if customSearchURLFocused {
+                        Button(LocalizedStringKey("Done")) {
+                            customSearchURLFocused = false
+                            hideKeyboard()
+                        }
+                    }
+                    if walletPassTokenFocused {
+                        Button(LocalizedStringKey("Done")) {
+                            walletPassTokenFocused = false
+                            hideKeyboard()
+                        }
+                    }
+                }
+            }
+#endif
+            .onChange(of: walkthrough.step) { _, step in
+                guard step == .settingsHighlights else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeInOut) {
+                        proxy.scrollTo(ScrollTarget.offGrid, anchor: .center)
+                    }
+                }
+            }
+            .onAppear {
+                if walkthrough.step == .settingsHighlights {
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(ScrollTarget.offGrid, anchor: .center)
+                    }
+                }
+                if estimateModelPath.isEmpty {
+                    estimateModelPath = startupPreferences.localModelPath ?? (modelManager.loadedModel?.url.path ?? "")
+                }
+                selectedLanguageCode = currentLanguageCode
+            }
+            .onChange(of: settings.isAdvancedMode) { _, isAdvanced in
+                if !isAdvanced {
+                    customSearchURLFocused = false
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func iPhoneSettingsSection<Content: View>(title: Text,
+                                                      @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SettingsSectionLabel(title: title)
+            content()
+        }
+    }
+
+    private var modeSettingsHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker(LocalizedStringKey("Mode"), selection: $settings.isAdvancedMode) {
+                Text(LocalizedStringKey("Simple")).tag(false)
+                Text(LocalizedStringKey("Advanced")).tag(true)
+            }
+            .pickerStyle(.segmented)
+
+            Text(modeExplanation)
+                .font(.system(size: 15))
+                .foregroundStyle(Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var deviceOverviewCard: some View {
+        let metrics = ramMetrics()
+        return SettingsSurfaceCard {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .top, spacing: 14) {
+                    ZStack {
+                        Circle()
+                            .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                            .frame(width: 56, height: 56)
+                        Image(systemName: "iphone")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundStyle(Color.primary.opacity(0.9))
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(metrics.info.ram) – \(metrics.info.modelName)")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text(
+                            String.localizedStringWithFormat(
+                                String(localized: "Memory budget: %@ (conservative)", locale: localizationManager.locale),
+                                metrics.budgetText
+                            )
+                        )
+                        .font(.system(size: 14))
+                        .foregroundStyle(Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                        if let model = metrics.model, let estimateText = metrics.estimateText {
+                            Text(verbatim: workingSetEstimateSummary(for: model, estimateText: estimateText))
+                                .font(.system(size: 14))
+                                .foregroundStyle(Color.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        showRAMInfo = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 28))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if settings.isAdvancedMode {
+                    SettingsDivider()
+                    SettingsThermalStageRow()
+                    SettingsDivider()
+                    SettingsRAMUsageRow(info: metrics.info)
+                }
+            }
+        }
+    }
+
+    private var startupOverviewCard: some View {
+        SettingsSurfaceCard {
+            VStack(spacing: 0) {
+                Button {
+                    settingsDestination = .startupPreferences
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Local default"),
+                        trailingText: Text(verbatim: startupLocalDefaultTitle),
+                        showsChevron: true
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .startupPreferences
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text(verbatim: startupRemoteActionTitle),
+                        subtitle: startupRemoteActionSubtitle.map { Text(verbatim: $0) },
+                        trailingText: startupRemoteActionTrailing.map { Text(verbatim: $0) },
+                        leadingSystemImage: startupPreferences.remoteSelections.isEmpty ? "plus" : nil,
+                        leadingTint: Color.accentColor,
+                        titleColor: startupPreferences.remoteSelections.isEmpty ? Color.accentColor : Color.primary,
+                        showsChevron: true
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                SettingsToggleRow(
+                    title: Text("Bypass RAM safety check (may cause crashes)"),
+                    subtitle: Text("Load models even if they may exceed your device's memory budget."),
+                    isOn: $settings.bypassRAMCheck
+                )
+            }
+        }
+    }
+
+    private var diagnosticsOverviewCard: some View {
+        SettingsSurfaceCard {
+            VStack(alignment: .leading, spacing: 0) {
+                SettingsToggleRow(
+                    title: Text("Show generation diagnostics"),
+                    subtitle: Text("Show tokens, speed and total time under each answer, and absolute token counts on the context gauge."),
+                    isOn: $settings.showGenerationDiagnostics
+                )
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .diagnosticsHub
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Diagnostics & Tools"),
+                        subtitle: Text("Runtime health, model inspection & tuning"),
+                        leadingSystemImage: "stethoscope",
+                        leadingTint: Color.accentColor,
+                        showsChevron: true
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var memoryOverviewCard: some View {
+        SettingsSurfaceCard {
+            VStack(alignment: .leading, spacing: 0) {
+                SettingsToggleRow(
+                    title: Text("Persistent Memory"),
+                    subtitle: Text("Memories persist across conversations on this device."),
+                    isOn: $webSettings.memoryEnabled,
+                    infoAction: { showMemoryInfo = true }
+                )
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .manageMemories
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Manage Memories"),
+                        subtitle: memoryOverviewSubtitle,
+                        trailingText: Text(verbatim: memorySavedCountText),
+                        leadingSystemImage: "square.stack.3d.up",
+                        leadingTint: Color.accentColor,
+                        titleColor: Color.accentColor,
+                        showsChevron: true
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var codeExecutionCard: some View {
+        SettingsSurfaceCard {
+            VStack(spacing: 0) {
+                SettingsToggleRow(
+                    title: Text("Python Code Execution"),
+                    subtitle: pythonOverviewSubtitle,
+                    isOn: pythonEnabledBinding,
+                    infoAction: { showPythonInfo = true }
+                )
+
+                SettingsDivider()
+
+                SettingsToggleRow(
+                    title: Text("Off-grid Mode"),
+                    subtitle: Text("Block network, downloads and cloud connections."),
+                    isOn: $settings.offGrid,
+                    id: ScrollTarget.offGrid
+                )
+            }
+        }
+    }
+
+    private var modelSourcesCard: some View {
+        SettingsSurfaceCard {
+            SettingsHuggingFaceContent()
+                .padding(.vertical, 4)
+        }
+    }
+
+    private var searchOverviewCard: some View {
+        SettingsSurfaceCard {
+            VStack(alignment: .leading, spacing: 0) {
+                SettingsToggleRow(
+                    title: Text("Web Search button"),
+                    subtitle: Text("Enable privacy-preserving web search from chat."),
+                    isOn: webSearchEnabledBinding,
+                    infoAction: { showWebSearchInfo = true }
+                )
+
+                if webSettings.webSearchEnabled {
+                    SettingsDivider()
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(verbatim: webSearchStatusText)
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if settings.isAdvancedMode {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Custom SearXNG URL")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(Color.secondary)
+
+                                TextField("https://search.noemaai.com", text: $webSettings.customSearXNGURL)
+                                    .platformKeyboardType(.url)
+                                    .autocorrectionDisabled(true)
+                                    .platformAutocapitalization(.never)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 16))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 12)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                                    )
+                                    .focused($customSearchURLFocused)
+#if canImport(UIKit)
+                                    .submitLabel(.done)
+#endif
+                                    .onSubmit {
+                                        customSearchURLFocused = false
+                                    }
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                    .padding(.bottom, 4)
+                }
+            }
+        }
+    }
+
+    private var chatAndDataCard: some View {
+        SettingsSurfaceCard {
+            VStack(spacing: 0) {
+                Button {
+                    triggerImpact(.medium)
+                    confirmClearChats = true
+                } label: {
+                    SettingsActionRow(
+                        title: Text("Delete All Chats"),
+                        leadingSystemImage: "trash",
+                        accentColor: .red
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    triggerImpact(.medium)
+                    confirmResetAppData = true
+                } label: {
+                    SettingsActionRow(
+                        title: Text("Reset App Data"),
+                        leadingSystemImage: "arrow.clockwise",
+                        accentColor: .red
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(isResettingAppData)
+
+                SettingsDivider()
+
+                Button {
+                    Task { await performDownloadCleanup() }
+                } label: {
+                    SettingsActionRow(
+                        title: Text(isCleaningDownloadLeftovers ? "Cleaning Download Leftovers…" : "Clean Download Leftovers"),
+                        subtitle: Text("Remove incomplete downloads, stale resume data, and temporary files without deleting installed models or datasets."),
+                        leadingSystemImage: "externaldrive.badge.xmark",
+                        accentColor: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(isCleaningDownloadLeftovers)
+
+                SettingsDivider()
+
+                Button {
+                    reopenOnboarding()
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Reopen Onboarding"),
+                        leadingSystemImage: "sparkles",
+                        leadingTint: .accentColor,
+                        titleColor: .accentColor,
+                        showsChevron: false
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var aboutSupportCard: some View {
+        SettingsSurfaceCard {
+            VStack(spacing: 0) {
+                Link(destination: URL(string: "https://noemaai.com/terms")!) {
+                    SettingsNavigationRow(
+                        title: Text("Terms of Use"),
+                        leadingSystemImage: "doc.text",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Link(destination: URL(string: "https://noemaai.com/privacy")!) {
+                    SettingsNavigationRow(
+                        title: Text("Privacy Policy"),
+                        leadingSystemImage: "shield",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Link(destination: URL(string: "mailto:noema.clientcare@gmail.com")!) {
+                    SettingsNavigationRow(
+                        title: Text("Contact Support"),
+                        leadingSystemImage: "bubble.left",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .notesIssues
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Notes & Issues"),
+                        leadingSystemImage: "exclamationmark.circle",
+                        leadingTint: Color.secondary.opacity(0.8)
+                    )
+                }
+                .buttonStyle(.plain)
+
+                if (Bundle.main.infoDictionary?["AppStoreID"] as? String).map({ !$0.isEmpty }) == true {
+                    SettingsDivider()
+
+                    Button {
+                        ReviewPrompter.shared.openWriteReviewPageIfAvailable()
+                    } label: {
+                        SettingsNavigationRow(
+                            title: Text("Write a Review"),
+                            leadingSystemImage: "star",
+                            leadingTint: .accentColor
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                SettingsDivider()
+
+                Link(destination: URL(string: "https://noemaai.com/early-testers")!) {
+                    SettingsNavigationRow(
+                        title: Text("Join Early Testers"),
+                        subtitle: Text("Help shape Noema by trying upcoming features and sharing feedback."),
+                        leadingSystemImage: "sparkles",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var aboutNoemaCard: some View {
+        SettingsSurfaceCard {
+            VStack(spacing: 0) {
+                SettingsNavigationRow(
+                    title: Text("Llama.cpp"),
+                    subtitle: Text("Latest integrated release: \(llamaCppBuild)"),
+                    showsChevron: false
+                )
+
+                SettingsDivider()
+
+                SettingsNavigationRow(
+                    title: Text("Noema"),
+                    subtitle: Text("Version \(appVersion)"),
+                    leadingView: AnyView(
+                        Image("Noema")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 28, height: 28)
+                    ),
+                    showsChevron: false
+                )
+            }
+        }
+    }
+
+    private var advancedOptionsCard: some View {
+        SettingsSurfaceCard {
+            VStack(spacing: 0) {
+                Button {
+                    settingsDestination = .appPreferences
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("App Preferences"),
+                        subtitle: Text("Appearance, language, sound, and system prompt."),
+                        leadingSystemImage: "slider.horizontal.3",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .embeddingModel
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Embedding Model"),
+                        subtitle: Text(embedAvailable ? EmbeddingModelCatalog.activeRecord().displayName : "Not installed"),
+                        leadingSystemImage: "square.stack.3d.up",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .privacy
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Privacy"),
+                        subtitle: Text("Chat image cleanup and local data behavior."),
+                        leadingSystemImage: "lock",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .privacyFlight
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Privacy Flight Recorder"),
+                        subtitle: Text("Local, remote, network, and tool-state receipt."),
+                        leadingSystemImage: "lock.shield",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+                SettingsDivider()
+
+                Button {
+                    settingsDestination = .speechASR
+                } label: {
+                    SettingsNavigationRow(
+                        title: Text("Speech & ASR"),
+                        subtitle: Text("Transcription engine, locale, Whisper, and remote ASR."),
+                        leadingSystemImage: "waveform",
+                        leadingTint: .accentColor
+                    )
+                }
+                .buttonStyle(.plain)
+
+#if os(iOS)
+	                SettingsDivider()
+
+	                Button {
+	                    settingsDestination = .walletPasses
+	                } label: {
+	                    SettingsNavigationRow(
+	                        title: Text("Wallet Passes"),
+	                        subtitle: Text("Extraction model, hosted signing, retention, and warning settings."),
+	                        leadingSystemImage: "wallet.pass",
+	                        leadingTint: .accentColor
+	                    )
+	                }
+	                .buttonStyle(.plain)
+
+	                SettingsDivider()
+
+	                Button {
+	                    settingsDestination = .passExtractionModel
+	                } label: {
+	                    SettingsNavigationRow(
+	                        title: Text("Pass Extraction Model"),
+	                        subtitle: Text("Pass Scanner uses this model to read tickets and returns structured fields for review."),
+	                        leadingSystemImage: "viewfinder",
+	                        leadingTint: .accentColor
+	                    )
+	                }
+	                .buttonStyle(.plain)
+#endif
+
+                if settings.isAdvancedMode {
+                    SettingsDivider()
+
+                    Button {
+                        settingsDestination = .retrievalSettings
+                    } label: {
+                        SettingsNavigationRow(
+                            title: Text("Retrieval Settings"),
+                            subtitle: Text("Max chunks and similarity threshold."),
+                            leadingSystemImage: "slider.horizontal.3",
+                            leadingTint: .accentColor
+                        )
+                    }
+                    .buttonStyle(.plain)
+
+                    if !modelManager.hiddenModels.isEmpty {
+                        SettingsDivider()
+
+                        Button {
+                            settingsDestination = .hiddenModels
+                        } label: {
+                            SettingsNavigationRow(
+                                title: Text("Hidden Models"),
+                                subtitle: Text(verbatim: hiddenModelsSummaryText),
+                                leadingSystemImage: "eye.slash",
+                                leadingTint: .accentColor
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private var pythonOverviewSubtitle: Text {
+        let status = PythonRuntime.status()
+        let description = String(localized: "Write and run Python code in a sandbox.", locale: localizationManager.locale)
+        let backend: String
+        switch status.backend {
+        case "embedded":
+            backend = String(localized: "Using embedded Python runtime.", locale: localizationManager.locale)
+        case "process":
+            backend = String(localized: "Using system Python 3.", locale: localizationManager.locale)
+        default:
+            backend = String(localized: "Python runtime unavailable.", locale: localizationManager.locale)
+        }
+
+        var lines = [description, backend]
+        if webSettings.pythonEnabled, let reason = status.reason, !reason.isEmpty {
+            lines.append(reason)
+        }
+        return Text(verbatim: lines.joined(separator: "\n"))
+    }
+
+    private var pythonEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { webSettings.pythonEnabled },
+            set: { newValue in
+                webSettings.pythonEnabled = newValue
+                if !newValue {
+                    webSettings.pythonArmed = false
+                }
+            }
+        )
+    }
+
+    private var webSearchEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { webSettings.webSearchEnabled },
+            set: { newValue in
+                webSettings.webSearchEnabled = newValue
+                if !newValue {
+                    webSettings.webSearchArmed = false
+                    customSearchURLFocused = false
+                }
+            }
+        )
+    }
+
+    private var webSearchStatusText: String {
+        if webSettings.customSearXNGURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return String(localized: "Using default: https://search.noemaai.com. Search requests are available without quotas.", locale: localizationManager.locale)
+        }
+        return String.localizedStringWithFormat(
+            String(localized: "Using custom instance: %@", locale: localizationManager.locale),
+            webSettings.customSearXNGURL
+        )
+    }
+
+    private var startupLocalDefaultTitle: String {
+        guard let path = startupPreferences.localModelPath,
+              let model = modelManager.downloadedModels.first(where: { $0.url.path == path }) else {
+            return String(localized: "None", locale: localizationManager.locale)
+        }
+        return model.name
+    }
+
+    private var startupRemoteActionTitle: String {
+        startupPreferences.remoteSelections.isEmpty
+            ? String(localized: "Add remote default", locale: localizationManager.locale)
+            : String(localized: "Manage remote defaults", locale: localizationManager.locale)
+    }
+
+    private var startupRemoteActionSubtitle: String? {
+        guard !startupPreferences.remoteSelections.isEmpty else { return nil }
+        let count = startupPreferences.remoteSelections.count
+        let format = count == 1
+            ? String(localized: "%d remote default configured.", locale: localizationManager.locale)
+            : String(localized: "%d remote defaults configured.", locale: localizationManager.locale)
+        return String.localizedStringWithFormat(format, count)
+    }
+
+    private var startupRemoteActionTrailing: String? {
+        startupPreferences.remoteSelections.isEmpty
+            ? nil
+            : localizedCount(startupPreferences.remoteSelections.count)
+    }
+
+    private var memorySavedCountText: String {
+        String.localizedStringWithFormat(
+            String(localized: "%d of %d saved", locale: localizationManager.locale),
+            memoryStore.entries.count,
+            MemoryStore.maximumEntries
+        )
+    }
+
+    private var memoryOverviewSubtitle: Text? {
+        if let notice = currentMemoryNoticeText {
+            return Text(verbatim: notice)
+        }
+        if memoryStore.entries.count >= MemoryStore.maximumEntries {
+            return Text("Memory is full. Delete an entry to add another.")
+        }
+        if memoryStore.entries.isEmpty {
+            return Text("No memories saved yet.")
+        }
+        return Text(
+            String.localizedStringWithFormat(
+                String(localized: "Up to %d memories can be stored across conversations on this device.", locale: localizationManager.locale),
+                MemoryStore.maximumEntries
+            )
+        )
+    }
+
+    private var currentMemoryNoticeText: String? {
+        let status = chatVM.memoryPromptBudgetStatus
+        guard webSettings.memoryEnabled, status.shouldDisplayNotice else { return nil }
+        switch status.state {
+        case .partiallyLoaded:
+            return String.localizedStringWithFormat(
+                String(localized: "Current model preloads %d of %d memories.", locale: localizationManager.locale),
+                status.loadedCount,
+                status.totalCount
+            )
+        case .notLoaded:
+            return String(localized: "Current model cannot preload memories within its context budget.", locale: localizationManager.locale)
+        case .inactive, .allLoaded:
+            return nil
+        }
+    }
+
+    private var hiddenModelsSummaryText: String {
+        let count = modelManager.hiddenModels.count
+        let format = count == 1
+            ? String(localized: "%d model hidden from Stored.", locale: localizationManager.locale)
+            : String(localized: "%d models hidden from Stored.", locale: localizationManager.locale)
+        return String.localizedStringWithFormat(format, count)
+    }
+
+    private func workingSetEstimateSummary(for model: LocalModel, estimateText: String) -> String {
+        let ctx = Int(modelManager.settings(for: model).contextLength)
+        let ctxString = localizedCount(ctx)
+        return String.localizedStringWithFormat(
+            String(localized: "Working set estimate (%@): %@ @ %@ tokens", locale: localizationManager.locale),
+            model.name,
+            estimateText,
+            ctxString
+        )
+    }
+
+    private func localizedCount(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = localizationManager.locale
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private struct SettingsSectionLabel: View {
+        let title: Text
+
+        var body: some View {
+            title
+                .textCase(.uppercase)
+                .font(.system(size: 12, weight: .semibold))
+                .kerning(0.35)
+                .foregroundStyle(Color.secondary)
+                .padding(.horizontal, 4)
+        }
+    }
+
+    private struct SettingsSurfaceCard<Content: View>: View {
+        let content: Content
+
+        init(@ViewBuilder content: () -> Content) {
+            self.content = content()
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 0) {
+                content
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Color(uiColor: .systemBackground))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.025), radius: 8, x: 0, y: 3)
+        }
+    }
+
+    private struct SettingsDivider: View {
+        var body: some View {
+            Rectangle()
+                .fill(Color.primary.opacity(0.07))
+                .frame(height: 1)
+                .padding(.vertical, 12)
+        }
+    }
+
+    private struct SettingsRowText: View {
+        let title: Text
+        let subtitle: Text?
+        let titleColor: Color
+
+        init(title: Text, subtitle: Text? = nil, titleColor: Color = .primary) {
+            self.title = title
+            self.subtitle = subtitle
+            self.titleColor = titleColor
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 4) {
+                title
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(titleColor)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let subtitle {
+                    subtitle
+                        .font(.system(size: 14))
+                        .foregroundStyle(Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private struct SettingsToggleRow: View {
+        let title: Text
+        let subtitle: Text?
+        @Binding var isOn: Bool
+        let infoAction: (() -> Void)?
+        let id: ScrollTarget?
+
+        init(title: Text,
+             subtitle: Text? = nil,
+             isOn: Binding<Bool>,
+             infoAction: (() -> Void)? = nil,
+             id: ScrollTarget? = nil) {
+            self.title = title
+            self.subtitle = subtitle
+            self._isOn = isOn
+            self.infoAction = infoAction
+            self.id = id
+        }
+
+        var body: some View {
+            Group {
+                if id == .offGrid {
+                    rowContent
+                        .id(ScrollTarget.offGrid)
+                        .guideHighlight(.settingsOffGrid)
+                } else {
+                    rowContent
+                }
+            }
+            .onChange(of: isOn) { _, newValue in
+                if id == .offGrid {
+                    NetworkKillSwitch.setEnabled(newValue)
+                }
+            }
+        }
+
+        private var rowContent: some View {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        SettingsRowText(title: title)
+                        if let infoAction {
+                            Button(action: infoAction) {
+                                Image(systemName: "questionmark.circle.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(Color.secondary.opacity(0.8))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    if let subtitle {
+                        subtitle
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Spacer(minLength: 12)
+
+                Toggle("", isOn: $isOn)
+                    .labelsHidden()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+    }
+
+    private struct SettingsNavigationRow: View {
+        let title: Text
+        let subtitle: Text?
+        let trailingText: Text?
+        let leadingSystemImage: String?
+        let leadingTint: Color
+        let leadingView: AnyView?
+        let titleColor: Color
+        let showsChevron: Bool
+
+        init(title: Text,
+             subtitle: Text? = nil,
+             trailingText: Text? = nil,
+             leadingSystemImage: String? = nil,
+             leadingTint: Color = .accentColor,
+             leadingView: AnyView? = nil,
+             titleColor: Color = .primary,
+             showsChevron: Bool = true) {
+            self.title = title
+            self.subtitle = subtitle
+            self.trailingText = trailingText
+            self.leadingSystemImage = leadingSystemImage
+            self.leadingTint = leadingTint
+            self.leadingView = leadingView
+            self.titleColor = titleColor
+            self.showsChevron = showsChevron
+        }
+
+        var body: some View {
+            HStack(alignment: .center, spacing: 14) {
+                if let leadingView {
+                    leadingView
+                } else if let leadingSystemImage {
+                    ZStack {
+                        Circle()
+                            .fill(leadingTint.opacity(0.10))
+                            .frame(width: 44, height: 44)
+                        Image(systemName: leadingSystemImage)
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(leadingTint)
+                    }
+                }
+
+                SettingsRowText(title: title, subtitle: subtitle, titleColor: titleColor)
+
+                Spacer(minLength: 12)
+
+                HStack(spacing: 8) {
+                    if let trailingText {
+                        trailingText
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                    }
+                    if showsChevron {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.secondary.opacity(0.7))
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+    }
+
+    private struct SettingsActionRow: View {
+        let title: Text
+        let subtitle: Text?
+        let leadingSystemImage: String
+        let accentColor: Color
+
+        init(title: Text,
+             subtitle: Text? = nil,
+             leadingSystemImage: String,
+             accentColor: Color) {
+            self.title = title
+            self.subtitle = subtitle
+            self.leadingSystemImage = leadingSystemImage
+            self.accentColor = accentColor
+        }
+
+        var body: some View {
+            SettingsNavigationRow(
+                title: title,
+                subtitle: subtitle,
+                leadingSystemImage: leadingSystemImage,
+                leadingTint: accentColor,
+                titleColor: accentColor,
+                showsChevron: true
+            )
+        }
+    }
+
+    private struct SettingsStatusBadge: View {
+        let title: Text
+        let color: Color
+
+        var body: some View {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 12, height: 12)
+                title
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(color)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(color.opacity(0.10), in: Capsule())
+        }
+    }
+
+    private struct SettingsUsageRing: View {
+        let progress: Double
+        let color: Color
+        let label: Text
+
+        var body: some View {
+            ZStack {
+                Circle()
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 10)
+
+                Circle()
+                    .trim(from: 0, to: min(1, max(0, progress)))
+                    .stroke(color, style: StrokeStyle(lineWidth: 10, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+
+                label
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+            }
+            .frame(width: 68, height: 68)
+        }
+    }
+
+    private struct SettingsThermalStageRow: View {
+        @State private var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+
+        private var title: Text {
+            switch thermalState {
+            case .fair:
+                return Text("Fair")
+            case .serious:
+                return Text("Serious")
+            case .critical:
+                return Text("Critical")
+            default:
+                return Text("Nominal")
+            }
+        }
+
+        private var color: Color {
+            switch thermalState {
+            case .fair:
+                return .yellow
+            case .serious:
+                return .orange
+            case .critical:
+                return .red
+            default:
+                return .green
+            }
+        }
+
+        var body: some View {
+            HStack(spacing: 12) {
+                SettingsRowText(title: Text("Thermal Stage"))
+                Spacer()
+                SettingsStatusBadge(title: title, color: color)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
+                thermalState = ProcessInfo.processInfo.thermalState
+            }
+        }
+    }
+
+    private struct SettingsRAMUsageRow: View {
+        let info: DeviceRAMInfo
+        @State private var usageBytes: Int64 = 0
+        @State private var timer: Timer?
+
+        private var budgetBytes: Int64? {
+            info.conservativeLimitBytes()
+        }
+
+        private var progress: Double {
+            guard let budgetBytes, budgetBytes > 0 else { return 0 }
+            return min(1, Double(usageBytes) / Double(budgetBytes))
+        }
+
+        private var usageColor: Color {
+            switch progress {
+            case 0..<0.7:
+                return .green
+            case 0.7..<0.9:
+                return .orange
+            default:
+                return .red
+            }
+        }
+
+        private var usageSummary: String {
+            ByteCountFormatter.string(fromByteCount: usageBytes, countStyle: .memory)
+        }
+
+        private var budgetSummary: String {
+            guard let budgetBytes else { return "--" }
+            return ByteCountFormatter.string(fromByteCount: budgetBytes, countStyle: .memory)
+        }
+
+        var body: some View {
+            HStack(spacing: 16) {
+                SettingsUsageRing(
+                    progress: progress,
+                    color: usageColor,
+                    label: Text("\(Int(progress * 100))%")
+                )
+
+                SettingsRowText(
+                    title: Text("App Memory Usage (estimated)"),
+                    subtitle: Text(verbatim: "\(usageSummary) of \(budgetSummary) budget")
+                )
+
+                Spacer()
+            }
+            .onAppear {
+                refresh()
+                start()
+            }
+            .onDisappear {
+                timer?.invalidate()
+                timer = nil
+            }
+        }
+
+        private func start() {
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+                Task { @MainActor in
+                    refresh()
+                }
+            }
+        }
+
+        private func refresh() {
+            let bytes = Int64(c_app_memory_footprint())
+            withAnimation(.easeInOut(duration: 0.2)) {
+                usageBytes = max(0, bytes)
+            }
+        }
+    }
+
+    private struct iPhoneNoticeCard: View {
+        let title: String
+        let message: String
+
+        var body: some View {
+            SettingsSurfaceCard {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(Color.orange)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(verbatim: title)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                        Text(verbatim: message)
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+#endif
+
 
     private var modeCard: some View {
         SettingsCard(title: LocalizedStringKey("Mode"), icon: "slider.horizontal.3", minHeight: 220) {
@@ -405,20 +2203,26 @@ struct SettingsView: View {
 
     private enum SettingsPage: String, CaseIterable, Identifiable {
         case general = "General"
+        case enterprise = "Enterprise"
         case models = "Models"
+        case diagnostics = "Diagnostics"
         case search = "Search"
+        case speech = "Speech & ASR"
         case privacy = "Privacy"
         case advanced = "Advanced"
         case about = "About"
-        
+
         var id: String { rawValue }
         var titleKey: LocalizedStringKey { LocalizedStringKey(rawValue) }
-        
+
         var icon: String {
             switch self {
             case .general: return "gearshape"
+            case .enterprise: return "building.2"
             case .models: return "cpu"
+            case .diagnostics: return "stethoscope"
             case .search: return "magnifyingglass"
+            case .speech: return "waveform"
             case .privacy: return "hand.raised"
             case .advanced: return "slider.horizontal.3"
             case .about: return "info.circle"
@@ -437,7 +2241,7 @@ struct SettingsView: View {
                 ScrollView {
                     VStack(spacing: 4) {
                         ForEach(SettingsPage.allCases) { page in
-                            if page == .advanced && !settings.isAdvancedMode {
+                            if (page == .advanced || page == .diagnostics) && !settings.isAdvancedMode {
                                 EmptyView()
                             } else {
                                 Button(action: { selectedPage = page }) {
@@ -489,8 +2293,13 @@ struct SettingsView: View {
             .frame(minWidth: 400, maxWidth: .infinity)
             .background(AppTheme.windowBackground.ignoresSafeArea())
         }
+        .onChange(of: settings.isAdvancedMode) { _, isAdvanced in
+            if !isAdvanced && (selectedPage == .diagnostics || selectedPage == .advanced) {
+                selectedPage = .general
+            }
+        }
     }
-    
+
     @ViewBuilder
     private func settingsContent(for page: SettingsPage) -> some View {
         switch page {
@@ -506,21 +2315,30 @@ struct SettingsView: View {
                 startupCard
                 generalCard
             }
+        case .enterprise:
+            VStack(spacing: 24) {
+                enterpriseCard
+            }
         case .models:
             VStack(spacing: 24) {
                 ramCard
                 ramBypassCard
                 embeddingCard
+                modelSourcesMacCard
                 if !modelManager.hiddenModels.isEmpty {
                     hiddenModelsCard
                 }
             }
+        case .diagnostics:
+            macDiagnosticsContent
         case .search:
             VStack(spacing: 24) {
                 webSearchCard
                 memoryCard
                 offGridCard
             }
+        case .speech:
+            speechASRCard
         case .privacy:
             privacyCard
         case .advanced:
@@ -532,6 +2350,104 @@ struct SettingsView: View {
                 buildInfoCard
             }
         }
+    }
+
+    private var macDiagnosticsContent: some View {
+        VStack(spacing: 24) {
+            SettingsCard(title: LocalizedStringKey("Generation Diagnostics"), icon: "speedometer") {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(LocalizedStringKey("Show generation diagnostics"))
+                            .font(.system(size: 14, weight: .semibold))
+                        Text(LocalizedStringKey("Show tokens, speed and total time under each answer, and absolute token counts on the context gauge."))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 12)
+                    Toggle("", isOn: $settings.showGenerationDiagnostics)
+                        .labelsHidden()
+                }
+            }
+            SettingsCard(title: LocalizedStringKey("Runtime & Server"), icon: "waveform.path.ecg") {
+                VStack(spacing: 0) {
+                    macDiagnosticsRow("Runtime Diagnostics", subtitle: "Engine status & live session health", icon: "waveform.path.ecg", tint: .blue, destination: .runtimeDiagnostics)
+                    Divider()
+                    macDiagnosticsRow("Runtime Timeline", subtitle: "Recent load & inference events", icon: "chart.bar.xaxis", tint: .indigo, destination: .runtimeTimeline)
+                    Divider()
+                    macDiagnosticsRow("Loopback Server", subtitle: "Local server health & fixes", icon: "network", tint: .teal, destination: .loopbackServer)
+                    Divider()
+                    macDiagnosticsRow("Load Receipt", subtitle: "What happened on the last model load", icon: "doc.text.magnifyingglass", tint: .orange, destination: .loadReceipt)
+                    Divider()
+                    macDiagnosticsRow("Unload Verifier", subtitle: "Confirm memory is reclaimed on unload", icon: "arrow.down.circle", tint: .pink, destination: .unloadVerifier)
+                }
+            }
+            SettingsCard(title: LocalizedStringKey("Model Inspection"), icon: "cube") {
+                VStack(spacing: 0) {
+                    macDiagnosticsRow("Model Doctor", subtitle: "Readiness checks for installed models", icon: "cross.case", tint: .red, destination: .modelDoctor)
+                    Divider()
+                    macDiagnosticsRow("Model Internals", subtitle: "Metadata & dependency graph", icon: "cube", tint: .purple, destination: .modelInternals)
+                    Divider()
+                    macDiagnosticsRow("Storage Advisor", subtitle: "Disk usage & cleanup suggestions", icon: "internaldrive", tint: .brown, destination: .storageAdvisor)
+                    Divider()
+                    macDiagnosticsRow("Model Recommendations", subtitle: "Benchmarked picks for your device", icon: "sparkles", tint: .yellow, destination: .modelRecommendations)
+                }
+            }
+            SettingsCard(title: LocalizedStringKey("Performance"), icon: "hare") {
+                VStack(spacing: 0) {
+                    macDiagnosticsRow("Auto-Tuner", subtitle: "Tune runtime parameters automatically", icon: "slider.horizontal.3", tint: .green, destination: .autoTuner)
+                    Divider()
+                    macDiagnosticsRow("Speculative Decoding", subtitle: "Set up drafting & monitor acceptance", icon: "hare", tint: .mint, destination: .speculativeDecoding)
+                }
+            }
+            SettingsCard(title: LocalizedStringKey("Data & Tools"), icon: "wrench.and.screwdriver") {
+                VStack(spacing: 0) {
+                    macDiagnosticsRow("Dataset Health", subtitle: "Index status of your datasets", icon: "checkmark.seal", tint: .cyan, destination: .datasetHealth)
+                    Divider()
+                    macDiagnosticsRow("RAG Inspector", subtitle: "Inspect retrieval for the last answer", icon: "text.magnifyingglass", tint: .blue, destination: .ragInspector)
+                    Divider()
+                    macDiagnosticsRow("Tool Store", subtitle: "Enable model tools & integrations", icon: "wrench.and.screwdriver", tint: .gray, destination: .toolStore)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macDiagnosticsRow(_ title: LocalizedStringKey,
+                                   subtitle: LocalizedStringKey,
+                                   icon: String,
+                                   tint: Color,
+                                   destination: SettingsDestination) -> some View {
+        Button {
+            settingsDestination = destination
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 30, height: 30)
+                    .background(tint.opacity(0.15), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(FontTheme.body)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(AppTheme.text)
+                    Text(subtitle)
+                        .font(FontTheme.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
     }
 #endif
 
@@ -605,6 +2521,12 @@ struct SettingsView: View {
         }
     }
 
+    private var modelSourcesMacCard: some View {
+        SettingsCard(title: LocalizedStringKey("Model Sources"), icon: "arrow.down.circle") {
+            SettingsHuggingFaceContent()
+        }
+    }
+
     private var memoryCard: some View {
         SettingsCard(title: LocalizedStringKey("Memory"), icon: "bookmark", minHeight: 220) {
             SettingsMemorySummaryContent()
@@ -644,6 +2566,12 @@ struct SettingsView: View {
     private var privacyCard: some View {
         SettingsCard(title: LocalizedStringKey("Privacy"), icon: "hand.raised", minHeight: 220) {
             privacyContent
+        }
+    }
+
+    private var speechASRCard: some View {
+        SettingsCard(title: LocalizedStringKey("Speech & ASR"), icon: "waveform", minHeight: 220) {
+            transcriptionSettingsContent
         }
     }
 
@@ -1140,9 +3068,114 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var startupSettingsContent: some View {
+        startupRoutingAdviceRow
         localStartupPicker
         remoteStartupConfigurator
         priorityControls
+    }
+
+    private var startupRoutingAdviceRow: some View {
+        let advice = LocalRemoteRoutingAdvisor.advice(
+            for: LocalRemoteRoutingAdvisor.Context(
+                preferences: startupPreferences,
+                selectedLocalModel: startupSelectedLocalModel.map(LocalRemoteRoutingAdvisor.LocalModelSummary.init(model:)),
+                remoteSelectionCount: startupPreferences.remoteSelections.count,
+                offGrid: settings.offGrid
+            )
+        )
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: startupRoutingIcon(for: advice))
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(startupRoutingTint(for: advice))
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(startupRoutingTitle(for: advice))
+                    .font(FontTheme.subheadline.weight(.semibold))
+                    .foregroundStyle(AppTheme.text)
+                Text(startupRoutingDetail(for: advice))
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var startupSelectedLocalModel: LocalModel? {
+        guard let path = startupPreferences.localModelPath else { return nil }
+        return modelManager.downloadedModels.first { $0.url.path == path }
+    }
+
+    private func startupRoutingIcon(for advice: LocalRemoteRoutingAdvice) -> String {
+        switch advice.route {
+        case .unconfigured:
+            return "questionmark.circle"
+        case .localOnly:
+            return "iphone"
+        case .remoteOnly:
+            return "network"
+        case .localThenRemote:
+            return "iphone.and.arrow.forward"
+        case .remoteThenLocal:
+            return "network.badge.shield.half.filled"
+        case .blocked:
+            return "wifi.slash"
+        }
+    }
+
+    private func startupRoutingTint(for advice: LocalRemoteRoutingAdvice) -> Color {
+        switch advice.route {
+        case .unconfigured:
+            return .secondary
+        case .localOnly, .localThenRemote:
+            return .green
+        case .remoteOnly, .remoteThenLocal:
+            return .blue
+        case .blocked:
+            return .orange
+        }
+    }
+
+    private func startupRoutingTitle(for advice: LocalRemoteRoutingAdvice) -> LocalizedStringKey {
+        switch advice.route {
+        case .unconfigured:
+            return "No startup route"
+        case .localOnly:
+            return "Local route"
+        case .remoteOnly:
+            return "Remote route"
+        case .localThenRemote:
+            return "Local, then remote"
+        case .remoteThenLocal:
+            return "Remote, then local"
+        case .blocked:
+            return "Route blocked"
+        }
+    }
+
+    private func startupRoutingDetail(for advice: LocalRemoteRoutingAdvice) -> LocalizedStringKey {
+        switch advice.detail {
+        case .noDefaults:
+            return "Pick a local or remote default so Noema knows where to start."
+        case .offGridLocal:
+            return "Off-Grid is on, so remote defaults are skipped and the local model stays first."
+        case .offGridNoLocal:
+            return "Off-Grid is on and no local default is selected, so startup will not use remote compute."
+        case .localOnly:
+            return "Startup stays on device unless you manually choose a remote backend."
+        case .remoteOnly:
+            return "Startup uses the selected remote backend and needs network access."
+        case .localPriority:
+            return "Your local default is tried first; remote is a fallback if local loading fails."
+        case .remotePriority:
+            return "Your remote default is tried first; local is a fallback if the network or backend fails."
+        case .largeLocalRemoteFallback:
+            return "The local GGUF is large, so remote fallback is useful when memory or battery is tight."
+        case .lowPowerLocalEfficient:
+            return "Low Power Mode favors the efficient local model before remote networking."
+        }
     }
 
     private var ramBypassSection: some View {
@@ -1160,16 +3193,227 @@ struct SettingsView: View {
         Section { offGridContent }
     }
 
+    private var enterpriseSection: some View {
+        Section(LocalizedStringKey("Enterprise")) { enterpriseRow }
+    }
+
+    private var enterpriseCard: some View {
+        SettingsCard(title: LocalizedStringKey("Enterprise"), icon: "building.2") {
+            enterpriseRow
+        }
+    }
+
+    private var enterpriseRow: some View {
+        Button {
+            settingsDestination = .enterprise
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "building.2")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(enterpriseStatusTint)
+                    .frame(width: 30, height: 30)
+                    .background(enterpriseStatusTint.opacity(0.15), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    if case .connected = enterpriseManager.state, let policy = enterpriseManager.policy {
+                        Text(verbatim: policy.tenantName)
+                            .font(FontTheme.body)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(AppTheme.text)
+                    } else {
+                        Text(LocalizedStringKey("Enterprise"))
+                            .font(FontTheme.body)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(AppTheme.text)
+                    }
+                    enterpriseStatusSubtitle
+                        .font(FontTheme.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// iPhone settings card (the iPhone layout uses SettingsSurfaceCard rows).
+    /// Shared by iOS and visionOS, which now use the same card/navigation layout.
+#if os(iOS) || os(visionOS)
+    private var enterpriseOverviewCard: some View {
+        SettingsSurfaceCard {
+            Button {
+                settingsDestination = .enterprise
+            } label: {
+                SettingsNavigationRow(
+                    title: enterpriseRowTitle,
+                    subtitle: enterpriseRowSubtitle,
+                    leadingSystemImage: "building.2",
+                    leadingTint: enterpriseStatusTint
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+#endif
+
+    private var enterpriseRowTitle: Text {
+        if enterpriseManager.state.isEnrolledOnDevice, let policy = enterpriseManager.policy {
+            return Text(verbatim: policy.tenantName)
+        }
+        return Text("Connect to company")
+    }
+
+    private var enterpriseRowSubtitle: Text? {
+        switch enterpriseManager.state {
+        case .none, .disconnected:
+            return nil
+        case .connecting:
+            return Text("Connecting…")
+        case .awaitingEmailVerification:
+            return Text("Awaiting email verification")
+        case .pendingApproval:
+            return Text("Pending admin approval")
+        case .connected:
+            return Text("Connected — policy active")
+        case .policyExpired:
+            return Text("Connected — policy expired")
+        case .deviceRevoked:
+            return Text("Device access revoked")
+        case .policyInvalid:
+            return Text("Policy could not be verified")
+        }
+    }
+
+    private var enterpriseStatusTint: Color {
+        switch enterpriseManager.state {
+        case .connected: return .green
+        case .policyExpired, .pendingApproval, .awaitingEmailVerification, .connecting: return .orange
+        case .deviceRevoked, .policyInvalid: return .red
+        case .none, .disconnected: return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private var enterpriseStatusSubtitle: some View {
+        switch enterpriseManager.state {
+        case .none, .disconnected:
+            Text(LocalizedStringKey("Connect to company"))
+        case .connecting:
+            Text(LocalizedStringKey("Connecting…"))
+        case .awaitingEmailVerification:
+            Text(LocalizedStringKey("Awaiting email verification"))
+        case .pendingApproval:
+            Text(LocalizedStringKey("Pending admin approval"))
+        case .connected:
+            Text(LocalizedStringKey("Connected — policy active"))
+        case .policyExpired:
+            Text(LocalizedStringKey("Connected — policy expired"))
+        case .deviceRevoked:
+            Text(LocalizedStringKey("Device access revoked"))
+        case .policyInvalid:
+            Text(LocalizedStringKey("Policy could not be verified"))
+        }
+    }
+
+#if os(iOS)
+    private var walletPassSection: some View {
+        Section(LocalizedStringKey("Wallet Passes")) { walletPassContent }
+            .confirmationDialog(LocalizedStringKey("Delete All Saved Passes"), isPresented: $confirmDeleteWalletPassDrafts, titleVisibility: .visible) {
+                Button(LocalizedStringKey("Delete All Saved Passes"), role: .destructive) {
+                    boardingPassDraftStore.deleteAll()
+                    confirmDeleteWalletPassDrafts = false
+                }
+                Button(LocalizedStringKey("Cancel"), role: .cancel) {
+                    confirmDeleteWalletPassDrafts = false
+                }
+            } message: {
+                Text(LocalizedStringKey("This permanently removes every saved Wallet pass draft and any stored scan images. This action cannot be undone."))
+            }
+    }
+
+    @ViewBuilder
+    private var walletPassContent: some View {
+        Button {
+            settingsDestination = .passExtractionModel
+        } label: {
+            SettingsNavigationRow(
+                title: Text("Pass Extraction Model"),
+                subtitle: Text("Choose the local vision model used to read tickets."),
+                trailingText: Text(activePassExtractionModelName),
+                leadingSystemImage: "viewfinder",
+                leadingTint: .accentColor,
+                titleColor: .accentColor
+            )
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.accentColor.opacity(0.08))
+
+        Label(LocalizedStringKey("Wallet signing requires internet access and uses Noema’s hosted signer automatically."), systemImage: "network")
+            .foregroundStyle(AppTheme.text)
+
+        Toggle(LocalizedStringKey("Keep scans with drafts"), isOn: $settings.walletPassKeepScansWithDrafts)
+
+        if boardingPassDraftStore.drafts.isEmpty {
+            Text(LocalizedStringKey("No saved Wallet passes"))
+                .font(FontTheme.caption)
+                .foregroundStyle(AppTheme.secondaryText)
+        } else {
+            Button(role: .destructive) {
+                confirmDeleteWalletPassDrafts = true
+            } label: {
+                SettingsNavigationRow(
+                    title: Text("Delete All Saved Passes"),
+                    subtitle: Text(String.localizedStringWithFormat(String(localized: "%d saved Wallet passes"), boardingPassDraftStore.drafts.count)),
+                    leadingSystemImage: "trash",
+                    leadingTint: .red,
+                    titleColor: .red,
+                    showsChevron: false
+                )
+            }
+            .buttonStyle(.plain)
+        }
+
+        Picker(LocalizedStringKey("Warning Sensitivity"), selection: $settings.walletPassWarningSensitivity) {
+            Text(LocalizedStringKey("Relaxed")).tag("relaxed")
+            Text(LocalizedStringKey("Balanced")).tag("balanced")
+            Text(LocalizedStringKey("Strict")).tag("strict")
+        }
+
+        Text(LocalizedStringKey("Pass extraction runs on device with the selected local vision model. Adding the pass to Wallet requires internet access for Noema’s signer and sends only the confirmed draft JSON, not the scan image."))
+            .font(FontTheme.caption)
+            .foregroundStyle(AppTheme.secondaryText)
+    }
+
+    private var activePassExtractionModelName: String {
+        let hasSelection = !settings.walletPassActiveExtractionModelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !settings.walletPassActiveExtractionModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard hasSelection else { return String(localized: "Required") }
+        if let model = PassExtractionModelCatalog.activeModel(from: modelManager.downloadedModels) {
+            return model.name
+        }
+        let fallbackName = settings.walletPassActiveExtractionModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallbackName.isEmpty ? String(localized: "Missing") : fallbackName
+    }
+#endif
+
     @ViewBuilder
     private var offGridContent: some View {
         Toggle(LocalizedStringKey("Off-grid Mode"), isOn: $settings.offGrid)
             .id(ScrollTarget.offGrid)
             .guideHighlight(.settingsOffGrid)
+            .disabled(EnterprisePolicyGate.requiresOffGrid)
             .onChange(of: settings.offGrid) { on in
                 NetworkKillSwitch.setEnabled(on)
             }
         Text(LocalizedStringKey("Blocks all network traffic, model downloads, and cloud connections so everything stays on‑device."))
             .foregroundStyle(AppTheme.secondaryText)
+        if EnterprisePolicyGate.requiresOffGrid {
+            Text(LocalizedStringKey("Required by your organization's policy. Only your workspace's policy server can be reached."))
+                .foregroundStyle(.orange)
+        }
     }
 
     private var localStartupPicker: some View {
@@ -1338,12 +3582,13 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var embeddingContent: some View {
+        let activeRecord = EmbeddingModelCatalog.activeRecord()
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Nomic Embed Text v1.5 (Q4_K_M)")
+                Text(activeRecord.displayName)
                     .font(FontTheme.body)
                     .foregroundStyle(AppTheme.text)
-                Text(LocalizedStringKey("High-quality embedding model for local RAG"))
+                Text(LocalizedStringKey("Dataset search quality and indexing"))
                     .font(FontTheme.caption)
                     .foregroundStyle(AppTheme.secondaryText)
             }
@@ -1354,8 +3599,18 @@ struct SettingsView: View {
                 .accessibilityLabel(embedAvailable ? "Embedding model downloaded" : "Embedding model missing")
         }
         .contentShape(Rectangle())
+        .onTapGesture {
+            showEmbeddingModels = true
+        }
         // Keep swipe-to-delete on iOS, but provide explicit button on macOS where swiping is awkward
         .modifier(EmbeddingSwipeModifier(embedAvailable: embedAvailable, onDelete: deleteEmbeddingModel))
+
+        Button {
+            showEmbeddingModels = true
+        } label: {
+            Label(LocalizedStringKey("Change Embedding Model"), systemImage: "square.stack.3d.up")
+        }
+        .buttonStyle(GlassButtonStyle())
 
         // Action controls
         Group {
@@ -1368,7 +3623,7 @@ struct SettingsView: View {
                     Label(LocalizedStringKey("Delete Embedding Model"), systemImage: "trash")
                 }
                 .padding(.top, 6)
-                Text(LocalizedStringKey("The embedding model is installed. Delete it to free ~320 MB."))
+                Text(LocalizedStringKey("The embedding model is installed. Delete it to free ~640 MB."))
                     .font(FontTheme.caption)
                     .foregroundStyle(AppTheme.secondaryText)
                     .padding(.top, 2)
@@ -1405,7 +3660,7 @@ struct SettingsView: View {
                             .tint(.blue)
                             .frame(maxWidth: 280)
                     }
-                    Text(LocalizedStringKey("320 MB • One‑time download used for local dataset search"))
+                    Text(LocalizedStringKey("640 MB • One‑time download used for local dataset search"))
                         .font(FontTheme.caption)
                         .foregroundStyle(AppTheme.secondaryText)
                 }
@@ -1444,10 +3699,14 @@ struct SettingsView: View {
                     Text(LocalizedStringKey(strategy.titleKey)).tag(strategy)
                 }
             }
+            Text(LocalizedStringKey(ContextOverflowStrategy.from(settings.contextOverflowStrategyRaw).settingsDescriptionKey))
+                .font(FontTheme.caption)
+                .foregroundStyle(AppTheme.secondaryText)
         }
 
 #if os(iOS)
         Toggle(LocalizedStringKey("Haptics"), isOn: $settings.hapticsEnabled)
+        Toggle(LocalizedStringKey("Compact Chat Mode"), isOn: $settings.compactChatModeEnabled)
 
         Picker(
             LocalizedStringKey("Return Key Behavior"),
@@ -1484,14 +3743,39 @@ struct SettingsView: View {
 
 #if canImport(UIKit)
         Button(LocalizedStringKey("Reopen Onboarding")) {
-            triggerImpact(.medium)
-            showOnboarding = true
+            reopenOnboarding()
         }
+#elseif os(macOS)
+        Button(LocalizedStringKey("Reopen Onboarding")) {
+            reopenOnboarding()
+        }
+#endif
+    }
+
+    private func reopenOnboarding() {
+        triggerImpact(.medium)
+#if canImport(UIKit)
+        showOnboarding = true
+#elseif os(macOS)
+        showMacOnboarding = true
 #endif
     }
 
     private var earlyTestersSection: some View {
         Section(LocalizedStringKey("Early Testers")) { earlyTestersContent }
+    }
+
+    private var diagnosticsHubSection: some View {
+        Section(LocalizedStringKey("Diagnostics")) {
+            Button {
+                settingsDestination = .diagnosticsHub
+            } label: {
+                Label(LocalizedStringKey("Diagnostics & Tools"), systemImage: "stethoscope")
+            }
+            Text(LocalizedStringKey("Runtime health, model inspection, tuning, and data tools."))
+                .font(FontTheme.caption)
+                .foregroundStyle(AppTheme.secondaryText)
+        }
     }
 
     @ViewBuilder
@@ -1573,8 +3857,25 @@ struct SettingsView: View {
         Section(LocalizedStringKey("Privacy")) { privacyContent }
     }
 
+    private var privacyFlightSection: some View {
+        Section(LocalizedStringKey("Privacy")) {
+            Button {
+                settingsDestination = .privacyFlight
+            } label: {
+                Label(LocalizedStringKey("Privacy Flight Recorder"), systemImage: "lock.shield")
+            }
+            Text(LocalizedStringKey("Review local, remote, network, and tool-state privacy receipts."))
+                .font(FontTheme.caption)
+                .foregroundStyle(AppTheme.secondaryText)
+        }
+    }
+
+    private var speechASRSection: some View {
+        Section(LocalizedStringKey("Speech & ASR")) { transcriptionSettingsContent }
+    }
+
     @ViewBuilder
-    private var privacyContent: some View {
+    private var chatCleanupContent: some View {
         Picker(
             LocalizedStringKey("Chat Image Cleanup"),
             selection: Binding(
@@ -1594,7 +3895,12 @@ struct SettingsView: View {
         Text(LocalizedStringKey(ChatAttachmentCleanupPolicy.from(settings.chatAttachmentCleanupPolicyRaw).settingsDescriptionKey))
             .font(FontTheme.caption)
             .foregroundStyle(AppTheme.secondaryText)
+    }
 
+    @ViewBuilder
+    private var privacyContent: some View {
+        privacyLabelsContent
+        chatCleanupContent
         Button(LocalizedStringKey("Delete All Chats")) {
             triggerImpact(.medium)
             confirmClearChats = true
@@ -1622,6 +3928,224 @@ struct SettingsView: View {
             .foregroundStyle(AppTheme.secondaryText)
     }
 
+    private var privacyFeatureLabels: [PrivacyFeatureLabel] {
+        PrivacyFeatureLabelAdvisor.labels(
+            for: PrivacyFeatureLabelProfile(
+                offGrid: settings.offGrid,
+                webSearchEnabled: webSettings.webSearchEnabled,
+                pythonEnabled: webSettings.pythonEnabled,
+                memoryEnabled: webSettings.memoryEnabled,
+                remoteRedactionEnabled: false
+            )
+        )
+    }
+
+    @ViewBuilder
+    private var privacyLabelsContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "checklist.checked")
+                    .foregroundStyle(Color.accentColor)
+                Text(LocalizedStringKey("Feature Privacy Labels"))
+                    .font(.system(size: 15, weight: .semibold))
+            }
+
+            ForEach(privacyFeatureLabels) { label in
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: label.systemImage)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(privacyLabelTint(label.state))
+                        .frame(width: 22, height: 22)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(LocalizedStringKey(label.titleKey))
+                                .font(.system(size: 14, weight: .medium))
+                            Spacer(minLength: 4)
+                            Text(LocalizedStringKey(label.state.titleKey))
+                                .font(FontTheme.caption)
+                                .foregroundStyle(privacyLabelTint(label.state))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        Text(LocalizedStringKey(label.detailKey))
+                            .font(FontTheme.caption)
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func privacyLabelTint(_ state: PrivacyFeatureLabel.State) -> Color {
+        switch state {
+        case .local, .localSandbox:
+            return .green
+        case .optionalNetwork:
+            return .orange
+        case .remote:
+            return .purple
+        case .blocked:
+            return .green
+        case .off:
+            return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private var transcriptionSettingsContent: some View {
+        Group {
+            let availability = TranscriptionBackendFactory.primaryEngineChoices()
+            let selectedEngineID = TranscriptionSettings.selectedEngineID
+            let whisperEngineID = selectedEngineID.isLocalWhisper
+                ? selectedEngineID
+                : TranscriptionBackendFactory.preferredLocalWhisperEngineID()
+            let selectedPickerValue = selectedEngineID.isLocalWhisper
+                ? TranscriptionBackendFactory.preferredLocalWhisperEngineID().rawValue
+                : TranscriptionEngineID.appleSpeech.rawValue
+
+            Button {
+                settingsDestination = .whisperModelCatalog
+            } label: {
+#if os(iOS)
+                SettingsNavigationRow(
+                    title: Text("Whisper Model Catalog"),
+                    subtitle: Text("Choose the local speech model used for on-device transcription."),
+                    trailingText: Text(activeWhisperModelName(for: whisperEngineID)),
+                    leadingSystemImage: "waveform.badge.magnifyingglass",
+                    leadingTint: .accentColor,
+                    titleColor: .accentColor
+                )
+#else
+                HStack(alignment: .center, spacing: 14) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.accentColor.opacity(0.10))
+                            .frame(width: 44, height: 44)
+                        Image(systemName: "waveform.badge.magnifyingglass")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Whisper Model Catalog")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                        Text("Choose the local speech model used for on-device transcription.")
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Spacer(minLength: 12)
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.secondary.opacity(0.7))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+#endif
+            }
+            .buttonStyle(.plain)
+            .listRowBackground(Color.accentColor.opacity(0.08))
+
+            Picker(LocalizedStringKey("Transcription Engine"), selection: Binding(
+                get: { selectedPickerValue },
+                set: { newValue in
+                    let selected = TranscriptionEngineID(rawValue: newValue) ?? .appleSpeech
+                    settings.asrEngineIDRaw = selected.isLocalWhisper
+                        ? TranscriptionBackendFactory.preferredLocalWhisperEngineID().rawValue
+                        : TranscriptionEngineID.appleSpeech.rawValue
+                }
+            )) {
+                ForEach(availability) { entry in
+                    Text(primaryEngineRowLabel(for: entry))
+                        .tag(entry.id.rawValue)
+                }
+            }
+
+            if let entry = availability.first(where: { $0.id.rawValue == selectedPickerValue }),
+               !entry.isAvailable,
+               let reason = entry.unavailableReason {
+                Text(reason)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            Button(LocalizedStringKey("Remote Audio Endpoint")) {
+                settingsDestination = .remoteAudioEndpoint
+            }
+
+            HStack(spacing: 8) {
+                Text(LocalizedStringKey("ASR Locale"))
+                Button { showASRLocaleInfo = true } label: {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(LocalizedStringKey("What is ASR Locale?"))
+            }
+            TextField(
+                "",
+                text: Binding(
+                    get: { settings.asrLocaleIdentifier },
+                    set: { settings.asrLocaleIdentifier = $0 }
+                ),
+                prompt: Text(Locale.current.identifier)
+            )
+
+            HStack(spacing: 8) {
+                Toggle(
+                    LocalizedStringKey("On-device transcription only"),
+                    isOn: Binding(
+                        get: { settings.offGrid ? true : settings.asrOnDeviceOnly },
+                        set: { settings.asrOnDeviceOnly = $0 }
+                    )
+                )
+                .disabled(settings.offGrid)
+                Button { showOnDeviceTranscriptionInfo = true } label: {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(LocalizedStringKey("What is on-device transcription only?"))
+            }
+
+            Toggle(LocalizedStringKey("Auto-transcribe attachments"), isOn: $settings.asrAutoTranscribeAttachments)
+
+            Toggle(LocalizedStringKey("Include timestamps in chat transcript"), isOn: $settings.asrIncludeTimestamps)
+        }
+        .alert(LocalizedStringKey("ASR Locale"), isPresented: $showASRLocaleInfo) {
+            Button(LocalizedStringKey("OK"), role: .cancel) { }
+        } message: {
+            Text(LocalizedStringKey("Leave blank to use the current system language. Use \"auto\" to pick the best supported locale for your language."))
+        }
+        .alert(LocalizedStringKey("On-device transcription only"), isPresented: $showOnDeviceTranscriptionInfo) {
+            Button(LocalizedStringKey("OK"), role: .cancel) { }
+        } message: {
+            Text(settings.offGrid
+                 ? LocalizedStringKey("Off-grid Mode requires on-device transcription.")
+                 : LocalizedStringKey("When enabled, Noema blocks Apple Speech from using network recognition."))
+        }
+    }
+
+    private func primaryEngineRowLabel(for entry: EngineAvailability) -> String {
+        let displayName = entry.id.isLocalWhisper ? TranscriptionBackendFactory.localWhisperDisplayName : entry.id.displayName
+        if entry.isAvailable {
+            return displayName
+        }
+        return String.localizedStringWithFormat(
+            String(localized: "%@ (unavailable)"),
+            displayName
+        )
+    }
+
+    private func activeWhisperModelName(for engineID: TranscriptionEngineID) -> String {
+        WhisperModelCatalog.activeRecord(for: engineID)?.displayName ?? String(localized: "Required")
+    }
+
     private var aboutSection: some View {
         Section(LocalizedStringKey("About & Support")) { aboutContent }
     }
@@ -1636,8 +4160,8 @@ struct SettingsView: View {
                 ReviewPrompter.shared.openWriteReviewPageIfAvailable()
             }
         }
-        NavigationLink(LocalizedStringKey("Notes & Issues")) {
-            DisclaimerView()
+        Button(LocalizedStringKey("Notes & Issues")) {
+            settingsDestination = .notesIssues
         }
     }
 
@@ -1691,30 +4215,59 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var advancedRetrievalContent: some View {
-        Stepper(value: $settings.ragMaxChunks, in: 1...8) {
-            HStack(spacing: 8) {
-                let chunksFormatter: NumberFormatter = {
-                    let nf = NumberFormatter()
-                    nf.locale = localizationManager.locale
-                    nf.numberStyle = .decimal
-                    return nf
-                }()
-                let chunkString = chunksFormatter.string(from: NSNumber(value: settings.ragMaxChunks)) ?? "\(settings.ragMaxChunks)"
-                Text(
-                    String.localizedStringWithFormat(
-                        String(localized: "Max Chunks: %@", locale: localizationManager.locale),
-                        chunkString
-                    )
-                )
-                Spacer()
-                Button { showChunksInfo = true } label: {
-                    Image(systemName: "questionmark.circle")
-                        .foregroundColor(.blue)
+        // Retrieval Mode — segmented picker with an always-visible description
+        // that updates to explain the currently selected mode.
+        VStack(alignment: .leading, spacing: 6) {
+            Text(LocalizedStringKey("Retrieval Mode"))
+            Picker(LocalizedStringKey("Retrieval Mode"), selection: $settings.ragRetrievalModeRaw) {
+                ForEach(DatasetRetrievalMode.allCases) { mode in
+                    Text(retrievalModeTitle(mode))
+                        .tag(mode.rawValue)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(LocalizedStringKey("What is Max Chunks?"))
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            Text(retrievalModeDescription(DatasetRetrievalMode.from(settings.ragRetrievalModeRaw)))
+                .font(FontTheme.caption)
+                .foregroundStyle(AppTheme.tertiaryText)
+                .fixedSize(horizontal: false, vertical: true)
         }
+
+        // Max Chunks — stepper with an always-visible caption explaining it.
+        VStack(alignment: .leading, spacing: 6) {
+            Stepper(value: $settings.ragMaxChunks, in: 1...8) {
+                HStack(spacing: 8) {
+                    let chunksFormatter: NumberFormatter = {
+                        let nf = NumberFormatter()
+                        nf.locale = localizationManager.locale
+                        nf.numberStyle = .decimal
+                        return nf
+                    }()
+                    let chunkString = chunksFormatter.string(from: NSNumber(value: settings.ragMaxChunks)) ?? "\(settings.ragMaxChunks)"
+                    Text(
+                        String.localizedStringWithFormat(
+                            String(localized: "Max Chunks: %@", locale: localizationManager.locale),
+                            chunkString
+                        )
+                    )
+                    Spacer()
+                    Button { showChunksInfo = true } label: {
+                        Image(systemName: "questionmark.circle")
+                            .foregroundColor(.blue)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(LocalizedStringKey("What is Max Chunks?"))
+                }
+            }
+
+            Text(LocalizedStringKey("The most passages from your dataset that can be added to the prompt. Fewer may be used when only a little matches your question."))
+                .font(FontTheme.caption)
+                .foregroundStyle(AppTheme.tertiaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        // Similarity Threshold — slider with live value and an explanatory caption.
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(LocalizedStringKey("Similarity Threshold"))
@@ -1731,9 +4284,73 @@ struct SettingsView: View {
                     .foregroundStyle(AppTheme.secondaryText)
             }
             Slider(value: $settings.ragMinScore, in: 0...1)
-            Text(LocalizedStringKey("Lower = more results (more noise). Higher = stricter matches."))
+            Text(LocalizedStringKey("How closely a passage must match to be preferred. Lower = more passages (more noise); higher = fewer, stricter matches."))
                 .font(FontTheme.caption)
                 .foregroundStyle(AppTheme.tertiaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Ties the two controls together: shows the actual floor in use,
+            // i.e. the slider value after the selected Retrieval Mode adjusts it.
+            Label {
+                Text(retrievalThresholdRelationship(
+                    mode: DatasetRetrievalMode.from(settings.ragRetrievalModeRaw),
+                    base: settings.ragMinScore
+                ))
+            } icon: {
+                Image(systemName: "slider.horizontal.3")
+            }
+            .font(FontTheme.caption)
+            .foregroundStyle(AppTheme.secondaryText)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func retrievalModeTitle(_ mode: DatasetRetrievalMode) -> LocalizedStringKey {
+        switch mode {
+        case .focused:
+            return "Focused"
+        case .balanced:
+            return "Balanced"
+        case .broad:
+            return "Broad"
+        }
+    }
+
+    /// Plain-language explanation of what the selected retrieval mode does,
+    /// shown directly under the picker so the trade-off is obvious at a glance.
+    private func retrievalModeDescription(_ mode: DatasetRetrievalMode) -> LocalizedStringKey {
+        switch mode {
+        case .focused:
+            return "Returns only the closest-matching passages. Best for precise, fact-based questions."
+        case .balanced:
+            return "Balances precision and coverage. A good default for most questions."
+        case .broad:
+            return "Casts a wider net across more of your sources. Best for open-ended or exploratory questions."
+        }
+    }
+
+    /// Spells out how the Retrieval Mode and Similarity Threshold combine: the
+    /// slider sets a base floor, and the mode shifts it. Shows the resulting
+    /// "effective" value live so the relationship is concrete, not abstract.
+    private func retrievalThresholdRelationship(mode: DatasetRetrievalMode, base: Double) -> String {
+        let baseStr = String(format: "%.2f", base)
+        let effStr = String(format: "%.2f", Double(mode.effectiveThreshold(base: Float(base))))
+        switch mode {
+        case .focused:
+            return String.localizedStringWithFormat(
+                String(localized: "Focused keeps your full threshold — passages must score at least %@.", locale: localizationManager.locale),
+                baseStr
+            )
+        case .balanced:
+            return String.localizedStringWithFormat(
+                String(localized: "Balanced eases your %@ threshold down to %@, so more passages qualify.", locale: localizationManager.locale),
+                baseStr, effStr
+            )
+        case .broad:
+            return String.localizedStringWithFormat(
+                String(localized: "Broad eases your %@ threshold down to %@ for the widest net.", locale: localizationManager.locale),
+                baseStr, effStr
+            )
         }
     }
 
@@ -1748,6 +4365,26 @@ struct SettingsView: View {
 }
 
 private extension SettingsView {
+#if os(iOS)
+    func loadWalletPassTokenState() {
+        walletPassTokenStored = ((try? PassSigningCredentialStore.token()) ?? nil) != nil
+        walletPassSignerToken = ""
+    }
+
+    func saveWalletPassToken() {
+        let trimmed = walletPassSignerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try PassSigningCredentialStore.setToken(trimmed)
+            walletPassTokenStored = true
+            walletPassSignerToken = ""
+            walletPassTokenFocused = false
+        } catch {
+            Task { await logger.log("[Settings][WalletPass] Failed to save signer token: \(error.localizedDescription)") }
+        }
+    }
+#endif
+
     var languageOptions: [(code: String, name: String)] {
         let displayLocale = Locale(identifier: localizationManager.locale.identifier)
         return LocalizationManager.supportedLanguages.map { code in
@@ -1792,10 +4429,24 @@ private extension SettingsView {
         modelManager.activeDataset = nil
         modelManager.modelSettings.removeAll()
 
+        let jobs = await DownloadEngine.shared.snapshots()
+        for job in jobs {
+            var urlsToDelete: [URL] = []
+            for artifact in job.artifacts {
+                BackgroundDownloadManager.shared.cancel(destination: artifact.destinationURL)
+                urlsToDelete.append(artifact.stagingURL)
+                urlsToDelete.append(artifact.finalURL)
+            }
+            _ = ModelStorageCleanup.deleteURLs(urlsToDelete)
+            await DownloadEngine.shared.removeJob(externalID: job.externalID)
+        }
+
         let models = modelManager.downloadedModels
         for model in models {
             modelManager.delete(model)
         }
+        _ = ModelStorageCleanup.removeAllSupportModelStorage()
+        _ = ModelStorageCleanup.pruneOrphanedModelDirectories(installedModels: [], activeDownloadURLs: [])
 
         let datasets = datasetManager.datasets
         for dataset in datasets {
@@ -1830,6 +4481,10 @@ private extension SettingsView {
             do {
                 if FileManager.default.fileExists(atPath: url.path) {
                     try FileManager.default.removeItem(at: url)
+                }
+                let directory = EmbeddingModelCatalog.directoryURL(for: EmbeddingModelCatalog.activeRecord().id)
+                if FileManager.default.fileExists(atPath: directory.path) {
+                    try? FileManager.default.removeItem(at: directory)
                 }
                 UserDefaults.standard.removeObject(forKey: "hasInstalledEmbedModel:\(url.path)")
                 await MainActor.run {
@@ -1974,94 +4629,13 @@ private func triggerImpact(_ style: ImpactStyle) {
 @_silgen_name("app_memory_footprint")
 fileprivate func c_app_memory_footprint() -> UInt
 
-private struct LiveRAMUsageView: View {
-    let info: DeviceRAMInfo
-    @State private var usageBytes: Int64 = 0
-    @State private var timer: Timer?
-
-    private var budgetBytes: Int64? {
-        // Use the conservative budget the app uses for gating estimates
-        return info.conservativeLimitBytes()
-    }
-
-    private var progress: Double {
-        guard let cap = budgetBytes, cap > 0 else { return 0 }
-        return min(1.0, Double(usageBytes) / Double(cap))
-    }
-
-    private var color: Color {
-        switch progress {
-        case 0..<0.7: return .green
-        case 0.7..<0.9: return .orange
-        default: return .red
-        }
-    }
-
-    private var usageText: String {
-        ByteCountFormatter.string(fromByteCount: usageBytes, countStyle: .memory)
-    }
-
-    private var capText: String {
-        if let cap = budgetBytes { return ByteCountFormatter.string(fromByteCount: cap, countStyle: .memory) }
-        return "--"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                ZStack {
-                    Circle()
-                        .stroke(Color.gray.opacity(0.2), lineWidth: 10)
-                        .frame(width: 64, height: 64)
-                    Circle()
-                        .trim(from: 0, to: CGFloat(progress))
-                        .stroke(color, style: StrokeStyle(lineWidth: 10, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                        .frame(width: 64, height: 64)
-                    Text("\(Int(progress * 100))%")
-                        .font(.caption2)
-                        .monospacedDigit()
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(LocalizedStringKey("App Memory Usage (estimated)"))
-                    Text(String.localizedStringWithFormat(String(localized: "%@ of %@ budget"), usageText, capText))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-        }
-        .onAppear { start() }
-        .onDisappear { stop() }
-#if canImport(UIKit)
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
-            Task { @MainActor in refresh() }
-        }
-#endif
-        .accessibilityElement(children: .contain)
-    }
-
-    private func start() {
-        Task { @MainActor in refresh() }
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            Task { @MainActor in refresh() }
-        }
-    }
-
-    private func stop() { timer?.invalidate(); timer = nil }
-
-    private func refresh() {
-        let bytes = Int64(c_app_memory_footprint())
-        withAnimation(.easeInOut(duration: 0.2)) { usageBytes = max(0, bytes) }
-    }
-}
-
 #Preview {
     SettingsView()
         .environmentObject(ChatVM())
+        .environmentObject(TabRouter())
         .environmentObject(AppModelManager())
         .environmentObject(DatasetManager())
+        .environmentObject(DownloadController())
         .environmentObject(GuidedWalkthroughManager())
         .environmentObject(LocalizationManager())
 }

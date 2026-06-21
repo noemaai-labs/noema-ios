@@ -1,6 +1,19 @@
 // PythonExecutor.swift
 import Foundation
 
+/// Generated file metadata captured from a Python execution sandbox.
+struct PythonExecutionArtifact: Codable, Equatable, Sendable, Identifiable {
+    let relativePath: String
+    let filename: String
+    let kind: String
+    let mimeType: String?
+    let sizeBytes: Int64
+    let preview: String?
+    let base64Data: String?
+
+    var id: String { relativePath }
+}
+
 /// Result of a Python execution
 struct PythonExecutionResult: Codable, Sendable {
     let stdout: String
@@ -9,6 +22,46 @@ struct PythonExecutionResult: Codable, Sendable {
     let executionTimeMs: Int
     let error: String?
     let timedOut: Bool
+    let artifacts: [PythonExecutionArtifact]
+
+    init(
+        stdout: String,
+        stderr: String,
+        exitCode: Int32,
+        executionTimeMs: Int,
+        error: String?,
+        timedOut: Bool,
+        artifacts: [PythonExecutionArtifact] = []
+    ) {
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exitCode = exitCode
+        self.executionTimeMs = executionTimeMs
+        self.error = error
+        self.timedOut = timedOut
+        self.artifacts = artifacts
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case stdout
+        case stderr
+        case exitCode
+        case executionTimeMs
+        case error
+        case timedOut
+        case artifacts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        stdout = try container.decode(String.self, forKey: .stdout)
+        stderr = try container.decode(String.self, forKey: .stderr)
+        exitCode = try container.decode(Int32.self, forKey: .exitCode)
+        executionTimeMs = try container.decode(Int.self, forKey: .executionTimeMs)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        timedOut = try container.decode(Bool.self, forKey: .timedOut)
+        artifacts = try container.decodeIfPresent([PythonExecutionArtifact].self, forKey: .artifacts) ?? []
+    }
 }
 
 /// Protocol for platform-specific Python execution backends
@@ -197,3 +250,110 @@ del _sys
 del _os
 
 """
+
+enum PythonExecutionArtifactCollector {
+    static let maxArtifacts = 12
+    static let maxPreviewBytes = 32_768
+    static let maxEmbeddedBytes = 700_000
+    static let maxTotalEmbeddedBytes = 1_400_000
+
+    static func collect(from rootURL: URL, excluding excludedRelativePaths: Set<String> = ["script.py"]) -> [PythonExecutionArtifact] {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return []
+        }
+
+        var artifacts: [PythonExecutionArtifact] = []
+        var embeddedBytes = 0
+
+        for case let fileURL as URL in enumerator {
+            guard artifacts.count < maxArtifacts else { break }
+            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+
+            let relativePath = normalizedRelativePath(for: fileURL, rootURL: rootURL)
+            guard !excludedRelativePaths.contains(relativePath),
+                  !relativePath.hasPrefix("__pycache__/"),
+                  !relativePath.hasSuffix(".pyc") else {
+                continue
+            }
+
+            let sizeBytes = Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            let classification = classify(fileURL)
+            let canEmbed = sizeBytes >= 0
+                && sizeBytes <= Int64(maxEmbeddedBytes)
+                && embeddedBytes + Int(sizeBytes) <= maxTotalEmbeddedBytes
+            let data = canEmbed ? try? Data(contentsOf: fileURL) : nil
+            let base64Data = classification.kind == "image" ? data?.base64EncodedString() : nil
+            let preview = previewText(from: data, kind: classification.kind)
+
+            if data != nil {
+                embeddedBytes += max(0, Int(sizeBytes))
+            }
+
+            artifacts.append(
+                PythonExecutionArtifact(
+                    relativePath: relativePath,
+                    filename: fileURL.lastPathComponent,
+                    kind: classification.kind,
+                    mimeType: classification.mimeType,
+                    sizeBytes: sizeBytes,
+                    preview: preview,
+                    base64Data: base64Data
+                )
+            )
+        }
+
+        return artifacts
+    }
+
+    private static func normalizedRelativePath(for fileURL: URL, rootURL: URL) -> String {
+        let rootPath = rootURL.standardizedFileURL.path
+        let filePath = fileURL.standardizedFileURL.path
+        if filePath.hasPrefix(rootPath + "/") {
+            return String(filePath.dropFirst(rootPath.count + 1))
+        }
+        return fileURL.lastPathComponent
+    }
+
+    private static func classify(_ fileURL: URL) -> (kind: String, mimeType: String?) {
+        switch fileURL.pathExtension.lowercased() {
+        case "png":
+            return ("image", "image/png")
+        case "jpg", "jpeg":
+            return ("image", "image/jpeg")
+        case "gif":
+            return ("image", "image/gif")
+        case "webp":
+            return ("image", "image/webp")
+        case "bmp":
+            return ("image", "image/bmp")
+        case "tif", "tiff":
+            return ("image", "image/tiff")
+        case "svg":
+            return ("text", "image/svg+xml")
+        case "csv":
+            return ("table", "text/csv")
+        case "tsv":
+            return ("table", "text/tab-separated-values")
+        case "json":
+            return ("json", "application/json")
+        case "jsonl":
+            return ("text", "application/x-ndjson")
+        case "txt", "md", "markdown", "log", "out", "err", "py":
+            return ("text", "text/plain")
+        default:
+            return ("file", nil)
+        }
+    }
+
+    private static func previewText(from data: Data?, kind: String) -> String? {
+        guard kind != "image", let data, !data.isEmpty else { return nil }
+        let previewData = data.prefix(maxPreviewBytes)
+        guard let text = String(data: previewData, encoding: .utf8) else { return nil }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

@@ -41,3 +41,6 @@ int gguf_moe_scan(const char *path, struct gguf_moe_scan_result *out_result);
 #if __has_include("EmbeddedPythonBridge.h")
 #import "EmbeddedPythonBridge.h"
 #endif
+#if __has_include("WhisperCpp.h")
+#import "WhisperCpp.h"
+#endif

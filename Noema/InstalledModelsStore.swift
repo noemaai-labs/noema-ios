@@ -18,8 +18,9 @@ struct InstalledModel: Identifiable, Codable {
     var isToolCapable: Bool = false
     var moeInfo: MoEInfo? = nil
     var etBackend: ETBackend? = nil
+    var alias: String? = nil
 
-    init(id: UUID = UUID(), modelID: String, quantLabel: String, parameterCountLabel: String? = nil, url: URL, format: ModelFormat, sizeBytes: Int64, lastUsed: Date?, installDate: Date, checksum: String?, isFavourite: Bool, totalLayers: Int, isMultimodal: Bool = false, isToolCapable: Bool = false, moeInfo: MoEInfo? = nil, etBackend: ETBackend? = nil) {
+    init(id: UUID = UUID(), modelID: String, quantLabel: String, parameterCountLabel: String? = nil, url: URL, format: ModelFormat, sizeBytes: Int64, lastUsed: Date?, installDate: Date, checksum: String?, isFavourite: Bool, totalLayers: Int, isMultimodal: Bool = false, isToolCapable: Bool = false, moeInfo: MoEInfo? = nil, etBackend: ETBackend? = nil, alias: String? = nil) {
         self.id = id
         self.modelID = modelID
         self.quantLabel = quantLabel
@@ -36,12 +37,16 @@ struct InstalledModel: Identifiable, Codable {
         self.isToolCapable = isToolCapable
         self.moeInfo = moeInfo
         self.etBackend = etBackend
+        self.alias = alias
     }
 }
 
 extension InstalledModel {
     /// Human-friendly name for display in logs/UI.
     var displayName: String {
+        if let alias = alias?.trimmingCharacters(in: .whitespacesAndNewlines), !alias.isEmpty {
+            return alias
+        }
         if !modelID.isEmpty {
             return quantLabel.isEmpty ? modelID : "\(modelID) (\(quantLabel))"
         }
@@ -89,7 +94,8 @@ final class InstalledModelsStore {
                                           isMultimodal: m.isMultimodal,
                                           isToolCapable: m.isToolCapable,
                                           moeInfo: m.moeInfo,
-                                          etBackend: m.etBackend)
+                                          etBackend: m.etBackend,
+                                          alias: m.alias)
             self.items.append(newModel)
             self.save()
         }
@@ -113,7 +119,8 @@ final class InstalledModelsStore {
                                           isMultimodal: m.isMultimodal,
                                           isToolCapable: m.isToolCapable,
                                           moeInfo: m.moeInfo,
-                                          etBackend: m.etBackend)
+                                          etBackend: m.etBackend,
+                                          alias: m.alias)
             if let index = self.items.firstIndex(where: { $0.modelID == m.modelID && $0.quantLabel == m.quantLabel }) {
                 self.items[index] = newModel
             } else {
@@ -188,6 +195,16 @@ final class InstalledModelsStore {
         }
     }
 
+    func updateAlias(modelID: String, quantLabel: String, alias: String?) {
+        queue.sync {
+            if let index = items.firstIndex(where: { $0.modelID == modelID && $0.quantLabel == quantLabel }) {
+                let trimmed = alias?.trimmingCharacters(in: .whitespacesAndNewlines)
+                items[index].alias = trimmed?.isEmpty == false ? trimmed : nil
+                save()
+            }
+        }
+    }
+
     func reload() {
         guard let data = try? Data(contentsOf: url) else { return }
         if let decoded = try? JSONDecoder().decode([InstalledModel].self, from: data) {
@@ -252,7 +269,8 @@ final class InstalledModelsStore {
                                                isMultimodal: item.isMultimodal,
                                                isToolCapable: item.isToolCapable,
                                                moeInfo: item.moeInfo,
-                                               etBackend: item.etBackend)
+                                               etBackend: item.etBackend,
+                                               alias: item.alias)
                     pendingMigrations.append(PathMigration(oldPath: oldURL.path, newPath: canonical.path))
                     changed = true
                 }
@@ -388,7 +406,8 @@ final class InstalledModelsStore {
                     isMultimodal: sourceItems.contains(where: { $0.isMultimodal }),
                     isToolCapable: sourceItems.contains(where: { $0.isToolCapable }),
                     moeInfo: mergedMoE,
-                    etBackend: nil
+                    etBackend: nil,
+                    alias: sourceItems.compactMap(\.alias).first
                 )
 
                 removalIndices.formUnion(state.indices)
@@ -480,6 +499,48 @@ final class InstalledModelsStore {
                 return fixed
             }
             return fixed.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL
+        case .coreai:
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            if let artifact = enclosingCoreAIArtifact(for: fixed) {
+                return artifact.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL
+            }
+            if fm.fileExists(atPath: fixed.path, isDirectory: &isDir), isDir.boolValue {
+                return fixed
+            }
+            return fixed.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL
+        }
+    }
+
+    /// Walks up from `url` to find an enclosing `.aimodel` / `.aimodelc` bundle.
+    static func enclosingCoreAIArtifact(for url: URL) -> URL? {
+        let fm = FileManager.default
+        var candidate = url.resolvingSymlinksInPath().standardizedFileURL
+        while true {
+            let ext = candidate.pathExtension.lowercased()
+            if (ext == "aimodel" || ext == "aimodelc"),
+               fm.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            let parent = candidate.deletingLastPathComponent()
+            // Directory-flagged URLs never converge at "/" — deleting yields
+            // "/..", then "/../.." forever. Stop on any non-shrinking step.
+            if parent.path.count >= candidate.path.count {
+                return nil
+            }
+            candidate = parent
+        }
+    }
+
+    /// Finds the first `.aimodel` / `.aimodelc` bundle directly inside `dir`.
+    static func firstCoreAIArtifact(in dir: URL) -> URL? {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        return entries.first { url in
+            let ext = url.pathExtension.lowercased()
+            return ext == "aimodel" || ext == "aimodelc"
         }
     }
 
@@ -495,7 +556,9 @@ final class InstalledModelsStore {
             }
 
             let parent = candidate.deletingLastPathComponent()
-            if parent.path == candidate.path {
+            // Directory-flagged URLs never converge at "/" — deleting yields
+            // "/..", then "/../.." forever. Stop on any non-shrinking step.
+            if parent.path.count >= candidate.path.count {
                 return nil
             }
             candidate = parent
@@ -509,6 +572,8 @@ final class InstalledModelsStore {
             return canonicalURL(for: base, format: .ane)
         case .afm:
             return canonicalURL(for: base, format: .afm)
+        case .coreai:
+            return canonicalURL(for: base, format: .coreai)
         case .gguf, .mlx, .et:
             let relativePath = quant.primaryDownloadRelativePath
             let candidate = base.appendingPathComponent(relativePath)
@@ -519,7 +584,7 @@ final class InstalledModelsStore {
     /// Base directory used for storing models of the given format and id.
     static func baseDir(for format: ModelFormat, modelID: String) -> URL {
         switch format {
-        case .gguf, .mlx, .et, .ane, .afm:
+        case .gguf, .mlx, .et, .ane, .afm, .coreai:
             var dir = FileManager.default
                 .urls(for: .documentDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("LocalLLMModels", isDirectory: true)
@@ -566,6 +631,12 @@ final class InstalledModelsStore {
                     } else {
                         repaired = nil
                     }
+                case .coreai:
+                    if Self.firstCoreAIArtifact(in: base) != nil || Self.enclosingCoreAIArtifact(for: base) != nil {
+                        repaired = Self.canonicalURL(for: base, format: .coreai)
+                    } else {
+                        repaired = nil
+                    }
                 }
                 if let newURL = repaired {
                     let oldURL = item.url
@@ -584,7 +655,8 @@ final class InstalledModelsStore {
                                                isMultimodal: item.isMultimodal,
                                                isToolCapable: item.isToolCapable,
                                                moeInfo: item.moeInfo,
-                                               etBackend: item.etBackend)
+                                               etBackend: item.etBackend,
+                                               alias: item.alias)
                     pendingMigrations.append(PathMigration(oldPath: oldURL.path, newPath: newURL.path))
                     changed = true
                 }

@@ -136,3 +136,74 @@ enum ProjectorLocator {
         return candidates.first?.path
     }
 }
+
+enum MtpLocator {
+    private static let mtpKeywords = ["mtp", "draft", "nextn"]
+
+    static func hasMtpFile(alongside modelURL: URL) -> Bool {
+        mtpPath(alongside: modelURL) != nil
+    }
+
+    static func mtpPath(alongside modelURL: URL) -> String? {
+        let dir: URL = {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: modelURL.path, isDirectory: &isDir), isDir.boolValue {
+                return modelURL
+            }
+            return modelURL.deletingLastPathComponent()
+        }()
+
+        let artifactsURL = dir.appendingPathComponent("artifacts.json")
+        if let data = try? Data(contentsOf: artifactsURL),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let rel = obj["mtp"] as? String {
+            let abs = dir.appendingPathComponent(rel)
+            if FileManager.default.fileExists(atPath: abs.path) { return abs.path }
+        }
+
+        let candidates = mtpCandidates(in: dir, excluding: modelURL)
+        return candidates.first?.path
+    }
+
+    private static func mtpCandidates(in directory: URL, excluding modelURL: URL) -> [URL] {
+        guard let contents = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+            return []
+        }
+
+        var candidates = contents.filter { isMtpFile($0, excluding: modelURL) }
+        for entry in contents {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                continue
+            }
+            if let subcontents = try? FileManager.default.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil) {
+                candidates.append(contentsOf: subcontents.filter { isMtpFile($0, excluding: modelURL) })
+            }
+        }
+        return candidates.sorted { lhs, rhs in
+            mtpScore(lhs) == mtpScore(rhs)
+                ? lhs.lastPathComponent.localizedCaseInsensitiveCompare(rhs.lastPathComponent) == .orderedAscending
+                : mtpScore(lhs) > mtpScore(rhs)
+        }
+    }
+
+    private static func isMtpFile(_ url: URL, excluding modelURL: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "gguf" else { return false }
+        guard url.standardizedFileURL.path != modelURL.standardizedFileURL.path else { return false }
+        let lower = url.lastPathComponent.lowercased()
+        guard !lower.contains("mmproj"), !lower.contains("projector"), !lower.contains("image_proj") else {
+            return false
+        }
+        return mtpKeywords.contains { lower.contains($0) }
+    }
+
+    private static func mtpScore(_ url: URL) -> Int {
+        let lower = url.lastPathComponent.lowercased()
+        var score = 0
+        if lower.contains("mtp-") || lower.contains("-mtp") { score += 30 }
+        if lower.contains("nextn") { score += 20 }
+        if lower.contains("draft") { score += 10 }
+        if lower.contains("f16") || lower.contains("f32") { score += 5 }
+        return score
+    }
+}

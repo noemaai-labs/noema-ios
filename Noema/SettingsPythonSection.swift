@@ -2,6 +2,14 @@
 import SwiftUI
 
 struct SettingsPythonSection: View {
+    var body: some View {
+        Section(header: Text("Code Execution")) {
+            SettingsPythonContent()
+        }
+    }
+}
+
+struct SettingsPythonContent: View {
     @ObservedObject private var settings = SettingsStore.shared
     @State private var showInfo = false
 
@@ -21,7 +29,7 @@ struct SettingsPythonSection: View {
     }
 
     var body: some View {
-        Section(header: Text("Code Execution")) {
+        VStack(alignment: .leading, spacing: 0) {
             Toggle(isOn: $settings.pythonEnabled) {
                 HStack(spacing: 8) {
                     Text("Python Code Execution")

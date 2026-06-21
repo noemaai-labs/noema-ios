@@ -9,6 +9,8 @@ struct SettingsMemorySection: View {
 }
 
 struct SettingsMemorySummaryContent: View {
+    let onManage: (() -> Void)?
+
     @ObservedObject private var settings = SettingsStore.shared
     @ObservedObject private var store = MemoryStore.shared
     @EnvironmentObject private var chatVM: ChatVM
@@ -16,8 +18,18 @@ struct SettingsMemorySummaryContent: View {
     @State private var showInfo = false
     @State private var isPresentingManager = false
 
+    init(onManage: (() -> Void)? = nil) {
+        self.onManage = onManage
+    }
+
     private var isAtCapacity: Bool {
         store.entries.count >= MemoryStore.maximumEntries
+    }
+
+    private var pendingConflictCount: Int {
+        store.reviewItems.reduce(0) { partial, item in
+            partial + (item.possibleConflicts ?? []).count
+        }
     }
 
     private var currentModelNoticeText: String? {
@@ -66,7 +78,11 @@ struct SettingsMemorySummaryContent: View {
 
             HStack {
                 Button {
-                    isPresentingManager = true
+                    if let onManage {
+                        onManage()
+                    } else {
+                        isPresentingManager = true
+                    }
                 } label: {
                     Label("Manage Memories", systemImage: "square.stack.3d.up")
                 }
@@ -82,6 +98,28 @@ struct SettingsMemorySummaryContent: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            }
+
+            if !store.reviewItems.isEmpty {
+                Text(
+                    String.localizedStringWithFormat(
+                        String(localized: "%d pending review"),
+                        store.reviewItems.count
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+
+            if pendingConflictCount > 0 {
+                Text(
+                    String.localizedStringWithFormat(
+                        String(localized: "%d possible memory conflicts"),
+                        pendingConflictCount
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
 
             if isAtCapacity {
@@ -108,6 +146,11 @@ struct SettingsMemorySummaryContent: View {
         .sheet(isPresented: $isPresentingManager) {
             NavigationStack {
                 MemoryManagementView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { isPresentingManager = false }
+                        }
+                    }
             }
             .presentationDetents([.medium, .large])
         }
@@ -119,13 +162,15 @@ struct SettingsMemorySummaryContent: View {
     }
 }
 
-private struct MemoryManagementView: View {
+struct MemoryManagementView: View {
     @ObservedObject private var store = MemoryStore.shared
+    @ObservedObject private var settings = SettingsStore.shared
 
     @State private var draft = MemoryEditorDraft()
     @State private var isPresentingEditor = false
     @State private var deleteTarget: MemoryEntry?
     @State private var editorError: String?
+    @State private var reviewError: String?
 
     private var isAtCapacity: Bool {
         store.entries.count >= MemoryStore.maximumEntries
@@ -154,6 +199,38 @@ private struct MemoryManagementView: View {
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
+
+                Toggle(isOn: $settings.memoryReviewRequired) {
+                    Label("Review Memory Saves", systemImage: "checklist.checked")
+                }
+                .tint(.blue)
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.secondary.opacity(0.08))
+                )
+
+                if !store.reviewItems.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Memory Review Inbox")
+                            .font(.headline)
+                        Text("Review model-proposed memories before saving them.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(store.reviewItems) { item in
+                            MemoryReviewItemCard(
+                                item: item,
+                                onApprove: { approveReviewItem(item) },
+                                onReject: { rejectReviewItem(item) }
+                            )
+                        }
+                        if let reviewError, !reviewError.isEmpty {
+                            Text(reviewError)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
                 }
 
                 Button {
@@ -236,12 +313,16 @@ private struct MemoryManagementView: View {
                 _ = try MemoryStore.shared.updateEntry(
                     id: entryID,
                     title: draft.title,
-                    content: draft.content
+                    content: draft.content,
+                    scope: draft.scope,
+                    expiresAt: draft.hasExpiry ? draft.expiresAt : nil
                 )
             } else {
                 _ = try MemoryStore.shared.create(
                     title: draft.title,
-                    content: draft.content
+                    content: draft.content,
+                    scope: draft.scope,
+                    expiresAt: draft.hasExpiry ? draft.expiresAt : nil
                 )
             }
             editorError = nil
@@ -250,12 +331,109 @@ private struct MemoryManagementView: View {
             editorError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
+
+    private func approveReviewItem(_ item: MemoryReviewItem) {
+        do {
+            _ = try MemoryStore.shared.approveReviewItem(id: item.id)
+            reviewError = nil
+        } catch {
+            reviewError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func rejectReviewItem(_ item: MemoryReviewItem) {
+        do {
+            _ = try MemoryStore.shared.rejectReviewItem(id: item.id)
+            reviewError = nil
+        } catch {
+            reviewError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+}
+
+private struct MemoryReviewItemCard: View {
+    let item: MemoryReviewItem
+    let onApprove: () -> Void
+    let onReject: () -> Void
+
+    private var conflicts: [MemoryConflict] {
+        item.possibleConflicts ?? []
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "brain.head.profile")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.title)
+                        .font(.headline)
+                    Text(item.content)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Created by Memory Tool")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(item.effectiveScope.localizedTitle)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color.blue.opacity(0.12)))
+                        if let expiresAt = item.expiresAt {
+                            Text(item.isExpired ? String(localized: "Expired") : String.localizedStringWithFormat(String(localized: "Expires %@"), expiresAt.formatted(date: .abbreviated, time: .omitted)))
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(item.isExpired ? .orange : .secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.10)))
+                        }
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+
+            if !conflicts.isEmpty {
+                MemoryConflictSummary(conflicts: conflicts, tint: .orange)
+            }
+
+            HStack {
+                Text(item.createdAt, style: .date)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button("Reject", role: .destructive, action: onReject)
+                    .buttonStyle(.borderless)
+                Button("Approve", action: onApprove)
+                    .buttonStyle(.borderless)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.orange.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.orange.opacity(0.18), lineWidth: 1)
+        )
+    }
 }
 
 private struct MemoryEntryCard: View {
+    @ObservedObject private var store = MemoryStore.shared
+
     let entry: MemoryEntry
     let onEdit: () -> Void
     let onDelete: () -> Void
+
+    private var conflicts: [MemoryConflict] {
+        store.possibleConflicts(title: entry.title, content: entry.content, excluding: entry.id)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -267,9 +445,29 @@ private struct MemoryEntryCard: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Text(entry.effectiveScope.localizedTitle)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color.blue.opacity(0.12)))
+                        if let expiresAt = entry.expiresAt {
+                            Text(entry.isExpired ? String(localized: "Expired") : String.localizedStringWithFormat(String(localized: "Expires %@"), expiresAt.formatted(date: .abbreviated, time: .omitted)))
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(entry.isExpired ? .orange : .secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.10)))
+                        }
+                    }
                 }
 
                 Spacer()
+            }
+
+            if !conflicts.isEmpty {
+                MemoryConflictSummary(conflicts: conflicts, tint: .orange)
             }
 
             HStack {
@@ -297,10 +495,45 @@ private struct MemoryEntryCard: View {
     }
 }
 
+private struct MemoryConflictSummary: View {
+    let conflicts: [MemoryConflict]
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Possible Conflict", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(tint)
+            ForEach(conflicts.prefix(2)) { conflict in
+                Text(
+                    String.localizedStringWithFormat(
+                        String(localized: "May contradict \"%@\""),
+                        conflict.title
+                    )
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                Text(conflict.kind.localizedSummary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Review both memories before saving.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 private struct MemoryEditorDraft {
     var entryID: UUID?
     var title: String = ""
     var content: String = ""
+    var scope: MemoryScope = .allChats
+    var hasExpiry = false
+    var expiresAt = Calendar.current.date(byAdding: .month, value: 1, to: Date()) ?? Date()
 
     init() { }
 
@@ -308,6 +541,11 @@ private struct MemoryEditorDraft {
         self.entryID = entry.id
         self.title = entry.title
         self.content = entry.content
+        self.scope = entry.effectiveScope
+        self.hasExpiry = entry.expiresAt != nil
+        if let expiresAt = entry.expiresAt {
+            self.expiresAt = expiresAt
+        }
     }
 
     var isNew: Bool { entryID == nil }
@@ -326,6 +564,20 @@ private struct MemoryEditorSheet: View {
                 TextField("Memory Title", text: $draft.title)
                 TextEditor(text: $draft.content)
                     .frame(minHeight: 220)
+                Picker("Memory Scope", selection: $draft.scope) {
+                    ForEach(MemoryScope.allCases, id: \.self) { scope in
+                        Text(scope.localizedTitle).tag(scope)
+                    }
+                }
+                Toggle("Expires", isOn: $draft.hasExpiry)
+                if draft.hasExpiry {
+                    DatePicker(
+                        "Expiry Date",
+                        selection: $draft.expiresAt,
+                        in: Date()...,
+                        displayedComponents: [.date]
+                    )
+                }
             } header: {
                 Text(draft.isNew ? "New Memory" : "Edit Memory")
             } footer: {

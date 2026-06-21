@@ -8,6 +8,7 @@ public enum ModelFormat: String, CaseIterable, Hashable, Sendable {
     case et  = "ET"
     case ane = "ANE"
     case afm = "AFM"
+    case coreai = "CoreAI"
 }
 
 extension ModelFormat: Codable {
@@ -96,10 +97,23 @@ extension MoEInfo {
 }
 
 extension ModelFormat {
+    /// CoreAI (Apple on-device foundation-model bundles) require iOS/macOS/visionOS 27+.
+    /// The app is built against the 27 SDK, but the runtime can't load these on older
+    /// OS versions, so CoreAI models must be hidden from users below 27 everywhere they
+    /// could otherwise be browsed, listed, selected, or downloaded.
+    static var isCoreAIRuntimeAvailable: Bool {
+        if #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) {
+            return true
+        }
+        return false
+    }
+
     var displayName: String {
         switch self {
         case .ane:
             return "CML"
+        case .coreai:
+            return "Core AI"
         default:
             return rawValue
         }
@@ -128,6 +142,8 @@ extension ModelFormat {
             return LinearGradient(colors: [Color.green, Color.teal], startPoint: .topLeading, endPoint: .bottomTrailing)
         case .afm:
             return LinearGradient(colors: [Color.indigo, Color.blue], startPoint: .topLeading, endPoint: .bottomTrailing)
+        case .coreai:
+            return LinearGradient(colors: [Color.purple, Color.indigo], startPoint: .topLeading, endPoint: .bottomTrailing)
         }
     }
 
@@ -137,10 +153,15 @@ extension ModelFormat {
         if url.scheme?.lowercased() == "afm" {
             return .afm
         }
+        if url.scheme?.lowercased() == "coreai" {
+            return .coreai
+        }
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "afm":
             return .afm
+        case "aimodel", "aimodelc":
+            return .coreai
         case "mlx":
             return .mlx
         case "bundle", "pte":
@@ -183,6 +204,8 @@ public struct QuantInfo: Identifiable, Hashable, Codable, Sendable {
     public let downloadParts: [DownloadPart]?
     /// Optional repo-advertised importance matrix (iMatrix) companion for IQ GGUF quants.
     public let importanceMatrix: AuxiliaryFile?
+    /// Optional repo-advertised MTP draft-head companion for GGUF quants.
+    public let mtp: AuxiliaryFile?
 
     public init(
         label: String,
@@ -192,7 +215,8 @@ public struct QuantInfo: Identifiable, Hashable, Codable, Sendable {
         sha256: String?,
         configURL: URL?,
         downloadParts: [DownloadPart]? = nil,
-        importanceMatrix: AuxiliaryFile? = nil
+        importanceMatrix: AuxiliaryFile? = nil,
+        mtp: AuxiliaryFile? = nil
     ) {
         self.label = label
         self.format = format
@@ -202,6 +226,7 @@ public struct QuantInfo: Identifiable, Hashable, Codable, Sendable {
         self.configURL = configURL
         self.downloadParts = downloadParts
         self.importanceMatrix = importanceMatrix
+        self.mtp = mtp
     }
 }
 
@@ -279,7 +304,8 @@ extension QuantInfo {
         sha256: String?? = nil,
         configURL: URL?? = nil,
         downloadParts: [DownloadPart]?? = nil,
-        importanceMatrix: AuxiliaryFile?? = nil
+        importanceMatrix: AuxiliaryFile?? = nil,
+        mtp: AuxiliaryFile?? = nil
     ) -> QuantInfo {
         QuantInfo(
             label: label ?? self.label,
@@ -289,7 +315,8 @@ extension QuantInfo {
             sha256: sha256 ?? self.sha256,
             configURL: configURL ?? self.configURL,
             downloadParts: downloadParts ?? self.downloadParts,
-            importanceMatrix: importanceMatrix ?? self.importanceMatrix
+            importanceMatrix: importanceMatrix ?? self.importanceMatrix,
+            mtp: mtp ?? self.mtp
         )
     }
 
@@ -317,6 +344,9 @@ extension QuantInfo {
     }
 
     var isLowBitQuant: Bool {
+        // Core AI repos publish verified per-platform bundles, not a bit-width
+        // quality ladder — stem tokens like "hc0"/"int8v3" are not quant grades.
+        if format == .coreai { return false }
         if let bits = inferredBitWidth {
             return bits <= 2
         }
@@ -355,6 +385,9 @@ extension QuantInfo {
     }
 
     var quantTypeDescriptor: QuantTypeDescriptor {
+        if format == .coreai {
+            return Self.coreAIQuantTypeDescriptor(label: label)
+        }
         let upper = label.uppercased()
         let isUD = upper.hasPrefix("UD-") || upper.hasPrefix("UD_")
         let normalized: String = {
@@ -418,6 +451,7 @@ extension QuantInfo {
                 case .et: return "ET"
                 case .ane: return "CML"
                 case .afm: return "AFM"
+                case .coreai: return "Core AI"
                 case .gguf: return "Quant"
                 }
             }
@@ -519,6 +553,123 @@ extension QuantInfo {
             title: isUD && !titleBase.hasPrefix("UD ") ? "UD \(titleBase)" : titleBase,
             body: paragraphs.joined(separator: "\n\n")
         )
+    }
+
+    /// Core AI repos publish one verified bundle per platform × compute unit
+    /// rather than a quality ladder, so the chip names the target instead of a
+    /// bit width and the explainer says which bundle fits this device.
+    private static func coreAIQuantTypeDescriptor(label: String) -> QuantTypeDescriptor {
+        guard let family = CoreAIBundleFamily.detect(from: label) else {
+            return QuantTypeDescriptor(
+                family: .generic,
+                isUD: false,
+                nominalBits: nil,
+                tier: nil,
+                chipLabel: "Core AI",
+                title: "Core AI Bundle",
+                body: "A Core AI .aimodel bundle. Published Core AI repos ship one verified bundle per platform and compute unit — when several variants are listed, pick the one matching your device."
+            )
+        }
+
+        var paragraphs: [String] = [
+            "Core AI repos publish one verified bundle per platform and compute unit instead of a quality ladder — the variants decode equivalently and differ in where they run and how fast. Pick by device, not by name."
+        ]
+        switch family {
+        case .iosANE:
+            paragraphs.append("This bundle prefers the Neural Engine on iPhone (GPU on a Mac) and is the most battery-friendly option. Temperature/top-k/top-p sampling fully applies. New prompt tokens are processed one per pass, but the chat history is cached across turns so only your newest message is processed each time. It is usually the same file content as the repo's Mac bundle.")
+        case .macOSGPU:
+            paragraphs.append("This bundle runs on the GPU with full temperature/top-k/top-p sampling. New prompt tokens are processed one per pass, but the chat history is cached across turns so only your newest message is processed each time. It is usually the same file content as the repo's iPhone Neural Engine bundle.")
+        case .gpuPipelined:
+            paragraphs.append("A decode-only graph for Apple's pipelined engine — the fastest generation speed, with temperature/top-k sampling. The trade-off: it re-processes the whole chat history one token per pass before every reply, so the wait before the first token grows as the conversation gets longer.")
+        case .iosGPU:
+            paragraphs.append("A static build with fused Metal kernels that picks the most likely token inside the graph. It runs on the GPU only and always decodes greedily — temperature/top-k/top-p settings don't apply. Prompts are processed in fast 16-token blocks via the bundled prefill companion, and the chat history is cached across turns, so replies start quickly even in long conversations. Recommended for chat on iPhone.")
+        }
+
+        return QuantTypeDescriptor(
+            family: .generic,
+            isUD: false,
+            nominalBits: nil,
+            tier: nil,
+            chipLabel: family.displayName,
+            title: "Core AI · \(family.displayName)",
+            body: paragraphs.joined(separator: "\n\n")
+        )
+    }
+}
+
+/// Platform / compute-unit family of a Core AI `.aimodel` bundle, derived from
+/// the repo's top-level folder, which the quant label keeps as its prefix
+/// (e.g. "ios-ane/decode_int8"). Mirrors the published Core AI export layout
+/// (one bundle per platform × compute unit, see coreai-model-zoo).
+public enum CoreAIBundleFamily: String, CaseIterable, Sendable {
+    case iosANE = "ios-ane"
+    case iosGPU = "ios-gpu"
+    case gpuPipelined = "gpu-pipelined"
+    case macOSGPU = "macos"
+
+    public static func detect(from label: String) -> CoreAIBundleFamily? {
+        let lowered = label.lowercased()
+        let head = lowered.split(separator: "/").first.map(String.init) ?? lowered
+        return CoreAIBundleFamily(rawValue: head)
+    }
+
+    public var displayName: String {
+        switch self {
+        case .iosANE: return "iPhone · Neural Engine"
+        case .iosGPU: return "iPhone · GPU"
+        case .gpuPipelined: return "iPhone & Mac · GPU"
+        case .macOSGPU: return "Mac · GPU"
+        }
+    }
+
+    /// Preference order on the current platform; 0 sorts first and earns the
+    /// "Recommended" badge. On iPhone the host-cache `ios-gpu` bundles win for
+    /// chat: their chunked-prefill companion processes prompts in 16-token
+    /// blocks (~147 vs ~27-45 tok/s) and their host-owned state caches the
+    /// chat history across turns, so the time to first token stays flat as the
+    /// conversation grows. Pipelined bundles decode fastest but re-process the
+    /// full history one token per pass every message. On a Mac the GPU is fast
+    /// enough that the pipelined engine's decode advantage dominates.
+    public var sortRank: Int {
+        #if os(macOS)
+        switch self {
+        case .gpuPipelined: return 0
+        case .macOSGPU: return 1
+        case .iosANE: return 2
+        case .iosGPU: return 3
+        }
+        #else
+        switch self {
+        case .iosGPU: return 0
+        case .gpuPipelined: return 1
+        case .iosANE: return 2
+        case .macOSGPU: return 3
+        }
+        #endif
+    }
+
+    public var isRecommendedOnThisDevice: Bool { sortRank == 0 }
+
+    /// One-line note shown under the quant row.
+    public var caption: String {
+        switch self {
+        case .iosANE:
+            #if os(macOS)
+            return "Usually identical to the Mac build"
+            #else
+            return "Battery-friendly; chat cached across turns"
+            #endif
+        case .macOSGPU:
+            #if os(macOS)
+            return "Full sampling on the GPU; chat cached across turns"
+            #else
+            return "Usually identical to the iPhone Neural Engine build"
+            #endif
+        case .gpuPipelined:
+            return "Fastest decode; re-processes the chat each turn"
+        case .iosGPU:
+            return "Fast prompts, chat cached across turns; greedy decoding"
+        }
     }
 }
 
@@ -647,7 +798,7 @@ extension QuantInfo: DownloadableModel {
         switch format {
         case .afm:
             return .appleFoundation
-        case .gguf, .mlx, .et, .ane:
+        case .gguf, .mlx, .et, .ane, .coreai:
             return .huggingFace
         }
     }

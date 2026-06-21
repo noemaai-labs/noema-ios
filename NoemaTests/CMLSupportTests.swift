@@ -395,6 +395,157 @@ final class CMLSupportTests: XCTestCase {
     }
 
     @available(iOS 18.0, visionOS 2.0, *)
+    func testMetadataClassificationRoutesExactTransformersNamesToTransformersRuntime() throws {
+        let stateless = CoreMLArtifactMetadata(
+            inputSchema: [CoreMLArtifactFeature(name: "inputIds", dataType: "Int32")],
+            outputSchema: [CoreMLArtifactFeature(name: "logits", dataType: "Float16")]
+        )
+        XCTAssertEqual(ANEModelResolver.classify(metadata: stateless), .transformersLanguageModel)
+
+        // camelCase stateful with the exact swift-transformers names stays on
+        // that runtime (it supports keyCache/valueCache MLState natively).
+        let stateful = CoreMLArtifactMetadata(
+            inputSchema: [
+                CoreMLArtifactFeature(name: "inputIds", dataType: "Int32"),
+                CoreMLArtifactFeature(name: "causalMask", dataType: "Float16")
+            ],
+            outputSchema: [CoreMLArtifactFeature(name: "logits", dataType: "Float16")],
+            stateSchema: [
+                CoreMLArtifactFeature(name: "keyCache", dataType: "Float16"),
+                CoreMLArtifactFeature(name: "valueCache", dataType: "Float16")
+            ]
+        )
+        XCTAssertEqual(ANEModelResolver.classify(metadata: stateful), .transformersLanguageModel)
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testMetadataClassificationDoesNotCrashRouteStatefulModelsWithoutInputIds() throws {
+        // keyCache/valueCache states but no exact "inputIds" input: routing this
+        // to swift-transformers would force-unwrap-crash. It must resolve to
+        // Noema's own stateful runtime via role aliases instead.
+        let metadata = CoreMLArtifactMetadata(
+            inputSchema: [
+                CoreMLArtifactFeature(name: "tokens", dataType: "Int32"),
+                CoreMLArtifactFeature(name: "attention_mask", dataType: "Float16")
+            ],
+            outputSchema: [CoreMLArtifactFeature(name: "output_logits", dataType: "Float16")],
+            stateSchema: [
+                CoreMLArtifactFeature(name: "keyCache", dataType: "Float16"),
+                CoreMLArtifactFeature(name: "valueCache", dataType: "Float16")
+            ]
+        )
+
+        XCTAssertEqual(ANEModelResolver.classify(metadata: metadata), .statefulCausalLM)
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testMetadataClassificationResolvesAliasAndAutoNamedFeatures() throws {
+        // coremltools auto-named logits output plus snake-case KV states.
+        let metadata = CoreMLArtifactMetadata(
+            inputSchema: [
+                CoreMLArtifactFeature(name: "input_ids", dataType: "Int32"),
+                CoreMLArtifactFeature(name: "causal_mask", dataType: "Float16")
+            ],
+            outputSchema: [CoreMLArtifactFeature(name: "var_546", dataType: "Float16")],
+            stateSchema: [
+                CoreMLArtifactFeature(name: "key_cache", dataType: "Float16"),
+                CoreMLArtifactFeature(name: "value_cache", dataType: "Float16")
+            ]
+        )
+
+        XCTAssertEqual(ANEModelResolver.classify(metadata: metadata), .statefulCausalLM)
+
+        let roles = CoreMLRoleResolver.resolve(metadata: metadata)
+        XCTAssertEqual(roles.tokenInput, "input_ids")
+        XCTAssertEqual(roles.maskInput, "causal_mask")
+        XCTAssertEqual(roles.logitsOutput, "var_546")
+        XCTAssertEqual(roles.keyCacheState, "key_cache")
+        XCTAssertEqual(roles.valueCacheState, "value_cache")
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testMetadataClassificationRejectsAmbiguousLayouts() throws {
+        // Two integer inputs and no recognizable names: token role is ambiguous.
+        let metadata = CoreMLArtifactMetadata(
+            inputSchema: [
+                CoreMLArtifactFeature(name: "alpha", dataType: "Int32"),
+                CoreMLArtifactFeature(name: "beta", dataType: "Int32")
+            ],
+            outputSchema: [CoreMLArtifactFeature(name: "logits", dataType: "Float16")],
+            stateSchema: [
+                CoreMLArtifactFeature(name: "key_cache", dataType: "Float16"),
+                CoreMLArtifactFeature(name: "value_cache", dataType: "Float16")
+            ]
+        )
+
+        XCTAssertEqual(ANEModelResolver.classify(metadata: metadata), .unknown)
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testStatefulCMLContractAcceptsFixedSingleTokenInputWithMaskWidthContext() throws {
+        let contract = try makeValidStatefulCMLContract(
+            inputDimensions: [.fixed(1), .fixed(1)],
+            maskDimensions: [.fixed(1), .fixed(1), .fixed(1), .fixed(2048)]
+        )
+
+        XCTAssertEqual(contract.contextLength, 2048)
+        XCTAssertEqual(contract.effectivePromptTokenLimit, 2047)
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testStatefulCMLContractDerivesContextLengthFromKeyCacheWhenMaskless() throws {
+        let contract = try makeValidStatefulCMLContract(
+            includeMask: false,
+            inputDimensions: [.fixed(1), .fixed(1)],
+            keyCacheState: StatefulCMLStateSpec(
+                name: "key_cache",
+                dataType: .float16,
+                bufferShape: [1, 8, 4096, 64]
+            )
+        )
+
+        XCTAssertEqual(contract.contextLength, 4096)
+        XCTAssertNil(contract.causalMask)
+        XCTAssertNil(contract.maskLayout)
+        XCTAssertTrue(contract.summary.contains("causal_mask=<none>"))
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testStatefulCMLContractPrefersMetadataContextLength() throws {
+        let contract = try makeValidStatefulCMLContract(
+            includeMask: false,
+            inputDimensions: [.fixed(1), .fixed(1)],
+            metadata: CoreMLArtifactMetadata(
+                generatedClassName: "Qwen3_0_6B",
+                userDefinedMetadata: ["context_length": "1024"]
+            )
+        )
+
+        XCTAssertEqual(contract.contextLength, 1024)
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testStatefulCMLContractRejectsFixedMultiTokenChunkInput() throws {
+        XCTAssertThrowsError(
+            try makeValidStatefulCMLContract(inputDimensions: [.fixed(1), .fixed(64)])
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("fixed prompt-chunk length"))
+        }
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
+    func testStatefulCMLContractRejectsFixedSingleTokenInputWithoutContextSource() throws {
+        XCTAssertThrowsError(
+            try makeValidStatefulCMLContract(
+                includeMask: false,
+                inputDimensions: [.fixed(1), .fixed(1)]
+            )
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Could not determine the context length"))
+        }
+    }
+
+    @available(iOS 18.0, visionOS 2.0, *)
     func testStatefulCMLContractAcceptsValidSnakeCaseSchema() throws {
         let contract = try makeValidStatefulCMLContract(contextLength: 2048)
 
@@ -1605,27 +1756,33 @@ final class CMLSupportTests: XCTestCase {
         logitsDataType: MLMultiArrayDataType = .float16,
         hasKeyCache: Bool = true,
         hasValueCache: Bool = true,
+        includeMask: Bool = true,
+        inputDimensions: [StatefulCMLDimension]? = nil,
         maskDimensions: [StatefulCMLDimension]? = nil,
-        logitsDimensions: [StatefulCMLDimension]? = nil
+        logitsDimensions: [StatefulCMLDimension]? = nil,
+        keyCacheState: StatefulCMLStateSpec? = nil,
+        metadata: CoreMLArtifactMetadata? = nil
     ) throws -> StatefulCMLContract {
         let inputIDs = StatefulCMLTensorSpec(
             name: "input_ids",
             dataType: inputDataType,
-            dimensions: [
+            dimensions: inputDimensions ?? [
                 .fixed(1),
                 StatefulCMLDimension(minValue: 1, maxValue: contextLength)
             ]
         )
-        let causalMask = StatefulCMLTensorSpec(
-            name: "causal_mask",
-            dataType: maskDataType,
-            dimensions: maskDimensions ?? [
-                .fixed(1),
-                .fixed(1),
-                .fixed(1),
-                StatefulCMLDimension(minValue: 1, maxValue: contextLength)
-            ]
-        )
+        let causalMask: StatefulCMLTensorSpec? = includeMask
+            ? StatefulCMLTensorSpec(
+                name: "causal_mask",
+                dataType: maskDataType,
+                dimensions: maskDimensions ?? [
+                    .fixed(1),
+                    .fixed(1),
+                    .fixed(1),
+                    StatefulCMLDimension(minValue: 1, maxValue: contextLength)
+                ]
+            )
+            : nil
         let logits = StatefulCMLTensorSpec(
             name: "logits",
             dataType: logitsDataType,
@@ -1642,7 +1799,8 @@ final class CMLSupportTests: XCTestCase {
             logits: logits,
             hasKeyCache: hasKeyCache,
             hasValueCache: hasValueCache,
-            metadata: CoreMLArtifactMetadata(
+            keyCacheState: keyCacheState,
+            metadata: metadata ?? CoreMLArtifactMetadata(
                 generatedClassName: "Qwen3_0_6B"
             )
         )
@@ -1970,45 +2128,46 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
     }
 
     func testModelSettingsRoundTripPreservesAllFields() throws {
-        var settings = ModelSettings()
-        settings.contextLength = 8192
-        settings.gpuLayers = 24
-        settings.cpuThreads = 6
-        settings.kvCacheOffload = false
-        settings.keepInMemory = false
-        settings.useMmap = false
-        settings.disableWarmup = false
-        settings.flashAttention = true
-        settings.seed = 1234
-        settings.kCacheQuant = .q8_0
-        settings.vCacheQuant = .q5_1
-        settings.tokenizerPath = "/tmp/tokenizer.json"
-        settings.promptTemplate = "<|im_start|>user"
-        settings.temperature = 0.33
-        settings.repetitionPenalty = 1.23
-        settings.topK = 73
-        settings.topP = 0.88
-        settings.minP = 0.12
-        settings.repeatLastN = 96
-        settings.presencePenalty = 0.4
-        settings.frequencyPenalty = 0.2
-        settings.stopSequences = ["</s>", "<|eot_id|>"]
-        settings.speculativeDecoding = .init(helperModelID: "helper-model", mode: .max, value: 96)
-        settings.ropeScaling = .init(factor: 2.0, originalContext: 4096, lowFrequency: 0.75, highFrequency: 1.25)
-        settings.logitBias = [1: -0.5, 42: 1.0]
-        settings.promptCacheEnabled = true
-        settings.promptCachePath = "/tmp/prompt-cache.bin"
-        settings.promptCacheAll = true
-        settings.tensorOverride = .expertsCPU
-        settings.moeActiveExperts = 7
-        settings.etBackend = .mps
-        settings.processingUnitConfiguration = .cpuAndGPU
-        settings.afmGuardrails = .permissiveContentTransformations
+        let settings = fullyPopulatedModelSettings()
 
         let data = try JSONEncoder().encode(settings)
         let decoded = try JSONDecoder().decode(ModelSettings.self, from: data)
 
         XCTAssertEqual(decoded, settings)
+    }
+
+    func testModelSettingsMigrationFixtureCoversEveryPersistedKey() throws {
+        let object = try settingsJSONObject(fullyPopulatedModelSettings())
+        let encodedKeys = Set(object.keys)
+        let persistedKeys = Set(ModelSettings.CodingKeys.allCases.map(\.rawValue))
+
+        XCTAssertEqual(encodedKeys, persistedKeys)
+    }
+
+    func testModelSettingsDecodeToleratesEveryMissingPersistedKey() throws {
+        let fullObject = try settingsJSONObject(fullyPopulatedModelSettings())
+        let defaultObject = try settingsJSONObject(ModelSettings())
+
+        for key in ModelSettings.CodingKeys.allCases {
+            var legacyObject = fullObject
+            legacyObject.removeValue(forKey: key.rawValue)
+
+            let data = try JSONSerialization.data(withJSONObject: legacyObject)
+            let decoded = try JSONDecoder().decode(ModelSettings.self, from: data)
+            let decodedObject = try settingsJSONObject(decoded)
+
+            var expectedObject = fullObject
+            if let defaultValue = defaultObject[key.rawValue] {
+                expectedObject[key.rawValue] = defaultValue
+            } else {
+                expectedObject.removeValue(forKey: key.rawValue)
+            }
+
+            XCTAssertTrue(
+                NSDictionary(dictionary: decodedObject).isEqual(to: expectedObject),
+                "Missing \(key.rawValue) should decode with the current default while preserving every other persisted setting"
+            )
+        }
     }
 
     func testModelSettingsLegacyDecodeAppliesDefaultsForMissingKeys() throws {
@@ -2035,7 +2194,7 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
         XCTAssertFalse(decoded.promptCacheEnabled)
         XCTAssertEqual(decoded.tensorOverride, .none)
         XCTAssertEqual(decoded.etBackend, .xnnpack)
-        XCTAssertEqual(decoded.afmGuardrails, .default)
+        XCTAssertEqual(decoded.afmGuardrails, .permissiveContentTransformations)
     }
 
     func testModelSettingsExplicitWarmupValueOverridesDefault() throws {
@@ -2105,6 +2264,46 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
         XCTAssertTrue(ModelSettings.default(for: .et).disableWarmup)
         XCTAssertTrue(ModelSettings.default(for: .ane).disableWarmup)
         XCTAssertTrue(ModelSettings.default(for: .afm).disableWarmup)
+    }
+
+    private func fullyPopulatedModelSettings() -> ModelSettings {
+        var settings = ModelSettings()
+        settings.contextLength = 8192
+        settings.gpuLayers = 24
+        settings.cpuThreads = 6
+        settings.kvCacheOffload = false
+        settings.keepInMemory = false
+        settings.useMmap = false
+        settings.disableWarmup = false
+        settings.flashAttention = true
+        settings.seed = 1234
+        settings.kCacheQuant = .q8_0
+        settings.vCacheQuant = .q5_1
+        settings.tokenizerPath = "/tmp/tokenizer.json"
+        settings.promptTemplate = "<|im_start|>user"
+        settings.temperature = 0.33
+        settings.repetitionPenalty = 1.23
+        settings.topK = 73
+        settings.topP = 0.88
+        settings.minP = 0.12
+        settings.repeatLastN = 96
+        settings.presencePenalty = 0.4
+        settings.frequencyPenalty = 0.2
+        settings.stopSequences = ["</s>", "<|eot_id|>"]
+        settings.speculativeDecoding = .init(helperModelID: "helper-model", mode: .max, value: 96)
+        settings.ropeScaling = .init(factor: 2.0, originalContext: 4096, lowFrequency: 0.75, highFrequency: 1.25)
+        settings.logitBias = [1: -0.5, 42: 1.0]
+        settings.promptCacheEnabled = true
+        settings.promptCachePath = "/tmp/prompt-cache.bin"
+        settings.promptCacheAll = true
+        settings.tensorOverride = .expertsCPU
+        settings.moeActiveExperts = 7
+        settings.etBackend = .mps
+        settings.processingUnitConfiguration = .cpuAndGPU
+        settings.afmGuardrails = .default
+        settings.systemPromptMode = .override
+        settings.systemPromptOverride = "You are concise."
+        return settings
     }
 
     private func settingsJSONObject(_ settings: ModelSettings) throws -> [String: Any] {

@@ -15,25 +15,31 @@ struct ModelRow: View {
     @EnvironmentObject var vm: ChatVM
     @EnvironmentObject var modelManager: AppModelManager
 
+    /// Noema Teams: model exists locally but the active policy forbids loading it.
+    /// It stays on disk — the user decides whether to keep or delete it.
+    private var lockedByPolicy: Bool {
+        EnterprisePolicyGate.isActive &&
+            (!EnterprisePolicyGate.allowsModel(modelID: model.modelID) ||
+             !EnterprisePolicyGate.allowsModelFormat(model.format))
+    }
+
     var body: some View {
         let hidesArchitectureAndMoEChips = model.format == .ane || model.format == .afm
         let hidesStoredSize = model.format == .afm
-        let displayName: String = {
-            if model.quant.isEmpty {
-                return model.name
-            } else {
-                return model.name
-                    .replacingOccurrences(of: "-\(model.quant)", with: "")
-                    .replacingOccurrences(of: ".\(model.quant)", with: "")
-            }
-        }()
+        let displayName = model.displayName
 
         let rowContent = HStack {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    if lockedByPolicy {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel(Text(LocalizedStringKey("Locked by your organization's policy")))
+                    }
                     if model.isFavourite {
                         Image(systemName: "star.fill")
-                            .font(.system(size: 14))
+                            .font(.system(size: 12))
                             .foregroundStyle(.yellow)
                     }
                     Text(displayName)
@@ -43,17 +49,17 @@ struct ModelRow: View {
                     
                     if model.isReasoningModel {
                         Image(systemName: "brain")
-                            .font(.system(size: 14))
+                            .font(.system(size: 12))
                             .foregroundColor(.purple)
                     }
                     if UIConstants.showMultimodalUI && model.isMultimodal {
                         Image(systemName: "eye")
-                            .font(.system(size: 14))
+                            .font(.system(size: 12))
                             .foregroundStyle(AppTheme.secondaryText)
                     }
                     if model.isToolCapable {
                         Image(systemName: "hammer")
-                            .font(.system(size: 14))
+                            .font(.system(size: 12))
                             .foregroundColor(.blue)
                     }
                 }
@@ -62,65 +68,64 @@ struct ModelRow: View {
                     .font(FontTheme.caption)
                     .foregroundStyle(AppTheme.secondaryText)
 
-                // Chips
-                HStack(spacing: 8) {
+                // Minimalist metadata
+                HStack(spacing: 6) {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(model.format.tagGradient)
+                            .frame(width: 6, height: 6)
+                        Text(model.format.displayName)
+                    }
+                    
                     if !model.quant.isEmpty && model.format != .ane {
-                        chip(text: QuantExtractor.shortLabel(from: model.quant, format: model.format), color: .accentColor)
+                        Text("·")
+                        Text(QuantExtractor.shortLabel(from: model.quant, format: model.format))
                     }
                     if let source = model.slmSourceFormatLabel {
-                        chip(text: source, color: .secondary)
+                        Text("·")
+                        Text(source)
                     }
                     if model.format != .et && !hidesArchitectureAndMoEChips {
                         if !model.architectureFamily.isEmpty {
-                            chip(text: model.architectureFamily.uppercased(), color: .secondary)
+                            Text("·")
+                            Text(model.architectureFamily.uppercased())
                         }
                         if let moeInfo = model.moeInfo {
-                            let isMoE = moeInfo.isMoE
-                            chip(text: isMoE ? "MoE" : "Dense", color: isMoE ? .orange : .gray)
-                        } else {
-                            chip(text: String(localized: "Checking…"), color: .secondary, isStroked: true)
+                            Text("·")
+                            Text(moeInfo.isMoE ? "MoE" : "DENSE")
                         }
                     }
-                }
-                .padding(.top, 4)
-
-                // Format chip
-                HStack {
-                    Text(model.format.displayName)
-                        .font(FontTheme.caption)
-                        .fontWeight(.bold)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(model.format.tagGradient)
-                        .clipShape(Capsule())
-                        .foregroundColor(.white)
                     if model.format == .et {
                         let backend = modelManager.displaySettings(for: model).etBackend.displayName
+                        Text("·")
                         Text(backend)
-                            .font(FontTheme.caption.weight(.semibold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(AppTheme.cardFill)
-                            .overlay(
-                                Capsule()
-                                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-                            )
-                            .clipShape(Capsule())
-                            .foregroundStyle(AppTheme.text)
                     }
-                    Spacer(minLength: 0)
                 }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .padding(.top, 2)
             }
             Spacer()
             
             VStack(alignment: .trailing, spacing: 6) {
                 if !hidesStoredSize {
                     Text(String(format: "%.1f GB", model.sizeGB))
-                        .font(FontTheme.caption)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
                         .foregroundStyle(AppTheme.secondaryText)
                 }
                 
-                if !isLoaded {
+                if lockedByPolicy {
+                    HStack(spacing: 4) {
+                        Image(systemName: "lock.fill")
+                        Text(LocalizedStringKey("Locked"))
+                    }
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.orange.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                } else if !isLoaded {
                     #if os(macOS)
                     HStack(spacing: 8) {
                         if let settingsAction {
@@ -139,21 +144,21 @@ struct ModelRow: View {
                     #endif
                 } else {
                     HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
+                        Image(systemName: "checkmark")
                         Text(LocalizedStringKey("Loaded"))
                     }
-                    .font(FontTheme.caption)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundColor(.green)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                     .background(Color.green.opacity(0.1))
-                    .clipShape(Capsule())
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 }
             }
         }
-        .padding(.vertical, 12)
+        .padding(.vertical, 8)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(hidesStoredSize ? model.name : "\(model.name), size \(String(format: "%.1f", model.sizeGB)) gigabytes")
+        .accessibilityLabel(hidesStoredSize ? displayName : String.localizedStringWithFormat(String(localized: "%1$@, size %2$@ GB"), displayName, String(format: "%.1f", model.sizeGB)))
 
         if let settingsAction, let deleteAction {
             rowContent
@@ -188,25 +193,83 @@ struct ModelRow: View {
         .buttonStyle(GlassButtonStyle())
         .disabled(isLoading || vm.loading)
     }
+}
 
-    @ViewBuilder
-    private func chip(text: String, color: Color, isStroked: Bool = false) -> some View {
-        Text(text)
-            .font(FontTheme.caption)
-            .fontWeight(.medium)
-            .lineLimit(1)
-            .fixedSize()
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(
-                Capsule()
-                    .fill(isStroked ? Color.clear : color.opacity(0.15))
-            )
-            .overlay(
-                Capsule()
-                    .strokeBorder(color.opacity(0.3), lineWidth: isStroked ? 1 : 0)
-            )
-            .foregroundStyle(color)
+struct SupportModelRow: View {
+    let item: SupportModelInventoryItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: item.kind == .speech ? "waveform" : "point.3.connected.trianglepath.dotted")
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(.blue)
+                .frame(width: 24, height: 24)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(LocalizedStringKey(item.titleKey))
+                        .font(FontTheme.body.weight(.medium))
+                        .foregroundStyle(AppTheme.text)
+                    Spacer(minLength: 8)
+                    statusBadge
+                }
+
+                Text(item.displayName)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+
+                HStack(spacing: 6) {
+                    Text(item.detail)
+                    if let sizeBytes = item.sizeBytes {
+                        Text("·")
+                        Text(formatBytes(sizeBytes))
+                    }
+                }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .padding(.top, 2)
+
+                if item.state == .downloading, let progress = item.progress {
+                    ProgressView(value: progress)
+                        .tint(.blue)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .padding(.top, 4)
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var statusBadge: some View {
+        HStack(spacing: 4) {
+            Circle().fill(statusColor).frame(width: 6, height: 6)
+            Text(LocalizedStringKey(item.state.titleKey))
+        }
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .foregroundStyle(statusColor)
+    }
+
+    private var statusColor: Color {
+        switch item.state {
+        case .ready: return .green
+        case .missing: return AppTheme.secondaryText
+        case .downloading: return .blue
+        case .paused: return .orange
+        case .failed, .incomplete: return .red
+        }
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
     }
 }
 
@@ -220,6 +283,7 @@ struct StoredView: View {
     @EnvironmentObject var datasetManager: DatasetManager
     @EnvironmentObject var tabRouter: TabRouter
     @EnvironmentObject var walkthrough: GuidedWalkthroughManager
+    @EnvironmentObject var downloadController: DownloadController
     @AppStorage("offGrid") private var offGrid = false
 
     @State private var loadingModelID: LocalModel.ID?
@@ -234,6 +298,7 @@ struct StoredView: View {
     @State private var importedDataset: LocalDataset?
     @State private var askStartIndexing = false
     @State private var datasetToIndex: LocalDataset?
+    @State private var importNotice: String?
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
     @AppStorage("hideGGUFOffloadWarning") private var hideGGUFOffloadWarning = false
@@ -247,6 +312,7 @@ struct StoredView: View {
                 ScrollView {
                     VStack(spacing: 24) {
                         modelsSection
+                        supportModelsSection
                         if !modelManager.remoteBackends.isEmpty {
                             remoteBackendsSection
                         }
@@ -422,15 +488,21 @@ struct StoredView: View {
                           allowsMultipleSelection: true) { result in
                 switch result {
                 case .success(let urls):
-                    let filtered = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) }
-                    guard !filtered.isEmpty else { return }
-                    pendingPickedURLs = filtered
-                    datasetName = suggestName(from: filtered) ?? String(localized: "Imported Dataset")
+                    let accepted = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) || TranscriptionMediaSupport.isSupported($0) }
+                    guard !accepted.isEmpty else {
+                        // Everything picked was unsupported (e.g. CSV/TSV) — tell the
+                        // user instead of silently doing nothing.
+                        importNotice = DatasetDocumentSupport.skippedMessage(for: urls)
+                        return
+                    }
+                    pendingPickedURLs = accepted
+                    datasetName = suggestName(from: accepted) ?? String(localized: "Imported Dataset")
                     showNameSheet = true
                 case .failure:
                     break
                 }
             }
+            .datasetImportNotice($importNotice)
             .sheet(isPresented: $showNameSheet) {
                 DatasetImportNamePromptView(
                     datasetName: $datasetName,
@@ -523,7 +595,7 @@ struct StoredView: View {
     @ViewBuilder private var modelsSection: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .firstTextBaseline) {
-                Text(LocalizedStringKey("Your Models"))
+                Text(LocalizedStringKey("Models"))
                     .font(FontTheme.heading)
                     .foregroundStyle(AppTheme.text)
                 Spacer()
@@ -583,40 +655,82 @@ struct StoredView: View {
                 .background(AppTheme.cardFill)
                 .cornerRadius(AppTheme.cornerRadius)
             } else {
-                LazyVStack(spacing: 16) {
+                LazyVStack(spacing: 0) {
                     ForEach(modelManager.downloadedModels, id: \.id) { model in
-                        ModelRow(model: model,
-                                isLoading: loadingModelID == model.id,
-                                isLoaded: modelManager.loadedModel?.id == model.id,
-                                settingsAction: { selectedModel = model },
-                                deleteAction: model.format == .afm ? nil : { modelPendingDeletion = model }) {
-                            load(model)
-                        }
-                        .environmentObject(vm)
-                        .padding(20)
-                        .background(AppTheme.cardFill)
-                        .clipShape(RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                                .stroke(AppTheme.cardStroke, lineWidth: 1)
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            // Always open settings on tap, do not trigger row button's load unintentionally
-                            selectedModel = model
-                        }
-                        .contextMenu {
-                            if model.format != .afm {
-                                Button(role: .destructive) {
-                                    modelPendingDeletion = model
-                                } label: {
-                                    Label(LocalizedStringKey("Delete"), systemImage: "trash")
+                        VStack(spacing: 0) {
+                            ModelRow(model: model,
+                                    isLoading: loadingModelID == model.id,
+                                    isLoaded: modelManager.loadedModel?.id == model.id,
+                                    settingsAction: { selectedModel = model },
+                                    deleteAction: model.format == .afm ? nil : { modelPendingDeletion = model }) {
+                                load(model)
+                            }
+                            .environmentObject(vm)
+                            .padding(.horizontal, 8)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                // Always open settings on tap, do not trigger row button's load unintentionally
+                                selectedModel = model
+                            }
+                            .contextMenu {
+                                if model.format != .afm {
+                                    Button(role: .destructive) {
+                                        modelPendingDeletion = model
+                                    } label: {
+                                        Label(LocalizedStringKey("Delete"), systemImage: "trash")
+                                    }
                                 }
+                            }
+                            if model.id != modelManager.downloadedModels.last?.id {
+                                Divider().padding(.leading, 8)
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder private var supportModelsSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text(LocalizedStringKey("Support Models"))
+                .font(FontTheme.heading)
+                .foregroundStyle(AppTheme.text)
+
+            LazyVStack(spacing: 0) {
+                ForEach(supportModelItems) { item in
+                    VStack(spacing: 0) {
+                        NavigationLink {
+                            supportModelDestination(for: item)
+                        } label: {
+                            SupportModelRow(item: item)
+                                .padding(.horizontal, 8)
+                        }
+                        .buttonStyle(.plain)
+                        
+                        if item.id != supportModelItems.last?.id {
+                            Divider().padding(.leading, 38)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var supportModelItems: [SupportModelInventoryItem] {
+        [
+            SupportModelInventory.speechItem(whisperItems: downloadController.whisperItems),
+            SupportModelInventory.embeddingItem(embeddingItems: downloadController.embeddingItems)
+        ]
+    }
+
+    @ViewBuilder
+    private func supportModelDestination(for item: SupportModelInventoryItem) -> some View {
+        switch item.kind {
+        case .speech:
+            WhisperModelsView(engineID: TranscriptionSettings.selectedEngineID.isLocalWhisper ? TranscriptionSettings.selectedEngineID : TranscriptionBackendFactory.preferredLocalWhisperEngineID())
+        case .embedding:
+            EmbeddingModelsView()
         }
     }
 
@@ -626,33 +740,39 @@ struct StoredView: View {
                 .font(FontTheme.heading)
                 .foregroundStyle(AppTheme.text)
             
-            LazyVStack(spacing: 16) {
+            LazyVStack(spacing: 0) {
                 ForEach(modelManager.remoteBackends, id: \.id) { backend in
-                    NavigationLink {
-                        RemoteBackendDetailView(backendID: backend.id)
-                            .environmentObject(modelManager)
-                    } label: {
-                        RemoteBackendRow(
-                            backend: backend,
-                            isFetching: modelManager.remoteBackendsFetching.contains(backend.id),
-                            isOffline: offGrid,
-                            activeSession: modelManager.activeRemoteSession
-                        )
-                        .padding(20)
-                        .background(AppTheme.cardFill)
-                        .clipShape(RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                                .stroke(AppTheme.cardStroke, lineWidth: 1)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                         Button(role: .destructive) {
-                             modelManager.deleteRemoteBackend(id: backend.id)
-                         } label: {
-                             Label(LocalizedStringKey("Delete"), systemImage: "trash")
-                         }
+                    VStack(spacing: 0) {
+                        Menu {
+                            NavigationLink {
+                                RemoteBackendDetailView(backendID: backend.id)
+                                    .environmentObject(modelManager)
+                            } label: {
+                                Label(LocalizedStringKey("Manage"), systemImage: "gearshape")
+                            }
+                            Button(role: .destructive) {
+                                modelManager.deleteRemoteBackend(id: backend.id)
+                            } label: {
+                                Label(LocalizedStringKey("Delete"), systemImage: "trash")
+                            }
+                        } label: {
+                            RemoteBackendRow(
+                                backend: backend,
+                                isFetching: modelManager.remoteBackendsFetching.contains(backend.id),
+                                isOffline: offGrid,
+                                activeSession: modelManager.activeRemoteSession
+                            )
+                            .padding(.horizontal, 8)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        #if os(macOS)
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        #endif
+                        if backend.id != modelManager.remoteBackends.last?.id {
+                            Divider().padding(.leading, 8)
+                        }
                     }
                 }
             }
@@ -661,37 +781,80 @@ struct StoredView: View {
 
     @ViewBuilder private var datasetsSection: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text(LocalizedStringKey("Your Datasets"))
+            Text(LocalizedStringKey("Datasets"))
                 .font(FontTheme.heading)
                 .foregroundStyle(AppTheme.text)
             
-            LazyVStack(spacing: 16) {
+            LazyVStack(spacing: 0) {
                 ForEach(modelManager.downloadedDatasets) { ds in
-                    DatasetRow(
-                        dataset: ds,
-                        indexing: datasetManager.indexingDatasetID == ds.datasetID,
-                        deleteAction: { datasetPendingDeletion = ds }
-                    )
-                        .padding(20)
-                        .background(AppTheme.cardFill)
-                        .clipShape(RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                                .stroke(AppTheme.cardStroke, lineWidth: 1)
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture { selectedDataset = ds }
-                        .contextMenu {
+                    VStack(spacing: 0) {
+                        Menu {
+                            if modelManager.activeDataset?.datasetID == ds.datasetID {
+                                Button {
+                                    vm.setDatasetForActiveSession(nil)
+                                } label: {
+                                    Label(LocalizedStringKey("Stop Using"), systemImage: "xmark.circle")
+                                }
+                            } else {
+                                Button {
+                                    useDataset(ds)
+                                } label: {
+                                    Label(LocalizedStringKey("Use"), systemImage: "checkmark.circle")
+                                }
+                            }
+                            Button {
+                                selectedDataset = ds
+                            } label: {
+                                Label(LocalizedStringKey("Manage"), systemImage: "gearshape")
+                            }
                             Button(role: .destructive) {
-                                datasetPendingDeletion = ds
+                                requestDatasetDeletion(ds)
                             } label: {
                                 Label(LocalizedStringKey("Delete"), systemImage: "trash")
                             }
+                        } label: {
+                            DatasetRow(
+                                dataset: ds,
+                                indexing: datasetManager.indexingDatasetID == ds.datasetID,
+                                deleteAction: { datasetPendingDeletion = ds }
+                            )
+                            .padding(.horizontal, 8)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        #if os(macOS)
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        #endif
+                        if ds.id != modelManager.downloadedDatasets.last?.id {
+                            Divider().padding(.leading, 32)
+                        }
+                    }
                 }
             }
         }
         .guideHighlight(.storedDatasets)
+    }
+
+    /// Activates a dataset for the current chat session straight from the menu,
+    /// so the user doesn't have to open the detail view. If the dataset isn't
+    /// indexed yet, fall back to the detail view where it can be prepared.
+    private func useDataset(_ ds: LocalDataset) {
+        let isReady = !ds.requiresReindex && (ds.isIndexed || DatasetIndexIO.hasValidIndex(at: ds.url))
+        if isReady {
+            vm.setDatasetForActiveSession(ds)
+        } else {
+            selectedDataset = ds
+        }
+    }
+
+    /// Routes a delete request through the confirmation alert. The assignment is
+    /// deferred a runloop so the menu finishes dismissing first — otherwise the
+    /// menu's dismissal transaction swallows the alert presentation.
+    private func requestDatasetDeletion(_ ds: LocalDataset) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            datasetPendingDeletion = ds
+        }
     }
 
     private func load(_ model: LocalModel, settings: ModelSettings? = nil, bypassWarning: Bool = false) {
@@ -798,6 +961,9 @@ struct StoredView: View {
             case .afm:
                 loadURL = InstalledModelsStore.baseDir(for: .afm, modelID: model.modelID)
                 try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
+            case .coreai:
+                loadURL = InstalledModelsStore.baseDir(for: .coreai, modelID: model.modelID)
+                try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
             }
             let success = await vm.load(url: loadURL, settings: settings, format: model.format)
             if success {
@@ -814,12 +980,8 @@ struct StoredView: View {
     }
 
     // MARK: - Import helpers
-    private func allowedExtensions() -> Set<String> { ["pdf", "epub", "txt"] }
-    private func allowedUTTypes() -> [UTType] {
-        var types: [UTType] = [.pdf, .plainText]
-        if let epub = UTType(filenameExtension: "epub") { types.append(epub) }
-        return types
-    }
+    private func allowedExtensions() -> Set<String> { DatasetDocumentSupport.acceptedExtensions }
+    private func allowedUTTypes() -> [UTType] { DatasetDocumentSupport.allowedUTTypes() }
     private func suggestName(from urls: [URL]) -> String? {
         if let pdfURL = urls.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
             if let doc = PDFDocument(url: pdfURL), let title = doc.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -865,6 +1027,7 @@ struct StoredView: View {
     @EnvironmentObject var tabRouter: TabRouter
     @EnvironmentObject var walkthrough: GuidedWalkthroughManager
     @EnvironmentObject var macModalPresenter: MacModalPresenter
+    @EnvironmentObject var downloadController: DownloadController
     @AppStorage("offGrid") private var offGrid = false
     @AppStorage("hideGGUFOffloadWarning") private var hideGGUFOffloadWarning = false
 
@@ -880,6 +1043,7 @@ struct StoredView: View {
     @State private var datasetName: String = ""
     @State private var datasetToIndex: LocalDataset?
     @State private var askStartIndexing = false
+    @State private var importNotice: String?
     @State private var showRemoteBackendForm = false
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
@@ -954,6 +1118,9 @@ struct StoredView: View {
                     return
                 }
                 modelPendingDeletion = nil
+                if selectedModel?.id == model.id {
+                    selectedModel = nil
+                }
                 Task { @MainActor in
                     if modelManager.loadedModel?.id == model.id {
                         await vm.unload()
@@ -1000,15 +1167,21 @@ struct StoredView: View {
         ) { result in
             switch result {
             case .success(let urls):
-                let filtered = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) }
-                guard !filtered.isEmpty else { return }
-                pendingPickedURLs = filtered
-                datasetName = suggestName(from: filtered) ?? String(localized: "Imported Dataset")
+                let accepted = urls.filter { allowedExtensions().contains($0.pathExtension.lowercased()) || TranscriptionMediaSupport.isSupported($0) }
+                guard !accepted.isEmpty else {
+                    // Everything picked was unsupported (e.g. CSV/TSV) — tell the user
+                    // instead of silently doing nothing.
+                    importNotice = DatasetDocumentSupport.skippedMessage(for: urls)
+                    return
+                }
+                pendingPickedURLs = accepted
+                datasetName = suggestName(from: accepted) ?? String(localized: "Imported Dataset")
                 showNameSheet = true
             case .failure:
                 break
             }
         }
+        .datasetImportNotice($importNotice)
         .confirmationDialog(Text(LocalizedStringKey("Start indexing now?")), isPresented: $askStartIndexing, titleVisibility: .visible) {
             Button(LocalizedStringKey("Start")) {
                 if let ds = datasetToIndex {
@@ -1037,10 +1210,6 @@ struct StoredView: View {
             if !newValue {
                 modelManager.refreshRemoteBackends(offGrid: false)
             }
-        }
-        .onChangeCompat(of: selectedModel) { _, model in
-            guard let model else { return }
-            presentModelSettings(for: model)
         }
         .onChangeCompat(of: showRemoteBackendForm) { _, presenting in
             guard presenting else { return }
@@ -1089,7 +1258,15 @@ struct StoredView: View {
     private var navigationContent: some View {
         NavigationStack {
             ZStack {
-                storedList
+                HStack(spacing: 0) {
+                    if let model = selectedModel {
+                        modelSettingsPane(for: model)
+                            .transition(.move(edge: .leading).combined(with: .opacity))
+                        Divider()
+                    }
+                    storedList
+                }
+                .animation(.spring(response: 0.35, dampingFraction: 0.85), value: selectedModel != nil)
                 if offGrid {
                     offGridBadge
                         .transition(.scale.combined(with: .opacity))
@@ -1099,10 +1276,83 @@ struct StoredView: View {
         }
     }
 
+    private var settingsPaneWidth: CGFloat { 620 }
+
+    @ViewBuilder
+    private func modelSettingsPane(for model: LocalModel) -> some View {
+        VStack(spacing: 0) {
+            settingsPaneHeader(for: model)
+            Divider()
+            ModelSettingsView(model: model) { settings in
+                load(model, settings: settings)
+            }
+            // Reset ModelSettingsView's @State when switching models in place.
+            .id(model.id)
+            .environment(\.macModalDismiss, MacModalDismissAction { selectedModel = nil })
+        }
+        .frame(width: settingsPaneWidth)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func settingsPaneHeader(for model: LocalModel) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Menu {
+                    ForEach(modelManager.downloadedModels, id: \.id) { candidate in
+                        Button {
+                            selectedModel = candidate
+                        } label: {
+                            if candidate.id == model.id {
+                                Label(candidate.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(candidate.displayName)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(model.displayName)
+                            .font(.system(size: 16, weight: .semibold))
+                            .lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(LocalizedStringKey("Switch model"))
+
+                Text(model.format.displayName)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                selectedModel = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(8)
+                    .background(
+                        Circle()
+                            .fill(Color.primary.opacity(0.08))
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(LocalizedStringKey("Close")))
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
     private var storedList: some View {
         ScrollView {
             VStack(spacing: 32) {
                 modelsSection
+                supportModelsSection
                 remoteBackendsSection
                 datasetsSection
             }
@@ -1204,7 +1454,7 @@ struct StoredView: View {
     @ViewBuilder private var modelsSection: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .firstTextBaseline) {
-                Text(LocalizedStringKey("Your Models"))
+                Text(LocalizedStringKey("Models"))
                     .font(FontTheme.heading)
                     .foregroundStyle(AppTheme.text)
                 Spacer()
@@ -1282,6 +1532,10 @@ struct StoredView: View {
                             }
                         }
                         .environmentObject(vm)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
+                                .stroke(Color.accentColor.opacity(selectedModel?.id == model.id ? 0.7 : 0), lineWidth: 2)
+                        )
                         .contentShape(Rectangle())
                         .onTapGesture {
                             selectedModel = model
@@ -1299,6 +1553,44 @@ struct StoredView: View {
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder private var supportModelsSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text(LocalizedStringKey("Support Models"))
+                .font(FontTheme.heading)
+                .foregroundStyle(AppTheme.text)
+
+            LazyVStack(spacing: 16) {
+                ForEach(supportModelItems) { item in
+                    NavigationLink {
+                        supportModelDestination(for: item)
+                    } label: {
+                        storedCard {
+                            SupportModelRow(item: item)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var supportModelItems: [SupportModelInventoryItem] {
+        [
+            SupportModelInventory.speechItem(whisperItems: downloadController.whisperItems),
+            SupportModelInventory.embeddingItem(embeddingItems: downloadController.embeddingItems)
+        ]
+    }
+
+    @ViewBuilder
+    private func supportModelDestination(for item: SupportModelInventoryItem) -> some View {
+        switch item.kind {
+        case .speech:
+            WhisperModelsView(engineID: TranscriptionSettings.selectedEngineID.isLocalWhisper ? TranscriptionSettings.selectedEngineID : TranscriptionBackendFactory.preferredLocalWhisperEngineID())
+        case .embedding:
+            EmbeddingModelsView()
         }
     }
 
@@ -1523,6 +1815,9 @@ struct StoredView: View {
             case .afm:
                 loadURL = InstalledModelsStore.baseDir(for: .afm, modelID: model.modelID)
                 try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
+            case .coreai:
+                loadURL = InstalledModelsStore.baseDir(for: .coreai, modelID: model.modelID)
+                try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
             }
 
             let success = await vm.load(url: loadURL, settings: settings, format: model.format)
@@ -1537,13 +1832,9 @@ struct StoredView: View {
         }
     }
 
-    private func allowedExtensions() -> Set<String> { ["pdf", "epub", "txt"] }
+    private func allowedExtensions() -> Set<String> { DatasetDocumentSupport.acceptedExtensions }
 
-    private func allowedUTTypes() -> [UTType] {
-        var types: [UTType] = [.pdf, .plainText]
-        if let epub = UTType(filenameExtension: "epub") { types.append(epub) }
-        return types
-    }
+    private func allowedUTTypes() -> [UTType] { DatasetDocumentSupport.allowedUTTypes() }
 
     private func suggestName(from urls: [URL]) -> String? {
         if let pdfURL = urls.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
@@ -1647,31 +1938,6 @@ struct StoredView: View {
         activeDatasetModal = nil
         if macModalPresenter.isPresented {
             macModalPresenter.dismiss()
-        }
-    }
-
-    private func presentModelSettings(for model: LocalModel) {
-        macModalPresenter.present(
-            title: model.name,
-            subtitle: model.format.displayName,
-            showCloseButton: true,
-            dimensions: MacModalDimensions(
-                minWidth: 600,
-                idealWidth: 660,
-                maxWidth: 720,
-                minHeight: 540,
-                idealHeight: 620,
-                maxHeight: 760
-            ),
-            contentInsets: EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0),
-            onDismiss: { selectedModel = nil }
-        ) {
-            ModelSettingsView(model: model) { settings in
-                load(model, settings: settings)
-            }
-            .environmentObject(modelManager)
-            .environmentObject(vm)
-            .environmentObject(walkthrough)
         }
     }
 

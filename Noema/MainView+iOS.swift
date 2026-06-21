@@ -18,6 +18,7 @@ struct MainView: View {
     @EnvironmentObject private var walkthrough: GuidedWalkthroughManager
     @AppStorage("offGrid") private var offGrid = false
     @State private var didAutoLoad = false
+    @StateObject private var backgroundUnloadController = BackgroundModelUnloadController()
 
     private let mainGuideSteps: Set<GuidedWalkthroughManager.Step> = [
         .chatIntro,
@@ -138,17 +139,28 @@ struct MainView: View {
             NetworkKillSwitch.setEnabled(on)
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .background {
+            switch phase {
+            case .active:
+                backgroundUnloadController.cancelPendingUnload()
+            case .inactive:
+                backgroundUnloadController.scheduleIfNeeded(
+                    sceneState: .inactive,
+                    chatVM: chatVM,
+                    modelManager: modelManager
+                )
+            case .background:
                 // Persist all rolling thought boxes for restoration on next launch
                 let keys = Array(chatVM.rollingThoughtViewModels.keys)
                 UserDefaults.standard.set(keys, forKey: "RollingThought.Keys")
                 for (key, vm) in chatVM.rollingThoughtViewModels {
                     vm.saveState(forKey: "RollingThought." + key)
                 }
-                // Free GPU/CPU resources when app goes to background
-                if !chatVM.isStreaming {
-                    Task { await chatVM.unload() }
-                }
+                // Free large local runtimes in the background while keeping lightweight ET/CML/AFM ready.
+                backgroundUnloadController.scheduleIfNeeded(
+                    sceneState: .background,
+                    chatVM: chatVM,
+                    modelManager: modelManager
+                )
                 // If the embedder isn't actively running, unload it too to reduce memory pressure.
                 Task.detached {
                     if await EmbeddingModel.shared.activeOperationsCount == 0 {
@@ -156,6 +168,8 @@ struct MainView: View {
                     }
                     await DatasetRetriever.shared.clearCache()
                 }
+            @unknown default:
+                break
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in

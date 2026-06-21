@@ -5,14 +5,24 @@ struct ToolAvailability: Equatable {
     let webSearch: Bool
     let python: Bool
     let memory: Bool
+    let calculator: Bool
+    let unitConverter: Bool
 
-    init(webSearch: Bool, python: Bool, memory: Bool = false) {
+    init(
+        webSearch: Bool,
+        python: Bool,
+        memory: Bool = false,
+        calculator: Bool = false,
+        unitConverter: Bool = false
+    ) {
         self.webSearch = webSearch
         self.python = python
         self.memory = memory
+        self.calculator = calculator
+        self.unitConverter = unitConverter
     }
 
-    var any: Bool { webSearch || python || memory }
+    var any: Bool { webSearch || python || memory || calculator || unitConverter }
 
     static let none = ToolAvailability(webSearch: false, python: false, memory: false)
 
@@ -198,8 +208,8 @@ Rules:
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let header = """
-**MEMORY (ARMED)**: Use the persistent memory tool to read or update long-lived notes that persist across multiple conversations on this device.
-All stored memories are about the user, not about you.
+**MEMORY (AVAILABLE)**: You have access to a persistent memory tool for reading or updating long-lived notes that persist across multiple conversations on this device.
+All stored memories are about the user, not about you. Using the memory tool is optional — only call it if the conversation genuinely requires reading or saving a durable fact.
 
 **CALL FORMAT (respond exactly as shown; no extra text):**
 <tool_call>
@@ -217,12 +227,13 @@ Rules:
 """
 
         var rules: [String] = [
+            "- Only use the memory tool when genuinely needed — for example, when the user asks you to remember something, or when recalling a stored fact would meaningfully improve your answer.",
             "- Use memory for durable facts such as stable user preferences, long-lived project constraints, or recurring environment details.",
             "- Treat every stored memory as user-specific context. If a memory says \"My name is ...\" or uses first-person wording, interpret that as referring to the user.",
             "- Read memory before relying on remembered facts, especially across different conversations.",
             "- Do not save transient details or speculative conclusions.",
             "- Replace the example title and content with the actual fact for this conversation. Do not copy placeholder or example text into the saved memory.",
-            "- Make exactly one memory tool call and WAIT for the result."
+            "- If you do call the memory tool, make exactly one call and WAIT for the result before continuing."
         ]
 
         if includeThinkRestriction {
@@ -258,6 +269,94 @@ Rules:
         return true
     }
 
+    static func calculatorToolGuidance(includeThinkRestriction: Bool) -> String {
+        let header = """
+**CALCULATOR (ARMED)**: Use the local deterministic calculator for arithmetic or single-expression math when Python would be unnecessary overhead.
+
+**CALL FORMAT (respond exactly as shown; no extra text):**
+<tool_call>
+{
+  \"name\": \"noema.math.calculate\",
+  \"arguments\": {
+    \"expression\": \"sqrt(144) + 3 * 2\"
+  }
+}
+</tool_call>
+
+Rules:
+"""
+
+        var rules: [String] = [
+            "- Supports +, -, *, /, ^, parentheses, pi, e, and common functions such as sqrt, abs, sin, cos, tan, log, ln, exp, floor, ceil, and round.",
+            "- Trigonometric functions use radians.",
+            "- Make exactly one tool call and WAIT for the result."
+        ]
+
+        if includeThinkRestriction {
+            rules.append("- You may mention calculation inside your Chain of Thought, but finish reasoning before emitting the <tool_call> tag that actually triggers the call.")
+        }
+
+        rules.append(contentsOf: [
+            "- Do NOT use code fences (```); emit only the <tool_call> wrapper shown above.",
+            "- When calculator results arrive, treat them as authoritative for the expression you evaluated."
+        ])
+
+        return header + "\n" + rules.joined(separator: "\n")
+    }
+
+    @discardableResult
+    static func appendCalculatorToolGuidance(to text: inout String, includeThinkRestriction: Bool) -> Bool {
+        let guidance = calculatorToolGuidance(includeThinkRestriction: includeThinkRestriction)
+        guard !text.contains("**CALCULATOR (ARMED)**") else { return false }
+        text += "\n\n" + guidance
+        return true
+    }
+
+    static func unitConverterToolGuidance(includeThinkRestriction: Bool) -> String {
+        let header = """
+**UNIT CONVERTER (ARMED)**: Use the local deterministic unit converter for common length, mass, temperature, volume, time, data-size, and speed conversions.
+
+**CALL FORMAT (respond exactly as shown; no extra text):**
+<tool_call>
+{
+  \"name\": \"noema.units.convert\",
+  \"arguments\": {
+    \"value\": 10,
+    \"from_unit\": \"km\",
+    \"to_unit\": \"mi\"
+  }
+}
+</tool_call>
+
+Rules:
+"""
+
+        var rules: [String] = [
+            "- Use source and target units from the same family.",
+            "- Supported examples include m, km, ft, mi, kg, lb, C, F, K, l, gal, min, GB, GiB, m/s, km/h, and mph.",
+            "- Make exactly one tool call and WAIT for the result."
+        ]
+
+        if includeThinkRestriction {
+            rules.append("- You may mention conversion inside your Chain of Thought, but finish reasoning before emitting the <tool_call> tag that actually triggers the call.")
+        }
+
+        rules.append(contentsOf: [
+            "- Do NOT use code fences (```); emit only the <tool_call> wrapper shown above.",
+            "- When conversion results arrive, treat them as authoritative for the unit conversion you requested."
+        ])
+
+        return header + "\n" + rules.joined(separator: "\n")
+    }
+
+    @discardableResult
+    static func appendUnitConverterToolGuidance(to text: inout String, includeThinkRestriction: Bool) -> Bool {
+        let guidance = unitConverterToolGuidance(includeThinkRestriction: includeThinkRestriction)
+        guard !text.contains("**UNIT CONVERTER (ARMED)**") else { return false }
+        text += "\n\n" + guidance
+        return true
+    }
+
     @discardableResult
     static func appendToolGuidance(
         to text: inout String,
@@ -278,6 +377,12 @@ Rules:
                 includeThinkRestriction: includeThinkRestriction,
                 memorySnapshot: memorySnapshot
             ) || appended
+        }
+        if availability.calculator {
+            appended = appendCalculatorToolGuidance(to: &text, includeThinkRestriction: includeThinkRestriction) || appended
+        }
+        if availability.unitConverter {
+            appended = appendUnitConverterToolGuidance(to: &text, includeThinkRestriction: includeThinkRestriction) || appended
         }
         return appended
     }

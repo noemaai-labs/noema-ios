@@ -1,4 +1,9 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 struct ToolCallView: View {
     let toolCall: ChatVM.Msg.ToolCall
@@ -61,6 +66,29 @@ struct ToolCallView: View {
         ToolCallViewSupport.isActiveWebSearch(toolName: toolCall.toolName, phase: toolCall.phase)
     }
 
+    private var statusTitleKey: String {
+        switch toolCall.phase {
+        case .requesting:
+            return "Tool requested"
+        case .executing, .running:
+            return "Tool running"
+        case .completed:
+            return "Tool completed"
+        case .failed:
+            return "Tool failed"
+        }
+    }
+
+    private var outcomePreview: (titleKey: String, text: String, isError: Bool)? {
+        if let error = toolCall.error?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty {
+            return ("Tool error", Self.compactPreview(error), true)
+        }
+        if let result = toolCall.result?.trimmingCharacters(in: .whitespacesAndNewlines), !result.isEmpty {
+            return ("Tool result", Self.compactPreview(ToolCallViewSupport.formatRawResult(result)), false)
+        }
+        return nil
+    }
+
     var body: some View {
         Button(action: { showingDetails = true }) {
             VStack(alignment: .leading, spacing: 10) {
@@ -84,6 +112,15 @@ struct ToolCallView: View {
                     .font(.caption2)
                     .foregroundStyle(secondaryPillForegroundColor)
 
+                HStack(spacing: 6) {
+                    Text(LocalizedStringKey(statusTitleKey))
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(toolCall.phase == .failed ? .orange : secondaryPillForegroundColor)
+                    Text(toolCall.timestamp, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(secondaryPillForegroundColor)
+                }
+
                 if !parameterSummaryEntries.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(parameterSummaryEntries) { entry in
@@ -104,6 +141,21 @@ struct ToolCallView: View {
                                 .foregroundStyle(secondaryPillForegroundColor)
                                 .italic()
                         }
+                    }
+                    .padding(.horizontal, 2)
+                }
+
+                if let outcomePreview {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(LocalizedStringKey(outcomePreview.titleKey))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(outcomePreview.isError ? .orange : secondaryPillForegroundColor)
+                        Text(outcomePreview.text)
+                            .font(.caption2)
+                            .foregroundStyle(colorScheme == .dark ? Color.white.opacity(0.86) : Color.black.opacity(0.74))
+                            .lineLimit(2)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .padding(.horizontal, 2)
                 }
@@ -160,6 +212,15 @@ struct ToolCallView: View {
             handlePhaseChange(newPhase)
         }
         .toolCallDetailPresentation(isPresented: $showingDetails, toolCall: toolCall)
+    }
+
+    private static func compactPreview(_ text: String) -> String {
+        let condensed = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard condensed.count > 180 else { return condensed }
+        return String(condensed.prefix(177)) + "..."
     }
 
     @ViewBuilder
@@ -326,12 +387,24 @@ struct ToolCallView: View {
     }
 }
 
+extension ToolCallView: Equatable {
+    /// When the parent re-renders (e.g. every streaming token in the same turn),
+    /// SwiftUI uses this to skip re-evaluating `body` for tool calls whose data
+    /// hasn't changed — preventing layout thrashing from `GeometryReader` and
+    /// relative-time `Text` nodes inside the card.
+    static func == (lhs: ToolCallView, rhs: ToolCallView) -> Bool {
+        lhs.toolCall == rhs.toolCall
+    }
+}
+
 struct ToolCallDetailSheet: View {
     let toolCall: ChatVM.Msg.ToolCall
 
+    @EnvironmentObject private var vm: ChatVM
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
     @State private var resultDisplayMode: ToolCallViewSupport.ResultDisplayMode
+    @State private var pinnedResult = false
 
     init(toolCall: ChatVM.Msg.ToolCall) {
         self.toolCall = toolCall
@@ -344,11 +417,11 @@ struct ToolCallDetailSheet: View {
     }
 
     private var sectionBackgroundColor: Color {
-        colorScheme == .dark ? Color(white: 0.15) : Color(white: 0.97)
+        Color.primary.opacity(colorScheme == .dark ? 0.06 : 0.04)
     }
 
     private var sectionBorderColor: Color {
-        Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.10)
+        Color.primary.opacity(0.08)
     }
 
     private var neutralPillBackgroundColor: Color {
@@ -375,63 +448,162 @@ struct ToolCallDetailSheet: View {
         Color.orange.opacity(0.18)
     }
 
+    private var hasPinPayload: Bool {
+        toolCall.result?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || toolCall.error?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private var canRequestRepair: Bool {
+        toolCall.phase == .failed
+            && vm.canAcceptChatInput
+            && !vm.isStreamingInAnotherSession
+    }
+
     var body: some View {
+#if os(macOS)
+        // Compact, fixed-size popover: a quiet title bar instead of a large
+        // navigation chrome, and tight content sections.
+        VStack(spacing: 0) {
+            macHeaderBar
+            Divider().opacity(0.5)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    actionSection
+                    requestParameterSection
+                    outcomeSections
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .onChangeCompat(of: toolCall.result) { _, newValue in
+            handleResultChange(newValue)
+        }
+#else
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     headerSection
+                    actionSection
                     requestParameterSection
-
-                    if let error = toolCall.error {
-                        errorSection(error)
-                        if let result = toolCall.result {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Raw Response")
-                                    .font(.headline)
-                                rawResultView(for: result)
-                            }
-                        }
-                    } else if let result = toolCall.result {
-                        resultSection(result)
-                    } else {
-                        inFlightSection
-                    }
+                    outcomeSections
 
                     Spacer(minLength: 20)
                 }
                 .padding()
             }
             .navigationTitle("Tool Call Details")
-            #if !os(macOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
             .toolbar {
-                #if os(macOS)
-                ToolbarItem(placement: .automatic) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .accessibilityLabel("Close")
-                }
-                #else
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
                     }
                 }
-                #endif
             }
             .onChangeCompat(of: toolCall.result) { _, newValue in
-                guard let newValue else { return }
-                if resultDisplayMode == .formatted,
-                   !ToolCallViewSupport.supportsFormattedResultDisplay(
-                    toolName: toolCall.toolName,
-                    result: newValue
-                   ) {
-                    resultDisplayMode = .raw
+                handleResultChange(newValue)
+            }
+        }
+#endif
+    }
+
+    private func handleResultChange(_ newValue: String?) {
+        guard let newValue else { return }
+        if resultDisplayMode == .formatted,
+           !ToolCallViewSupport.supportsFormattedResultDisplay(
+            toolName: toolCall.toolName,
+            result: newValue
+           ) {
+            resultDisplayMode = .raw
+        }
+    }
+
+    @ViewBuilder
+    private var outcomeSections: some View {
+        if let error = toolCall.error {
+            errorSection(error)
+            if let result = toolCall.result {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Raw Response")
+                        .font(.system(size: 13, weight: .semibold))
+                    rawResultView(for: result)
                 }
+            }
+        } else if let result = toolCall.result {
+            resultSection(result)
+        } else {
+            inFlightSection
+        }
+    }
+
+#if os(macOS)
+    private var macHeaderBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: toolCall.iconName)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(toolCall.phase == .failed ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+            Text(toolCall.displayName)
+                .font(.system(size: 13, weight: .semibold))
+            Text(verbatim: toolCall.toolName)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Text(toolCall.timestamp, style: .time)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+#endif
+
+    @ViewBuilder
+    private var actionSection: some View {
+        if hasPinPayload || toolCall.phase == .failed {
+            HStack(spacing: 8) {
+                if hasPinPayload {
+                    Button {
+                        vm.pinToolCallToActiveScratchpad(toolCall)
+                        pinnedResult = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            pinnedResult = false
+                        }
+                    } label: {
+                        Label(
+                            pinnedResult ? LocalizedStringKey("Pinned Result") : LocalizedStringKey("Pin Result"),
+                            systemImage: pinnedResult ? "checkmark" : "note.text.badge.plus"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if toolCall.phase == .failed {
+                    Button {
+                        dismiss()
+                        Task { await vm.requestToolCallRepair(toolCall) }
+                    } label: {
+                        Label("Repair Tool Call", systemImage: "wrench.and.screwdriver")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(!canRequestRepair)
+                }
+
+                Spacer(minLength: 0)
             }
         }
     }
@@ -465,55 +637,53 @@ struct ToolCallDetailSheet: View {
         .cornerRadius(12)
     }
 
+    /// Compact key/value rows on one quiet surface — no nested monospaced
+    /// boxes per parameter.
     private var requestParameterSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Request Parameters")
-                .font(.headline)
+            Text("Parameters")
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.secondary)
 
             if toolCall.requestParams.isEmpty {
                 Text("No parameters")
+                    .font(.caption)
                     .foregroundColor(.secondary)
                     .italic()
             } else {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(toolCall.requestParams.keys.sorted()), id: \.self) { key in
-                        VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
                             Text(key)
-                                .font(.caption.weight(.semibold))
+                                .font(.caption.weight(.medium))
                                 .foregroundColor(secondaryPillForegroundColor)
-
+                                .frame(width: 92, alignment: .leading)
                             Text(ToolCallViewSupport.formatParameterValue(toolCall.requestParams[key]?.value))
                                 .font(.system(size: 12, weight: .regular, design: .monospaced))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
-                                .background(monospaceBackgroundColor)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .stroke(sectionBorderColor, lineWidth: 0.8)
-                                )
-                                .cornerRadius(6)
                         }
                     }
                 }
             }
         }
-        .padding()
+        .padding(12)
         .background(sectionBackgroundColor)
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(sectionBorderColor, lineWidth: 0.8)
         )
-        .cornerRadius(8)
+        .cornerRadius(10)
     }
 
     private func errorSection(_ error: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
                     .foregroundColor(.orange)
                 Text("Error")
-                    .font(.headline)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(.orange)
             }
 
@@ -531,15 +701,11 @@ struct ToolCallDetailSheet: View {
     }
 
     private func resultSection(_ result: String) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.secondary)
-                    Text("Result")
-                        .font(.headline)
-                        .foregroundColor(.primary)
-                }
+                Text("Result")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
 
                 Spacer()
 
@@ -550,7 +716,8 @@ struct ToolCallDetailSheet: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 180)
+                .controlSize(.small)
+                .frame(maxWidth: 150)
             }
 
             Group {
@@ -568,9 +735,10 @@ struct ToolCallDetailSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Image(systemName: toolCall.phase == .requesting ? "clock.fill" : "play.circle.fill")
+                    .font(.caption)
                     .foregroundColor(secondaryPillForegroundColor)
                 Text(toolCall.phase == .requesting ? "Requesting Tool" : "Running Tool")
-                    .font(.headline)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(.primary)
             }
 
@@ -583,88 +751,164 @@ struct ToolCallDetailSheet: View {
 
     @ViewBuilder
     private func formattedResultView(for result: String) -> some View {
-        switch ToolCallViewSupport.toolKind(for: toolCall.toolName) {
-        case .python:
-            pythonResultView(for: result)
-        case .memory:
-            memoryResultView(for: result)
-        case .webSearch:
-            let hits = ToolCallViewSupport.parseWebResults(from: result)
-            if hits.isEmpty {
-                unavailableFormattedResultView
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(Array(hits.enumerated()), id: \.offset) { index, item in
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text("\(index + 1).")
-                                        .font(.headline.weight(.semibold))
-                                    Text(item.displayTitle.isEmpty ? "Untitled Result" : item.displayTitle)
-                                        .font(.headline)
-                                        .foregroundColor(.primary)
-                                        .multilineTextAlignment(.leading)
-                                }
-
-                                if !item.snippet.isEmpty {
-                                    Text(item.snippet.strippingHTMLTags())
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                        .textSelection(.enabled)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-
-                                if !item.url.isEmpty {
-                                    if let destination = URL(string: item.url) ?? URL(string: "https://" + item.url) {
-                                        Link(item.url, destination: destination)
-                                            .font(.caption)
-                                            .foregroundColor(.blue)
-                                            .lineLimit(2)
-                                    } else {
-                                        Text(item.url)
-                                            .font(.caption)
-                                            .foregroundColor(.blue)
-                                            .lineLimit(2)
-                                            .textSelection(.enabled)
+        if let dryRun = ToolCallViewSupport.parseDryRunResult(from: result) {
+            dryRunResultView(dryRun)
+        } else {
+            switch ToolCallViewSupport.toolKind(for: toolCall.toolName) {
+            case .python:
+                pythonResultView(for: result)
+            case .memory:
+                memoryResultView(for: result)
+            case .calculator, .unitConverter:
+                deterministicResultView(for: result)
+            case .webSearch:
+                let hits = ToolCallViewSupport.parseWebResults(from: result)
+                if hits.isEmpty {
+                    unavailableFormattedResultView
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(Array(hits.enumerated()), id: \.offset) { index, item in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        Text("\(index + 1).")
+                                            .font(.headline.weight(.semibold))
+                                        Text(item.displayTitle.isEmpty ? "Untitled Result" : item.displayTitle)
+                                            .font(.headline)
+                                            .foregroundColor(.primary)
+                                            .multilineTextAlignment(.leading)
                                     }
-                                }
 
-                                if item.engine != nil {
-                                    HStack(spacing: 6) {
-                                        if let engine = item.engine, !engine.isEmpty {
-                                            Text(engine)
-                                                .font(.caption2.weight(.semibold))
-                                                .foregroundColor(neutralPillForegroundColor)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 4)
-                                                .background(neutralPillBackgroundColor)
-                                                .clipShape(Capsule())
+                                    if !item.snippet.isEmpty {
+                                        Text(item.snippet.strippingHTMLTags())
+                                            .font(.subheadline)
+                                            .foregroundColor(.secondary)
+                                            .textSelection(.enabled)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+
+                                    if !item.url.isEmpty {
+                                        if let destination = URL(string: item.url) ?? URL(string: "https://" + item.url) {
+                                            Link(item.url, destination: destination)
+                                                .font(.caption)
+                                                .foregroundColor(.blue)
+                                                .lineLimit(2)
+                                        } else {
+                                            Text(item.url)
+                                                .font(.caption)
+                                                .foregroundColor(.blue)
+                                                .lineLimit(2)
+                                                .textSelection(.enabled)
+                                        }
+                                    }
+
+                                    if item.engine != nil {
+                                        HStack(spacing: 6) {
+                                            if let engine = item.engine, !engine.isEmpty {
+                                                Text(engine)
+                                                    .font(.caption2.weight(.semibold))
+                                                    .foregroundColor(neutralPillForegroundColor)
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 4)
+                                                    .background(neutralPillBackgroundColor)
+                                                    .clipShape(Capsule())
+                                            }
                                         }
                                     }
                                 }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding()
+                                .background(sectionBackgroundColor)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(sectionBorderColor, lineWidth: 0.8)
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding()
-                            .background(sectionBackgroundColor)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .stroke(sectionBorderColor, lineWidth: 0.8)
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 4)
-                }
-                .modifier(
-                    ResultBoxStyle(
-                        backgroundColor: sectionBackgroundColor,
-                        borderColor: sectionBorderColor
+                    .modifier(
+                        ResultBoxStyle(
+                            backgroundColor: sectionBackgroundColor,
+                            borderColor: sectionBorderColor
+                        )
                     )
-                )
+                }
+            case .generic:
+                unavailableFormattedResultView
             }
-        case .generic:
-            unavailableFormattedResultView
+        }
+    }
+
+    private func dryRunResultView(_ result: ToolCallViewSupport.DryRunToolResult) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "hand.raised.fill")
+                    .foregroundStyle(.orange)
+                Text(LocalizedStringKey("Dry Run"))
+                    .font(.headline)
+            }
+            Text(LocalizedStringKey("Tool call was recorded but not executed."))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            if !result.tool.isEmpty {
+                Text(verbatim: result.tool)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .modifier(
+            ResultBoxStyle(
+                backgroundColor: sectionBackgroundColor,
+                borderColor: sectionBorderColor
+            )
+        )
+    }
+
+    @ViewBuilder
+    private func deterministicResultView(for result: String) -> some View {
+        if let response = ToolCallViewSupport.parseDeterministicResult(from: result) {
+            VStack(alignment: .leading, spacing: 10) {
+                if let error = response.error, !error.isEmpty {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(verbatim: error)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: response.toUnit == nil ? "function" : "arrow.left.arrow.right")
+                            .foregroundStyle(.secondary)
+                        Text(verbatim: response.displayResult)
+                            .font(.title3.monospacedDigit().weight(.semibold))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.7)
+                            .textSelection(.enabled)
+                    }
+
+                    if let detail = response.detailText {
+                        Text(verbatim: detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .modifier(
+                ResultBoxStyle(
+                    backgroundColor: sectionBackgroundColor,
+                    borderColor: sectionBorderColor
+                )
+            )
+        } else {
+            rawResultView(for: result)
         }
     }
 
@@ -775,9 +1019,13 @@ struct ToolCallDetailSheet: View {
                     }
                 }
 
+                if !pythonResult.artifacts.isEmpty {
+                    pythonNotebookArtifactsView(pythonResult.artifacts)
+                }
+
                 if !pythonResult.stdout.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Output")
+                        Text(LocalizedStringKey("Execution Log"))
                             .font(.caption.weight(.semibold))
                         ScrollView {
                             Text(pythonResult.stdout)
@@ -798,7 +1046,7 @@ struct ToolCallDetailSheet: View {
 
                 if !pythonResult.stderr.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Errors")
+                        Text(LocalizedStringKey("Errors"))
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.orange)
                         ScrollView {
@@ -834,6 +1082,200 @@ struct ToolCallDetailSheet: View {
         } else {
             rawResultView(for: result)
         }
+    }
+
+    @ViewBuilder
+    private func pythonNotebookArtifactsView(_ artifacts: [PythonExecutionArtifact]) -> some View {
+        let imageArtifacts = artifacts.filter { $0.kind == "image" }
+        let tableArtifacts = artifacts.filter { $0.kind == "table" }
+        let otherArtifacts = artifacts.filter { $0.kind != "image" && $0.kind != "table" }
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.stack.badge.play")
+                    .foregroundStyle(.secondary)
+                Text(LocalizedStringKey("Notebook Output"))
+                    .font(.caption.weight(.semibold))
+                Text(
+                    String.localizedStringWithFormat(
+                        String(localized: "%d artifact(s)"),
+                        artifacts.count
+                    )
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+
+            if !imageArtifacts.isEmpty {
+                artifactGroup(titleKey: "Charts", systemImage: "chart.xyaxis.line") {
+                    ForEach(imageArtifacts) { artifact in
+                        pythonImageArtifactView(artifact)
+                    }
+                }
+            }
+
+            if !tableArtifacts.isEmpty {
+                artifactGroup(titleKey: "Tables", systemImage: "tablecells") {
+                    ForEach(tableArtifacts) { artifact in
+                        pythonTableArtifactView(artifact)
+                    }
+                }
+            }
+
+            if !otherArtifacts.isEmpty {
+                artifactGroup(titleKey: "Generated Files", systemImage: "doc.badge.gearshape") {
+                    ForEach(otherArtifacts) { artifact in
+                        pythonFileArtifactView(artifact)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func artifactGroup<Content: View>(
+        titleKey: String,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(LocalizedStringKey(titleKey), systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func pythonImageArtifactView(_ artifact: PythonExecutionArtifact) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            artifactHeader(artifact)
+
+            #if os(macOS)
+            if let image = ToolCallViewSupport.platformImage(fromBase64: artifact.base64Data) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 220)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            } else {
+                unavailableArtifactPreview
+            }
+            #elseif canImport(UIKit)
+            if let image = ToolCallViewSupport.platformImage(fromBase64: artifact.base64Data) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 220)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            } else {
+                unavailableArtifactPreview
+            }
+            #else
+            unavailableArtifactPreview
+            #endif
+        }
+        .modifier(
+            ResultBoxStyle(
+                backgroundColor: monospaceBackgroundColor,
+                borderColor: sectionBorderColor
+            )
+        )
+    }
+
+    private func pythonTableArtifactView(_ artifact: PythonExecutionArtifact) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            artifactHeader(artifact)
+
+            let rows = ToolCallViewSupport.tablePreviewRows(for: artifact)
+            if rows.isEmpty {
+                unavailableArtifactPreview
+            } else {
+                ScrollView(.horizontal) {
+                    Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                            GridRow {
+                                ForEach(Array(row.enumerated()), id: \.offset) { _, value in
+                                    Text(value)
+                                        .font(.caption2.monospaced())
+                                        .lineLimit(2)
+                                        .textSelection(.enabled)
+                                        .frame(minWidth: 72, maxWidth: 150, alignment: .leading)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 5)
+                                        .background(rowIndex == 0 ? neutralPillBackgroundColor : Color.clear)
+                                        .border(sectionBorderColor.opacity(0.7), width: 0.5)
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 180)
+            }
+        }
+        .modifier(
+            ResultBoxStyle(
+                backgroundColor: monospaceBackgroundColor,
+                borderColor: sectionBorderColor
+            )
+        )
+    }
+
+    private func pythonFileArtifactView(_ artifact: PythonExecutionArtifact) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            artifactHeader(artifact)
+
+            if let preview = artifact.preview, !preview.isEmpty {
+                Text(preview)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+                    .lineLimit(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(monospaceBackgroundColor)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            } else {
+                unavailableArtifactPreview
+            }
+        }
+        .modifier(
+            ResultBoxStyle(
+                backgroundColor: sectionBackgroundColor,
+                borderColor: sectionBorderColor
+            )
+        )
+    }
+
+    private func artifactHeader(_ artifact: PythonExecutionArtifact) -> some View {
+        HStack(spacing: 8) {
+            Text(artifact.relativePath)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            Text(ToolCallViewSupport.fileSizeString(artifact.sizeBytes))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(artifact.kind.uppercased())
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(neutralPillForegroundColor)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(neutralPillBackgroundColor)
+                .clipShape(Capsule())
+        }
+    }
+
+    private var unavailableArtifactPreview: some View {
+        Text(LocalizedStringKey("Preview truncated or unavailable"))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .italic()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(monospaceBackgroundColor)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func rawResultView(for result: String) -> some View {
@@ -874,6 +1316,8 @@ enum ToolCallViewSupport {
         case webSearch
         case python
         case memory
+        case calculator
+        case unitConverter
         case generic
     }
 
@@ -943,8 +1387,54 @@ enum ToolCallViewSupport {
         var id: String { key }
     }
 
+    struct DeterministicToolResult: Equatable {
+        let expression: String?
+        let value: String?
+        let fromUnit: String?
+        let toUnit: String?
+        let category: String?
+        let formattedResult: String?
+        let error: String?
+
+        var displayResult: String {
+            if let formattedResult, !formattedResult.isEmpty {
+                if let toUnit, !toUnit.isEmpty {
+                    return "\(formattedResult) \(toUnit)"
+                }
+                return formattedResult
+            }
+            return error ?? ""
+        }
+
+        var detailText: String? {
+            if let expression, !expression.isEmpty {
+                return expression
+            }
+            guard let value, let fromUnit else { return category }
+            let base = "\(value) \(fromUnit) -> \(displayResult)"
+            if let category, !category.isEmpty {
+                return "\(base) · \(category)"
+            }
+            return base
+        }
+    }
+
+    struct DryRunToolResult: Equatable {
+        let tool: String
+    }
+
     static func toolKind(for toolName: String) -> ToolKind {
         let normalizedToolName = toolName.lowercased()
+        if normalizedToolName.contains("noema.math.calculate")
+            || normalizedToolName.contains("math")
+            || normalizedToolName.contains("calculator") {
+            return .calculator
+        }
+        if normalizedToolName.contains("noema.units.convert")
+            || normalizedToolName.contains("unit")
+            || normalizedToolName.contains("convert") {
+            return .unitConverter
+        }
         if normalizedToolName.contains("python") {
             return .python
         }
@@ -965,6 +1455,7 @@ enum ToolCallViewSupport {
 
     static func supportsFormattedResultDisplay(toolName: String, result: String?) -> Bool {
         guard let result else { return false }
+        if parseDryRunResult(from: result) != nil { return true }
 
         switch toolKind(for: toolName) {
         case .python:
@@ -973,8 +1464,10 @@ enum ToolCallViewSupport {
             return parseMemoryResult(from: result) != nil
         case .webSearch:
             return !parseWebResults(from: result).isEmpty
+        case .calculator, .unitConverter:
+            return parseDeterministicResult(from: result) != nil
         case .generic:
-            return false
+            return parseDryRunResult(from: result) != nil
         }
     }
 
@@ -989,6 +1482,43 @@ enum ToolCallViewSupport {
     static func parsePythonResult(from result: String) -> PythonExecutionResult? {
         guard let data = result.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(PythonExecutionResult.self, from: data)
+    }
+
+    static func parseDeterministicResult(from result: String) -> DeterministicToolResult? {
+        guard let data = result.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let error = object["error"] as? String
+        let formattedResult = object["formatted_result"] as? String
+        guard error?.isEmpty == false || formattedResult?.isEmpty == false else {
+            return nil
+        }
+
+        func stringValue(_ key: String) -> String? {
+            if let string = object[key] as? String { return string }
+            if let number = object[key] as? NSNumber { return number.stringValue }
+            return nil
+        }
+
+        return DeterministicToolResult(
+            expression: stringValue("expression"),
+            value: stringValue("value"),
+            fromUnit: stringValue("from_unit"),
+            toUnit: stringValue("to_unit"),
+            category: stringValue("category"),
+            formattedResult: formattedResult,
+            error: error
+        )
+    }
+
+    static func parseDryRunResult(from result: String) -> DryRunToolResult? {
+        guard let data = result.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["dry_run"] as? Bool == true else {
+            return nil
+        }
+        return DryRunToolResult(tool: object["tool"] as? String ?? "")
     }
 
     static func parseWebResults(from result: String) -> [WebSearchResultItem] {
@@ -1049,12 +1579,12 @@ enum ToolCallViewSupport {
             return string
         }
         if let dict = value as? [String: Any],
-           let data = try? JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted),
+           let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
            let prettyString = String(data: data, encoding: .utf8) {
             return prettyString
         }
         if let array = value as? [Any],
-           let data = try? JSONSerialization.data(withJSONObject: array, options: .prettyPrinted),
+           let data = try? JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys]),
            let prettyString = String(data: data, encoding: .utf8) {
             return prettyString
         }
@@ -1062,10 +1592,100 @@ enum ToolCallViewSupport {
         return String(describing: value)
     }
 
+    static func fileSizeString(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: max(0, bytes), countStyle: .file)
+    }
+
+    static func tablePreviewRows(for artifact: PythonExecutionArtifact, maxRows: Int = 8, maxColumns: Int = 6) -> [[String]] {
+        guard let preview = artifact.preview, !preview.isEmpty else { return [] }
+        let delimiter = artifact.filename.lowercased().hasSuffix(".tsv") ? "\t" : ","
+        return preview
+            .split(whereSeparator: \.isNewline)
+            .prefix(maxRows)
+            .map { line in
+                parseDelimitedLine(String(line), delimiter: Character(delimiter))
+                    .prefix(maxColumns)
+                    .map { value in
+                        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return trimmed.isEmpty ? " " : trimmed
+                    }
+            }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func parseDelimitedLine(_ line: String, delimiter: Character) -> [String] {
+        var fields: [String] = []
+        var current = ""
+        var insideQuotes = false
+        var iterator = line.makeIterator()
+
+        while let character = iterator.next() {
+            if character == "\"" {
+                if insideQuotes, let next = iterator.next() {
+                    if next == "\"" {
+                        current.append("\"")
+                    } else {
+                        insideQuotes = false
+                        if next == delimiter {
+                            fields.append(current)
+                            current = ""
+                        } else {
+                            current.append(next)
+                        }
+                    }
+                } else {
+                    insideQuotes.toggle()
+                }
+            } else if character == delimiter, !insideQuotes {
+                fields.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+
+        fields.append(current)
+        return fields
+    }
+
+    #if os(macOS)
+    static func platformImage(fromBase64 base64Data: String?) -> NSImage? {
+        guard let base64Data,
+              let data = Data(base64Encoded: base64Data) else {
+            return nil
+        }
+        return NSImage(data: data)
+    }
+    #elseif canImport(UIKit)
+    static func platformImage(fromBase64 base64Data: String?) -> UIImage? {
+        guard let base64Data,
+              let data = Data(base64Encoded: base64Data) else {
+            return nil
+        }
+        return UIImage(data: data)
+    }
+    #endif
+
+    /// Memoized — this runs inside `body` paths that re-render ~10 Hz during
+    /// streaming, and JSON round-tripping a large result per render is wasted
+    /// main-thread time. Deterministic (`.sortedKeys`), so caching is safe.
+    private static let formattedResultCache = TextComputationCache<String>(countLimit: 128)
+
     static func formatRawResult(_ result: String) -> String {
+        formattedResultCache.value(for: result) {
+            formatRawResultUncached(result)
+        }
+    }
+
+    private static func formatRawResultUncached(_ result: String) -> String {
+        // `.sortedKeys` is essential: JSONSerialization.jsonObject yields an unordered
+        // dictionary, so without a stable key order each re-serialization emits keys in
+        // a different order. Because this runs inside `body` (recomputed on every
+        // streaming token and on hover), that non-determinism made the rendered lines
+        // visibly swap places. Sorting keys makes the output byte-stable across renders.
         if let data = result.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data),
-           let prettyData = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
+           let prettyData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
            let prettyString = String(data: prettyData, encoding: .utf8) {
             return prettyString
         }
@@ -1095,7 +1715,9 @@ private extension View {
     @ViewBuilder
     func toolCallDetailPopupPresentation() -> some View {
         #if os(macOS)
-        frame(minWidth: 560, minHeight: 520)
+        // Fixed, restrained popover size — without a max the popover balloons
+        // to fit wide result content and reads like a full-screen takeover.
+        frame(width: 560, height: 560)
         #else
         self
         #endif
@@ -1251,4 +1873,5 @@ fileprivate extension String {
     .padding()
     .frame(maxWidth: .infinity)
     .background(Color(uiColor: .systemBackground))
+    .environmentObject(ChatVM())
 }

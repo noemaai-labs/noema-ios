@@ -8,6 +8,29 @@ public protocol Tool: Sendable {
     func call(args: Data) async throws -> Data // JSON in → JSON out
 }
 
+enum ToolDryRunSupport {
+    static let defaultsKey = "toolDryRunEnabled"
+
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? false
+    }
+
+    static func resultString(toolName: String, arguments: [String: Any]) -> String {
+        let payload: [String: Any] = [
+            "dry_run": true,
+            "tool": toolName,
+            "arguments": arguments,
+            "message": "Dry-run mode is on. The tool call was recorded but not executed."
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
+              let string = String(data: data, encoding: .utf8) else {
+            return #"{"dry_run":true,"message":"Dry-run mode is on. The tool call was recorded but not executed."}"#
+        }
+        return string
+    }
+}
+
 // Enhanced tool registry with catalog generation and validation
 @MainActor
 public final class ToolRegistry {
@@ -187,5 +210,4 @@ public final class ToolRegistry {
         }
     }
 }
-
 

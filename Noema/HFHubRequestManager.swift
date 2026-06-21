@@ -42,6 +42,7 @@ actor HFHubRequestManager {
 	          headers: [String: String] = [:]) async throws -> (Data, URLResponse) {
 		// Enforce off-grid: fail fast with no network
 		if NetworkKillSwitch.isEnabled { throw URLError(.notConnectedToInternet) }
+		let url = HFEndpoint.rewrite(url)
 		let cacheKey = key ?? "\(url.absoluteString)|\(accept ?? "")|\(method)|\(token ?? "")"
 		if let existing = inflight[cacheKey] {
 			return try await existing.value
@@ -58,7 +59,7 @@ actor HFHubRequestManager {
 				if let timeout { req.timeoutInterval = timeout }
 				if let accept { req.setValue(accept, forHTTPHeaderField: "Accept") }
 				for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-				if let token, !token.isEmpty {
+				if let token, !token.isEmpty, HFEndpoint.shouldSendAuthorization(to: url) {
 					req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 				}
 				do {

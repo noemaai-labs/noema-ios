@@ -5,86 +5,49 @@ import SwiftUI
 import AppKit
 #endif
 
+// Quiet, platform-adaptive palette: light translucent surfaces that read as
+// native disclosure rows rather than debug consoles. Built on Color.primary
+// so light and dark mode both stay low-contrast.
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 private extension Color {
     static var rollingThoughtSurface: Color {
-#if os(macOS)
-        return Color(white: 0.15)
-#else
-        return Color(white: 0.97)
-#endif
+        Color.primary.opacity(0.045)
     }
 
     static var rollingThoughtPillBackground: Color {
-#if os(macOS)
-        return Color.white.opacity(0.1)
-#else
-        return Color.black.opacity(0.05)
-#endif
+        Color.primary.opacity(0.06)
     }
 
     static var rollingThoughtPillForeground: Color {
-#if os(macOS)
-        return Color.black.opacity(0.88)
-#else
-        return Color.white.opacity(0.96)
-#endif
+        Color.primary.opacity(0.75)
     }
 
     static var rollingThoughtSecondaryPillBackground: Color {
-#if os(macOS)
-        return Color.white.opacity(0.08)
-#else
-        return Color.white.opacity(0.72)
-#endif
+        Color.primary.opacity(0.05)
     }
 
     static var rollingThoughtSecondaryPillForeground: Color {
-#if os(macOS)
-        return Color.white.opacity(0.6)
-#else
-        return Color.black.opacity(0.5)
-#endif
+        Color.primary.opacity(0.55)
     }
 
     static var rollingThoughtText: Color {
-#if os(macOS)
-        return Color.white.opacity(0.92)
-#else
-        return Color.black.opacity(0.86)
-#endif
+        Color.primary.opacity(0.78)
     }
 
     static var rollingThoughtSubtext: Color {
-#if os(macOS)
-        return Color.white.opacity(0.62)
-#else
-        return Color.black.opacity(0.54)
-#endif
+        Color.primary.opacity(0.5)
     }
 
     static var rollingThoughtInset: Color {
-#if os(macOS)
-        return Color.white.opacity(0.05)
-#else
-        return Color.white.opacity(0.72)
-#endif
+        Color.primary.opacity(0.035)
     }
 
     static var rollingThoughtBorder: Color {
-#if os(macOS)
-        return Color.white.opacity(0.1)
-#else
-        return Color.black.opacity(0.08)
-#endif
+        Color.primary.opacity(0.08)
     }
 
     static var rollingThoughtShadow: Color {
-#if os(macOS)
-        return Color.black.opacity(0.1)
-#else
-        return Color.black.opacity(0.04)
-#endif
+        Color.clear
     }
 
     static var rollingThoughtWarningBackground: Color {
@@ -271,6 +234,27 @@ public final class RollingThoughtViewModel: ObservableObject {
     public func deferCompletionUntilStreamEnds() {
         shouldFinishWhenStreamEnds = true
     }
+
+    /// Authoritatively replace the thinking text in one shot.
+    ///
+    /// This is the race-free alternative to `start`/`append`: callers that already
+    /// hold the complete text so far (e.g. re-parsed from a growing stream buffer)
+    /// should use this instead of computing a delta and feeding a token stream.
+    /// The delta+`append` approach raced with `consumeStream`'s async `fullText`
+    /// mutation and could duplicate content ("results results"), which also broke
+    /// the `fullText == content` completion check so the box never finalized.
+    public func setContent(_ text: String) {
+        // Drop any in-flight token stream so it can't append stale tokens on top
+        // of the authoritative text we're assigning here.
+        streamTask?.cancel()
+        streamTask = nil
+        if phase == .idle {
+            phase = .streaming
+        }
+        guard fullText != text else { return }
+        fullText = text
+        updateRollingLines()
+    }
     
     private func consumeStream<S: AsyncSequence>(_ sequence: S) async where S.Element == String {
         do {
@@ -367,14 +351,23 @@ public struct RollingThoughtBox: View {
         self.viewModel = viewModel
     }
 
-    private var streamingLineCount: Int {
-        let rawLines = viewModel.fullText.components(separatedBy: "\n")
-        let lineCount = max(rawLines.count, viewModel.fullText.isEmpty ? 1 : 0)
-        return min(max(lineCount, 1), viewModel.rollingLineLimit)
+    /// One visual row of the 11 pt monospaced font.
+    private static let streamingRowHeight: CGFloat = 14.0
+
+    /// The rolling window never grows past `rollingLineLimit` visual rows.
+    private var streamingMaxContentHeight: CGFloat {
+        CGFloat(viewModel.rollingLineLimit) * Self.streamingRowHeight
     }
 
-    private var streamingContentHeight: CGFloat {
-        CGFloat(streamingLineCount) * 14.0
+    /// Measured (wrapped) height of the streaming content, clamped to the
+    /// rolling window. Lines wrap now, so the window height must come from
+    /// actual layout instead of counting "\n" — a long paragraph with no
+    /// newline still needs the full window.
+    @State private var measuredStreamHeight: CGFloat = 14.0
+
+    private struct StreamContentHeightKey: PreferenceKey {
+        static var defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
     }
 
     private var thoughtSurfaceBackground: Color {
@@ -414,11 +407,11 @@ public struct RollingThoughtBox: View {
     }
 
     private var cardCornerRadius: CGFloat {
-        18
+        10
     }
 
     private var insetCornerRadius: CGFloat {
-        14
+        8
     }
 
     public var body: some View {
@@ -473,24 +466,23 @@ public struct RollingThoughtBox: View {
     }
     
     private var streamingView: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: "brain")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(thoughtSubtextColor)
-                    Text("THINKING")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .tracking(0.5)
+                    Text("Thinking…")
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundColor(thoughtSubtextColor)
                 }
-                
+
                 Spacer()
             }
             
             // Rolling content with auto-scroll to the currently generating line
             ScrollViewReader { proxy in
-                ScrollView { 
+                ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         let allLines = viewModel.fullText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
                         ForEach(Array(allLines.enumerated()), id: \.offset) { i, l in
@@ -498,18 +490,37 @@ public struct RollingThoughtBox: View {
                                 .id("rt-line-\(i)")
                                 .font(.system(size: 11, weight: .regular, design: .monospaced))
                                 .foregroundColor(thoughtTextColor.opacity(0.82))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
+                                // Wrap instead of truncating: a paragraph that hasn't
+                                // emitted "\n" yet must stay fully readable inside the
+                                // box rather than running past its trailing edge.
+                                .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .frame(minHeight: 14)
+                                .frame(minHeight: Self.streamingRowHeight)
                         }
                         // Bottom anchor to ensure reliable auto-scroll as content grows
                         Color.clear
                             .frame(height: 1)
                             .id("rt-bottom")
                     }
+                    .background(
+                        GeometryReader { contentProxy in
+                            Color.clear.preference(
+                                key: StreamContentHeightKey.self,
+                                value: contentProxy.size.height
+                            )
+                        }
+                    )
                 }
-                .frame(height: streamingContentHeight)
+                .frame(height: measuredStreamHeight)
+                .onPreferenceChange(StreamContentHeightKey.self) { height in
+                    // Clamp before storing so state stops churning once the
+                    // window is at its cap (content keeps growing past it).
+                    let clamped = min(max(height, Self.streamingRowHeight), streamingMaxContentHeight)
+                    guard abs(clamped - measuredStreamHeight) > 0.5 else { return }
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        measuredStreamHeight = clamped
+                    }
+                }
                 .padding(.horizontal, 4)
                 .simultaneousGesture(DragGesture().onChanged { _ in shouldAutoScroll = false })
                 .onChange(of: viewModel.fullText) { _ in
@@ -550,14 +561,13 @@ public struct RollingThoughtBox: View {
                 )
             }
         }
-        .padding(14)
+        .padding(12)
         .background(thoughtSurfaceBackground)
         .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                 .strokeBorder(thoughtSurfaceBorder, lineWidth: 0.6)
         )
-        .shadow(color: .rollingThoughtShadow, radius: 8, x: 0, y: 4)
         .contentShape(Rectangle())
         .onTapGesture {
             viewModel.toggleExpanded()
@@ -566,22 +576,25 @@ public struct RollingThoughtBox: View {
     }
     
     private var expandedView: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 HStack(spacing: 6) {
                     Image(systemName: "brain")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(thoughtSubtextColor)
-                    Text("CHAIN OF THOUGHT")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .tracking(0.5)
+                    Text("Reasoning")
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundColor(thoughtSubtextColor)
                 }
-                
+
                 Spacer()
                 Button(action: { viewModel.toggleExpanded() }) {
-                    Text("Collapse")
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                    HStack(spacing: 3) {
+                        Text("Hide")
+                            .font(.system(size: 11, weight: .medium))
+                        Image(systemName: "chevron.up")
+                            .font(.system(size: 8, weight: .semibold))
+                    }
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(thoughtSecondaryPillForeground)
@@ -592,7 +605,13 @@ public struct RollingThoughtBox: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(viewModel.fullText.isEmpty ? "Waiting for thoughts..." : viewModel.fullText)
+                        Group {
+                            if viewModel.fullText.isEmpty {
+                                Text("Waiting for thoughts...")
+                            } else {
+                                Text(viewModel.fullText)
+                            }
+                        }
                             .font(.system(size: 11, weight: .regular, design: .monospaced))
                             .foregroundColor(thoughtTextColor)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -649,92 +668,72 @@ public struct RollingThoughtBox: View {
                 }
             }
         }
-        .padding(14)
-        .background(
-            LinearGradient(
-                colors: [
-                    thoughtSurfaceBackground,
-                    thoughtSurfaceBackground.opacity(colorScheme == .dark ? 0.92 : 0.98)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
-                .strokeBorder(thoughtSurfaceBorder, lineWidth: 0.6)
-        )
-        .shadow(color: .rollingThoughtShadow, radius: 16, x: 0, y: 10)
-    }
-    
-    private var completeView: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(thoughtSubtextColor)
-                Text("THOUGHT COMPLETE")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .tracking(0.5)
-                    .foregroundColor(thoughtSubtextColor)
-            }
-            
-            Spacer()
-            
-            Button(action: { viewModel.toggleExpanded() }) {
-                Text("View")
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundColor(thoughtSecondaryPillForeground)
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-        }
-        .padding(10)
+        .padding(12)
         .background(thoughtSurfaceBackground)
         .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                 .strokeBorder(thoughtSurfaceBorder, lineWidth: 0.6)
         )
-        .shadow(color: .rollingThoughtShadow, radius: 4, x: 0, y: 2)
+    }
+    
+    /// Compact disclosure row shown once reasoning has finished. Hugs its
+    /// content instead of spanning the chat width, and reopens on tap.
+    private var completeView: some View {
+        Button(action: { viewModel.toggleExpanded() }) {
+            HStack(spacing: 6) {
+                Image(systemName: "brain")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(thoughtSubtextColor)
+                Text("Reasoning complete")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(thoughtSubtextColor)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(thoughtSecondaryPillForeground)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(thoughtSurfaceBackground)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(thoughtSurfaceBorder, lineWidth: 0.6)
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Reasoning complete. Show reasoning."))
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var interruptedView: some View {
-        HStack(spacing: 8) {
+        Button(action: { viewModel.toggleExpanded() }) {
             HStack(spacing: 6) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11, weight: .bold))
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.orange)
-                Text("THOUGHT INTERRUPTED")
-                    .font(.system(size: 10, weight: .black, design: .rounded))
-                    .tracking(0.8)
-                    .foregroundColor(.orange)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(thoughtSecondaryPillBackground)
-            .clipShape(Capsule())
-
-            Spacer()
-
-            Button(action: { viewModel.toggleExpanded() }) {
-                Text("View")
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                Text("Reasoning interrupted")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(thoughtSubtextColor)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
                     .foregroundColor(thoughtSecondaryPillForeground)
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.rollingThoughtWarningBackground)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.rollingThoughtWarningBorder, lineWidth: 0.6)
+            )
+            .contentShape(Capsule())
         }
-        .padding(10)
-        .background(Color.rollingThoughtWarningBackground)
-        .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
-                .strokeBorder(Color.rollingThoughtWarningBorder, lineWidth: 0.6)
-        )
-        .shadow(color: .rollingThoughtShadow, radius: 4, x: 0, y: 2)
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Reasoning interrupted. Show partial reasoning."))
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

@@ -21,7 +21,10 @@ final class BlockMathStyleTests: XCTestCase {
 }
 
 final class ChatMarkdownRenderPlannerTests: XCTestCase {
-    func testMacOSPlannerKeepsHeadingSeparateFromBodyText() {
+    func testMacOSPlannerFoldsHeadingIntoSelectableBlock() {
+        // Headings now fold into the same textMathBlock as the surrounding prose
+        // (emitted as "#"-prefixed paragraphs) so a single NSTextView can be
+        // drag-selected across the heading and body together.
         let entries: [ChatMarkdownPlannerEntry] = [
             .heading(level: 1, content: "Title"),
             .text("Body text")
@@ -30,12 +33,11 @@ final class ChatMarkdownRenderPlannerTests: XCTestCase {
         let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: true)
 
         XCTAssertEqual(units, [
-            .entryIndex(0),
-            .textMathBlock("Body text")
+            .textMathBlock("# Title\n\nBody text")
         ])
     }
 
-    func testMacOSPlannerKeepsMultipleHeadingsAsStandaloneEntries() {
+    func testMacOSPlannerFoldsMultipleHeadingsIntoOneBlock() {
         let entries: [ChatMarkdownPlannerEntry] = [
             .heading(level: 1, content: "H1"),
             .heading(level: 2, content: "H2"),
@@ -46,10 +48,7 @@ final class ChatMarkdownRenderPlannerTests: XCTestCase {
         let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: true)
 
         XCTAssertEqual(units, [
-            .entryIndex(0),
-            .entryIndex(1),
-            .entryIndex(2),
-            .textMathBlock("Paragraph")
+            .textMathBlock("# H1\n\n## H2\n\n### H3\n\nParagraph")
         ])
     }
 
@@ -79,10 +78,25 @@ final class ChatMarkdownRenderPlannerTests: XCTestCase {
         let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: true)
 
         XCTAssertEqual(units, [
-            .entryIndex(0),
-            .textMathBlock("Intro"),
+            .textMathBlock("## Section\n\nIntro"),
             .entryIndex(2),
             .textMathBlock("Outro")
+        ])
+    }
+
+    func testMacOSPlannerKeepsThematicBreakAsStandaloneBoundary() {
+        let entries: [ChatMarkdownPlannerEntry] = [
+            .text("Before"),
+            .thematicBreak,
+            .text("After")
+        ]
+
+        let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: true)
+
+        XCTAssertEqual(units, [
+            .textMathBlock("Before"),
+            .entryIndex(1),
+            .textMathBlock("After")
         ])
     }
 }

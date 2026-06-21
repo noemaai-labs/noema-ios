@@ -1,0 +1,66 @@
+name: Smoke Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - newideas
+
+concurrency:
+  group: smoke-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Localization And Docs
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Xcode Version
+        run: xcodebuild -version
+
+      - name: Localization Lint
+        run: make lint-localization
+
+      - name: Runtime Docs Lint
+        run: make lint-docs-runtime
+
+  build:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: ios
+            name: iOS App
+            scheme: Noema
+            destination: generic/platform=iOS
+          - id: macos
+            name: macOS App
+            scheme: NoemaMac
+            destination: platform=macOS
+          - id: visionos
+            name: visionOS App
+            scheme: NoemaVisionOS
+            destination: generic/platform=visionOS
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Xcode Version
+        run: xcodebuild -version
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project Noema.xcodeproj \
+            -scheme "${{ matrix.scheme }}" \
+            -configuration Debug \
+            -destination "${{ matrix.destination }}" \
+            -derivedDataPath "$RUNNER_TEMP/noema-dd-${{ matrix.id }}" \
+            CODE_SIGNING_ALLOWED=NO

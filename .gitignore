@@ -3,9 +3,11 @@
 /.swiftpm/*
 
 # Xcode build artifacts and user-specific data
+/.derived/
 DerivedData/
 build/
 Build/
+*.xcresult
 *.pbxuser
 !default.pbxuser
 *.mode1v3
@@ -29,3 +31,17 @@ xcuserdata/
 Frameworks/Python-iOS.xcframework/
 Frameworks/Python-visionOS.xcframework/
 Frameworks/Python-macOS.xcframework/
+
+# Vendored coreai-models package (External/coreai-models): commit the patched
+# sources, ignore standalone-`swift build` artifacts (~700 MB of checkouts +
+# objects) and its local resolved file (the Xcode workspace's is authoritative).
+External/coreai-models/.build/
+External/coreai-models/.swiftpm/
+External/coreai-models/Package.resolved
+
+# Claude Code local files
+.claude/
+
+# Python bytecode cache
+__pycache__/
+*.pyc

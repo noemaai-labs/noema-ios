@@ -8,6 +8,8 @@ private struct MemoryToolArguments: Decodable {
     let oldString: String?
     let newString: String?
     let insertAt: Int?
+    let scope: String?
+    let expiresAt: String?
 
     private enum CodingKeys: String, CodingKey {
         case operation
@@ -17,6 +19,8 @@ private struct MemoryToolArguments: Decodable {
         case oldString = "old_string"
         case newString = "new_string"
         case insertAt = "insert_at"
+        case scope
+        case expiresAt = "expires_at"
     }
 }
 
@@ -25,6 +29,8 @@ struct MemoryToolResponse: Codable, Sendable {
         let id: String
         let title: String
         let content: String
+        let scope: String
+        let expiresAt: Date?
         let createdAt: Date
         let updatedAt: Date
 
@@ -32,8 +38,22 @@ struct MemoryToolResponse: Codable, Sendable {
             self.id = entry.id.uuidString
             self.title = entry.title
             self.content = entry.content
+            self.scope = entry.effectiveScope.rawValue
+            self.expiresAt = entry.expiresAt
             self.createdAt = entry.createdAt
             self.updatedAt = entry.updatedAt
+        }
+    }
+
+    struct ConflictPayload: Codable, Sendable {
+        let entryID: String
+        let title: String
+        let reason: String
+
+        init(_ conflict: MemoryConflict) {
+            self.entryID = conflict.entryID.uuidString
+            self.title = conflict.title
+            self.reason = conflict.kind.localizedSummary
         }
     }
 
@@ -41,8 +61,27 @@ struct MemoryToolResponse: Codable, Sendable {
     let operation: String
     let entry: EntryPayload?
     let entries: [EntryPayload]?
+    let conflicts: [ConflictPayload]?
     let message: String?
     let error: String?
+
+    init(
+        ok: Bool,
+        operation: String,
+        entry: EntryPayload?,
+        entries: [EntryPayload]?,
+        conflicts: [ConflictPayload]? = nil,
+        message: String?,
+        error: String?
+    ) {
+        self.ok = ok
+        self.operation = operation
+        self.entry = entry
+        self.entries = entries
+        self.conflicts = conflicts
+        self.message = message
+        self.error = error
+    }
 }
 
 public struct MemoryTool: Tool {
@@ -81,6 +120,16 @@ public struct MemoryTool: Tool {
           "type":"integer",
           "minimum":0,
           "description":"Character offset used by insert. Defaults to appending at the end."
+        },
+        "scope":{
+          "type":"string",
+          "enum":["allChats","currentProject","temporary"],
+          "description":"Scope for create. Defaults to allChats. Use temporary for facts that should expire soon."
+        },
+        "expires_at":{
+          "type":"string",
+          "format":"date-time",
+          "description":"Optional ISO-8601 expiry date for create. Temporary memories default to about 24 hours if omitted."
         }
       },
       "required":["operation"]
@@ -101,10 +150,40 @@ public struct MemoryTool: Tool {
                 let entry = try await MainActor.run { try MemoryStore.shared.entry(id: input.entryID, title: input.title) }
                 response = MemoryToolResponse(ok: true, operation: operation, entry: .init(entry), entries: nil, message: "Loaded memory entry.", error: nil)
             case "create":
-                let entry = try await MainActor.run {
-                    try MemoryStore.shared.create(title: input.title ?? "", content: input.content ?? "")
+                let scope = Self.scope(from: input.scope) ?? .allChats
+                let explicitExpiry = Self.expiryDate(from: input.expiresAt)
+                let expiresAt = explicitExpiry ?? Self.defaultExpiryDate(for: scope)
+                let reviewRequired = UserDefaults.standard.object(forKey: "memoryReviewRequired") as? Bool ?? true
+                if reviewRequired {
+                    let item = try await MainActor.run {
+                        try MemoryStore.shared.proposeCreate(
+                            title: input.title ?? "",
+                            content: input.content ?? "",
+                            scope: scope,
+                            expiresAt: expiresAt
+                        )
+                    }
+                    let conflicts = item.possibleConflicts?.map(MemoryToolResponse.ConflictPayload.init) ?? []
+                    response = MemoryToolResponse(
+                        ok: true,
+                        operation: operation,
+                        entry: nil,
+                        entries: nil,
+                        conflicts: conflicts.isEmpty ? nil : conflicts,
+                        message: conflicts.isEmpty ? "Memory save queued for review." : "Memory save queued with possible conflicts.",
+                        error: nil
+                    )
+                } else {
+                    let entry = try await MainActor.run {
+                        try MemoryStore.shared.create(
+                            title: input.title ?? "",
+                            content: input.content ?? "",
+                            scope: scope,
+                            expiresAt: expiresAt
+                        )
+                    }
+                    response = MemoryToolResponse(ok: true, operation: operation, entry: .init(entry), entries: nil, message: "Created memory entry.", error: nil)
                 }
-                response = MemoryToolResponse(ok: true, operation: operation, entry: .init(entry), entries: nil, message: "Created memory entry.", error: nil)
             case "replace":
                 let entry = try await MainActor.run {
                     try MemoryStore.shared.replace(id: input.entryID, title: input.title, content: input.content ?? "")
@@ -155,5 +234,25 @@ public struct MemoryTool: Tool {
             encoder.dateEncodingStrategy = .iso8601
             return try encoder.encode(response)
         }
+    }
+
+    private static func scope(from rawScope: String?) -> MemoryScope? {
+        guard let rawScope else { return nil }
+        return MemoryScope(rawValue: rawScope.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func expiryDate(from rawDate: String?) -> Date? {
+        guard let rawDate = rawDate?.trimmingCharacters(in: .whitespacesAndNewlines), !rawDate.isEmpty else {
+            return nil
+        }
+        if let date = ISO8601DateFormatter().date(from: rawDate) {
+            return date
+        }
+        return nil
+    }
+
+    private static func defaultExpiryDate(for scope: MemoryScope) -> Date? {
+        guard scope == .temporary else { return nil }
+        return Calendar.current.date(byAdding: .day, value: 1, to: Date())
     }
 }

@@ -54,6 +54,7 @@ struct ProcessPythonExecutor: PythonExecutor, Sendable {
                 let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
                 let stderr = String(data: stderrData, encoding: .utf8) ?? ""
                 let elapsed = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+                let artifacts = PythonExecutionArtifactCollector.collect(from: tempDir)
 
                 return PythonExecutionResult(
                     stdout: stdout,
@@ -61,7 +62,8 @@ struct ProcessPythonExecutor: PythonExecutor, Sendable {
                     exitCode: process.terminationStatus,
                     executionTimeMs: elapsed,
                     error: process.terminationStatus != 0 ? "Process exited with code \(process.terminationStatus)" : nil,
-                    timedOut: false
+                    timedOut: false,
+                    artifacts: artifacts
                 )
             }
 
@@ -81,6 +83,7 @@ struct ProcessPythonExecutor: PythonExecutor, Sendable {
                 let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
                 let stderr = String(data: stderrData, encoding: .utf8) ?? ""
                 let elapsed = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+                let artifacts = PythonExecutionArtifactCollector.collect(from: tempDir)
 
                 return PythonExecutionResult(
                     stdout: stdout,
@@ -88,7 +91,8 @@ struct ProcessPythonExecutor: PythonExecutor, Sendable {
                     exitCode: -1,
                     executionTimeMs: elapsed,
                     error: "Execution timed out after \(Int(timeout)) seconds",
-                    timedOut: true
+                    timedOut: true,
+                    artifacts: artifacts
                 )
             }
 

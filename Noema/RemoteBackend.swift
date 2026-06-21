@@ -2108,9 +2108,17 @@ enum RemoteBackendAPI {
         guard !containerID.isEmpty else {
             throw RemoteBackendError.validationFailed(String(localized: "Missing CloudKit container identifier.", locale: appLocale()))
         }
-        try await requestRelayCatalogRefreshIfNeeded(for: backend,
-                                                     containerID: containerID,
-                                                     hostDeviceID: hostDeviceID)
+        // A refresh nudges the host to republish, but it's only an optimization:
+        // if the command times out or the host is momentarily offline we still
+        // serve whatever snapshot was last published rather than failing the
+        // whole model list.
+        do {
+            try await requestRelayCatalogRefreshIfNeeded(for: backend,
+                                                         containerID: containerID,
+                                                         hostDeviceID: hostDeviceID)
+        } catch {
+            await logger.log("[RemoteBackendAPI] ⚠️ Relay catalog refresh request failed (\(error.localizedDescription)); falling back to last published snapshot")
+        }
         await logger.log("[RemoteBackendAPI] ⇢ Fetching Noema Relay catalog for backend=\(backend.name)")
         let maxAttempts = 3
         var lastError: Error?

@@ -16,6 +16,12 @@
 #ifndef LLAMA_POOLING_MEAN
 #define LLAMA_POOLING_MEAN 1
 #endif
+#ifndef LLAMA_POOLING_CLS
+#define LLAMA_POOLING_CLS 2
+#endif
+#ifndef LLAMA_POOLING_LAST
+#define LLAMA_POOLING_LAST 3
+#endif
 
 // The declarations are now provided by the bridging header,
 // so this block is no longer needed.
@@ -51,15 +57,36 @@ static inline void noema_llama_kv_cache_clear(struct llama_context *ctx) {
 #endif
 }
 
+typedef NS_ENUM(NSInteger, NoemaEmbeddingEvalMode) {
+  NoemaEmbeddingEvalModeUnsupported = 0,
+  NoemaEmbeddingEvalModeEncode,
+  NoemaEmbeddingEvalModeDecode,
+};
+
+static const char * noema_embedding_eval_mode_name(NoemaEmbeddingEvalMode mode) {
+  switch (mode) {
+    case NoemaEmbeddingEvalModeEncode:
+      return "encode";
+    case NoemaEmbeddingEvalModeDecode:
+      return "decode";
+    case NoemaEmbeddingEvalModeUnsupported:
+    default:
+      return "unsupported";
+  }
+}
+
 @implementation LlamaEmbedder {
   llama_model *_model;
   llama_context *_ctx;
   int _dim;
+  NoemaEmbeddingEvalMode _evalMode;
 }
 
 - (instancetype)initWithModelPath:(NSString *)modelPath
                           threads:(int)threads
-                       nGpuLayers:(int)nGpuLayers {
+                       nGpuLayers:(int)nGpuLayers
+                    contextLength:(int)contextLength
+                       poolingType:(int)poolingType {
   self = [super init];
   if (!self) return nil;
     noema_llama_backend_addref();
@@ -78,23 +105,51 @@ static inline void noema_llama_kv_cache_clear(struct llama_context *ctx) {
     }
     _model = llama_load_model_from_file(modelPath.UTF8String, mp);
     if (!_model) { noema_llama_backend_release(); return self; }
+    const BOOL hasEncoder = llama_model_has_encoder(_model);
+    const BOOL hasDecoder = llama_model_has_decoder(_model);
+    if (hasDecoder) {
+      _evalMode = NoemaEmbeddingEvalModeDecode;
+    } else if (hasEncoder) {
+      _evalMode = NoemaEmbeddingEvalModeEncode;
+    } else {
+      _evalMode = NoemaEmbeddingEvalModeUnsupported;
+    }
+    NSLog(@"[Embed] selected embedding API mode=%s hasEncoder=%d hasDecoder=%d",
+          noema_embedding_eval_mode_name(_evalMode),
+          (int) hasEncoder,
+          (int) hasDecoder);
+    if (_evalMode == NoemaEmbeddingEvalModeUnsupported) {
+      NSLog(@"[Embed] unsupported embedding model capabilities for path=%@", modelPath);
+      llama_model_free(_model);
+      _model = NULL;
+      noema_llama_backend_release();
+      return self;
+    }
     struct llama_context_params cp = llama_context_default_params();
     cp.embeddings = true;
     // manage batches and outputs manually.
     cp.n_threads = threads > 0 ? threads : 2;
     cp.n_threads_batch = cp.n_threads;
-    // Use a larger context appropriate for nomic-embed-text-v1.5 (n_ctx_train = 2048)
-    cp.n_ctx = 2048;
+    const int resolvedContextLength = contextLength > 0 ? contextLength : 2048;
+    cp.n_ctx = resolvedContextLength;
     // Configure batching for single-sequence processing. We embed one text at a time
     // but allow up to `n_ctx` tokens per batch.
-    cp.n_batch = 2048;
+    cp.n_batch = resolvedContextLength;
     cp.n_ubatch = cp.n_batch;
     cp.n_seq_max = 1;
-    // Respect model's mean pooling requirement (nomic-bert.pooling_type = 1)
-    cp.pooling_type = (enum llama_pooling_type)LLAMA_POOLING_MEAN;
-    // Explicitly disable Flash Attention for non-causal BERT-style models.
+    int resolvedPoolingType = poolingType;
+    if (resolvedPoolingType < 0) {
+      resolvedPoolingType = LLAMA_POOLING_MEAN;
+    }
+    cp.pooling_type = (enum llama_pooling_type)resolvedPoolingType;
+    // Keep flash attention disabled in this wrapper for embedding compatibility.
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cp.offload_kqv = false;
+    // Decoder-style embedders (e.g. Qwen3-Embedding) need the KV cache on GPU
+    // when weights are offloaded; otherwise attention ops run on CPU. For
+    // CPU-only loads, keep KV on CPU explicitly.
+    if (nGpuLayers <= 0) {
+      cp.offload_kqv = false;
+    }
   // Initialize context using modern API
   _ctx = llama_init_from_model(_model, cp);
   if (!_ctx) { llama_model_free(_model); _model = NULL; noema_llama_backend_release(); return self; }
@@ -103,7 +158,7 @@ static inline void noema_llama_kv_cache_clear(struct llama_context *ctx) {
   return self;
 }
 
-- (BOOL)isReady { return _model && _ctx && _dim > 0; }
+- (BOOL)isReady { return _model && _ctx && _dim > 0 && _evalMode != NoemaEmbeddingEvalModeUnsupported; }
 - (int)dimension { return _dim; }
 
 - (int)countTokens:(NSString *)text {
@@ -118,9 +173,13 @@ static inline void noema_llama_kv_cache_clear(struct llama_context *ctx) {
 
 - (BOOL)embedText:(NSString *)text intoBuffer:(float *)buffer length:(int)length {
   if (!_model || !_ctx || !buffer || length < _dim) return NO;
-  
-  // Clear the KV cache before processing a new sequence to ensure a clean state.
-  noema_llama_kv_cache_clear(_ctx);
+  if (_evalMode == NoemaEmbeddingEvalModeUnsupported) return NO;
+
+  // Decoder-style embedding models use the KV-backed decode path, so clear state
+  // before each new sequence to keep pooled outputs isolated per request.
+  if (_evalMode == NoemaEmbeddingEvalModeDecode) {
+    noema_llama_kv_cache_clear(_ctx);
+  }
   
   std::string s(text.UTF8String);
   std::vector<llama_token> toks;
@@ -154,16 +213,27 @@ static inline void noema_llama_kv_cache_clear(struct llama_context *ctx) {
     batch.pos[i] = i;
     batch.seq_id[i][0] = 0;
     batch.n_seq_id[i] = 1;
-    // Mark all tokens as outputs so mean pooling can aggregate across the
-    // entire sequence when pooling_type is LLAMA_POOLING_MEAN.
+    // Mark all tokens as outputs so pooled embedding modes can aggregate or
+    // select the appropriate token row for the whole sequence.
     batch.logits[i] = 1;
   }
-  // Forcibly use llama_encode as we are linking against a modern llama.cpp library
-  int rc = llama_encode(_ctx, batch);
+  int rc = 0;
+  switch (_evalMode) {
+    case NoemaEmbeddingEvalModeEncode:
+      rc = llama_encode(_ctx, batch);
+      break;
+    case NoemaEmbeddingEvalModeDecode:
+      rc = llama_decode(_ctx, batch);
+      break;
+    case NoemaEmbeddingEvalModeUnsupported:
+    default:
+      llama_batch_free(batch);
+      return NO;
+  }
   llama_batch_free(batch);
   if (rc != 0) return NO;
 
-  // For mean pooling, get the embedding for the entire sequence (ID 0)
+  // Pooled embedding models expose one sequence embedding per sequence ID.
   const float *emb = llama_get_embeddings_seq(_ctx, 0);
   if (!emb) return NO;
   

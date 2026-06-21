@@ -122,6 +122,54 @@ struct AFMBackend: InferenceBackend {
     }
 }
 
+struct CoreAIBackend: InferenceBackend {
+    static let supported: Set<ModelFormat> = [.coreai]
+    private var client: AnyLLMClient?
+
+    mutating func load(_ installed: InstalledModel) async throws {
+        let resolved = try CoreAIModelResolver.resolve(modelURL: installed.url)
+        let coreaiClient = CoreAILLMClient(resolved: resolved)
+        try await coreaiClient.load()
+        client = AnyLLMClient(
+            textStream: { input in
+                try await coreaiClient.textStream(from: input)
+            },
+            cancel: nil,
+            unload: { coreaiClient.unload() },
+            syncSystemPrompt: { prompt in
+                await coreaiClient.syncSystemPrompt(prompt)
+            }
+        )
+    }
+
+    func generate(streaming request: GenerateRequest) -> AsyncThrowingStream<TokenEvent, Error> {
+        AsyncThrowingStream { continuation in
+            guard let client = client else {
+                continuation.finish(throwing: NSError(domain: "Noema", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "CoreAIBackend client not loaded"]))
+                return
+            }
+
+            Task {
+                do {
+                    let input = LLMInput.plain(request.prompt)
+                    for try await token in try await client.textStream(from: input) {
+                        continuation.yield(.token(token))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    mutating func unload() {
+        client?.unload()
+        client = nil
+    }
+}
+
 #if os(iOS) || os(visionOS)
 @available(iOS 18.0, visionOS 2.0, *)
 struct CoreMLBackend: InferenceBackend {
@@ -173,15 +221,7 @@ struct ExecuTorchBackend: InferenceBackend {
     private var client: AnyLLMClient?
 
     mutating func load(_ installed: InstalledModel) async throws {
-        guard let pte = ETModelResolver.pteURL(for: installed.url) else {
-            throw NSError(domain: "Noema", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Missing .pte file for ET model."])
-        }
-        guard let tokenizer = ETModelResolver.tokenizerURL(for: installed.url)
-                ?? ETModelResolver.tokenizerURL(for: pte.deletingLastPathComponent()) else {
-            throw NSError(domain: "Noema", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Missing tokenizer for ET model."])
-        }
+        let artifacts = try ETModelResolver.resolveLoadArtifacts(for: installed.url)
 
         let effectiveSettings: ModelSettings = {
             var settings = ModelSettings.default(for: .et)
@@ -193,8 +233,8 @@ struct ExecuTorchBackend: InferenceBackend {
         }()
 
         let etClient = ExecuTorchLLMClient(
-            modelPath: pte.path,
-            tokenizerPath: tokenizer.path,
+            modelPath: artifacts.pteURL.path,
+            tokenizerPath: artifacts.tokenizerURL.path,
             isVision: installed.isMultimodal,
             settings: effectiveSettings
         )
@@ -255,6 +295,12 @@ final class BackendRouter {
         }
         if AFMBackend.supported.contains(model.format) {
             var b = AFMBackend()
+            try await b.load(model)
+            backend = b
+            return b
+        }
+        if CoreAIBackend.supported.contains(model.format) {
+            var b = CoreAIBackend()
             try await b.load(model)
             backend = b
             return b

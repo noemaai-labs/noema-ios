@@ -489,7 +489,7 @@ final class LeapBundleDownloader: NSObject, @unchecked Sendable {
         // 1) Fetch manifest.
         var manifestReq = URLRequest(url: leapResolveURL(for: entry.remotePath))
         withAuthHeaders(&manifestReq, token: token)
-        let (manifestData, manifestResp) = try await URLSession.shared.data(for: manifestReq)
+        let (manifestData, manifestResp) = try await URLSession.shared.data(for: HFEndpoint.rewrite(manifestReq))
         if let http = manifestResp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw URLError(.badServerResponse)
         }

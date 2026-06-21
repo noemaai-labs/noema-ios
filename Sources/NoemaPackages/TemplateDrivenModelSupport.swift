@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public enum TemplateDrivenModelSupport {
     public enum Profile: String, Sendable {
@@ -69,7 +72,12 @@ public enum TemplateDrivenModelSupport {
                                                   host: String = "127.0.0.1",
                                                   preferredPort: Int32 = 0,
                                                   ggufPath: String,
-                                                  mmprojPath: String?) -> LlamaServerBridge.StartConfiguration {
+                                                  mmprojPath: String?,
+                                                  mtpPath: String? = nil,
+                                                  speculativeType: String? = nil,
+                                                  specDraftNMax: Int32? = nil,
+                                                  specDraftNMin: Int32? = nil,
+                                                  specDraftPMin: Double? = nil) -> LlamaServerBridge.StartConfiguration {
         let resolution = resolve(modelID: modelID, modelURL: modelURL)
         if resolution.profile == .gemma4 {
             return LlamaServerBridge.StartConfiguration(
@@ -77,9 +85,14 @@ public enum TemplateDrivenModelSupport {
                 preferredPort: preferredPort,
                 ggufPath: ggufPath,
                 mmprojPath: mmprojPath,
+                mtpPath: mtpPath,
                 chatTemplateFile: resolution.chatTemplateFile,
                 cacheRamMiB: 2048,
                 ctxCheckpoints: 2,
+                speculativeType: speculativeType,
+                specDraftNMax: specDraftNMax,
+                specDraftNMin: specDraftNMin,
+                specDraftPMin: specDraftPMin,
                 useJinja: true
             )
         }
@@ -89,8 +102,13 @@ public enum TemplateDrivenModelSupport {
                 preferredPort: preferredPort,
                 ggufPath: ggufPath,
                 mmprojPath: mmprojPath,
+                mtpPath: mtpPath,
                 chatTemplateFile: resolution.chatTemplateFile,
                 reasoningBudget: -1,
+                speculativeType: speculativeType,
+                specDraftNMax: specDraftNMax,
+                specDraftNMin: specDraftNMin,
+                specDraftPMin: specDraftPMin,
                 useJinja: true
             )
         }
@@ -99,7 +117,12 @@ public enum TemplateDrivenModelSupport {
             preferredPort: preferredPort,
             ggufPath: ggufPath,
             mmprojPath: mmprojPath,
-            chatTemplateFile: resolution.chatTemplateFile
+            mtpPath: mtpPath,
+            chatTemplateFile: resolution.chatTemplateFile,
+            speculativeType: speculativeType,
+            specDraftNMax: specDraftNMax,
+            specDraftNMin: specDraftNMin,
+            specDraftPMin: specDraftPMin
         )
     }
 
@@ -432,9 +455,7 @@ public enum TemplateDrivenModelSupport {
         let containsEnableThinking = contents.contains("enable_thinking")
         let firstLine = contents.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
         let signature = "path=\(path) matches=\(matchesSource) think=\(containsThink) function=\(containsFunction) enable_thinking=\(containsEnableThinking) first=\(firstLine.prefix(80)) bytes=\(contents.utf8.count)"
-        if let data = "[Loopback][Template] \(signature)\n".data(using: .utf8) {
-            FileHandle.standardError.write(data)
-        }
+        writeStderr("[Loopback][Template] \(signature)\n")
     }
 
     private static func profile(fromTemplate template: String) -> Profile {
@@ -489,8 +510,11 @@ public enum TemplateDrivenModelSupport {
         let modelComponent = modelID ?? modelURL?.lastPathComponent ?? "unknown"
         let templateName = resolution.chatTemplateFile.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         let line = "[Loopback][Profile] model=\(modelComponent) profile=\(resolution.profile.rawValue) source=\(resolution.source) template=\(templateName)\n"
-        if let data = line.data(using: .utf8) {
-            FileHandle.standardError.write(data)
-        }
+        writeStderr(line)
+    }
+
+    private static func writeStderr(_ line: String) {
+        fputs(line, stderr)
+        fflush(stderr)
     }
 }
