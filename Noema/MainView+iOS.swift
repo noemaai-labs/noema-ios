@@ -36,7 +36,7 @@ struct MainView: View {
         .exploreSwitchToModels,
         .exploreModelTypes,
         .exploreMLX,
-        .exploreSLM,
+        .exploreET,
         .settingsIntro,
         .settingsHighlights,
         .completed
@@ -76,6 +76,16 @@ struct MainView: View {
                         .environmentObject(walkthrough)
                         .tabItem { Label(LocalizedStringKey("Explore"), systemImage: "safari") }
                 }
+
+                ToolsHubView()
+                    .tag(MainTab.tools)
+                    .environmentObject(chatVM)
+                    .environmentObject(modelManager)
+                    .environmentObject(datasetManager)
+                    .environmentObject(tabRouter)
+                    .environmentObject(downloadController)
+                    .environmentObject(walkthrough)
+                    .tabItem { Label(LocalizedStringKey("Tools"), systemImage: "wrench.and.screwdriver") }
 
                 SettingsView()
                     .tag(MainTab.settings)
@@ -142,13 +152,25 @@ struct MainView: View {
             switch phase {
             case .active:
                 backgroundUnloadController.cancelPendingUnload()
+                AutopilotAFMBrain.syncWarmState(armed: modelManager.autoRoutingArmed)
+                _ = chatVM.resumeDeferredAutoRoutingIfNeeded()
             case .inactive:
+                // Inactive is commonly transient (system overlays, permission
+                // prompts, app switching). Never destroy an in-flight turn here.
                 backgroundUnloadController.scheduleIfNeeded(
                     sceneState: .inactive,
                     chatVM: chatVM,
                     modelManager: modelManager
                 )
             case .background:
+                AutopilotAFMBrain.syncWarmState(armed: false, cancelInFlight: true)
+                _ = chatVM.deferAutoRoutingLocallyUntilActive(
+                    reason: "scene-background"
+                )
+                // Flush any coalesced session save now so a message added just before
+                // backgrounding isn't lost if the app is suspended/killed before the
+                // trailing delayed save fires.
+                chatVM.flushPendingSessionSavesNow()
                 // Persist all rolling thought boxes for restoration on next launch
                 let keys = Array(chatVM.rollingThoughtViewModels.keys)
                 UserDefaults.standard.set(keys, forKey: "RollingThought.Keys")
@@ -173,18 +195,39 @@ struct MainView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
-            // Under heavy downloads + indexing, iPadOS can get memory pressure during rotation/background snapshots.
-            // Proactively unload optional caches/backends to avoid jetsam / UIKit crashes.
+            // A memory warning during autopilot routing must not call `stop()`:
+            // that invalidates the send, deletes its empty assistant placeholder,
+            // and makes the resident GGUF appear idle. Abandon only the routing
+            // verdict and let the same turn continue locally. Win the one-shot
+            // router continuation synchronously, before a late result can replace
+            // the local memory-pressure fallback.
+            let deferredUntilActive: Bool
+            let continuedLocally: Bool
+            AutopilotAFMBrain.syncWarmState(armed: false, cancelInFlight: true)
+            if scenePhase == .active {
+                deferredUntilActive = false
+                continuedLocally = chatVM.cancelAutoRoutingAndContinueLocally(
+                    reason: "memory-warning"
+                )
+            } else {
+                deferredUntilActive = chatVM.deferAutoRoutingLocallyUntilActive(
+                    reason: "memory-warning-background"
+                )
+                continuedLocally = false
+            }
+            let wasStreaming = chatVM.isStreaming
+            let sendWasInFlight = chatVM.sendInFlight
+            Task {
+                await logger.log(
+                    "[Lifecycle][MemoryWarning] routingFallback=\(continuedLocally) deferredUntilActive=\(deferredUntilActive) streaming=\(wasStreaming) sendInFlight=\(sendWasInFlight)"
+                )
+            }
             Task.detached {
                 if await EmbeddingModel.shared.activeOperationsCount == 0 {
                     await EmbeddingModel.shared.unload()
                 }
                 await DatasetRetriever.shared.clearCache()
-                await MainActor.run {
-                    if !chatVM.isStreaming {
-                        Task { await chatVM.unload() }
-                    }
-                }
+                _ = await chatVM.unloadIfIdle(reason: "memory-warning")
             }
         }
     }

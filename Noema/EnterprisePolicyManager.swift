@@ -1,7 +1,3 @@
-// EnterprisePolicyManager.swift
-// Owns the Noema Teams connection lifecycle: enrollment, the device token (Keychain),
-// the cached policy snapshot, periodic refresh, dataset sync, and the off-grid mapping.
-// Enforcement itself happens synchronously in EnterprisePolicyGate.
 import Foundation
 import SwiftUI
 #if os(iOS) || os(visionOS)
@@ -509,6 +505,14 @@ final class EnterprisePolicyManager: ObservableObject {
     }
 
     var offGridForcedByPolicy: Bool { EnterprisePolicyGate.requiresOffGrid }
+
+    /// Reasserts the current cached policy after broad settings mutations such
+    /// as Reset App Data. This prevents those flows from temporarily disabling
+    /// a mandatory off-grid policy or losing the marker used to restore the
+    /// user's prior preference when the policy is removed.
+    func reapplyOffGridMapping() {
+        applyOffGridMapping()
+    }
 
     // MARK: Disconnect
 

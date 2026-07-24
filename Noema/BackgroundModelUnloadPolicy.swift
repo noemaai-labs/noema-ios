@@ -10,6 +10,8 @@ struct BackgroundModelUnloadPolicy: Equatable, Sendable {
     struct Profile: Equatable, Sendable {
         var hasActiveChatModel: Bool
         var isStreaming: Bool
+        var sendInFlight: Bool
+        var isRouting: Bool
         var format: ModelFormat?
         var estimatedWorkingSetBytes: Int64?
         var memoryBudgetBytes: Int64?
@@ -60,6 +62,12 @@ struct BackgroundModelUnloadPolicy: Equatable, Sendable {
         }
         guard !profile.isStreaming else {
             return .keep(reason: "generation in progress")
+        }
+        guard !profile.sendInFlight else {
+            return .keep(reason: "send in progress")
+        }
+        guard !profile.isRouting else {
+            return .keep(reason: "routing in progress")
         }
         guard let format = profile.format else {
             return .keep(reason: "no local runtime format")

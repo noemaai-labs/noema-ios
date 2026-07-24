@@ -2,6 +2,93 @@ import XCTest
 @testable import Noema
 
 final class BackgroundDownloadManagerTests: XCTestCase {
+    func testCompleteStagingFileIsAdoptedOnlyAtExactKnownSize() {
+        XCTAssertTrue(
+            BackgroundDownloadManager.canAdoptCompletedStagingFile(
+                existingBytes: 10_000,
+                expectedBytes: 10_000
+            )
+        )
+        XCTAssertFalse(
+            BackgroundDownloadManager.canAdoptCompletedStagingFile(
+                existingBytes: 9_999,
+                expectedBytes: 10_000
+            )
+        )
+        XCTAssertFalse(
+            BackgroundDownloadManager.canAdoptCompletedStagingFile(
+                existingBytes: 10_000,
+                expectedBytes: nil
+            )
+        )
+    }
+
+    func testTransportPolicyKeepsEveryActiveIOSVersionOnFastSession() {
+        XCTAssertEqual(
+            DownloadTransportPolicy.preferred(
+                isAppActive: true,
+                supportsContinuedProcessing: false,
+                hasContinuedProcessingTask: false
+            ),
+            .foreground
+        )
+        XCTAssertEqual(
+            DownloadTransportPolicy.preferred(
+                isAppActive: true,
+                supportsContinuedProcessing: true,
+                hasContinuedProcessingTask: false
+            ),
+            .foreground
+        )
+    }
+
+    func testMacOSActiveProcessAlwaysUsesFastSession() {
+        XCTAssertEqual(DownloadTransportPolicy.macOSActiveProcess, .foreground)
+    }
+
+    func testTransportPolicyUsesContinuedProcessingOnlyWhileBackgroundedAndProtected() {
+        XCTAssertEqual(
+            DownloadTransportPolicy.preferred(
+                isAppActive: false,
+                supportsContinuedProcessing: true,
+                hasContinuedProcessingTask: true
+            ),
+            .foreground
+        )
+        XCTAssertEqual(
+            DownloadTransportPolicy.preferred(
+                isAppActive: false,
+                supportsContinuedProcessing: true,
+                hasContinuedProcessingTask: false
+            ),
+            .background
+        )
+        XCTAssertEqual(
+            DownloadTransportPolicy.preferred(
+                isAppActive: false,
+                supportsContinuedProcessing: false,
+                hasContinuedProcessingTask: true
+            ),
+            .background
+        )
+    }
+
+    func testProgressThrottlerCoalescesTicksAndAllowsForcedCompletion() {
+        var now = 100.0
+        let throttler = ProgressThrottler<String>(interval: 0.5, nowSeconds: { now })
+
+        XCTAssertTrue(throttler.shouldAllow(key: "download"))
+        now += 0.1
+        XCTAssertFalse(throttler.shouldAllow(key: "download"))
+        now += 0.4
+        XCTAssertTrue(throttler.shouldAllow(key: "download"))
+        now += 0.01
+        XCTAssertTrue(throttler.shouldAllow(key: "download", force: true))
+
+        throttler.clear(key: "download")
+        XCTAssertTrue(throttler.shouldAllow(key: "download"))
+    }
+
     func testTaskSnapshotIncludesResumeOffsetInWrittenTotal() {
         let snapshot = BackgroundDownloadManager.makeTaskSnapshot(
             jobID: "job-1",
@@ -163,6 +250,19 @@ final class BackgroundDownloadManagerTests: XCTestCase {
         XCTAssertEqual(result.mode, .freshTask)
     }
 
+    func testNormalizeProgressSaturatesMalformedOverflowingTotals() {
+        let result = BackgroundDownloadManager.normalizeProgressTotals(
+            resumeOffset: Int64.max,
+            totalBytesWritten: Int64.max,
+            taskExpected: Int64.max,
+            recordedExpected: Int64.max
+        )
+
+        XCTAssertEqual(result.writtenTotal, Int64.max)
+        XCTAssertEqual(result.fullExpected, Int64.max)
+        XCTAssertEqual(result.mode, .resumeFullSize)
+    }
+
     func testDownloadArtifactDecodesLegacyDestinationIntoStagingAndFinalURLs() throws {
         let legacyDestination = URL(fileURLWithPath: "/tmp/model.gguf.download")
         let payload: [String: Any] = [
@@ -185,5 +285,40 @@ final class BackgroundDownloadManagerTests: XCTestCase {
         XCTAssertEqual(artifact.destinationURL, legacyDestination)
         XCTAssertEqual(artifact.state, .paused)
         XCTAssertTrue(artifact.manualPause)
+    }
+
+    func testDownloadJobTotalsSaturateInsteadOfOverflowing() {
+        let finalURL = URL(fileURLWithPath: "/tmp/model.gguf")
+        let artifacts = ["a", "b"].map { id in
+            DownloadArtifact(
+                id: id,
+                role: .mainWeights,
+                remoteURL: nil,
+                stagingURL: finalURL.appendingPathExtension("download"),
+                finalURL: finalURL,
+                expectedBytes: Int64.max,
+                downloadedBytes: Int64.max,
+                checksum: nil,
+                state: .downloading,
+                retryCount: 0,
+                nextRetryAt: nil,
+                lastErrorDescription: nil,
+                manualPause: false
+            )
+        }
+        let job = DownloadJob(
+            id: "overflow",
+            owner: .embedding(EmbeddingDownloadOwner(repoID: "test/overflow")),
+            state: .downloading,
+            artifacts: artifacts,
+            createdAt: Date(),
+            updatedAt: Date(),
+            lastErrorDescription: nil,
+            manualPause: false
+        )
+
+        XCTAssertEqual(job.totalExpectedBytes, Int64.max)
+        XCTAssertEqual(job.totalDownloadedBytes, Int64.max)
+        XCTAssertEqual(job.progress, 1)
     }
 }

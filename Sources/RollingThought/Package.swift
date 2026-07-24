@@ -18,6 +18,7 @@ let package = Package(
             name: "RollingThought",
             dependencies: [],
             path: ".",
+            exclude: ["build"],
             sources: ["RollingThought.swift"]
         )
     ]

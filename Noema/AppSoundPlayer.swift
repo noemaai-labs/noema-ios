@@ -50,6 +50,9 @@ enum AppSoundPlayer {
     static func play(_ sound: AppSound) {
 #if canImport(AVFoundation)
         guard !soundsMuted else { return }
+        // Never flip the shared session category out from under a live voice
+        // feature (dictation / voice mode) — it would silently kill the mic.
+        guard !VoiceSessionOwnership.shared.isOwned else { return }
 #if os(iOS)
         // AVAudioSession setCategory / setActive must NOT be called on the main thread
         // while the session is active — it can cause UI unresponsiveness. Move that work

@@ -1,4 +1,3 @@
-// EPUBTextExtractor.swift
 import Foundation
 import Compression
 

@@ -21,6 +21,20 @@
                ReferencedContainer = "container:Noema.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "D10000012F50000000000025"
+               BuildableName = "NoemaMCPTests.xctest"
+               BlueprintName = "NoemaMCPTests"
+               ReferencedContainer = "container:Noema.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -30,6 +44,17 @@
       shouldUseLaunchSchemeArgsEnv = "YES"
       shouldAutocreateTestPlan = "YES">
       <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "D10000012F50000000000025"
+               BuildableName = "NoemaMCPTests.xctest"
+               BlueprintName = "NoemaMCPTests"
+               ReferencedContainer = "container:Noema.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
          <TestableReference
             skipped = "NO"
             parallelizable = "YES">

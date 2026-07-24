@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AppStoreID</key>
+	<string>6751169935</string>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.noema.download.maintenance</string>
+	</array>
+	<key>CFBundleName</key>
+	<string>Noema</string>
+	<key>CFBundleDisplayName</key>
+	<string>Noema</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>Model Context Protocol OAuth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>noema-mcp</string>
+			</array>
+		</dict>
+	</array>
+        <key>ITSAppUsesNonExemptEncryption</key>
+        <false/>
+        <key>CloudKitContainerIdentifier</key>
+        <string>iCloud.arminproducts.Noema</string>
+        <key>NSCalendarsFullAccessUsageDescription</key>
+        <string>Allow Noema to read your calendar and add events you confirm in chat.</string>
+        <key>NSCameraUsageDescription</key>
+        <string>Allow Noema to capture a photo for your chat attachment.</string>
+        <key>NSPhotoLibraryUsageDescription</key>
+        <string>Allow Noema to show your recent photos when attaching images.</string>
+        <key>NSMicrophoneUsageDescription</key>
+        <string>Allow Noema to record audio so it can be transcribed locally when available.</string>
+        <key>NSSpeechRecognitionUsageDescription</key>
+        <string>Allow Noema to transcribe audio and video attachments into text.</string>
+        <key>LSApplicationCategoryType</key>
+        <string>public.app-category.productivity</string>
+        <key>LSUIElement</key>
+        <false/>
+        <key>NSAppTransportSecurity</key>
+        <dict>
+                <key>NSAllowsArbitraryLoads</key>
+                <true/>
+                <key>NSExceptionDomains</key>
+                <dict>
+                        <key>127.0.0.1</key>
+                        <dict>
+                                <key>NSTemporaryExceptionAllowsInsecureHTTPLoads</key>
+                                <true/>
+                                <key>NSTemporaryExceptionMinimumTLSVersion</key>
+                                <string>TLSv1.2</string>
+                        </dict>
+                        <key>localhost</key>
+                        <dict>
+                                <key>NSTemporaryExceptionAllowsInsecureHTTPLoads</key>
+                                <true/>
+                                <key>NSTemporaryExceptionMinimumTLSVersion</key>
+                                <string>TLSv1.2</string>
+                        </dict>
+                </dict>
+        </dict>
+        <key>UIBackgroundModes</key>
+        <array>
+                <string>fetch</string>
+                <string>processing</string>
+        </array>
+        <key>NSBluetoothAlwaysUsageDescription</key>
+        <string>Noema uses Bluetooth to share relay setup details with your other devices.</string>
+        <key>NSBluetoothPeripheralUsageDescription</key>
+        <string>Noema uses Bluetooth to share relay setup details with your other devices.</string>
+</dict>
+</plist>

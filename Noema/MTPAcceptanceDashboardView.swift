@@ -75,7 +75,7 @@ struct MTPAcceptanceDashboardSummaryContent: View {
             modelManager.settings(for: $0).speculativeDecoding.mtpEnabled
         }.count
         let options = LlamaServerBridge.lastStartOptions()
-        result.running = options?.speculativeType.isEmpty == false
+        result.running = options?.speculativeType == "draft-mtp"
         summary = result
     }
 
@@ -101,16 +101,35 @@ struct MTPAcceptanceDashboardView: View {
     @State private var exportError: String?
 
     var body: some View {
+        platformContent
+            .task { await refreshLatestResponse() }
+    }
+
+    private var platformContent: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons); the sheet already supplies the
+        // title + close, so macOS gets the industrial card layout with no
+        // navigationTitle.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("MTP Dashboard"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             Section(LocalizedStringKey("MTP Acceptance")) {
                 MTPMetricRow(title: LocalizedStringKey("Draft Tokens"), value: draftTokenValue, systemImage: "bolt.fill", tint: .orange)
                 MTPMetricRow(title: LocalizedStringKey("Accepted Tokens"), value: acceptedTokenValue, systemImage: "checkmark.seal.fill", tint: .green)
                 MTPMetricRow(title: LocalizedStringKey("Acceptance Rate"), value: acceptanceRateValue, systemImage: "percent", tint: acceptanceTint)
-                MTPMetricRow(title: LocalizedStringKey("Speed Delta"), value: speedDeltaValue, systemImage: "speedometer", tint: .blue)
+                MTPMetricRow(title: LocalizedStringKey("Draft Yield"), value: draftYieldValue, systemImage: "speedometer", tint: .blue)
             }
 
             Section(LocalizedStringKey("Current MTP Run")) {
                 MTPValueRow(title: LocalizedStringKey("Running Mode"), value: runningModeValue)
+                MTPValueRow(title: LocalizedStringKey("Auto Draft Length"), value: autoDraftLengthValue)
                 MTPValueRow(title: LocalizedStringKey("Draft Source"), value: draftSourceValue)
                 MTPValueRow(title: LocalizedStringKey("Prompt Rate"), value: promptRateValue)
                 MTPValueRow(title: LocalizedStringKey("Generation Rate"), value: generationRateValue)
@@ -159,15 +178,92 @@ struct MTPAcceptanceDashboardView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("MTP Dashboard"))
-        .task { await refreshLatestResponse() }
     }
 
+#if os(macOS)
+    private var macBody: some View {
+        MacSettingsPage {
+            MacSettingsCard(LocalizedStringKey("MTP Acceptance")) {
+                MacSettingsStatusRow(title: LocalizedStringKey("Draft Tokens"), value: draftTokenValue, systemImage: "bolt.fill", tint: .orange, divider: false)
+                MacSettingsStatusRow(title: LocalizedStringKey("Accepted Tokens"), value: acceptedTokenValue, systemImage: "checkmark.seal.fill", tint: .green)
+                MacSettingsStatusRow(title: LocalizedStringKey("Acceptance Rate"), value: acceptanceRateValue, systemImage: "percent", tint: acceptanceTint)
+                MacSettingsStatusRow(title: LocalizedStringKey("Draft Yield"), value: draftYieldValue, systemImage: "speedometer", tint: .blue)
+            }
+
+            MacSettingsCard(LocalizedStringKey("Current MTP Run")) {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Running Mode"), value: runningModeValue, divider: false)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Auto Draft Length"), value: autoDraftLengthValue)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Draft Source"), value: draftSourceValue)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Prompt Rate"), value: promptRateValue)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Generation Rate"), value: generationRateValue)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Last Response"), value: lastResponseValue)
+                MacSettingsActionRow {
+                    Button {
+                        refresh()
+                    } label: {
+                        Label(LocalizedStringKey("Refresh MTP Metrics"), systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.industrial(.prominent))
+                }
+            }
+
+            MacSettingsCard(LocalizedStringKey("MTP Guidance")) {
+                ForEach(Array(guidanceRows.enumerated()), id: \.offset) { index, row in
+                    MacSettingsNoteRow(row, divider: index != 0)
+                }
+            }
+
+            MacSettingsCard(LocalizedStringKey("Installed MTP Models")) {
+                if mtpRows.isEmpty {
+                    MacSettingsNoteRow(LocalizedStringKey("No MTP-capable GGUF models detected"), divider: false)
+                } else {
+                    ForEach(Array(mtpRows.enumerated()), id: \.element.id) { index, row in
+                        MacMTPInstalledModelRow(row: row, divider: index != 0)
+                    }
+                }
+            }
+
+            MacSettingsCard(LocalizedStringKey("MTP Export")) {
+                MacSettingsActionRow(divider: false) {
+                    Button {
+                        generateExport()
+                    } label: {
+                        Label(LocalizedStringKey("Generate MTP JSON"), systemImage: "doc.badge.gearshape")
+                    }
+                    .buttonStyle(.industrial(.tinted))
+
+                    if let exportURL {
+                        ShareLink(item: exportURL) {
+                            Label(LocalizedStringKey("Share MTP JSON"), systemImage: "square.and.arrow.up")
+                        }
+                        .buttonStyle(.industrial(.quiet))
+                    }
+                }
+
+                if let exportURL {
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Export File"), value: exportURL.lastPathComponent)
+                }
+                if let exportError {
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Export Error"), value: exportError)
+                }
+            }
+        }
+    }
+#endif
+
     private var timings: LoopbackSpeculativeTimings? {
-        latestResponse?.timings
+        guard latestResponse?.speculativeType == "draft-mtp",
+              latestResponse?.timings?.speculativeType == "draft-mtp" else { return nil }
+        return latestResponse?.timings
     }
 
     private var activeLocalModel: LocalModel? {
+        if let modelIdentifier = latestResponse?.modelIdentifier,
+           let responseModel = modelManager.downloadedModels.first(where: {
+               $0.url.path == modelIdentifier || $0.modelID == modelIdentifier
+           }) {
+            return responseModel
+        }
         if let url = chatVM.loadedModelURL {
             return modelManager.downloadedModels.first { $0.url == url || $0.url.path == url.path }
         }
@@ -196,7 +292,7 @@ struct MTPAcceptanceDashboardView: View {
         return .red
     }
 
-    private var speedDeltaValue: String {
+    private var draftYieldValue: String {
         guard let timings, let draft = timings.draftN, draft > 0 else { return "--" }
         let accepted = timings.draftNAccepted ?? 0
         let rejected = max(0, draft - accepted)
@@ -205,10 +301,28 @@ struct MTPAcceptanceDashboardView: View {
     }
 
     private var runningModeValue: String {
-        guard let options = LlamaServerBridge.lastStartOptions(), !options.speculativeType.isEmpty else {
+        guard latestResponse?.speculativeType == "draft-mtp" else {
             return String(localized: "MTP off")
         }
-        return options.speculativeType
+        switch timings?.speculativeState {
+        case "disabled_for_request":
+            return String(localized: "Disabled for this request")
+        case "configured":
+            return String(localized: "Configured")
+        case "attempted_empty":
+            return String(localized: "Attempted — no proposals")
+        case "paused":
+            return String(localized: "Paused")
+        default:
+            return "draft-mtp"
+        }
+    }
+
+    private var autoDraftLengthValue: String {
+        guard let dynLength = timings?.draftNDyn else {
+            return String(localized: "Off")
+        }
+        return dynLength > 0 ? "\(dynLength)" : String(localized: "Paused")
     }
 
     private var draftSourceValue: String {
@@ -220,9 +334,6 @@ struct MTPAcceptanceDashboardView: View {
         }
         if GGUFMetadata.hasMTP(at: model.url) {
             return String(localized: "Embedded MTP head")
-        }
-        if let options = LlamaServerBridge.lastStartOptions(), !options.mtpPath.isEmpty {
-            return URL(fileURLWithPath: options.mtpPath).lastPathComponent
         }
         return String(localized: "Not installed")
     }
@@ -253,7 +364,7 @@ struct MTPAcceptanceDashboardView: View {
             return [LocalizedStringKey("The backend returned draft counts without an acceptance rate.")]
         }
         if rate >= 0.70 {
-            return [LocalizedStringKey("Acceptance is strong; MTP is likely helping this model.")]
+            return [LocalizedStringKey("Draft acceptance is high; confirm the benefit with a plain benchmark.")]
         }
         if rate >= 0.40 {
             return [LocalizedStringKey("Acceptance is mixed; compare against a non-MTP benchmark before keeping it on.")]
@@ -312,6 +423,13 @@ struct MTPAcceptanceDashboardView: View {
             "draftSource": draftSourceValue,
             "draftTokens": timings?.draftN ?? 0,
             "acceptedTokens": timings?.draftNAccepted ?? 0,
+            "draftAttempts": timings?.draftAttempts ?? 0,
+            "emptyDraftAttempts": timings?.draftEmptyAttempts ?? 0,
+            "draftMilliseconds": timings?.draftMS ?? 0,
+            "verificationMilliseconds": timings?.draftVerificationMS ?? 0,
+            "rollbackMilliseconds": timings?.draftRollbackMS ?? 0,
+            "acceptedPerPosition": timings?.draftAcceptedPerPosition ?? [],
+            "speculativeState": timings?.speculativeState ?? "unavailable",
             "acceptanceRate": timings?.acceptanceRate ?? 0,
             "promptRate": timings?.promptPerSecond ?? 0,
             "generationRate": timings?.predictedPerSecond ?? 0,
@@ -414,3 +532,39 @@ private struct MTPInstalledModelRow: View {
         }
     }
 }
+
+#if os(macOS)
+private struct MacMTPInstalledModelRow: View {
+    let row: MTPInstalledModel
+    var divider: Bool = true
+
+    var body: some View {
+        MacSettingsRowContainer(divider: divider) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: row.configured ? "bolt.fill" : "bolt")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(verbatim: row.name)
+                        .textCase(.uppercase)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.3)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                    Text(verbatim: row.detail)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.4))
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 12)
+                IndustrialBadge(
+                    verbatim: row.configured ? String(localized: "Configured") : String(localized: "Available"),
+                    tint: row.configured ? .green : .secondary,
+                    dot: true
+                )
+            }
+        }
+    }
+}
+#endif

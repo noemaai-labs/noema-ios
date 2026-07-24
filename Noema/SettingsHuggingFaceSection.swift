@@ -1,4 +1,3 @@
-// SettingsHuggingFaceSection.swift
 import SwiftUI
 
 struct SettingsHuggingFaceSection: View {
@@ -11,6 +10,7 @@ struct SettingsHuggingFaceSection: View {
 
 struct SettingsHuggingFaceContent: View {
     @ObservedObject private var settings = SettingsStore.shared
+    @AppStorage(VisionProjectorDownloadPreference.defaultsKey) private var projectorPreferenceRaw = VisionProjectorDownloadPreference.defaultPreference.rawValue
     @FocusState private var customURLFocused: Bool
 
     private var mode: HFEndpoint.Mode {
@@ -54,6 +54,22 @@ struct SettingsHuggingFaceContent: View {
             }
 
             Text("Model search and downloads use this endpoint. Choose HF-Mirror if huggingface.co is blocked or slow in your region. Applies to new downloads.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+                .padding(.vertical, 4)
+
+            Picker("Default mmproj File Quality", selection: $projectorPreferenceRaw) {
+                ForEach(VisionProjectorDownloadPreference.allCases) { preference in
+                    Text(LocalizedStringKey(preference.mmprojTitleKey)).tag(preference.rawValue)
+                }
+            }
+            .pickerStyle(.menu)
+            .help("Choose the quality of the companion mmproj vision-projector file. This does not change model quality or quantization.")
+
+            Text("Selects only the companion mmproj vision-projector file downloaded with a vision model. It does not change the model weights or model quantization. If that mmproj precision is unavailable, Noema will show the available projector-file alternatives.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

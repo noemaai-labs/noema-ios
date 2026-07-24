@@ -39,13 +39,23 @@ let package = Package(
                 .process("Resources")
             ],
             linkerSettings: [
-                .unsafeFlags(["-Wl,-all_load"]),
+                .unsafeFlags(["-Xlinker", "-all_load"]),
             ]
         ),
         .target(
             name: "RelayKit",
             dependencies: [],
             path: "Sources/RelayKit"
+        ),
+        .testTarget(
+            name: "NoemaPackagesTests",
+            dependencies: ["NoemaPackages"],
+            path: "Tests/NoemaPackagesTests"
+        ),
+        .testTarget(
+            name: "RelayKitTests",
+            dependencies: ["RelayKit"],
+            path: "Tests/RelayKitTests"
         )
     ]
 )

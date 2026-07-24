@@ -94,7 +94,8 @@ final class ModelBenchmarkResultStoreTests: XCTestCase {
                 predictedMS: 3_000.0,
                 predictedPerSecond: generationRate,
                 draftN: 40,
-                draftNAccepted: 20
+                draftNAccepted: 20,
+                draftNDyn: nil
             )
         )
 

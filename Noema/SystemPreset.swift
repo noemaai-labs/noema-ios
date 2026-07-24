@@ -1,4 +1,3 @@
-// SystemPreset.swift
 import Foundation
 
 /// Predefined system prompt presets. Exactly one may be active at a time.
@@ -10,28 +9,10 @@ enum SystemPreset: String, CaseIterable, Identifiable {
 
     static let customSystemPromptIntroKey = "customSystemPromptIntro"
 
-    static let defaultEditableIntro = """
-    You are Noema, a helpful assistant.
-
-    Write in clear, natural language. Use Markdown only when it improves readability (short headings, short lists).
-    """
-
-    private static let generalLockedSuffix = """
-    #### Math and notation
-
-    - Use mathematical notation only when the user asks a math or technical question, or when symbols meaningfully increase precision.
-    - When you do use math, format it with LaTeX delimiters:
-      - Inline: \\(...\\)
-      - Display (for multi-step work or standalone equations): $$...$$ with blank lines before and after.
-    - Do not mention "LaTeX," "formatting," or these rules in your answer unless the user explicitly asks about formatting.
-    - Avoid boxed styling such as \\boxed{}, \\fbox{}, \\colorbox{}, or \\
-    framebox{} unless the user explicitly requests it.
-
-    #### Style and safety
-
-    - Do not add unrelated tips, disclaimers, or meta-commentary.
-    - If the user greets you or makes small talk, respond naturally.
-    """
+    // Minimal by design: just the identity line, nothing about house style, Markdown,
+    // math notation, or safety. We let the model be itself and let its own Jinja chat
+    // template drive formatting (LM Studio-style). User-editable in Settings.
+    static let defaultEditableIntro = "You are Noema, a helpful assistant."
 
     private static let ragLockedBody = """
     You are a retrieval-focused assistant. Prioritize the provided context and cite sources inline for claims grounded in that context. Use [n] citations when numbered snippets are provided; otherwise cite the source name/text label directly. You may also use your general knowledge when it helps answer the question; do not fabricate citations for non-context knowledge. Use clear markdown with headings and bullet lists, separated by blank lines. Do not include step-by-step or 'Step N:' enumerations in the final answer.
@@ -54,7 +35,9 @@ enum SystemPreset: String, CaseIterable, Identifiable {
     }
 
     static func generalText(editableIntro: String?) -> String {
-        compose(editableIntro: editableIntro, lockedBody: generalLockedSuffix)
+        // Identity line only (or empty when the user excludes the global intro).
+        // No locked house-style suffix — see defaultEditableIntro.
+        trimmedEditableIntro(from: editableIntro) ?? ""
     }
 
     static func ragText(editableIntro: String?) -> String {

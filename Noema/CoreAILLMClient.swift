@@ -31,7 +31,7 @@ enum CoreAILLMClientError: LocalizedError {
 }
 
 /// Sampling configuration derived from the model's `ModelSettings`.
-struct CoreAISamplingParams: Sendable {
+struct CoreAISamplingParams: Sendable, Equatable {
     var temperature: Float
     var topK: Int
     var topP: Float
@@ -51,6 +51,13 @@ struct CoreAISamplingParams: Sendable {
         self.topK = settings.topK
         self.topP = Float(settings.topP)
         self.seed = settings.seed.map { UInt64(bitPattern: Int64($0)) }
+    }
+
+    init(settings: ModelSettings, options: LLMGenerationOptions) {
+        self.temperature = Float(options.temperature ?? settings.temperature)
+        self.topK = options.topK ?? settings.topK
+        self.topP = Float(options.topP ?? settings.topP)
+        self.seed = (options.seed ?? settings.seed).map { UInt64(bitPattern: Int64($0)) }
     }
 }
 
@@ -645,13 +652,14 @@ final class CoreAILLMClient: @unchecked Sendable {
             promptIDs += tok.encode(text: "<think>\n\n</think>\n\n").map { Int32($0) }
         }
 
-        let temperature = Double(settings.temperature)
+        let samplingParams = CoreAISamplingParams(settings: settings, options: input.generationOptions)
+        let temperature = Double(samplingParams.temperature)
         let sampling: SamplingConfiguration = temperature <= 0.01
             ? .greedy
             : SamplingConfiguration(
                 temperature: temperature,
-                topK: settings.topK > 0 ? settings.topK : nil,
-                topP: settings.topP > 0 && settings.topP < 1 ? Double(settings.topP) : nil
+                topK: samplingParams.topK > 0 ? samplingParams.topK : nil,
+                topP: samplingParams.topP > 0 && samplingParams.topP < 1 ? Double(samplingParams.topP) : nil
             )
         // Always finite: the engine generates to maxTokens on its own schedule,
         // and EOS termination happens on our side — an unbounded run would hold
@@ -692,10 +700,11 @@ final class CoreAILLMClient: @unchecked Sendable {
                     for try await output in stream {
                         try Task.checkCancellation()
                         if firstTokenAt == nil {
-                            firstTokenAt = Date()
+                            let firstToken = Date()
+                            firstTokenAt = firstToken
                             print(String(
                                 format: "[CoreAI][engine] prefill: %d tokens in %.2fs",
-                                ids.count, firstTokenAt!.timeIntervalSince(start)
+                                ids.count, firstToken.timeIntervalSince(start)
                             ))
                         }
                         if eosIDs.contains(output.tokenId) { break }
@@ -756,6 +765,7 @@ final class CoreAILLMClient: @unchecked Sendable {
         let maxNewTokens = min(options.maxOutputTokens ?? 512, budget)
 
         let decoderStart = Date()
+        let requestedSampling = CoreAISamplingParams(settings: settings, options: options)
         // One decoder serves the whole session. When the new prompt extends
         // the already-fed token sequence (resent history + a new message),
         // prefill skips straight to the unseen suffix; otherwise the instance
@@ -767,7 +777,8 @@ final class CoreAILLMClient: @unchecked Sendable {
         let decoder: CoreAIDecoder
         let ownsActiveDecoder: Bool
         if !activeDecoderBusy, let cached = activeDecoder as? CoreAIDecoder,
-           cached.maxContext == contextWindow {
+           cached.maxContext == contextWindow,
+           cached.sampling == requestedSampling {
             if !cached.fedTokens.isEmpty,
                promptIDs.count > cached.fedTokens.count,
                promptIDs.starts(with: cached.fedTokens) {
@@ -782,7 +793,7 @@ final class CoreAILLMClient: @unchecked Sendable {
                 function: function,
                 descriptor: descriptor,
                 maxContext: contextWindow,
-                sampling: CoreAISamplingParams(settings: settings),
+                sampling: requestedSampling,
                 prefillFunction: loadedPrefillFunction as? InferenceFunction,
                 prefillDescriptor: loadedPrefillDescriptor as? InferenceFunctionDescriptor
             )
@@ -1028,7 +1039,7 @@ final class CoreAIDecoder: @unchecked Sendable {
     /// Effective context window: the requested budget, additionally capped by a
     /// host-cache graph's static KV capacity.
     let maxContext: Int
-    private let sampling: CoreAISamplingParams
+    let sampling: CoreAISamplingParams
     private var rng: SplitMix64
     /// Non-nil when the graph follows the host-cache contract.
     private let hostCache: HostCacheRuntime?

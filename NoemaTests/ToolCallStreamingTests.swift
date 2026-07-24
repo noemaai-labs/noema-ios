@@ -429,7 +429,7 @@ final class ToolCallStreamingTests: XCTestCase {
     }
 
     @MainActor
-    func testPostToolContinuationNudgePrefersAnsweringFromPythonResult() {
+    func testPostToolContinuationNudgeDoesNotImposeAnotherToolLimit() {
         let vm = ChatVM()
 
         let nudge = vm.postToolContinuationNudge(
@@ -437,10 +437,10 @@ final class ToolCallStreamingTests: XCTestCase {
             originalQuestion: "Do 2+2 with the python tool"
         )
 
-        XCTAssertTrue(nudge.contains("Use the latest tool result to answer the user's original question directly."))
-        XCTAssertTrue(nudge.contains("The Python result is authoritative for the computation that was run."))
-        XCTAssertTrue(nudge.contains("Only call another tool if the current result is empty, malformed, or clearly insufficient."))
-        XCTAssertTrue(nudge.contains("Original question: Do 2+2 with the python tool"))
+        XCTAssertTrue(nudge.contains("Continue the answer using the Python result above."))
+        XCTAssertTrue(nudge.contains("Call another tool only if more evidence is needed."))
+        XCTAssertFalse(nudge.contains("don't call another tool"))
+        XCTAssertTrue(nudge.contains("Question: Do 2+2 with the python tool"))
     }
 
     @MainActor
@@ -508,6 +508,61 @@ final class ToolCallStreamingTests: XCTestCase {
         wait(for: [expectation], timeout: 0.2)
         withExtendedLifetime(cancellable) {}
         XCTAssertEqual(vm.streamMsgs[1].promptProcessing?.progress ?? -1, 0.66, accuracy: 0.0001)
+    }
+
+    @MainActor
+    func testAFMToolLifecycleAppearsBeforeAnswerAndUpdatesInPlace() {
+        let vm = makeChatVM(userText: "Search the web")
+        let callID = "afm-web-1"
+        let startedAt = Date()
+        let params = ["query": AnyCodable("NoemaAI company")]
+
+        vm.handleAFMToolSummary(
+            AFMToolExecutionSummary(
+                calls: [
+                    AFMToolCallSummary(
+                        id: callID,
+                        toolName: "noema.web.retrieve",
+                        requestParams: params,
+                        phase: .executing,
+                        result: nil,
+                        error: nil,
+                        timestamp: startedAt
+                    )
+                ]
+            )
+        )
+
+        XCTAssertEqual(vm.streamMsgs[1].text, "")
+        XCTAssertEqual(vm.streamMsgs[1].toolCalls?.count, 1)
+        XCTAssertEqual(vm.streamMsgs[1].toolCalls?.first?.phase, .executing)
+        XCTAssertEqual(vm.streamMsgs[1].toolCalls?.first?.externalToolCallID, callID)
+        XCTAssertEqual(vm.streamMsgs[1].usedWebSearch, true)
+
+        let payload = """
+        [{"title":"Noema","url":"https://example.com","snippet":"Private local AI","engine":"searxng","score":0.8}]
+        """
+        vm.handleAFMToolSummary(
+            AFMToolExecutionSummary(
+                calls: [
+                    AFMToolCallSummary(
+                        id: callID,
+                        toolName: "noema.web.retrieve",
+                        requestParams: params,
+                        phase: .completed,
+                        result: payload,
+                        error: nil,
+                        timestamp: startedAt,
+                        completedAt: Date()
+                    )
+                ]
+            )
+        )
+
+        XCTAssertEqual(vm.streamMsgs[1].toolCalls?.count, 1)
+        XCTAssertEqual(vm.streamMsgs[1].toolCalls?.first?.phase, .completed)
+        XCTAssertEqual(vm.streamMsgs[1].webHits?.count, 1)
+        XCTAssertTrue(vm.streamMsgs[1].postToolWaiting)
     }
 
     @MainActor
@@ -740,7 +795,42 @@ final class ToolCallStreamingTests: XCTestCase {
 
         XCTAssertEqual(try decoder.decode(ChatVM.Msg.ToolCall.self, from: completedData).phase, .completed)
         XCTAssertEqual(try decoder.decode(ChatVM.Msg.ToolCall.self, from: failedData).phase, .failed)
-        XCTAssertEqual(try decoder.decode(ChatVM.Msg.ToolCall.self, from: executingData).phase, .executing)
+        // No phase, no result, no error: the call was interrupted before finishing.
+        // A persisted call can never still be running, so decode lands on a terminal
+        // failed phase instead of reloading as an eternal spinner.
+        let interrupted = try decoder.decode(ChatVM.Msg.ToolCall.self, from: executingData)
+        XCTAssertEqual(interrupted.phase, .failed)
+        XCTAssertNotNil(interrupted.error)
+        XCTAssertNotNil(interrupted.completedAt)
+    }
+
+    func testToolCallDecodeNormalizesPersistedInFlightPhases() throws {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        let executing = ChatVM.Msg.ToolCall(
+            toolName: "noema.web.retrieve",
+            displayName: "Web Search",
+            iconName: "globe",
+            requestParams: [:],
+            phase: .executing
+        )
+        let reloaded = try decoder.decode(ChatVM.Msg.ToolCall.self, from: encoder.encode(executing))
+        XCTAssertEqual(reloaded.phase, .failed)
+        XCTAssertNotNil(reloaded.error)
+
+        // An in-flight phase persisted alongside a recorded result decodes as completed.
+        let executingWithResult = ChatVM.Msg.ToolCall(
+            toolName: "noema.python.execute",
+            displayName: "Python",
+            iconName: "chevron.left.forwardslash.chevron.right",
+            requestParams: [:],
+            phase: .executing,
+            result: "{\"stdout\":\"4\"}"
+        )
+        let reloadedWithResult = try decoder.decode(ChatVM.Msg.ToolCall.self, from: encoder.encode(executingWithResult))
+        XCTAssertEqual(reloadedWithResult.phase, .completed)
+        XCTAssertNil(reloadedWithResult.error)
     }
 
     func testToolCallViewSupportDefaultResultDisplayModeUsesFormattedOnlyForParseablePythonAndWebResults() {

@@ -111,6 +111,25 @@ struct ModelMetadataInspectorView: View {
     }
 
     var body: some View {
+        platformContent
+            .onAppear(perform: ensureSelection)
+            .onReceive(modelManager.$downloadedModels) { _ in ensureSelection() }
+    }
+
+    private var platformContent: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons), and that sheet already supplies
+        // the title + close, so macOS gets the industrial card layout with no
+        // navigationTitle.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Model Metadata"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             if availableModels.isEmpty {
                 Section(LocalizedStringKey("Model Metadata")) {
@@ -152,10 +171,160 @@ struct ModelMetadataInspectorView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("Model Metadata"))
-        .onAppear(perform: ensureSelection)
-        .onReceive(modelManager.$downloadedModels) { _ in ensureSelection() }
     }
+
+#if os(macOS)
+    // MARK: - macOS industrial layout
+
+    private var macBody: some View {
+        MacSettingsPage {
+            if availableModels.isEmpty {
+                MacSettingsCard(LocalizedStringKey("Model Metadata")) {
+                    MacSettingsNoteRow(LocalizedStringKey("No local models installed"), divider: false)
+                    MacSettingsNoteRow(LocalizedStringKey("Install a local model to inspect architecture, context, tokenizer, vision, MoE, and MTP metadata."))
+                }
+            } else {
+                MacSettingsCard(LocalizedStringKey("Model")) {
+                    MacSettingsControlRow(LocalizedStringKey("Inspect Model"), divider: false) {
+                        Picker(LocalizedStringKey("Inspect Model"), selection: selectedPathBinding) {
+                            ForEach(availableModels, id: \.id) { model in
+                                Text(verbatim: modelLabel(model)).tag(model.url.path)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Format"), value: selectedModel?.format.displayName ?? String(localized: "Unknown"))
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("File"), value: selectedModel?.url.lastPathComponent ?? String(localized: "Unknown"))
+                }
+
+                if let model = selectedModel {
+                    if model.format == .gguf {
+                        macGGUFSections(for: model)
+                    } else {
+                        macNonGGUFSection(for: model)
+                    }
+                    macExportSection(for: model)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macNonGGUFSection(for model: LocalModel) -> some View {
+        MacSettingsCard(LocalizedStringKey("Metadata Inspector")) {
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Detailed Header Scan"),
+                value: String(localized: "GGUF only"),
+                systemImage: "info.circle",
+                tint: .secondary,
+                divider: false
+            )
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Architecture"), value: model.architecture.isEmpty ? String(localized: "Unknown") : model.architecture)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Tokenizer"), value: ModelSettings.resolvedTokenizerPath(for: model).map { URL(fileURLWithPath: $0).lastPathComponent } ?? String(localized: "Managed by backend"))
+        }
+    }
+
+    @ViewBuilder
+    private func macExportSection(for model: LocalModel) -> some View {
+        MacSettingsCard(LocalizedStringKey("Metadata Export")) {
+            MacSettingsActionRow(divider: false) {
+                Button {
+                    generateMetadataExport(for: model)
+                } label: {
+                    Label(LocalizedStringKey("Generate Metadata JSON"), systemImage: "doc.badge.gearshape")
+                }
+                .buttonStyle(.industrial(.prominent))
+
+                if let exportURL {
+                    ShareLink(item: exportURL) {
+                        Label(LocalizedStringKey("Share Metadata JSON"), systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.industrial(.quiet))
+                }
+            }
+
+            if let exportURL {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Export File"), value: exportURL.lastPathComponent)
+            }
+            if let exportError {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Export Error"), value: exportError)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macGGUFSections(for model: LocalModel) -> some View {
+        let snapshot = ModelMetadataInspectorSnapshot(model: model)
+
+        MacSettingsCard(LocalizedStringKey("Architecture")) {
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Display Name"), value: snapshot.displayName, divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Architecture"), value: snapshot.architecture)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Layers"), value: snapshot.layers)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Training Context"), value: snapshot.trainingContext)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Size"), value: snapshot.size)
+        }
+
+        MacSettingsCard(LocalizedStringKey("Tokenizer & Template")) {
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Tokenizer"), value: snapshot.tokenizer, divider: false)
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Chat Template"),
+                value: snapshot.chatTemplateStatus,
+                systemImage: snapshot.hasChatTemplate ? "checkmark.circle.fill" : "xmark.circle",
+                tint: snapshot.hasChatTemplate ? .green : .secondary
+            )
+            if let preview = snapshot.chatTemplatePreview {
+                MacMetadataTemplatePreviewRow(preview: preview)
+            }
+        }
+
+        MacSettingsCard(LocalizedStringKey("Capabilities")) {
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Vision Projector"),
+                value: snapshot.projector,
+                systemImage: snapshot.hasProjector ? "photo.on.rectangle.angled" : "photo",
+                tint: snapshot.hasProjector ? .green : .secondary,
+                divider: false
+            )
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Tool Hints"),
+                value: snapshot.toolHints,
+                systemImage: snapshot.hasToolHints ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver",
+                tint: snapshot.hasToolHints ? .green : .secondary
+            )
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("MTP Support"),
+                value: snapshot.mtp,
+                systemImage: snapshot.hasMTP ? "bolt.fill" : "bolt.slash",
+                tint: snapshot.hasMTP ? .green : .secondary
+            )
+        }
+
+        // Only Mixture-of-Experts models carry expert routing metadata; dense models
+        // would just show a wall of "Unknown"/"None", so hide the card entirely.
+        if snapshot.isMoE {
+            MacSettingsCard(LocalizedStringKey("MoE")) {
+                MacSettingsStatusRow(
+                    title: LocalizedStringKey("MoE Model"),
+                    value: snapshot.moeStatus,
+                    systemImage: "square.grid.3x3.fill",
+                    tint: .green,
+                    divider: false
+                )
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Experts"), value: snapshot.experts)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("MoE Layers"), value: snapshot.moeLayers)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Hidden Size"), value: snapshot.hiddenSize)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Feed Forward Size"), value: snapshot.feedForwardSize)
+            }
+        }
+
+        MacSettingsCard(LocalizedStringKey("Sidecars")) {
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Weights"), value: model.url.lastPathComponent, divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Projector"), value: snapshot.projectorFile)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("MTP Draft Model"), value: snapshot.mtpFile)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Install Folder"), value: model.url.deletingLastPathComponent().lastPathComponent)
+        }
+    }
+#endif
 
     private var selectedPathBinding: Binding<String> {
         Binding(
@@ -280,17 +449,21 @@ struct ModelMetadataInspectorView: View {
             )
         }
 
-        Section(LocalizedStringKey("MoE")) {
-            MetadataStatusRow(
-                title: LocalizedStringKey("MoE Model"),
-                value: snapshot.moeStatus,
-                systemImage: snapshot.isMoE ? "square.grid.3x3.fill" : "square.grid.3x3",
-                tint: snapshot.isMoE ? .green : .secondary
-            )
-            MetadataValueRow(title: LocalizedStringKey("Experts"), value: snapshot.experts)
-            MetadataValueRow(title: LocalizedStringKey("MoE Layers"), value: snapshot.moeLayers)
-            MetadataValueRow(title: LocalizedStringKey("Hidden Size"), value: snapshot.hiddenSize)
-            MetadataValueRow(title: LocalizedStringKey("Feed Forward Size"), value: snapshot.feedForwardSize)
+        // Only Mixture-of-Experts models carry expert routing metadata; dense models
+        // would just show a wall of "Unknown"/"None", so hide the section entirely.
+        if snapshot.isMoE {
+            Section(LocalizedStringKey("MoE")) {
+                MetadataStatusRow(
+                    title: LocalizedStringKey("MoE Model"),
+                    value: snapshot.moeStatus,
+                    systemImage: "square.grid.3x3.fill",
+                    tint: .green
+                )
+                MetadataValueRow(title: LocalizedStringKey("Experts"), value: snapshot.experts)
+                MetadataValueRow(title: LocalizedStringKey("MoE Layers"), value: snapshot.moeLayers)
+                MetadataValueRow(title: LocalizedStringKey("Hidden Size"), value: snapshot.hiddenSize)
+                MetadataValueRow(title: LocalizedStringKey("Feed Forward Size"), value: snapshot.feedForwardSize)
+            }
         }
 
         Section(LocalizedStringKey("Sidecars")) {
@@ -301,6 +474,26 @@ struct ModelMetadataInspectorView: View {
         }
     }
 }
+
+#if os(macOS)
+/// Full-width monospace chat-template preview inside the Tokenizer card. The
+/// text is a dynamic GGUF template excerpt, so it stays verbatim rather than a
+/// localizable note row.
+private struct MacMetadataTemplatePreviewRow: View {
+    let preview: String
+
+    var body: some View {
+        MacSettingsRowContainer {
+            Text(verbatim: preview)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Color.primary.opacity(0.45))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+#endif
 
 private struct MetadataCapsuleMetric: View {
     let title: LocalizedStringKey
@@ -383,11 +576,26 @@ private struct ModelMetadataInspectorSnapshot {
     let mtpFile: String
 
     init(model: LocalModel) {
-        let info = GGUFMetadata.architectureInfo(at: model.url)
-        let moeInfo = model.moeInfo ?? GGUFMetadata.moeInfo(at: model.url)
-        let layerCount = model.totalLayers > 0 ? model.totalLayers : (GGUFMetadata.layerCount(at: model.url) ?? 0)
-        let context = GGUFMetadata.contextLength(at: model.url)
-        let template = GGUFMetadata.chatTemplate(at: model.url)
+        // model.url can point at an install directory for some layouts; resolve the
+        // actual .gguf file so the GGUF KV reads (layers/context/MoE) don't silently
+        // come back empty.
+        let ggufURL = Self.resolvedGGUFURL(for: model)
+        let info = GGUFMetadata.architectureInfo(at: ggufURL)
+        let moeInfo = model.moeInfo ?? GGUFMetadata.moeInfo(at: ggufURL)
+        // Prefer the layer count detected at discovery; fall back to a fresh GGUF read
+        // and finally to the MoE descriptor's total-layer count so a real value is shown.
+        let layerCount = model.totalLayers > 0
+            ? model.totalLayers
+            : (GGUFMetadata.layerCount(at: ggufURL) ?? moeInfo?.totalLayerCount ?? 0)
+        let context = GGUFMetadata.contextLength(at: ggufURL)
+        // Use the same authoritative resolver the runtime uses (curated → sidecar
+        // chat_template → hub.json → tokenizer_config → tokenizer.json → config.json →
+        // embedded GGUF) instead of only the embedded GGUF template, so models whose
+        // template lives in a sidecar no longer read as "Missing".
+        let template = ModelSettings.promptTemplateResolution(
+            for: model,
+            directory: ModelSettings.settingsDirectory(for: model)
+        ).template
         let projectorPath = ProjectorLocator.projectorPath(alongside: model.url)
         let mergedProjector = GGUFMetadata.hasMultimodalProjector(at: model.url)
         let mtpPath = MtpLocator.mtpPath(alongside: model.url)
@@ -434,6 +642,20 @@ private struct ModelMetadataInspectorSnapshot {
         feedForwardSize = moeInfo?.feedForwardSize?.nonzeroString ?? String(localized: "Unknown")
         projectorFile = projectorPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? String(localized: "None")
         mtpFile = mtpPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? String(localized: "None")
+    }
+
+    /// Resolves the concrete `.gguf` file for a model whose URL may point at a
+    /// containing directory, so the metadata reads target real bytes.
+    private static func resolvedGGUFURL(for model: LocalModel) -> URL {
+        var url = model.url
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            if let gguf = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+                .first(where: { $0.pathExtension.lowercased() == "gguf" }) {
+                url = gguf
+            }
+        }
+        return url
     }
 
     private static func preview(_ text: String) -> String {

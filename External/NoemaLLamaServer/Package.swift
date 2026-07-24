@@ -10,8 +10,8 @@ let package = Package(
         .macCatalyst(.v13)
     ],
     products: [
-        // Build as a dynamic library so we can ship a newer llama.cpp build for the
-        // loopback server without colliding with the app's in-process llama.framework.
+        // The app ships this as its single llama.cpp runtime. The dynamic library
+        // provides both the public C API and the embedded loopback server.
         .library(name: "NoemaLLamaServer", type: .dynamic, targets: ["NoemaLLamaServer"])
     ],
     targets: [
@@ -51,7 +51,6 @@ let package = Package(
                 // Keep the server's generated UI entry point, but exclude the
                 // web app sources that SwiftPM would otherwise scan as resources.
                 "upstream/tools/ui/src",
-                "upstream/tools/ui/static",
                 "upstream/tools/ui/tests",
                 // exclude backends we don't ship in the iOS loopback build
                 "upstream/ggml/src/ggml-webgpu",
@@ -63,6 +62,7 @@ let package = Package(
                 "upstream/ggml/src/ggml-openvino",
                 "upstream/ggml/src/ggml-vulkan",
                 "upstream/ggml/src/ggml-cann",
+                "upstream/ggml/src/ggml-et",
                 "upstream/ggml/src/ggml-musa",
                 "upstream/ggml/src/ggml-sycl",
                 "upstream/ggml/src/ggml-hip",
@@ -72,8 +72,9 @@ let package = Package(
                 "upstream/ggml/src/ggml-cpu/spacemit",
                 // Optional dependency; only built when enabled via CMake + headers present.
                 "upstream/ggml/src/ggml-cpu/kleidiai",
-                // SwiftPM does not apply llama.cpp's per-architecture SIMD flags.
-                // Use the generic CPU path for package builds.
+                // SwiftPM does not apply llama.cpp's per-architecture source
+                // selection. Noema-owned wrappers below include only the active
+                // architecture's quantization and repacking kernels.
                 "upstream/ggml/src/ggml-cpu/arch",
                 // We embed the Metal shader source via bridge/ggml_metal_embed.cpp.
                 // Prevent SwiftPM/Xcode from trying to compile ggml-metal.metal directly.
@@ -81,8 +82,8 @@ let package = Package(
             ],
             publicHeadersPath: "include",
             cSettings: [
-                .define("GGML_VERSION", to: "\"0.14.0\""),
-                .define("GGML_COMMIT", to: "\"b9592\""),
+                .define("GGML_VERSION", to: "\"0.16.0\""),
+                .define("GGML_COMMIT", to: "\"b10018\""),
                 .define("LLAMA_USE_HTTPLIB", to: "1"),
                 .define("LLAMA_SHARED", to: "1"),
                 .define("GGML_USE_CPU", to: "1"),
@@ -90,21 +91,27 @@ let package = Package(
                 .define("GGML_METAL_EMBED_LIBRARY", to: "1"),
                 .define("GGML_USE_ACCELERATE", to: "1"),
                 .define("GGML_BLAS_USE_ACCELERATE", to: "1"),
-                .define("GGML_CPU_GENERIC", to: "1"),
+                .define("GGML_USE_CPU_REPACK", to: "1"),
                 .define("ACCELERATE_NEW_LAPACK", to: "1"),
                 .define("ACCELERATE_LAPACK_ILP64", to: "1"),
                 .define("NOEMA_LLAMA_SERVER_TEST_HOOKS", .when(configuration: .debug)),
                 // ggml-metal sources are written for manual retain/release.
                 .unsafeFlags([
                     "-fno-objc-arc",
-                    // Avoid ODR/symbol collisions with the app's in-process llama.framework.
-                    // Only the Noema entry points are meant to be public.
+                    // Hide implementation-only symbols while the llama.cpp public C API
+                    // and Noema server bridge retain their declared export visibility.
                     "-fvisibility=hidden",
                     // Xcode coverage instrumentation does not link the profiling runtime
                     // for package framework products, so keep vendored llama.cpp uninstrumented.
                     "-fno-profile-instr-generate",
                     "-fno-coverage-mapping"
                 ]),
+                // iOS and Catalyst deliberately remain baseline arm64. Dot-product
+                // is enabled only where Noema's deployment targets guarantee it.
+                .unsafeFlags(
+                    ["-Xarch_arm64", "-march=armv8.2-a+dotprod+fp16"],
+                    .when(platforms: [.macOS, .visionOS])
+                ),
                 .headerSearchPath("upstream"),
                 .headerSearchPath("upstream/common"),
                 .headerSearchPath("upstream/src"),
@@ -121,11 +128,12 @@ let package = Package(
                 .headerSearchPath("upstream/ggml/src/ggml-cpu"),
                 .headerSearchPath("upstream/ggml/src/ggml-metal"),
                 .headerSearchPath("upstream/tools/mtmd"),
-                .headerSearchPath("upstream/tools/ui")
+                .headerSearchPath("upstream/tools/ui"),
+                .headerSearchPath("bridge/paged")
             ],
             cxxSettings: [
-                .define("GGML_VERSION", to: "\"0.14.0\""),
-                .define("GGML_COMMIT", to: "\"b9592\""),
+                .define("GGML_VERSION", to: "\"0.16.0\""),
+                .define("GGML_COMMIT", to: "\"b10018\""),
                 .define("LLAMA_USE_HTTPLIB", to: "1"),
                 .define("LLAMA_SHARED", to: "1"),
                 .define("GGML_USE_CPU", to: "1"),
@@ -133,15 +141,15 @@ let package = Package(
                 .define("GGML_METAL_EMBED_LIBRARY", to: "1"),
                 .define("GGML_USE_ACCELERATE", to: "1"),
                 .define("GGML_BLAS_USE_ACCELERATE", to: "1"),
-                .define("GGML_CPU_GENERIC", to: "1"),
+                .define("GGML_USE_CPU_REPACK", to: "1"),
                 .define("ACCELERATE_NEW_LAPACK", to: "1"),
                 .define("ACCELERATE_LAPACK_ILP64", to: "1"),
                 .define("NOEMA_LLAMA_SERVER_TEST_HOOKS", .when(configuration: .debug)),
                 // Keep ObjC++ sources consistent with the ggml-metal (non-ARC) build.
                 .unsafeFlags([
                     "-fno-objc-arc",
-                    // Avoid ODR/symbol collisions with the app's in-process llama.framework.
-                    // Only the Noema entry points are meant to be public.
+                    // Hide implementation-only symbols while the llama.cpp public C API
+                    // and Noema server bridge retain their declared export visibility.
                     "-fvisibility=hidden",
                     "-fvisibility-inlines-hidden",
                     // Xcode coverage instrumentation does not link the profiling runtime
@@ -149,6 +157,10 @@ let package = Package(
                     "-fno-profile-instr-generate",
                     "-fno-coverage-mapping"
                 ]),
+                .unsafeFlags(
+                    ["-Xarch_arm64", "-march=armv8.2-a+dotprod+fp16"],
+                    .when(platforms: [.macOS, .visionOS])
+                ),
                 .headerSearchPath("upstream"),
                 .headerSearchPath("upstream/common"),
                 .headerSearchPath("upstream/src"),
@@ -165,7 +177,8 @@ let package = Package(
                 .headerSearchPath("upstream/ggml/src/ggml-cpu"),
                 .headerSearchPath("upstream/ggml/src/ggml-metal"),
                 .headerSearchPath("upstream/tools/mtmd"),
-                .headerSearchPath("upstream/tools/ui")
+                .headerSearchPath("upstream/tools/ui"),
+                .headerSearchPath("bridge/paged")
             ],
             linkerSettings: []
         ),

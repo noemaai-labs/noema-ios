@@ -341,7 +341,9 @@ struct NoemaVisionMainScene: SwiftUI.Scene {
             .environmentObject(localizationManager)
             .environment(\.locale, localizationManager.locale)
             .visionAppearance(colorScheme)
+            .calendarConfirmationHost()
             .onAppear {
+                ReviewPrompter.shared.trackSession()
                 AppIntentDriver.shared.bind(chatVM: chatVM,
                                             modelManager: modelManager,
                                             datasetManager: datasetManager,

@@ -45,3 +45,20 @@ External/coreai-models/Package.resolved
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+*.p8
+AuthKey_*.p8
+*.mobileprovision
+*.cer
+*.p12
+
+/scripts/release/
+/AppStorePromoMockups/
+/KNOWLEDGE_PACKS_*.md
+/External/NoemaLLamaServer/Tests/NoemaLLamaServerTests/ScratchTraceExperiment.swift
+/NEXT_STEPS_IDEAS.md
+/DocumentationforAPIs&SDKs/NEXT STEPS/
+/AGENTS.md
+/Noema/UsageLimiterDemo.swift
+/Noema/ToolIntegration.swift
+/Noema/ReadmeMobileFormatterTests.swift

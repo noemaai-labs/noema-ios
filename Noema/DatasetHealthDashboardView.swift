@@ -89,9 +89,24 @@ struct DatasetHealthSummaryContent: View {
 struct DatasetHealthDashboardView: View {
     @EnvironmentObject private var datasetManager: DatasetManager
     @State private var searchText = ""
+    @State private var loadedSnapshots: [DatasetHealthSnapshot] = []
 
-    private var snapshots: [DatasetHealthSnapshot] {
-        DatasetHealthSnapshot.snapshots(for: datasetManager.datasets, statuses: datasetManager.processingStatus)
+    // Cached: building snapshots reads each dataset's index files (incl. vectors.json). Previously
+    // `snapshots` was an uncached computed property read ~7× per body pass AND on every search
+    // keystroke, so the whole health scan ran many times per render. Now it is computed once per
+    // dataset/status change via `.task(id:)`; filtering operates on the cached array.
+    private var snapshots: [DatasetHealthSnapshot] { loadedSnapshots }
+
+    private var snapshotSignature: String {
+        let d = datasetManager.datasets.map { "\($0.datasetID):\($0.isIndexed):\($0.requiresReindex):\($0.ragIndexOutdated)" }.joined(separator: "|")
+        let s = datasetManager.processingStatus.map { "\($0.key):\($0.value.stage.rawValue)" }.sorted().joined(separator: ",")
+        return d + "#" + s
+    }
+
+    @MainActor private func reloadSnapshots() async {
+        let datasets = datasetManager.datasets
+        let statuses = datasetManager.processingStatus
+        loadedSnapshots = DatasetHealthSnapshot.snapshots(for: datasets, statuses: statuses)
     }
 
     private var filteredSnapshots: [DatasetHealthSnapshot] {
@@ -112,6 +127,23 @@ struct DatasetHealthDashboardView: View {
     }
 
     var body: some View {
+        platformContent
+            .task(id: snapshotSignature) { await reloadSnapshots() }
+    }
+
+    private var platformContent: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons); macOS gets the industrial card
+        // kit instead. The sheet already supplies the title + close.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Dataset Health"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             Section(LocalizedStringKey("Dataset Health")) {
                 HStack(spacing: 8) {
@@ -192,8 +224,57 @@ struct DatasetHealthDashboardView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("Dataset Health"))
     }
+
+#if os(macOS)
+    private var macBody: some View {
+        MacSettingsPage {
+            MacSettingsCard(LocalizedStringKey("Dataset Health")) {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Datasets"), value: "\(snapshots.count)", divider: false)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Issues"), value: "\(issueCount)")
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Rebuildable"), value: "\(staleSnapshots.count)")
+
+                MacSettingsControlRow(LocalizedStringKey("Search datasets")) {
+                    TextField(LocalizedStringKey("Search datasets"), text: $searchText)
+                        .labelsHidden()
+                        .autocorrectionDisabled()
+                        .industrialField(width: 220)
+                }
+
+                MacSettingsActionRow {
+                    Button {
+                        datasetManager.reloadFromDisk()
+                    } label: {
+                        Label(LocalizedStringKey("Refresh Health Checks"), systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.industrial(.tinted))
+
+                    Button {
+                        rebuildAllStaleDatasets()
+                    } label: {
+                        Label(LocalizedStringKey("Rebuild Stale Indexes"), systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.industrial(.prominent))
+                    .disabled(staleSnapshots.isEmpty)
+                }
+            }
+
+            MacSettingsCard(LocalizedStringKey("Dataset Checks")) {
+                if snapshots.isEmpty {
+                    MacSettingsNoteRow(LocalizedStringKey("No local datasets installed."), divider: false)
+                } else if filteredSnapshots.isEmpty {
+                    MacSettingsNoteRow(LocalizedStringKey("No matching datasets"), divider: false)
+                } else {
+                    ForEach(Array(filteredSnapshots.enumerated()), id: \.element.id) { index, snapshot in
+                        DatasetHealthMacCheckRow(snapshot: snapshot, divider: index != 0) {
+                            datasetManager.startIndexing(dataset: snapshot.dataset)
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     private func rebuildAllStaleDatasets() {
         for snapshot in staleSnapshots {
@@ -554,6 +635,69 @@ private struct DatasetHealthDatasetLabel: View {
         }
     }
 }
+
+#if os(macOS)
+/// The Form's DisclosureGroup rebuilt as a hairline-separated industrial row:
+/// the rich `DatasetHealthDatasetLabel` header toggles the same metrics, issue
+/// rows, and rebuild action the touch layout shows.
+private struct DatasetHealthMacCheckRow: View {
+    let snapshot: DatasetHealthSnapshot
+    var divider: Bool = true
+    let rebuild: () -> Void
+
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    DatasetHealthDatasetLabel(snapshot: snapshot)
+                        .frame(maxWidth: .infinity)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(0.3))
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 10) {
+                    DatasetHealthMetricsView(snapshot: snapshot)
+
+                    if snapshot.issues.isEmpty {
+                        DatasetHealthIssueRow(
+                            issue: DatasetHealthIssue(
+                                title: String(localized: "Healthy"),
+                                detail: String(localized: "Index metadata, vectors, and source files are consistent."),
+                                severity: .ready
+                            )
+                        )
+                    } else {
+                        ForEach(snapshot.issues) { issue in
+                            DatasetHealthIssueRow(issue: issue)
+                        }
+                    }
+
+                    if snapshot.canRebuild {
+                        Button(action: rebuild) {
+                            Label(LocalizedStringKey("Rebuild Dataset Index"), systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.industrial(.tinted))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+}
+#endif
 
 private struct DatasetHealthMetricsView: View {
     let snapshot: DatasetHealthSnapshot

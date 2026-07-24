@@ -206,10 +206,14 @@ struct WhisperModelsView: View {
     let engineID: TranscriptionEngineID
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var downloadController: DownloadController
+    @ObservedObject private var presentationUpdates = DownloadPresentationUpdates.shared
     @StateObject private var store = WhisperModelDownloadStore()
     @State private var activeRecordID: String = ""
     @State private var runtimeEngineID: TranscriptionEngineID
     @State private var searchText = ""
+#if os(macOS)
+    @State private var macContentAppeared = false
+#endif
 
     init(engineID: TranscriptionEngineID) {
         self.engineID = engineID
@@ -274,6 +278,22 @@ struct WhisperModelsView: View {
                 macSearchField
 #endif
 
+#if os(macOS)
+                // The model cards stat the disk for install state; keep the push
+                // animation clean by mounting them one tick later, faded in.
+                if macContentAppeared {
+                    Group {
+                        if hasVisibleRows {
+                            modelSection(title: "Downloaded", records: downloadedRecords)
+                            modelSection(title: "Recommended", records: recommendedRecords)
+                            modelSection(title: "Available", records: availableRecords)
+                        } else if !trimmedSearchText.isEmpty {
+                            emptySearchResults
+                        }
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.99, anchor: .top)))
+                }
+#else
                 if hasVisibleRows {
                     modelSection(title: "Downloaded", records: downloadedRecords)
                     modelSection(title: "Recommended", records: recommendedRecords)
@@ -281,6 +301,7 @@ struct WhisperModelsView: View {
                 } else if !trimmedSearchText.isEmpty {
                     emptySearchResults
                 }
+#endif
             }
             .padding(.horizontal, 20)
             .padding(.top, 18)
@@ -296,6 +317,11 @@ struct WhisperModelsView: View {
         }
 #if os(macOS)
         .frame(minWidth: 560, minHeight: 520)
+        .task {
+            guard !macContentAppeared else { return }
+            await Task.yield()
+            withAnimation(AppMotion.submenu) { macContentAppeared = true }
+        }
 #endif
     }
 
@@ -305,22 +331,16 @@ struct WhisperModelsView: View {
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(LocalizedStringKey("Whisper Model"))
-                    .font(.system(size: 24, weight: .semibold))
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(AppTheme.text)
                 Text(LocalizedStringKey("Choose the local speech model used for on-device transcription."))
-                    .font(.system(size: 14))
-                    .foregroundStyle(AppTheme.secondaryText)
+                    .industrialStat()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button {
+            IndustrialIconButton(systemImage: "xmark", help: LocalizedStringKey("Close")) {
                 dismiss()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 28, height: 28)
             }
-            .buttonStyle(.bordered)
             .accessibilityLabel(LocalizedStringKey("Close"))
         }
     }
@@ -336,9 +356,17 @@ struct WhisperModelsView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 16) {
                 VStack(alignment: .leading, spacing: 4) {
+#if os(macOS)
+                    Text(LocalizedStringKey("Runtime"))
+                        .textCase(.uppercase)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.3)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+#else
                     Text(LocalizedStringKey("Runtime"))
                         .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(AppTheme.text)
+#endif
                     Text(engineFootnote)
                         .font(.system(size: 14))
                         .foregroundStyle(AppTheme.secondaryText)
@@ -378,10 +406,10 @@ struct WhisperModelsView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background(cardBackground, in: RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(Color.primary.opacity(0.04), lineWidth: 1)
+            RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(catalogCardStrokeOpacity), lineWidth: 1)
         )
     }
 
@@ -390,7 +418,7 @@ struct WhisperModelsView: View {
     private var macSearchField: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 15, weight: .medium))
+                .font(.system(size: catalogSearchIconSize, weight: .medium))
                 .foregroundStyle(AppTheme.secondaryText)
                 .frame(width: 18)
 
@@ -409,13 +437,13 @@ struct WhisperModelsView: View {
                 .accessibilityLabel(LocalizedStringKey("Clear"))
             }
         }
-        .padding(.horizontal, 13)
+        .padding(.horizontal, catalogSearchFieldHorizontalPadding)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(cardBackground, in: RoundedRectangle(cornerRadius: catalogSearchFieldCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.04), lineWidth: 1)
+            RoundedRectangle(cornerRadius: catalogSearchFieldCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(catalogCardStrokeOpacity), lineWidth: 1)
         )
     }
 #endif
@@ -453,10 +481,14 @@ struct WhisperModelsView: View {
     private func modelSection(title: String, records: [WhisperModelRecord]) -> some View {
         if !records.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
+#if os(macOS)
+                IndustrialSectionHeader(LocalizedStringKey(title), detail: "\(records.count)")
+#else
                 Text(LocalizedStringKey(title))
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(AppTheme.secondaryText)
                     .padding(.horizontal, 4)
+#endif
 
                 ForEach(records) { record in
                     modelCard(for: record)
@@ -525,7 +557,8 @@ struct WhisperModelsView: View {
                 downloadProgressView(
                     state: state,
                     progressValue: progressValue,
-                    hasDeterminateProgress: hasDeterminateProgress
+                    hasDeterminateProgress: hasDeterminateProgress,
+                    speed: controllerItem?.speed
                 )
                 .padding(.leading, 42)
             }
@@ -552,12 +585,12 @@ struct WhisperModelsView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background(cardBackground, in: RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(Color.primary.opacity(0.04), lineWidth: 1)
+            RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(catalogCardStrokeOpacity), lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(0.035), radius: 12, x: 0, y: 5)
+        .shadow(color: Color.black.opacity(catalogCardShadowOpacity), radius: 12, x: 0, y: 5)
         .contextMenu {
             contextActions(
                 record: record,
@@ -602,30 +635,34 @@ struct WhisperModelsView: View {
                         WhisperModelCatalog.setActiveRecordID(record.id, for: runtimeEngineID)
                         activeRecordID = record.id
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.industrial(.tinted))
                 }
 
                 Button(LocalizedStringKey("Delete"), role: .destructive) {
                     store.delete(record: record, runtime: runtime)
                 }
+#if os(macOS)
+                .buttonStyle(.industrial(.destructive))
+#else
                 .buttonStyle(.borderless)
+#endif
             } else if state == .incomplete {
                 Button(LocalizedStringKey("Repair")) {
                     Task { await store.repairAndDownload(record: record, runtime: runtime) }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.industrial(.prominent))
                 .disabled(isDownloading)
             } else if state == .failed || state == .paused {
                 Button(LocalizedStringKey("Retry")) {
                     retry(record: record, controllerItem: controllerItem)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.industrial(.tinted))
                 .disabled(isDownloading)
             } else {
                 Button(LocalizedStringKey("Download")) {
                     download(record: record)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.industrial(.prominent))
                 .disabled(isDownloading)
             }
         }
@@ -709,36 +746,33 @@ struct WhisperModelsView: View {
                     .foregroundStyle(.white)
             } else {
                 Image(systemName: state.systemImage)
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(statusColor(state))
             }
         }
-        .frame(width: 28, height: 28)
+        .frame(width: catalogStatusIconFrame, height: catalogStatusIconFrame)
     }
 
     @ViewBuilder
     private func downloadProgressView(
         state: SupportModelState,
         progressValue: Double,
-        hasDeterminateProgress: Bool
+        hasDeterminateProgress: Bool,
+        speed: Double? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if hasDeterminateProgress {
-                ProgressView(value: progressValue)
-            } else {
+        if hasDeterminateProgress {
+            DownloadProgressCluster(
+                progress: progressValue,
+                speed: speed,
+                statusKey: state == .downloading ? nil : LocalizedStringKey(state.titleKey)
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
                 ProgressView()
                     .progressViewStyle(.linear)
-            }
-
-            HStack(spacing: 8) {
                 Text(LocalizedStringKey(state.titleKey))
                     .font(FontTheme.caption)
                     .foregroundStyle(AppTheme.secondaryText)
-                if hasDeterminateProgress {
-                    Text("\(Int((progressValue * 100).rounded()))%")
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
             }
         }
     }
@@ -755,7 +789,7 @@ struct WhisperModelsView: View {
         switch state {
         case .ready: return .green
         case .missing: return .secondary
-        case .downloading: return .blue
+        case .downloading: return .accentColor
         case .paused: return .orange
         case .failed, .incomplete: return .red
         }
@@ -774,7 +808,7 @@ struct WhisperModelsView: View {
 
     private var cardBackground: Color {
 #if os(macOS)
-        Color(nsColor: .controlBackgroundColor)
+        Color.primary.opacity(0.035)
 #else
         Color(uiColor: .secondarySystemGroupedBackground)
 #endif
@@ -819,6 +853,9 @@ struct WhisperModelsView: View {
 
     @ViewBuilder
     private func badge(_ text: String, color: Color) -> some View {
+#if os(macOS)
+        IndustrialBadge(verbatim: text, tint: color)
+#else
         Text(text)
             .font(FontTheme.caption)
             .fontWeight(.medium)
@@ -827,10 +864,24 @@ struct WhisperModelsView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(color.opacity(0.12), in: Capsule())
+#endif
     }
 
     @ViewBuilder
     private func detailChip(label: String) -> some View {
+#if os(macOS)
+        Text(label)
+            .textCase(.uppercase)
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.primary.opacity(0.5))
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.primary.opacity(0.05))
+            )
+#else
         Text(label)
             .font(FontTheme.caption)
             .foregroundStyle(AppTheme.secondaryText)
@@ -838,6 +889,7 @@ struct WhisperModelsView: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(Color.primary.opacity(0.06), in: Capsule())
+#endif
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
@@ -848,3 +900,23 @@ struct WhisperModelsView: View {
         return formatter.string(fromByteCount: bytes)
     }
 }
+
+#if os(macOS)
+private let catalogCardCornerRadius: CGFloat = 8
+private let catalogCardStrokeOpacity: Double = 0.08
+private let catalogCardShadowOpacity: Double = 0
+private let catalogStatusIconSize: CGFloat = 16
+private let catalogStatusIconFrame: CGFloat = 20
+private let catalogSearchFieldCornerRadius: CGFloat = 6
+private let catalogSearchIconSize: CGFloat = 12
+private let catalogSearchFieldHorizontalPadding: CGFloat = 10
+#else
+private let catalogCardCornerRadius: CGFloat = 22
+private let catalogCardStrokeOpacity: Double = 0.04
+private let catalogCardShadowOpacity: Double = 0.035
+private let catalogStatusIconSize: CGFloat = 27
+private let catalogStatusIconFrame: CGFloat = 28
+private let catalogSearchFieldCornerRadius: CGFloat = 14
+private let catalogSearchIconSize: CGFloat = 15
+private let catalogSearchFieldHorizontalPadding: CGFloat = 13
+#endif

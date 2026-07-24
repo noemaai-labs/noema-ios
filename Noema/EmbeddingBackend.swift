@@ -1,4 +1,3 @@
-// EmbeddingBackend.swift
 import Foundation
 
 enum EmbeddingError: Error, LocalizedError {

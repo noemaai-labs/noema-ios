@@ -1,9 +1,3 @@
-// EnterpriseDatasetStore.swift
-// Governed company datasets live under Documents/LocalLLMDatasets/Enterprise/<id>/ so the
-// existing DatasetManager scan and DatasetRetriever path reconstruction work unchanged:
-// they surface as LocalDataset values with datasetID "Enterprise/<id>" and source "Enterprise".
-// The directory is app-private (no UIFileSharingEnabled), excluded from backup, file-protected,
-// and purged whenever the workspace connection ends.
 import CryptoKit
 import Foundation
 

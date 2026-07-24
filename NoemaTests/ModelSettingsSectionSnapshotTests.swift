@@ -5,69 +5,67 @@ final class ModelSettingsSectionSnapshotTests: XCTestCase {
     func testCompactIPhoneSectionsByFormat() {
         XCTAssertEqual(
             sectionIDs(for: .gguf, isAdvancedMode: false, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "benchmark", "maintenance", "files", "provenance"]
+            ["essentials", "performance", "behavior", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .mlx, isAdvancedMode: false, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .et, isAdvancedMode: false, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .ane, isAdvancedMode: false, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .afm, isAdvancedMode: false, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "details"]
         )
     }
 
     func testAdvancedIPhoneSectionsByFormat() {
         XCTAssertEqual(
             sectionIDs(for: .gguf, isAdvancedMode: true, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "sampling", "speculativeDecoding", "benchmark", "maintenance", "files", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .mlx, isAdvancedMode: true, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "sampling", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .et, isAdvancedMode: true, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "sampling", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .ane, isAdvancedMode: true, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "sampling", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .afm, isAdvancedMode: true, platform: .iOSForm),
-            ["overview", "chatTemplatePreview", "formatSpecific", "sampling", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
     }
 
-    func testMacSectionsOmitTemplatePreviewAndKeepFormatSpecificPolicy() {
+    func testMacUsesTheSameHierarchyAsOtherDevices() {
         XCTAssertEqual(
             sectionIDs(for: .gguf, isAdvancedMode: true, platform: .macOS),
-            ["overview", "formatSpecific", "sampling", "speculativeDecoding", "benchmark", "maintenance", "files", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
         XCTAssertEqual(
             sectionIDs(for: .afm, isAdvancedMode: true, platform: .macOS),
-            ["overview", "formatSpecific", "sampling", "benchmark", "maintenance", "provenance"]
+            ["essentials", "performance", "behavior", "advanced", "details"]
         )
     }
 
-    func testSectionTitlesUseFormatDisplayNames() {
+    func testSectionTitlesDescribeTheSharedInformationArchitecture() {
         let ane = ModelSettingsSectionSnapshot.sections(for: .ane, isAdvancedMode: false, platform: .iOSForm)
-        XCTAssertEqual(ane.first?.title, "CML")
-        XCTAssertEqual(ane.first(where: { $0.id == .formatSpecific })?.title, "CML")
+        XCTAssertEqual(ane.first?.title, "Essentials")
+        XCTAssertEqual(ane.last?.title, "Model Details")
 
         let gguf = ModelSettingsSectionSnapshot.sections(for: .gguf, isAdvancedMode: false, platform: .iOSForm)
-        XCTAssertEqual(gguf.first?.title, "GGUF")
-        XCTAssertEqual(gguf.first(where: { $0.id == .provenance })?.title, "Provenance")
-        XCTAssertEqual(gguf.first(where: { $0.id == .files })?.title, "Files")
+        XCTAssertEqual(gguf.map(\.title), ["Essentials", "Performance", "Behavior", "Model Details"])
     }
 
     private func sectionIDs(

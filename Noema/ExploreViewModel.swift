@@ -1,4 +1,3 @@
-// ExploreViewModel.swift
 #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
 import Foundation
 import Combine
@@ -59,6 +58,7 @@ enum ExploreSearchMode: String {
 @MainActor
 final class ExploreViewModel: ObservableObject {
     @Published private(set) var recommended: [ModelRecord] = []
+    @Published private(set) var trendingRecords: [ModelRecord] = []
     @Published private(set) var cachedRecords: [ModelRecord] = []
     @Published private(set) var searchResults: [ModelRecord] = []
     @Published var searchText: String = ""
@@ -118,6 +118,22 @@ final class ExploreViewModel: ObservableObject {
             } else {
                 print("[ExploreVM] curated() returned nil (threw or empty)")
             }
+        }
+    }
+
+    func loadTrending(force: Bool = false, format: ModelFormat?) async {
+        if force { trendingRecords.removeAll() }
+        guard trendingRecords.isEmpty else { return }
+        guard !NetworkKillSwitch.isEnabled else { return }
+        guard let format else {
+            trendingRecords = []
+            return
+        }
+        let reg = registry
+        if let list = try? await reg.trending(format: format) {
+            var seen = Set<String>()
+            trendingRecords = list.filter { seen.insert($0.id).inserted }
+            prefetchVisionStatus(for: trendingRecords)
         }
     }
 
@@ -181,10 +197,6 @@ final class ExploreViewModel: ObservableObject {
         var unfilteredResults: [ModelRecord] = []
         var pageCount = 0
         
-        // Determine if we should include vision models based on search mode and UI filter.
-        // In MLX/GGUF/ET/ANE modes, default to fetching both pipelines; the format filter
-        // is applied client‑side. When the user selects the Vision filter, restrict
-        // to vision pipeline only; when Text is selected, restrict to text‑generation only.
         var includeVisionModels = (mode == .gguf || mode == .mlx || mode == .et || mode == .ane)
         if mode == .afm {
             includeVisionModels = false

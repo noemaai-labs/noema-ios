@@ -1,4 +1,3 @@
-// ManualDatasetRegistry.swift
 import Foundation
 
 /// Registry providing manually curated dataset listings.

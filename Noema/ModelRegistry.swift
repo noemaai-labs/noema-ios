@@ -1,4 +1,3 @@
-// ModelRegistry.swift
 import Foundation
 
 /// Registry APIs used across concurrency domains
@@ -7,6 +6,13 @@ public protocol ModelRegistry: Sendable {
     /// Streams search results as soon as individual records are fetched.
     func searchStream(query: String, page: Int, format: ModelFormat?, includeVisionModels: Bool, visionOnly: Bool) -> AsyncThrowingStream<ModelRecord, Error>
     func details(for id: String) async throws -> ModelDetails
+    /// Repos trending on the source this week; registries without a trending
+    /// feed return an empty list.
+    func trending(format: ModelFormat?) async throws -> [ModelRecord]
+}
+
+extension ModelRegistry {
+    public func trending(format: ModelFormat?) async throws -> [ModelRecord] { [] }
 }
 
 extension ModelRegistry {

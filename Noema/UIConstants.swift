@@ -1,4 +1,3 @@
-// UIConstants.swift
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -177,7 +176,6 @@ struct AppTheme {
     static let cornerRadius: CGFloat = 16
     static let padding: CGFloat = 24
     
-    // New High Contrast Theme Colors
     struct HighContrast {
         static var lightBackground: Color { Color(white: 0.98) }
         static var lightText: Color { Color(white: 0.1) }

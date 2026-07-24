@@ -1,5 +1,4 @@
 #if os(macOS) || targetEnvironment(macCatalyst)
-// ProcessPythonExecutor.swift
 import Foundation
 
 /// macOS Python executor using Foundation.Process to spawn system Python 3.
@@ -12,13 +11,11 @@ struct ProcessPythonExecutor: PythonExecutor, Sendable {
     func execute(code: String, timeout: TimeInterval) async throws -> PythonExecutionResult {
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        // Create unique temp directory for this execution
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("noema-python-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        // Write sandboxed code to temp file
         let scriptURL = tempDir.appendingPathComponent("script.py")
         let sandboxedCode = pythonSandboxPreamble + code
         try sandboxedCode.write(to: scriptURL, atomically: true, encoding: .utf8)

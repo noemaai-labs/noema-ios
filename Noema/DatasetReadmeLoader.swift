@@ -1,4 +1,3 @@
-// DatasetReadmeLoader.swift
 import Foundation
 import SwiftUI
 
@@ -22,7 +21,7 @@ final class DatasetReadmeLoader: ObservableObject {
 
     func load(force: Bool = false) {
         task?.cancel()
-        isLoading = true  // Set loading state immediately
+        isLoading = true
         task = Task { [weak self] in
             await self?.fetch(force: force)
         }
@@ -57,7 +56,9 @@ final class DatasetReadmeLoader: ObservableObject {
            Date().timeIntervalSince(mod) < 86_400,
            let data = try? Data(contentsOf: cacheURL) {
             let cleaned = Self.preprocess(String(decoding: data, as: UTF8.self), repo: repo)
-            markdown = ReadmeMobileFormatter.transform(cleaned)
+            // ReadmeCollapseView renders through ReadmeMarkdownView, which draws
+            // tables natively — keep them instead of the list rewrite.
+            markdown = ReadmeMobileFormatter.transform(cleaned, keepTables: true)
             await networkFetch(cacheURL: cacheURL, etagURL: etagURL, etag: cachedEtag)
             return
         }
@@ -88,7 +89,7 @@ final class DatasetReadmeLoader: ObservableObject {
             if data.count > 800_000 { md = String(md.prefix(600_000)) + "\n\n*(truncated)*" }
             try? md.data(using: .utf8)?.write(to: cacheURL)
             let cleaned = Self.preprocess(md, repo: repo)
-            markdown = ReadmeMobileFormatter.transform(cleaned)
+            markdown = ReadmeMobileFormatter.transform(cleaned, keepTables: true)
         } catch { self.error = error }
     }
 

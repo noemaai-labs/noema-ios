@@ -3,8 +3,8 @@
 
 #include <string>
 
-int LLAMA_BUILD_NUMBER = 9592;
-const char * LLAMA_COMMIT = "ac4cdde";
+int LLAMA_BUILD_NUMBER = 10018;
+const char * LLAMA_COMMIT = "22b208b1";
 const char * LLAMA_COMPILER = "AppleClang (SPM)";
 const char * LLAMA_BUILD_TARGET = "apple";
 
@@ -25,6 +25,6 @@ const char * llama_build_target(void) {
 }
 
 const char * llama_build_info(void) {
-    static std::string info = "b9592-ac4cdde";
+    static std::string info = "b10018-22b208b1";
     return info.c_str();
 }

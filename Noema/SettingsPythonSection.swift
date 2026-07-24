@@ -1,4 +1,3 @@
-// SettingsPythonSection.swift
 import SwiftUI
 
 struct SettingsPythonSection: View {

@@ -17,7 +17,7 @@ final class AFMIntegrationTests: XCTestCase {
         let registry = AppleFoundationModelRegistry()
         let curated = try await registry.curated()
 
-        if AppleFoundationModelAvailability.isSupportedDevice {
+        if AppleFoundationModelRegistry.availableKinds.contains(.onDevice) {
             XCTAssertEqual(curated.first?.parameterCountLabel, AppleFoundationModelRegistry.parameterCountLabel)
 
             let details = try await registry.details(for: AppleFoundationModelRegistry.modelID)
@@ -42,13 +42,9 @@ final class AFMIntegrationTests: XCTestCase {
         let registry = AppleFoundationModelRegistry()
         let curated = try await registry.curated()
 
-        if AppleFoundationModelAvailability.isSupportedDevice {
-            XCTAssertEqual(curated.count, 1)
-            XCTAssertEqual(curated.first?.id, AppleFoundationModelRegistry.modelID)
-            XCTAssertEqual(curated.first?.formats, [.afm])
-        } else {
-            XCTAssertTrue(curated.isEmpty)
-        }
+        XCTAssertEqual(curated.count, AppleFoundationModelRegistry.availableKinds.count)
+        XCTAssertEqual(Set(curated.map(\.id)), Set(AppleFoundationModelRegistry.availableKinds.map(\.modelID)))
+        XCTAssertTrue(curated.allSatisfy { $0.formats == [.afm] })
     }
 
     func testAFMRegistrySearchYieldsOnlyCanonicalEntry() async throws {
@@ -64,12 +60,8 @@ final class AFMIntegrationTests: XCTestCase {
             )
         )
 
-        if AppleFoundationModelAvailability.isSupportedDevice {
-            XCTAssertEqual(matching.count, 1)
-            XCTAssertEqual(matching.first?.id, AppleFoundationModelRegistry.modelID)
-        } else {
-            XCTAssertTrue(matching.isEmpty)
-        }
+        XCTAssertEqual(matching.count, AppleFoundationModelRegistry.availableKinds.count)
+        XCTAssertEqual(Set(matching.map(\.id)), Set(AppleFoundationModelRegistry.availableKinds.map(\.modelID)))
 
         let nonMatching = try await collect(
             registry.searchStream(
@@ -122,6 +114,7 @@ final class AFMIntegrationTests: XCTestCase {
         let curated = try await combined.curated()
 
         XCTAssertFalse(curated.contains(where: { $0.id == AppleFoundationModelRegistry.modelID }))
+        XCTAssertFalse(curated.contains(where: { $0.id == AppleFoundationModelRegistry.privateCloudModelID }))
     }
 
     func testANEExploreRestrictsResultsToAnemllAuthor() {
@@ -163,6 +156,26 @@ final class AFMIntegrationTests: XCTestCase {
         if let afmModel {
             XCTAssertEqual(afmModel.parameterCountLabel, AppleFoundationModelRegistry.parameterCountLabel)
             XCTAssertTrue(afmModel.isToolCapable)
+        }
+    }
+
+    @MainActor
+    func testAppModelManagerPublishesPCCAsASeparateStoredModelWhenSelectable() {
+        let fileName = uniqueInstalledStoreFile()
+        defer { removeInstalledStore(named: fileName) }
+
+        let manager = AppModelManager(store: InstalledModelsStore(filename: fileName))
+        let pcc = manager.downloadedModels.first {
+            $0.modelID == AppleFoundationModelRegistry.privateCloudModelID
+                && $0.quant == AppleFoundationModelRegistry.privateCloudQuantLabel
+                && $0.format == .afm
+        }
+
+        XCTAssertEqual(pcc != nil, ApplePrivateCloudComputeAvailability.isSelectable)
+        if let pcc {
+            XCTAssertEqual(pcc.parameterCountLabel, AppleFoundationModelRegistry.privateCloudParameterCountLabel)
+            XCTAssertTrue(pcc.isMultimodal)
+            XCTAssertTrue(pcc.isToolCapable)
         }
     }
 
@@ -223,9 +236,44 @@ final class AFMIntegrationTests: XCTestCase {
         XCTAssertTrue(ToolCapabilityDetector.isToolCapableLocal(url: URL(fileURLWithPath: "/tmp/afm"), format: .afm))
     }
 
-    func testAFMWebToolGateIsAlwaysDisabled() {
+    func testAFMWebToolGateDisabledForOnDeviceKind() {
+        // No persisted kind → resolves to .onDevice, which stays tool-free.
+        XCTAssertFalse(WebToolGate.isAvailable(currentFormat: .afm, afmKind: .onDevice))
+        XCTAssertFalse(ToolAvailability.current(currentFormat: .afm, afmKind: .onDevice).webSearch)
+    }
+
+    func testAFMWebToolGateAllowsPrivateCloudComputeKind() {
+        let defaults = UserDefaults.standard
+        let keys = [
+            "webSearchEnabled", "webSearchArmed", "offGrid",
+            "selectedDatasetID", "indexingDatasetIDPersisted",
+            "currentModelSupportsFunctionCalling",
+            AppleFoundationModelKind.persistedCurrentKindKey
+        ]
+        let previous = keys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
+        defer {
+            for key in keys {
+                if let value = previous[key] ?? nil { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        defaults.set(true, forKey: "webSearchEnabled")
+        defaults.set(true, forKey: "webSearchArmed")
+        defaults.set(false, forKey: "offGrid")
+        defaults.set("", forKey: "selectedDatasetID")
+        defaults.set("", forKey: "indexingDatasetIDPersisted")
+        defaults.set(true, forKey: "currentModelSupportsFunctionCalling")
+
+        // Explicit kind from an AFM client wins.
+        XCTAssertTrue(WebToolGate.isAvailable(currentFormat: .afm, afmKind: .privateCloudCompute))
+        XCTAssertTrue(ToolAvailability.current(currentFormat: .afm, afmKind: .privateCloudCompute).webSearch)
+        XCTAssertFalse(WebToolGate.isAvailable(currentFormat: .afm, afmKind: .onDevice))
+
+        // Callers that don't know the kind fall back to the persisted one.
+        defaults.set(AppleFoundationModelKind.privateCloudCompute.rawValue, forKey: AppleFoundationModelKind.persistedCurrentKindKey)
+        XCTAssertTrue(WebToolGate.isAvailable(currentFormat: .afm))
+        defaults.set(AppleFoundationModelKind.onDevice.rawValue, forKey: AppleFoundationModelKind.persistedCurrentKindKey)
         XCTAssertFalse(WebToolGate.isAvailable(currentFormat: .afm))
-        XCTAssertFalse(ToolAvailability.current(currentFormat: .afm).webSearch)
     }
 
     func testAFMDefaultSettingsUsePermissiveGuardrails() {
@@ -251,7 +299,7 @@ final class AFMIntegrationTests: XCTestCase {
         XCTAssertEqual(AFMLLMClient.resolvedGuardrailsMode(from: nil), .permissiveContentTransformations)
     }
 
-    func testAFMFixedContextNormalizationAlwaysReturns4096() {
+    func testAFMFixedContextNormalizationUsesRuntimeSystemWindow() {
         let model = LocalModel(
             modelID: AppleFoundationModelRegistry.modelID,
             name: AppleFoundationModelRegistry.modelName,
@@ -268,9 +316,49 @@ final class AFMIntegrationTests: XCTestCase {
             totalLayers: 0
         )
 
-        let stale = ModelSettings(contextLength: 16384)
-        XCTAssertEqual(ModelSettings.fixedContextLength(for: model), 4096)
-        XCTAssertEqual(stale.normalizedForLocalModel(model).contextLength, 4096)
+        let runtimeContext = AFMLLMClient.onDeviceContextLimit()
+        let stale = ModelSettings(contextLength: 1_000_000)
+        XCTAssertEqual(ModelSettings.fixedContextLength(for: model), runtimeContext)
+        XCTAssertEqual(stale.normalizedForLocalModel(model).contextLength, Double(runtimeContext))
+    }
+
+    func testPCCFixedContextNormalizationUses32KWindow() {
+        let model = LocalModel(
+            modelID: AppleFoundationModelRegistry.privateCloudModelID,
+            name: AppleFoundationModelRegistry.privateCloudModelName,
+            url: URL(fileURLWithPath: "/tmp/pcc"),
+            quant: AppleFoundationModelRegistry.privateCloudQuantLabel,
+            architecture: "",
+            architectureFamily: "",
+            format: .afm,
+            sizeGB: 0,
+            isMultimodal: true,
+            isToolCapable: true,
+            isDownloaded: true,
+            downloadDate: Date(),
+            totalLayers: 0
+        )
+
+        XCTAssertEqual(
+            ModelSettings.fixedContextLength(for: model),
+            AppleFoundationModelKind.privateCloudContextLimit
+        )
+    }
+
+    @MainActor
+    func testMsgPrivateCloudOriginRoundTrips() throws {
+        var msg = ChatVM.Msg(role: "🤖", text: "hello", timestamp: Date())
+        msg.ranOnPrivateCloudCompute = true
+
+        let data = try JSONEncoder().encode(msg)
+        let decoded = try JSONDecoder().decode(ChatVM.Msg.self, from: data)
+        XCTAssertEqual(decoded.ranOnPrivateCloudCompute, true)
+
+        let plain = ChatVM.Msg(role: "🤖", text: "hello", timestamp: Date())
+        let plainData = try JSONEncoder().encode(plain)
+        XCTAssertFalse(String(data: plainData, encoding: .utf8)!.contains("ranOnPrivateCloudCompute"))
+        let decodedPlain = try JSONDecoder().decode(ChatVM.Msg.self, from: plainData)
+        XCTAssertNil(decodedPlain.ranOnPrivateCloudCompute)
     }
 
     @MainActor
@@ -521,32 +609,6 @@ final class AFMIntegrationTests: XCTestCase {
         )
 
         XCTAssertEqual(resolved, "Transcript answer")
-    }
-
-    @MainActor
-    func testAFMPreflightHardStopKeepsHistoryAndReturnsFixedMessage() {
-        let history: [ChatVM.Msg] = [
-            .init(role: "🧑‍💻", text: "Question"),
-            .init(role: "🤖", text: "", streaming: true)
-        ]
-
-        let preflight = ChatVM.afmPreflight(history: history, estimateTokens: { _ in 5000 })
-        XCTAssertEqual(preflight.history, history)
-        XCTAssertEqual(preflight.contextLimit, 4096)
-        XCTAssertEqual(preflight.promptTokens, 5000)
-        XCTAssertEqual(preflight.stopMessage, "AFM context limit reached (4096 tokens). Start a new chat or shorten the conversation.")
-    }
-
-    @MainActor
-    func testAFMPreflightAllowsUnderLimitTurns() {
-        let history: [ChatVM.Msg] = [
-            .init(role: "🧑‍💻", text: "Question"),
-            .init(role: "🤖", text: "", streaming: true)
-        ]
-
-        let preflight = ChatVM.afmPreflight(history: history, estimateTokens: { _ in 4000 })
-        XCTAssertEqual(preflight.history, history)
-        XCTAssertNil(preflight.stopMessage)
     }
 
     private func uniqueInstalledStoreFile() -> String {

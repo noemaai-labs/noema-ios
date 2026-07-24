@@ -1,4 +1,3 @@
-// SettingsWebSearchSection.swift
 import SwiftUI
 
 struct SettingsWebSearchSection: View {

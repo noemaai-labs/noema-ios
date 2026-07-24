@@ -1,0 +1,709 @@
+{
+  "formatVersion": 1,
+  "createdBy": {
+    "tool": "make_paged_package.py",
+    "toolVersion": "1",
+    "nativeContractVersion": 3
+  },
+  "source": {
+    "fileName": "tiny-qwen3moe-f16.gguf",
+    "ggufSizeBytes": 717600,
+    "ggufSha256": "c22c777686edb0016300265e273f9b3245dbb1ce64972611a85711e31b30c34d"
+  },
+  "model": {
+    "architecture": "qwen3moe",
+    "expertCount": 8,
+    "expertsUsedDefault": 2,
+    "moeLayerCount": 2,
+    "totalLayerCount": 2,
+    "fusedGateUp": false
+  },
+  "alignment": 16384,
+  "resident": {
+    "path": "resident.gguf",
+    "sizeBytes": 127328,
+    "sha256": "bf6930e6a8cd283570694495b48fc1bc1d70a5c96c4ff2aace5981156f6a5a52"
+  },
+  "expertFiles": [
+    {
+      "path": "experts-000.bin",
+      "sizeBytes": 782336,
+      "sha256": "28bbbd47aec88bb7b0ef8106d0483ec7dbf3444856552a91c40734fc558e3dcc"
+    }
+  ],
+  "records": [
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 0,
+      "file": 0,
+      "offset": 0,
+      "length": 12288,
+      "xxh64": "c937460372cbed5f",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 1,
+      "file": 0,
+      "offset": 16384,
+      "length": 12288,
+      "xxh64": "590a126f7969c8d2",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 2,
+      "file": 0,
+      "offset": 32768,
+      "length": 12288,
+      "xxh64": "f92d510e13e10eaf",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 3,
+      "file": 0,
+      "offset": 49152,
+      "length": 12288,
+      "xxh64": "71d07b6a7babaaeb",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 4,
+      "file": 0,
+      "offset": 65536,
+      "length": 12288,
+      "xxh64": "f95a952fff803f2f",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 5,
+      "file": 0,
+      "offset": 81920,
+      "length": 12288,
+      "xxh64": "a375b1932d44ce55",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 6,
+      "file": 0,
+      "offset": 98304,
+      "length": 12288,
+      "xxh64": "dc2d16566e34633b",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "gate",
+      "expert": 7,
+      "file": 0,
+      "offset": 114688,
+      "length": 12288,
+      "xxh64": "19c1bc9b34298e52",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 0,
+      "file": 0,
+      "offset": 131072,
+      "length": 12288,
+      "xxh64": "b471633b31c5f321",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 1,
+      "file": 0,
+      "offset": 147456,
+      "length": 12288,
+      "xxh64": "274da57d71db7541",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 2,
+      "file": 0,
+      "offset": 163840,
+      "length": 12288,
+      "xxh64": "a1216a517fdda7d0",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 3,
+      "file": 0,
+      "offset": 180224,
+      "length": 12288,
+      "xxh64": "51ca6628f67aa650",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 4,
+      "file": 0,
+      "offset": 196608,
+      "length": 12288,
+      "xxh64": "36a09e8a7fced78b",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 5,
+      "file": 0,
+      "offset": 212992,
+      "length": 12288,
+      "xxh64": "f392c053395d3294",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 6,
+      "file": 0,
+      "offset": 229376,
+      "length": 12288,
+      "xxh64": "12180c1fa9a22ca8",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "up",
+      "expert": 7,
+      "file": 0,
+      "offset": 245760,
+      "length": 12288,
+      "xxh64": "4f0ab208c8024b7d",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 0,
+      "file": 0,
+      "offset": 262144,
+      "length": 12288,
+      "xxh64": "f0bd247dcb6a12b8",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 1,
+      "file": 0,
+      "offset": 278528,
+      "length": 12288,
+      "xxh64": "e1006dc89c8f0a15",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 2,
+      "file": 0,
+      "offset": 294912,
+      "length": 12288,
+      "xxh64": "16747f771cf3fd86",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 3,
+      "file": 0,
+      "offset": 311296,
+      "length": 12288,
+      "xxh64": "c6772e78f5e94152",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 4,
+      "file": 0,
+      "offset": 327680,
+      "length": 12288,
+      "xxh64": "d6aad3aeb47c8956",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 5,
+      "file": 0,
+      "offset": 344064,
+      "length": 12288,
+      "xxh64": "480a7e1d885bf010",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 6,
+      "file": 0,
+      "offset": 360448,
+      "length": 12288,
+      "xxh64": "ac29feb70e7ae2f4",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 0,
+      "family": "down",
+      "expert": 7,
+      "file": 0,
+      "offset": 376832,
+      "length": 12288,
+      "xxh64": "08f99562b8e8c641",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 0,
+      "file": 0,
+      "offset": 393216,
+      "length": 12288,
+      "xxh64": "a5a06237a1da8fad",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 1,
+      "file": 0,
+      "offset": 409600,
+      "length": 12288,
+      "xxh64": "e11b8107193803f1",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 2,
+      "file": 0,
+      "offset": 425984,
+      "length": 12288,
+      "xxh64": "4a4e0777302f4d20",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 3,
+      "file": 0,
+      "offset": 442368,
+      "length": 12288,
+      "xxh64": "8256e9ec8f03fccd",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 4,
+      "file": 0,
+      "offset": 458752,
+      "length": 12288,
+      "xxh64": "3c2f78ca7d20c943",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 5,
+      "file": 0,
+      "offset": 475136,
+      "length": 12288,
+      "xxh64": "35cf0aa46e574840",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 6,
+      "file": 0,
+      "offset": 491520,
+      "length": 12288,
+      "xxh64": "f78ac4ee874ade10",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "gate",
+      "expert": 7,
+      "file": 0,
+      "offset": 507904,
+      "length": 12288,
+      "xxh64": "c8a32d70f5a4f06a",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 0,
+      "file": 0,
+      "offset": 524288,
+      "length": 12288,
+      "xxh64": "f267ea778186396e",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 1,
+      "file": 0,
+      "offset": 540672,
+      "length": 12288,
+      "xxh64": "2ccf6cae82bcdda5",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 2,
+      "file": 0,
+      "offset": 557056,
+      "length": 12288,
+      "xxh64": "6b99a91fa3c0ffc5",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 3,
+      "file": 0,
+      "offset": 573440,
+      "length": 12288,
+      "xxh64": "a1acb2f12a156de1",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 4,
+      "file": 0,
+      "offset": 589824,
+      "length": 12288,
+      "xxh64": "25fbbc24d1f56457",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 5,
+      "file": 0,
+      "offset": 606208,
+      "length": 12288,
+      "xxh64": "329663e541b8b952",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 6,
+      "file": 0,
+      "offset": 622592,
+      "length": 12288,
+      "xxh64": "f2f45141d5de8443",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "up",
+      "expert": 7,
+      "file": 0,
+      "offset": 638976,
+      "length": 12288,
+      "xxh64": "cd120fc2a7eeb634",
+      "ggmlType": 1,
+      "ne": [
+        64,
+        96
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 0,
+      "file": 0,
+      "offset": 655360,
+      "length": 12288,
+      "xxh64": "20041948d42e829e",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 1,
+      "file": 0,
+      "offset": 671744,
+      "length": 12288,
+      "xxh64": "6b677892aceb7f8e",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 2,
+      "file": 0,
+      "offset": 688128,
+      "length": 12288,
+      "xxh64": "aa107975d2d7ca42",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 3,
+      "file": 0,
+      "offset": 704512,
+      "length": 12288,
+      "xxh64": "1f7e5c2f93c89ef5",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 4,
+      "file": 0,
+      "offset": 720896,
+      "length": 12288,
+      "xxh64": "c426e603338c9142",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 5,
+      "file": 0,
+      "offset": 737280,
+      "length": 12288,
+      "xxh64": "8ffb86ecf50b0e7a",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 6,
+      "file": 0,
+      "offset": 753664,
+      "length": 12288,
+      "xxh64": "164fa83a35e296b5",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    },
+    {
+      "layer": 1,
+      "family": "down",
+      "expert": 7,
+      "file": 0,
+      "offset": 770048,
+      "length": 12288,
+      "xxh64": "db0559e8c56e7406",
+      "ggmlType": 1,
+      "ne": [
+        96,
+        64
+      ]
+    }
+  ],
+  "fingerprint": "8bcf8eed66a1b0b7de8e8a581eaf69b8cd53d059e681eedbf5f32ae0acd9ff8d"
+}

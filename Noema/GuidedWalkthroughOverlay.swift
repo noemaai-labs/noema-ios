@@ -1,5 +1,4 @@
 #if os(iOS) || os(macOS) || os(visionOS)
-// GuidedWalkthroughOverlay.swift
 import SwiftUI
 
 struct GuidedWalkthroughOverlay: View {
@@ -185,7 +184,7 @@ struct GuidedWalkthroughOverlay: View {
         case .exploreMLX:
             Text("Switch the selector to MLX for Apple Silicon‑optimized builds that excel at speed.")
                 .multilineTextAlignment(.center)
-        case .exploreSLM:
+        case .exploreET:
             Text("Pick the ET format when you want ultra-responsive models that run well anywhere.")
                 .multilineTextAlignment(.center)
         case .settingsIntro:

@@ -1,4 +1,3 @@
-// DeviceRAMInfo.swift
 import Foundation
 import Darwin
 import os
@@ -192,6 +191,7 @@ struct DeviceRAMInfo {
         "iPhone14,3": ("iPhone 13 Pro Max", "6 GB", "~5 GB", nil),
         "iPhone14,4": ("iPhone 13 mini", "4 GB", "~3 GB", nil),
         "iPhone14,5": ("iPhone 13", "4 GB", "~3 GB", nil),
+        "iPhone14,6": ("iPhone SE (3rd generation, 2022)", "4 GB", "~3 GB", Int64(3000) * Int64(1024) * Int64(1024)),
         "iPhone14,7": ("iPhone 14", "6 GB", "~5 GB", nil),
         "iPhone14,8": ("iPhone 14 Plus", "6 GB", "~5 GB", nil),
         "iPhone15,2": ("iPhone 14 Pro", "6 GB", "~5 GB", nil),

@@ -1,4 +1,3 @@
-// ChatFormatter.swift
 import Foundation
 
 /// Chat formatting layer that prepares inputs for generation while honoring

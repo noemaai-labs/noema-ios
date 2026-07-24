@@ -1,4 +1,3 @@
-// LlamaBackendManager.mm
 #import "LlamaBackendManager.h"
 #if __has_include(<llama/llama.h>)
 #import <llama/llama.h>

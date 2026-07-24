@@ -1,4 +1,3 @@
-// AnyCodable.swift
 import Foundation
 
 public struct AnyCodable: Codable, Equatable, @unchecked Sendable {

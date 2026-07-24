@@ -1,6 +1,3 @@
-// EnterpriseAPIClient.swift
-// HTTP client for the Noema Teams workspace server, modeled on SearXNGSearchClient:
-// ephemeral sessions, NetworkKillSwitch tracking, explicit status-code mapping.
 import Foundation
 
 enum EnterpriseAPIError: Error, LocalizedError {

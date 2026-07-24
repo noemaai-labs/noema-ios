@@ -1,5 +1,5 @@
-// ModelBenchmarkService.swift
 import Foundation
+import NoemaPackages
 
 @MainActor
 protocol ModelBenchmarkingViewModel: AnyObject {
@@ -8,12 +8,21 @@ protocol ModelBenchmarkingViewModel: AnyObject {
     var loadedModelSettings: ModelSettings? { get }
     var loadedModelFormat: ModelFormat? { get }
     var loadError: String? { get }
+    var lastLoadBlockedByRAMSafety: Bool { get }
 
     func load(
         url: URL,
         settings: ModelSettings?,
         format: ModelFormat?,
         forceReload: Bool
+    ) async -> Bool
+
+    func load(
+        url: URL,
+        settings: ModelSettings?,
+        format: ModelFormat?,
+        forceReload: Bool,
+        bypassRAMCheck: Bool
     ) async -> Bool
 
     func activeClientForBenchmark() throws -> AnyLLMClient
@@ -30,6 +39,7 @@ private func c_app_memory_footprint() -> UInt
 enum ModelBenchmarkError: LocalizedError {
     case unsupportedFormat
     case weightsMissing
+    case ramSafetyBlocked
     case loadFailed(String)
     case generationFailed(String)
 
@@ -39,6 +49,8 @@ enum ModelBenchmarkError: LocalizedError {
             return String(localized: "Benchmarking is not available for this model format.")
         case .weightsMissing:
             return String(localized: "The selected model's weights could not be located.")
+        case .ramSafetyBlocked:
+            return String(localized: "Model likely exceeds memory budget. Lower context size or use a smaller quant/model.")
         case .loadFailed(let message):
             return String.localizedStringWithFormat(
                 String(localized: "Failed to load model for benchmark: %@"),
@@ -51,6 +63,20 @@ enum ModelBenchmarkError: LocalizedError {
             )
         }
     }
+}
+
+/// Paged-runtime telemetry attached to a benchmark run of a Noema Overfit
+/// model. Optional on `ModelBenchmarkResult` so records persisted before this
+/// field existed keep decoding.
+struct PagedBenchmarkMetrics: Codable, Equatable, Sendable {
+    let bytesRead: Int64
+    let bankHits: Int64
+    let bankMisses: Int64
+    let missesPerToken: Double
+    let stallMsTotal: Double
+    let latency: OverfitLatencySample?
+    let thermalStateRaw: Int
+    let pressureInterventions: Int
 }
 
 struct ModelBenchmarkResult: Identifiable, Codable, Equatable {
@@ -69,6 +95,7 @@ struct ModelBenchmarkResult: Identifiable, Codable, Equatable {
     let outputPreview: String
     let completedAt: Date
     let speculativeTimings: LoopbackSpeculativeTimings?
+    let paged: PagedBenchmarkMetrics?
 
     init(
         id: UUID = UUID(),
@@ -85,7 +112,8 @@ struct ModelBenchmarkResult: Identifiable, Codable, Equatable {
         memoryDeltaBytes: Int64,
         outputPreview: String,
         completedAt: Date,
-        speculativeTimings: LoopbackSpeculativeTimings?
+        speculativeTimings: LoopbackSpeculativeTimings?,
+        paged: PagedBenchmarkMetrics? = nil
     ) {
         self.id = id
         self.format = format
@@ -102,6 +130,7 @@ struct ModelBenchmarkResult: Identifiable, Codable, Equatable {
         self.outputPreview = outputPreview
         self.completedAt = completedAt
         self.speculativeTimings = speculativeTimings
+        self.paged = paged
     }
 }
 
@@ -153,6 +182,7 @@ enum ModelBenchmarkService {
         model: LocalModel,
         settings: ModelSettings,
         vm: VM,
+        bypassRAMCheck: Bool = false,
         progress: (@MainActor (ModelBenchmarkProgress) -> Void)? = nil
     ) async throws -> ModelBenchmarkResult {
         let vmRef = MainActorIsolated(value: vm)
@@ -193,9 +223,17 @@ enum ModelBenchmarkService {
                 url: model.url,
                 settings: settingsSnapshot,
                 format: model.format,
-                forceReload: true
+                forceReload: true,
+                bypassRAMCheck: bypassRAMCheck
             )
             if !loadSucceeded {
+                let blockedByRAMSafety = await MainActor.run {
+                    vmRef.value.lastLoadBlockedByRAMSafety
+                }
+                if blockedByRAMSafety {
+                    logError("Benchmark load stopped by RAM safety guard")
+                    throw ModelBenchmarkError.ramSafetyBlocked
+                }
                 let loadError = await MainActor.run { vmRef.value.loadError }
                 let message = loadError ?? "Unknown load failure"
                 logError("Benchmark load failed: \(message)")
@@ -246,6 +284,8 @@ enum ModelBenchmarkService {
         let start = Date()
         var aggregate = ""
         var firstTokenDate: Date?
+        var previousChunkDate: Date?
+        var interChunkLatenciesMs: [Double] = []
         var chunkCount = 0
         var lastProgressLog = Date()
         var lastUIUpdate = Date(timeIntervalSince1970: 0)
@@ -267,13 +307,18 @@ enum ModelBenchmarkService {
             for try await chunk in stream {
                 try Task.checkCancellation()
                 if firstTokenDate == nil {
-                    firstTokenDate = Date()
-                    let delay = firstTokenDate!.timeIntervalSince(start)
+                    let firstToken = Date()
+                    firstTokenDate = firstToken
+                    let delay = firstToken.timeIntervalSince(start)
                     log(String(format: "First token received after %.2fs", delay))
                 }
                 aggregate += chunk
                 chunkCount += 1
                 let now = Date()
+                if let previousChunkDate {
+                    interChunkLatenciesMs.append(now.timeIntervalSince(previousChunkDate) * 1000)
+                }
+                previousChunkDate = now
                 if now.timeIntervalSince(lastProgressLog) >= 2 {
                     let elapsed = now.timeIntervalSince(start)
                     log(String(format: "Stream progress: chunks=%d chars=%d elapsed=%.2fs", chunkCount, aggregate.count, elapsed))
@@ -358,6 +403,20 @@ enum ModelBenchmarkService {
             log("Benchmark ended after hitting the time limit")
         }
 
+        let paged = format == .gguf
+            ? LlamaServerBridge.pagedStatsJSON().flatMap {
+                pagedMetrics(
+                    fromStatsJSON: $0,
+                    interTokenLatenciesMs: interChunkLatenciesMs,
+                    generationTokens: generationTokens,
+                    thermalStateRaw: ProcessInfo.processInfo.thermalState.rawValue
+                )
+            }
+            : nil
+        if let paged {
+            log("Paged runtime: bytesRead=\(paged.bytesRead) hits=\(paged.bankHits) misses=\(paged.bankMisses) stallMs=\(String(format: "%.1f", paged.stallMsTotal)) pressure=\(paged.pressureInterventions)")
+        }
+
         return ModelBenchmarkResult(
             format: format,
             settings: settings,
@@ -372,8 +431,110 @@ enum ModelBenchmarkService {
             memoryDeltaBytes: delta,
             outputPreview: String(aggregate.prefix(400)),
             completedAt: Date(),
-            speculativeTimings: speculativeTimings
+            speculativeTimings: speculativeTimings,
+            paged: paged
         )
+    }
+
+    /// Defensive parse of `LlamaServerBridge.pagedStatsJSON()`. The Stage 1
+    /// runtime reports mode/preload counters only; the streamed Stage 2 bank
+    /// adds hit/miss/IO telemetry under keys this reader also accepts. Any
+    /// shape it does not recognize degrades to zeros rather than dropping the
+    /// whole benchmark record.
+    static func pagedMetrics(
+        fromStatsJSON json: String,
+        interTokenLatenciesMs: [Double],
+        generationTokens: Int,
+        thermalStateRaw: Int
+    ) -> PagedBenchmarkMetrics? {
+        guard let data = json.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let mode = statsInt(object["mode"]),
+              mode != 0 else {
+            return nil
+        }
+        let bank = object["bank"] as? [String: Any]
+        let io = object["io"] as? [String: Any]
+        let preload = object["preload"] as? [String: Any]
+        // Mode-2 telemetry all lives under "stream" (noema_paged_runtime
+        // stats_json); the flat/bank/io spellings only ever match mode-1
+        // shapes, so without this section a thrashing streamed bank decodes
+        // as hits=0/misses=0 and the canary records a perfect hit rate.
+        let stream = object["stream"] as? [String: Any]
+        let phases = object["phases"] as? [String: Any]
+        let ordinaryDecode = phases?["ordinaryDecode"] as? [String: Any]
+
+        // Current runtimes expose phase totals. Decode metrics must not mix in
+        // the prompt's broad expert sweep, which made a healthy canary report
+        // more than a hundred apparent misses per generated token.
+        let hits = statsInt(ordinaryDecode?["hits"])
+            ?? statsInt(stream?["hits"])
+            ?? statsInt(object["bankHits"])
+            ?? statsInt(bank?["hits"])
+            ?? statsInt(object["hits"])
+            ?? 0
+        let misses = statsInt(ordinaryDecode?["misses"])
+            ?? statsInt(stream?["misses"])
+            ?? statsInt(object["bankMisses"])
+            ?? statsInt(bank?["misses"])
+            ?? statsInt(object["misses"])
+            ?? 0
+        let bytesRead = statsInt(ordinaryDecode?["bytesRead"])
+            ?? statsInt(stream?["bytesRead"])
+            ?? statsInt(object["bytesRead"])
+            ?? statsInt(io?["bytesRead"])
+            ?? statsInt(io?["bytes"])
+            ?? statsInt(preload?["bytes"])
+            ?? 0
+        let stallMsTotal = statsDouble(ordinaryDecode?["stallNs"]).map { $0 / 1_000_000 }
+            ?? statsDouble(stream?["stallNs"]).map { $0 / 1_000_000 }
+            ?? statsDouble(object["stallMsTotal"])
+            ?? statsDouble(io?["stallMs"])
+            ?? 0
+        let pressureInterventions = statsInt(object["pressureInterventions"])
+            ?? statsInt(object["pressureLevel"])
+            ?? 0
+        let missesPerToken: Double
+        if ordinaryDecode != nil {
+            missesPerToken = generationTokens > 0 ? Double(misses) / Double(generationTokens) : 0
+        } else {
+            missesPerToken = statsDouble(object["missesPerToken"])
+                ?? (generationTokens > 0 ? Double(misses) / Double(generationTokens) : 0)
+        }
+
+        return PagedBenchmarkMetrics(
+            bytesRead: Int64(clamping: bytesRead),
+            bankHits: Int64(clamping: hits),
+            bankMisses: Int64(clamping: misses),
+            missesPerToken: missesPerToken,
+            stallMsTotal: stallMsTotal,
+            latency: OverfitLatencyClassifier.summarize(interTokenLatenciesMs: interTokenLatenciesMs),
+            thermalStateRaw: thermalStateRaw,
+            pressureInterventions: Int(clamping: pressureInterventions)
+        )
+    }
+
+    private static func statsInt(_ value: Any?) -> Int64? {
+        switch value {
+        case let number as NSNumber:
+            return number.int64Value
+        case let string as String:
+            return Int64(string)
+        default:
+            return nil
+        }
+    }
+
+    private static func statsDouble(_ value: Any?) -> Double? {
+        switch value {
+        case let number as NSNumber:
+            let double = number.doubleValue
+            return double.isFinite ? double : nil
+        case let string as String:
+            return Double(string)
+        default:
+            return nil
+        }
     }
 
     private static func inputWithBenchmarkOptions(_ input: LLMInput, maxOutputTokens: Int) -> LLMInput {
@@ -382,7 +543,17 @@ enum ModelBenchmarkService {
             reasoningEnabled: current.reasoningEnabled,
             maxOutputTokens: maxOutputTokens,
             thinkingBudgetTokens: current.thinkingBudgetTokens,
-            responseFormat: current.responseFormat
+            responseFormat: current.responseFormat,
+            seed: current.seed,
+            temperature: current.temperature,
+            topK: current.topK,
+            topP: current.topP,
+            minP: current.minP,
+            repeatPenalty: current.repeatPenalty,
+            repeatLastN: current.repeatLastN,
+            presencePenalty: current.presencePenalty,
+            frequencyPenalty: current.frequencyPenalty,
+            tools: current.tools
         )
         return LLMInput(input.content, generationOptions: options)
     }

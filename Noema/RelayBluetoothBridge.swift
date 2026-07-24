@@ -118,9 +118,15 @@ final class RelayBluetoothAdvertiser: NSObject, ObservableObject, CBPeripheralMa
         super.init()
     }
 
+    var isAdvertisingActive: Bool {
+        shouldAdvertise
+    }
+
     func startAdvertising(payload: RelayBluetoothPayload) {
         pendingPayload = payload
-        lastPayload = payload
+        if lastPayload != payload {
+            lastPayload = payload
+        }
         shouldAdvertise = true
         ensurePeripheralManager()
         updateAdvertisingState()

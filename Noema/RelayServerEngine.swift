@@ -4,7 +4,11 @@ import NoemaPackages
 
 actor RelayServerEngine {
     private struct LoadedClient {
+        let cacheID: UUID
         var client: AnyLLMClient
+        /// Retain the concrete client so GGUF cache hits can validate their
+        /// private lease on the process-global loopback generation.
+        var loopbackClient: NoemaLlamaClient?
         var descriptor: RelayModelDescriptor
         var lastUsed: Date
         var evictionTask: Task<Void, Never>?
@@ -104,7 +108,7 @@ actor RelayServerEngine {
         var finishReason: String
     }
 
-    struct ModelSnapshot {
+    struct ModelSnapshot: Equatable {
         var id: String
         var displayName: String
         var ownedBy: String
@@ -148,6 +152,10 @@ actor RelayServerEngine {
     private var descriptors: [String: RelayModelDescriptor] = [:]
     private var activeModelID: String?
     private var localClients: [String: LoadedClient] = [:]
+    /// Cold GGUF loads are globally serialized because every Relay GGUF shares
+    /// the process-global llama bridge, even when model IDs differ.
+    private var ggufLoadActive = false
+    private var ggufLoadWaiters: [CheckedContinuation<Void, Never>] = []
     // Models explicitly loaded by the user (manual/pinned). These should not be auto-unloaded
     // by JIT policies or idle TTL timers.
     private var pinnedModelIDs: Set<String> = []
@@ -159,7 +167,8 @@ actor RelayServerEngine {
     private let connectedClientExpiry: TimeInterval = 180
 
     func updateDescriptors(_ descriptors: [RelayModelDescriptor]) {
-        self.descriptors = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.id, $0) })
+        let descriptors = descriptors.map { advertisingOverfit($0) }
+        self.descriptors = Dictionary(descriptors.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         let validIDs = Set(self.descriptors.keys)
         let staleIDs = localClients.keys.filter { !validIDs.contains($0) }
         for id in staleIDs {
@@ -178,7 +187,70 @@ actor RelayServerEngine {
     }
 
     func updateCatalogEntries(_ entries: [RelayCatalogEntry]) {
-        catalogEntries = Dictionary(uniqueKeysWithValues: entries.map { ($0.modelID, $0) })
+        let entries = entries.map { entry -> RelayCatalogEntry in
+            guard entry.overfitClassification == nil,
+                  let descriptor = descriptors[entry.modelID],
+                  let advertisement = overfitAdvertisement(for: descriptor) else {
+                return entry
+            }
+            var entry = entry
+            entry.overfitClassification = advertisement.classification
+            entry.overfitMeasuredGenerationRate = advertisement.generationRate
+            return entry
+        }
+        catalogEntries = Dictionary(entries.map { ($0.modelID, $0) }, uniquingKeysWith: { _, latest in latest })
+    }
+
+    // MARK: - Overfit advertisement
+
+    /// Package fingerprint + volume identity per resident-GGUF path. The disk
+    /// walk and manifest read happen once per path (mirrors
+    /// OverfitPagedInstallCache); the canary record itself is re-read on every
+    /// catalog refresh so a newly completed canary is advertised.
+    private var overfitPackageIdentityCache: [String: OverfitPackageIdentity?] = [:]
+
+    private struct OverfitPackageIdentity {
+        var fingerprint: String
+        var volume: String
+    }
+
+    private func advertisingOverfit(_ descriptor: RelayModelDescriptor) -> RelayModelDescriptor {
+        guard let advertisement = overfitAdvertisement(for: descriptor) else { return descriptor }
+        var descriptor = descriptor
+        descriptor.overfitClassification = advertisement.classification
+        descriptor.overfitMeasuredGenerationRate = advertisement.generationRate
+        return descriptor
+    }
+
+    private func overfitAdvertisement(for descriptor: RelayModelDescriptor) -> (classification: String, generationRate: Double)? {
+        guard case .local(let model) = descriptor.kind,
+              model.format == .gguf,
+              OverfitPagedInstallCache.isPaged(model.url) else { return nil }
+        let key = model.url.standardizedFileURL.path
+        let identity: OverfitPackageIdentity?
+        if let cached = overfitPackageIdentityCache[key] {
+            identity = cached
+        } else {
+            if let directory = PagedPackageLocator.enclosingPackage(for: model.url),
+               let package = try? NoemaPagedPackage.load(at: directory) {
+                identity = OverfitPackageIdentity(
+                    fingerprint: package.manifest.fingerprint,
+                    volume: OverfitEnvironmentIdentity.volumeIdentifier(for: directory)
+                )
+            } else {
+                identity = nil
+            }
+            overfitPackageIdentityCache[key] = identity
+        }
+        guard let identity,
+              let record = OverfitCanaryStore.shared.record(
+                  fingerprint: identity.fingerprint,
+                  device: OverfitEnvironmentIdentity.deviceModelIdentifier,
+                  volume: identity.volume,
+                  contractVersion: OverfitEnvironmentIdentity.nativeContractVersion,
+                  appBuild: OverfitEnvironmentIdentity.appBuild
+              ) else { return nil }
+        return (record.classification.rawValue, record.generationRate)
     }
 
     func updateActiveModel(_ id: String?) {
@@ -265,9 +337,20 @@ actor RelayServerEngine {
     }
 
     func modelSnapshots() -> [ModelSnapshot] {
-        descriptors.values.sorted(by: { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }).map { descriptor in
+        // Deterministic order (id tiebreak) so equal display names can't flip
+        // between calls — Dictionary.values order isn't stable and callers
+        // diff consecutive snapshots to decide whether to republish.
+        descriptors.values.sorted(by: { lhs, rhs in
+            switch lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame: return lhs.id < rhs.id
+            }
+        }).map { descriptor in
             let isLoaded = localClients[descriptor.id] != nil
-            let created = catalogEntries[descriptor.id]?.lastChecked ?? Date()
+            // .distantPast (not Date()) keeps snapshots equal across calls when
+            // nothing changed; the UI hides the "Refreshed" label for it.
+            let created = catalogEntries[descriptor.id]?.lastChecked ?? .distantPast
             return ModelSnapshot(
                 id: descriptor.identifier,
                 displayName: descriptor.displayName,
@@ -283,14 +366,21 @@ actor RelayServerEngine {
         }
     }
 
-    func unloadAllClients() {
-        for entry in localClients.values {
-            entry.evictionTask?.cancel()
-            Task { await entry.client.unloadAndWait() }
-        }
-        localClients.removeAll()
+    func unloadAllClients() async {
+        await acquireGGUFLoadSlot()
+        defer { releaseGGUFLoadSlot() }
+
+        let ids = Array(localClients.keys)
         pinnedModelIDs.removeAll()
-        stopLoopbackIfIdle()
+        for id in ids {
+            if isModelBusy(id) {
+                pendingEvictions[id] = "unload all clients (deferred: model busy)"
+                continue
+            }
+            guard let entry = localClients.removeValue(forKey: id) else { continue }
+            entry.evictionTask?.cancel()
+            await entry.client.unloadAndWait()
+        }
     }
 
     enum LoadOrigin { case manual, jit }
@@ -309,7 +399,6 @@ actor RelayServerEngine {
                 entry.evictionTask = scheduleEvictionTimer(for: descriptor.id)
             }
             updateEntry(entry, for: descriptor.id)
-            if origin == .manual { pinnedModelIDs.insert(descriptor.id) }
         case .remote:
             RelayLog.record(category: "RelayServerEngine", message: "Remote model \(descriptor.displayName) does not require local load")
         }
@@ -317,10 +406,21 @@ actor RelayServerEngine {
 
     func unloadModel(_ modelID: String, reason: String = "manual unload") async {
         guard let descriptor = descriptor(for: modelID) else { return }
+        let isGGUF: Bool = {
+            guard case .local(let model) = descriptor.kind else { return false }
+            return model.format == .gguf
+        }()
+        if isGGUF {
+            await acquireGGUFLoadSlot()
+        }
+        defer {
+            if isGGUF {
+                releaseGGUFLoadSlot()
+            }
+        }
         // Remove manual pin, then evict the client if present
         pinnedModelIDs.remove(descriptor.id)
         await evictLoadedModel(id: descriptor.id, reason: reason)
-        stopLoopbackIfIdle()
     }
 
     func generateReply(for envelope: RelayEnvelope) async throws -> String {
@@ -372,7 +472,7 @@ actor RelayServerEngine {
         }
         switch descriptor.kind {
         case .local:
-            var entry = try await loadLocalClient(for: descriptor)
+            var entry = try await loadLocalClient(for: descriptor, reserveGeneration: true)
             let messages = envelope.messages.map { ChatMessage(role: $0.role, content: $0.text) }
             let input = LLMInput(.messages(messages))
             var accumulated = ""
@@ -390,6 +490,7 @@ actor RelayServerEngine {
                 modelID: descriptor.id,
                 input: input,
                 parameters: NormalizedParameters(),
+                generationSlotAlreadyAcquired: true,
                 yield: yield
             )
             entry.lastUsed = Date()
@@ -412,10 +513,7 @@ actor RelayServerEngine {
         }
         switch descriptor.kind {
         case .local:
-            var entry = try await loadLocalClient(for: descriptor)
-            if let settings = effectiveSettings(for: descriptor, parameters: request.parameters) {
-                applyEnvironmentVariables(from: settings)
-            }
+            var entry = try await loadLocalClient(for: descriptor, reserveGeneration: true)
             let input = LLMInput(.messages(request.messages))
             let promptTokens = estimateTokens(for: request.messages)
             let (text, finishReason, tokenCount) = try await collectText(
@@ -423,6 +521,7 @@ actor RelayServerEngine {
                 modelID: descriptor.id,
                 input: input,
                 parameters: request.parameters,
+                generationSlotAlreadyAcquired: true,
                 yield: nil
             )
             entry.lastUsed = Date()
@@ -508,10 +607,7 @@ actor RelayServerEngine {
         }
         switch descriptor.kind {
         case .local:
-            var entry = try await loadLocalClient(for: descriptor)
-            if let settings = effectiveSettings(for: descriptor, parameters: request.parameters) {
-                applyEnvironmentVariables(from: settings)
-            }
+            var entry = try await loadLocalClient(for: descriptor, reserveGeneration: true)
             let promptTokens = estimateTokens(for: request.messages)
             let input = LLMInput(.messages(request.messages))
             return AsyncThrowingStream { continuation in
@@ -522,6 +618,7 @@ actor RelayServerEngine {
                             modelID: descriptor.id,
                             input: input,
                             parameters: request.parameters,
+                            generationSlotAlreadyAcquired: true,
                             yield: { chunk in
                                 continuation.yield(.delta(chunk))
                             }
@@ -669,7 +766,9 @@ actor RelayServerEngine {
                 sizeBytes: descriptor.sizeBytes.flatMap { Int($0) },
                 tags: descriptor.tags,
                 health: entry.health.rawValue,
-                recordName: "model-\(entry.modelID)"
+                recordName: "model-\(entry.modelID)",
+                overfitClassification: descriptor.overfitClassification ?? entry.overfitClassification,
+                overfitMeasuredGenerationRate: descriptor.overfitMeasuredGenerationRate ?? entry.overfitMeasuredGenerationRate
             )
         }
         let response = CatalogResponse(models: models)
@@ -704,58 +803,124 @@ actor RelayServerEngine {
         var tags: [String]
         var health: String
         var recordName: String
+        var overfitClassification: String?
+        var overfitMeasuredGenerationRate: Double?
     }
 
-    private func loadLocalClient(for descriptor: RelayModelDescriptor, origin: LoadOrigin = .jit) async throws -> LoadedClient {
+    private func loadLocalClient(
+        for descriptor: RelayModelDescriptor,
+        origin: LoadOrigin = .jit,
+        reserveGeneration: Bool = false
+    ) async throws -> LoadedClient {
+        let needsGGUFLoadSlot: Bool = {
+            guard case .local(let model) = descriptor.kind else { return false }
+            return model.format == .gguf
+        }()
+        if needsGGUFLoadSlot {
+            await acquireGGUFLoadSlot()
+        }
+        defer {
+            if needsGGUFLoadSlot {
+                releaseGGUFLoadSlot()
+            }
+        }
+        if needsGGUFLoadSlot {
+            try Task.checkCancellation()
+        }
+
         if var cached = localClients[descriptor.id] {
-            cached.lastUsed = Date()
-            cached.evictionTask?.cancel()
-            // Preserve eviction policy on cache hit: re-arm TTL only for JIT-managed entries
-            if origin == .jit && !pinnedModelIDs.contains(descriptor.id) {
-                cached.evictionTask = scheduleEvictionTimer(for: descriptor.id)
+            let staleGGUFLease: Bool = {
+                guard case .local(let model) = cached.descriptor.kind,
+                      model.format == .gguf else { return false }
+                return cached.loopbackClient?.isCurrentLoopbackOwner() != true
+            }()
+            if staleGGUFLease {
+                localClients.removeValue(forKey: descriptor.id)
+                cached.evictionTask?.cancel()
+                await cached.client.unloadAndWait()
             } else {
-                cached.evictionTask = nil
+                cached.lastUsed = Date()
+                cached.evictionTask?.cancel()
+                // Preserve eviction policy on cache hit: re-arm TTL only for JIT-managed entries
+                if origin == .jit && !pinnedModelIDs.contains(descriptor.id) {
+                    cached.evictionTask = scheduleEvictionTimer(for: descriptor.id)
+                } else {
+                    cached.evictionTask = nil
+                }
+                localClients[descriptor.id] = cached
+                if origin == .manual {
+                    pinnedModelIDs.insert(descriptor.id)
+                }
+                if reserveGeneration {
+                    await acquireGenerationSlot(descriptor.id)
+                }
+                return cached
             }
-            // If this model is multimodal and loopback isn’t running, spin it up.
-            if needsLoopback(for: cached.descriptor),
-               Int(LlamaServerBridge.port()) <= 0 {
-                startLoopbackServer(for: cached.descriptor)
-            }
-            localClients[descriptor.id] = cached
-            return cached
         }
         guard case .local(let model) = descriptor.kind else {
             throw InferenceError.notConfigured
         }
+        if model.format == .gguf {
+            try await unloadConflictingRelayGGUF(keeping: descriptor.id)
+        }
         NotificationCenter.default.post(name: .relayWillLoadLocalModel, object: nil)
-        applyEnvironmentVariables(from: descriptor.settings)
 
         let client: AnyLLMClient
+        var loopbackClient: NoemaLlamaClient?
+        var pendingBridgeReservation: NoemaLlamaClient.BridgeMutationReservation?
+        defer { pendingBridgeReservation?.release() }
         switch model.format {
         case .gguf:
-            let context = descriptor.settings.map { settings -> Int in
+            let bridgeReservation = await NoemaLlamaClient.reserveLoopbackBridge()
+            pendingBridgeReservation = bridgeReservation
+            guard bridgeReservation.isActive else { throw CancellationError() }
+            try Task.checkCancellation()
+            guard LlamaServerBridge.port() <= 0 else {
+                throw InferenceError.other(
+                    String(
+                        localized: "The GGUF runtime is already in use.",
+                        locale: LocalizationManager.preferredLocale()
+                    )
+                )
+            }
+            let effectiveSettings = descriptor.settings ?? ModelSettings.default(for: .gguf)
+            let context = Optional(effectiveSettings).map { settings -> Int in
                 let clamped = max(1.0, min(settings.contextLength, Double(Int32.max)))
                 return Int(clamped)
             }
-            let threads = descriptor.settings.map { settings -> Int in
+            let threads = Optional(effectiveSettings).map { settings -> Int in
                 let requested = settings.cpuThreads > 0 ? settings.cpuThreads : ModelSettings.recommendedInferenceThreadCount
                 // Hard-clamp so inference always leaves a core for the UI, even for
                 // older persisted settings that requested every processor.
                 return min(max(1, requested), ModelSettings.maxInferenceThreadCount)
             }
-            // Pass explicit projector when available so remote worker uses the intended mmproj
+            // Pass an explicit projector when available. No separate external
+            // restart is needed: the concrete client starts the exact GGUF and
+            // claims its lease while the same bridge reservation is held.
             let explicitMMProj = ProjectorLocator.projectorPath(alongside: model.url)
-            let hasMergedProjector = GGUFMetadata.hasMultimodalProjector(at: model.url)
-            if explicitMMProj != nil || hasMergedProjector {
-                startLoopbackServer(for: descriptor, explicitMMProj: explicitMMProj)
+            let (configuration, overfitPlan) = await GGUFServerConfigurationResolver.resolveWithPlan(
+                modelURL: model.url,
+                settings: effectiveSettings,
+                mmprojPath: explicitMMProj,
+                contextShiftEnabled: true,
+                purpose: .relay
+            )
+            if case .refused(let reason) = overfitPlan {
+                throw InferenceError.other(OverfitPlanResolver.refusalMessage(reason))
             }
             let parameter = LlamaParameter(
                 options: LlamaOptions(extraEOSTokens: ["<|im_end|>", "<end_of_turn>"]),
                 contextLength: context,
                 threadCount: threads,
-                mmproj: explicitMMProj
+                mmproj: explicitMMProj,
+                serverConfiguration: configuration
             )
-            let llama = try await NoemaLlamaClient.llama(url: model.url, parameter: parameter)
+            let llama = try await NoemaLlamaClient.llama(
+                url: model.url,
+                parameter: parameter,
+                bridgeReservation: bridgeReservation
+            )
+            loopbackClient = llama
             client = AnyLLMClient(llama)
         case .mlx:
             client = try await MLXBridge.makeTextClient(url: model.url, settings: descriptor.settings)
@@ -769,100 +934,38 @@ actor RelayServerEngine {
             throw InferenceError.other("Core AI models are not supported by relay")
         }
 
-        var entry = LoadedClient(client: client, descriptor: descriptor, lastUsed: Date(), evictionTask: nil)
+        // `updateDescriptors` can run while an async load is suspended. Never
+        // publish a client for an ID that was removed or replaced mid-load;
+        // release the bridge first so an ownership-checked unload cannot wait
+        // on this function's own mutation reservation.
+        guard descriptors[descriptor.id] == descriptor else {
+            pendingBridgeReservation?.release()
+            await client.unloadAndWait()
+            throw InferenceError.notConfigured
+        }
+
+        var entry = LoadedClient(
+            cacheID: UUID(),
+            client: client,
+            loopbackClient: loopbackClient,
+            descriptor: descriptor,
+            lastUsed: Date(),
+            evictionTask: nil
+        )
         if origin == .jit && !pinnedModelIDs.contains(descriptor.id) {
             entry.evictionTask = scheduleEvictionTimer(for: descriptor.id)
         }
         localClients[descriptor.id] = entry
+        if origin == .manual {
+            pinnedModelIDs.insert(descriptor.id)
+        }
         if origin == .jit && config.onlyKeepLastJITModel {
             await unloadOtherClients(keeping: descriptor.id)
         }
+        if reserveGeneration {
+            await acquireGenerationSlot(descriptor.id)
+        }
         return entry
-    }
-
-    private func applyEnvironmentVariables(from settings: ModelSettings?) {
-        guard let settings else {
-            unsetenv("LLAMA_CONTEXT_SIZE")
-            unsetenv("LLAMA_CONTEXT_SHIFT")
-            unsetenv("LLAMA_N_GPU_LAYERS")
-            unsetenv("LLAMA_THREADS")
-            unsetenv("LLAMA_THREADS_BATCH")
-            unsetenv("LLAMA_KV_OFFLOAD")
-            unsetenv("LLAMA_MMAP")
-            unsetenv("LLAMA_KEEP")
-            unsetenv("LLAMA_WARMUP")
-            unsetenv("LLAMA_SEED")
-            unsetenv("LLAMA_FLASH_ATTENTION")
-            unsetenv("LLAMA_V_QUANT")
-            unsetenv("LLAMA_K_QUANT")
-            unsetenv("LLAMA_MOE_EXPERTS")
-            unsetenv("LLAMA_TOKENIZER_PATH")
-            return
-        }
-
-        setenv("LLAMA_CONTEXT_SIZE", String(Int(settings.contextLength)), 1)
-        // Relay serves remote clients: always allow context shifting so their
-        // long generations keep going, regardless of the local chat strategy
-        // (the env is process-global and ChatVM may have set it to 0).
-        setenv("LLAMA_CONTEXT_SHIFT", "1", 1)
-
-        let supportsOffload = DeviceGPUInfo.supportsGPUOffload
-        let gpuLayers: Int
-        if !supportsOffload {
-            gpuLayers = 0
-        } else if settings.gpuLayers < 0 {
-            gpuLayers = 1_000_000
-        } else {
-            gpuLayers = settings.gpuLayers
-        }
-        setenv("LLAMA_N_GPU_LAYERS", String(gpuLayers), 1)
-
-        let threads = settings.cpuThreads > 0 ? settings.cpuThreads : ModelSettings.recommendedInferenceThreadCount
-        // Hard-clamp so inference always leaves a core free for the UI.
-        let clampedThreads = min(max(1, threads), ModelSettings.maxInferenceThreadCount)
-        setenv("LLAMA_THREADS", String(clampedThreads), 1)
-        setenv("LLAMA_THREADS_BATCH", String(clampedThreads), 1)
-        // Backward-compat: a few builds key off GGML_* env vars
-        setenv("GGML_NUM_THREADS", String(clampedThreads), 1)
-        setenv("GGML_NUM_THREADS_BATCH", String(clampedThreads), 1)
-
-        let kvOffload = supportsOffload && gpuLayers > 0 && settings.kvCacheOffload
-        setenv("LLAMA_KV_OFFLOAD", kvOffload ? "1" : "0", 1)
-        setenv("LLAMA_MMAP", settings.useMmap ? "1" : "0", 1)
-        setenv("LLAMA_KEEP", settings.keepInMemory ? "1" : "0", 1)
-        if settings.disableWarmup {
-            setenv("LLAMA_WARMUP", "0", 1)
-        } else {
-            unsetenv("LLAMA_WARMUP")
-        }
-
-        if let seed = settings.seed {
-            setenv("LLAMA_SEED", String(seed), 1)
-        } else {
-            unsetenv("LLAMA_SEED")
-        }
-
-        if settings.flashAttention {
-            setenv("LLAMA_FLASH_ATTENTION", "1", 1)
-            setenv("LLAMA_V_QUANT", settings.vCacheQuant.rawValue, 1)
-        } else {
-            unsetenv("LLAMA_FLASH_ATTENTION")
-            unsetenv("LLAMA_V_QUANT")
-        }
-
-        setenv("LLAMA_K_QUANT", settings.kCacheQuant.rawValue, 1)
-
-        if let tokenizer = settings.tokenizerPath, !tokenizer.isEmpty {
-            setenv("LLAMA_TOKENIZER_PATH", tokenizer, 1)
-        } else {
-            unsetenv("LLAMA_TOKENIZER_PATH")
-        }
-
-        if let experts = settings.moeActiveExperts, experts > 0 {
-            setenv("LLAMA_MOE_EXPERTS", String(experts), 1)
-        } else {
-            unsetenv("LLAMA_MOE_EXPERTS")
-        }
     }
 
     private func generateRemoteReply(backend: RemoteBackend,
@@ -913,6 +1016,10 @@ actor RelayServerEngine {
         if let auth = backend.authHeader, !auth.isEmpty {
             request.setValue(auth, forHTTPHeaderField: "Authorization")
         }
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (responseData, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw InferenceError.network("Invalid response")
@@ -981,6 +1088,10 @@ actor RelayServerEngine {
         if let auth = backend.authHeader, !auth.isEmpty {
             request.setValue(auth, forHTTPHeaderField: "Authorization")
         }
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (responseData, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw InferenceError.network("Invalid response")
@@ -1059,6 +1170,14 @@ actor RelayServerEngine {
     }
 
     private func updateEntry(_ entry: LoadedClient, for id: String) {
+        guard let current = localClients[id], current.cacheID == entry.cacheID else {
+            return
+        }
+        if let loopbackClient = entry.loopbackClient,
+           !loopbackClient.isCurrentLoopbackOwner() {
+            localClients.removeValue(forKey: id)
+            return
+        }
         localClients[id] = entry
     }
 
@@ -1101,14 +1220,37 @@ actor RelayServerEngine {
                               modelID: String,
                               input: LLMInput,
                               parameters: NormalizedParameters,
+                              generationSlotAlreadyAcquired: Bool = false,
                               yield: ((String) -> Void)?) async throws -> (String, String, Int) {
         // Serialize generations per model: a single llama.cpp context is not
         // safe to drive from two concurrent requests. Other models (and all
         // non-generation actor work) remain free while one request generates.
-        await acquireGenerationSlot(modelID)
+        if !generationSlotAlreadyAcquired {
+            await acquireGenerationSlot(modelID)
+        }
         defer { releaseGenerationSlot(modelID) }
 
-        let stream = try await entry.client.textStream(from: input)
+        var generationOptions = input.generationOptions
+        if let maxTokens = parameters.maxTokens {
+            generationOptions.maxOutputTokens = maxTokens
+        }
+        if case .local(let model) = entry.descriptor.kind,
+           model.format == .gguf,
+           let settings = effectiveSettings(for: entry.descriptor, parameters: parameters) {
+            if generationOptions.seed == nil { generationOptions.seed = settings.seed }
+            if generationOptions.temperature == nil { generationOptions.temperature = settings.temperature }
+            if generationOptions.topK == nil { generationOptions.topK = settings.topK }
+            if generationOptions.topP == nil { generationOptions.topP = settings.topP }
+            if generationOptions.minP == nil { generationOptions.minP = settings.minP }
+            if generationOptions.repeatPenalty == nil { generationOptions.repeatPenalty = Double(settings.repetitionPenalty) }
+            if generationOptions.repeatLastN == nil { generationOptions.repeatLastN = settings.repeatLastN }
+            if generationOptions.presencePenalty == nil { generationOptions.presencePenalty = Double(settings.presencePenalty) }
+            if generationOptions.frequencyPenalty == nil { generationOptions.frequencyPenalty = Double(settings.frequencyPenalty) }
+            if generationOptions.logitBias == nil { generationOptions.logitBias = settings.logitBias }
+            if generationOptions.promptCache == nil { generationOptions.promptCache = settings.promptCacheEnabled }
+        }
+        let requestInput = LLMInput(input.content, generationOptions: generationOptions)
+        let stream = try await entry.client.textStream(from: requestInput)
         var buffer = ""
         var finishReason = "stop"
         var tokenCount = 0
@@ -1147,6 +1289,53 @@ actor RelayServerEngine {
     }
 
     // MARK: - Per-model generation serialization
+
+    private func acquireGGUFLoadSlot() async {
+        if !ggufLoadActive {
+            ggufLoadActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            ggufLoadWaiters.append(continuation)
+        }
+    }
+
+    private func releaseGGUFLoadSlot() {
+        if !ggufLoadWaiters.isEmpty {
+            let next = ggufLoadWaiters.removeFirst()
+            // Transfer the occupied slot directly to the resumed load.
+            next.resume()
+            return
+        }
+        ggufLoadActive = false
+    }
+
+    private func unloadConflictingRelayGGUF(keeping keepID: String) async throws {
+        let conflicts: [(String, LoadedClient)] = localClients.compactMap { id, entry in
+            guard id != keepID,
+                  case .local(let model) = entry.descriptor.kind,
+                  model.format == .gguf else { return nil }
+            return (id, entry)
+        }
+
+        for (id, entry) in conflicts {
+            guard !pinnedModelIDs.contains(id), !isModelBusy(id) else {
+                throw InferenceError.other(
+                    String(
+                        localized: "The GGUF runtime is already in use.",
+                        locale: LocalizationManager.preferredLocale()
+                    )
+                )
+            }
+            localClients.removeValue(forKey: id)
+            entry.evictionTask?.cancel()
+            await entry.client.unloadAndWait()
+            RelayLog.record(
+                category: "RelayServerEngine",
+                message: "Unloaded GGUF model \(entry.descriptor.displayName) before switching the shared runtime"
+            )
+        }
+    }
 
     private var busyModels: Set<String> = []
     private var generationWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
@@ -1215,10 +1404,9 @@ actor RelayServerEngine {
         entry.evictionTask?.cancel()
         await entry.client.unloadAndWait()
         RelayLog.record(category: "RelayServerEngine", message: "Evicted model \(entry.descriptor.displayName) – \(reason)")
-        stopLoopbackIfIdle()
     }
 
-    private func unloadOtherClients(keeping keepID: String) {
+    private func unloadOtherClients(keeping keepID: String) async {
         // Unload only non-pinned (JIT) models; preserve manually loaded models
         // and any model currently servicing a request.
         let otherIDs = localClients.keys.filter { $0 != keepID && !pinnedModelIDs.contains($0) }
@@ -1232,50 +1420,6 @@ actor RelayServerEngine {
                 Task { await entry.client.unloadAndWait() }
                 RelayLog.record(category: "RelayServerEngine", message: "Unloaded model \(entry.descriptor.displayName) to honour JIT policy")
             }
-        }
-        stopLoopbackIfIdle()
-    }
-
-    private func needsLoopback(for descriptor: RelayModelDescriptor) -> Bool {
-        // Tag-based heuristic plus file inspection for GGUF
-        let tagHasVision = descriptor.tags.contains { $0.caseInsensitiveCompare("multimodal") == .orderedSame }
-        guard case .local(let model) = descriptor.kind else { return false }
-        if model.format != .gguf { return tagHasVision }
-        let hasMergedProjector = GGUFMetadata.hasMultimodalProjector(at: model.url)
-        let explicitMMProj = ProjectorLocator.projectorPath(alongside: model.url)
-        return tagHasVision || hasMergedProjector || explicitMMProj != nil
-    }
-
-    private func startLoopbackServer(for descriptor: RelayModelDescriptor, explicitMMProj: String? = nil) {
-        guard case .local(let model) = descriptor.kind else { return }
-        guard needsLoopback(for: descriptor) else { return }
-        LlamaServerBridge.stop()
-        let resolvedMMProj = explicitMMProj ?? ProjectorLocator.projectorPath(alongside: model.url)
-        let port = LlamaServerBridge.start(
-            TemplateDrivenModelSupport.loopbackStartConfiguration(
-                modelID: model.modelID,
-                modelURL: model.url,
-                ggufPath: model.url.path,
-                mmprojPath: resolvedMMProj
-            )
-        )
-        if port > 0 {
-            let projName = resolvedMMProj.map { URL(fileURLWithPath: $0).lastPathComponent }
-                ?? (GGUFMetadata.hasMultimodalProjector(at: model.url) ? "merged" : "none")
-            let templateLabel = TemplateDrivenModelSupport.templateLabel(modelID: model.modelID, modelURL: model.url)
-            RelayLog.record(category: "RelayServerEngine",
-                            message: "Loopback vision server started on 127.0.0.1:\(port) (\(projName)) template=\(templateLabel)",
-                            suppressConsole: true)
-        } else {
-            RelayLog.record(category: "RelayServerEngine",
-                            message: "Loopback vision server failed to start for \(descriptor.displayName)",
-                            suppressConsole: true)
-        }
-    }
-
-    private func stopLoopbackIfIdle() {
-        if localClients.isEmpty {
-            LlamaServerBridge.stop()
         }
     }
 

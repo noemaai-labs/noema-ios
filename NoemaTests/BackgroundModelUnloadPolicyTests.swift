@@ -8,6 +8,18 @@ final class BackgroundModelUnloadPolicyTests: XCTestCase {
         XCTAssertEqual(decision, .keep(reason: "generation in progress"))
     }
 
+    func testKeepsModelWhileSendIsBetweenAsyncStages() {
+        let decision = policy.decision(for: profile(format: .gguf, sendInFlight: true))
+
+        XCTAssertEqual(decision, .keep(reason: "send in progress"))
+    }
+
+    func testKeepsModelWhileRouterIsDeciding() {
+        let decision = policy.decision(for: profile(format: .gguf, isRouting: true))
+
+        XCTAssertEqual(decision, .keep(reason: "routing in progress"))
+    }
+
     func testKeepsLightweightLocalRuntimesReady() {
         XCTAssertEqual(
             policy.decision(for: profile(format: .et, estimatedWorkingSetBytes: 4_000_000_000)),
@@ -62,12 +74,16 @@ final class BackgroundModelUnloadPolicyTests: XCTestCase {
     private func profile(
         format: ModelFormat?,
         isStreaming: Bool = false,
+        sendInFlight: Bool = false,
+        isRouting: Bool = false,
         estimatedWorkingSetBytes: Int64? = 5_000_000_000,
         sceneState: BackgroundModelUnloadPolicy.SceneState = .background
     ) -> BackgroundModelUnloadPolicy.Profile {
         BackgroundModelUnloadPolicy.Profile(
             hasActiveChatModel: true,
             isStreaming: isStreaming,
+            sendInFlight: sendInFlight,
+            isRouting: isRouting,
             format: format,
             estimatedWorkingSetBytes: estimatedWorkingSetBytes,
             memoryBudgetBytes: 6_000_000_000,

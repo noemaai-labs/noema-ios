@@ -1,6 +1,10 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 /// A reusable “liquid glass” pill background for inputs and controls.
+/// On macOS it resolves to a flat industrial panel instead of glass.
 struct GlassPill: ViewModifier {
     @Environment(\.colorScheme) private var colorScheme
     private let cornerRadius: CGFloat
@@ -10,6 +14,16 @@ struct GlassPill: ViewModifier {
     }
 
     func body(content: Content) -> some View {
+#if os(macOS)
+        let shape = RoundedRectangle(cornerRadius: min(cornerRadius, 10), style: .continuous)
+        content
+            .background(shape.fill(Color(nsColor: .windowBackgroundColor)))
+            .overlay(
+                shape
+                    .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                    .allowsHitTesting(false)
+            )
+#else
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         content
             .glassifyIfAvailable(in: shape)
@@ -49,6 +63,7 @@ struct GlassPill: ViewModifier {
                     .allowsHitTesting(false)
             )
             .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+#endif
 #endif
     }
 }

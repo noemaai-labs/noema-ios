@@ -1,36 +1,29 @@
-// NoemaError.swift
 import Foundation
 
 /// Comprehensive error types for Noema application
 enum NoemaError: Error, LocalizedError {
-    // Model loading errors
     case modelNotFound(path: String)
     case modelLoadFailed(format: ModelFormat, reason: String)
     case unsupportedModelFormat(ModelFormat)
     case insufficientMemory(required: Int, available: Int)
-    
-    // Backend errors
+
     case backendNotAvailable(String)
     case backendInitializationFailed(String)
     case contextCreationFailed(reason: String)
-    
-    // Generation errors
+
     case generationFailed(reason: String)
     case tokenizationFailed(text: String)
     case streamingError(String)
-    
-    // Embedding errors
+
     case embeddingModelMissing
     case embeddingFailed(reason: String)
     case invalidEmbeddingDimension(expected: Int, actual: Int)
-    
-    // RAG errors
+
     case datasetNotFound(id: String)
     case chunkingFailed(reason: String)
     case retrievalFailed(reason: String)
     case vectorDatabaseCorrupted(dataset: String)
-    
-    // Network errors
+
     case downloadFailed(url: String, reason: String)
     case networkUnavailable
     
@@ -146,8 +139,7 @@ extension NoemaError {
         default:
             break
         }
-        
-        // Default to generation error with the original message
+
         return .generationFailed(reason: description)
     }
 }

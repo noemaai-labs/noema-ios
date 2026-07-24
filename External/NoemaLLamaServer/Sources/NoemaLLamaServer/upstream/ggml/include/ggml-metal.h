@@ -44,6 +44,12 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_metal_init(void);
 
 GGML_BACKEND_API bool ggml_backend_is_metal(ggml_backend_t backend);
 
+// True only for a Metal buffer backed by CPU-addressable shared unified
+// memory. Unlike ggml_backend_buffer_is_host(), this deliberately describes
+// the storage mode rather than scheduler placement, so subsystems such as
+// Noema's verified page loader can safely pread into the final allocation.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_is_shared(ggml_backend_buffer_t buffer);
+
 GGML_BACKEND_API void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data);
 
 // helper to check if the device supports a specific family

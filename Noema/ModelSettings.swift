@@ -1,4 +1,3 @@
-// ModelSettings.swift
 import Foundation
 import SwiftUI
 
@@ -13,6 +12,58 @@ enum CacheQuant: String, Codable, CaseIterable, Identifiable {
     case iq4_nl = "IQ4_NL"
 
     var id: String { rawValue }
+}
+
+/// KV-cache precision supported by mlx-swift-lm's `GenerateParameters`.
+/// This is intentionally separate from llama.cpp's K/V cache formats: MLX
+/// quantizes the combined cache with affine 2, 3, 4, 5, 6, or 8-bit storage.
+/// MLX does not provide a 7-bit quantization kernel.
+enum MLXKVCacheQuantization: String, Codable, CaseIterable, Identifiable {
+    case fullPrecision
+    case eightBit
+    case sixBit
+    case fiveBit
+    case fourBit
+    case threeBit
+    case twoBit
+
+    var id: String { rawValue }
+
+    var bits: Int? {
+        switch self {
+        case .fullPrecision: return nil
+        case .eightBit: return 8
+        case .sixBit: return 6
+        case .fiveBit: return 5
+        case .fourBit: return 4
+        case .threeBit: return 3
+        case .twoBit: return 2
+        }
+    }
+
+    var titleKey: String {
+        switch self {
+        case .fullPrecision: return "Full Precision"
+        case .eightBit: return "8-bit"
+        case .sixBit: return "6-bit"
+        case .fiveBit: return "5-bit"
+        case .fourBit: return "4-bit"
+        case .threeBit: return "3-bit"
+        case .twoBit: return "2-bit"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .fullPrecision: return "FP"
+        case .eightBit: return "8-BIT"
+        case .sixBit: return "6-BIT"
+        case .fiveBit: return "5-BIT"
+        case .fourBit: return "4-BIT"
+        case .threeBit: return "3-BIT"
+        case .twoBit: return "2-BIT"
+        }
+    }
 }
 
 enum ProcessingUnitConfiguration: String, Codable, CaseIterable, Identifiable {
@@ -62,37 +113,33 @@ enum AFMGuardrailsMode: String, Codable, CaseIterable, Identifiable, Equatable {
     }
 }
 
-/// How an Apple Foundation Model request may use Private Cloud Compute (iOS 27+).
-enum AFMPrivateCloudComputeMode: String, Codable, CaseIterable, Identifiable, Equatable {
-    /// Route every reply through Private Cloud Compute.
-    case always
-    /// Run on-device, but let the model escalate individual replies to Private Cloud Compute when helpful.
-    case smart
-    /// Stay fully on-device; never use Private Cloud Compute.
+enum PCCReasoningLevel: String, Codable, CaseIterable, Identifiable, Equatable, Sendable {
     case off
+    case light
+    case moderate
+    case deep
 
     var id: String { rawValue }
 
-    /// Short label suitable for a segmented control.
     var titleKey: String {
         switch self {
-        case .always:
-            return "Always"
-        case .smart:
-            return "Smart"
-        case .off:
-            return "Off"
+        case .off: return "Off"
+        case .light: return "Light"
+        case .moderate: return "Moderate"
+        case .deep: return "Deep"
         }
     }
 
     var detailKey: String {
         switch self {
-        case .always:
-            return "Every reply runs on Apple's Private Cloud Compute — same privacy guarantees, larger context and deeper reasoning. Falls back to on-device automatically when offline or the daily limit is reached."
-        case .smart:
-            return "Replies run on-device and hand off mid-answer to Private Cloud Compute only when more capability is needed. The conversation is shared with Apple's secure cloud only when that happens. Requires iOS 27."
         case .off:
-            return "Keeps every reply fully on-device. Private Cloud Compute is never used."
+            return "Answers without extended reasoning for the lowest latency."
+        case .light:
+            return "Uses a small reasoning budget for quick analysis."
+        case .moderate:
+            return "Balances response time with deeper analysis. Apple recommends starting here."
+        case .deep:
+            return "Spends more time reasoning through complex, multi-step requests and uses more of the context window."
         }
     }
 }
@@ -138,8 +185,8 @@ private enum ANEModelSettingsCache {
     static func store(_ resolution: LocalModelSettingsResolution, for url: URL) {
         let key = cacheKey(for: url)
         storage.lock.lock()
+        defer { storage.lock.unlock() }
         storage.values[key] = resolution
-        storage.lock.unlock()
     }
 
     private static func cacheKey(for url: URL) -> String {
@@ -152,11 +199,21 @@ struct ModelSettings: Codable, Equatable {
     // -1 means: auto/offload all available layers (default). 0+ means explicit override
     var gpuLayers: Int = -1
     var cpuThreads: Int = 0
+    /// Logical maximum number of prompt tokens submitted to llama.cpp per decode.
+    var evaluationBatchSize: Int = ModelSettings.defaultEvaluationBatchSize
+    /// Physical micro-batch used by llama.cpp while processing a logical batch.
+    var physicalBatchSize: Int = ModelSettings.defaultPhysicalBatchSize
+    /// Whether llama.cpp should discover and load a companion vision projector.
+    /// Defaults to true so settings saved by older app versions keep their behavior.
+    var loadVisionProjector: Bool = true
     var kvCacheOffload: Bool = true
+    /// Share one llama.cpp KV allocation across server slots instead of
+    /// statically partitioning the context between them.
+    var unifiedKVCache: Bool = true
     var keepInMemory: Bool = true
     var useMmap: Bool = true
     var disableWarmup: Bool = true
-    var flashAttention: Bool = false
+    var flashAttention: Bool = true
     var seed: Int?
     var kCacheQuant: CacheQuant = .f16
     var vCacheQuant: CacheQuant = .f16
@@ -166,7 +223,7 @@ struct ModelSettings: Codable, Equatable {
     var promptTemplate: String?
     // Sampling parameters for generation (used by MLX and others)
     var temperature: Double = 0.7
-    var repetitionPenalty: Float = 1.1
+    var repetitionPenalty: Float = 1.0
     var topK: Int = 40
     var topP: Double = 0.95
     var minP: Double = 0.0
@@ -178,10 +235,25 @@ struct ModelSettings: Codable, Equatable {
     var speculativeDecoding: SpeculativeDecodingSettings = .init()
     var ropeScaling: RopeScalingSettings? = nil
     var logitBias: [Int: Double] = [:]
-    var promptCacheEnabled: Bool = false
+    /// Reuse matching GGUF prompt prefixes by default. The cache is bounded by the
+    /// loopback server configuration, and paged/low-memory modes can still disable it.
+    var promptCacheEnabled: Bool = true
     var promptCachePath: String = ""
     var promptCacheAll: Bool = false
+    /// Reuse the in-memory MLX KV cache across turns with a shared prompt prefix.
+    var mlxPromptCacheEnabled: Bool = true
+    /// MLX KV-cache precision. Full precision matches the upstream default.
+    var mlxKVCacheQuantization: MLXKVCacheQuantization = .fullPrecision
+    /// Quantization group size passed to mlx-swift-lm.
+    var mlxKVCacheGroupSize: Int = 64
+    /// Number of cached tokens to keep full precision before MLX quantizes the cache.
+    var mlxKVCacheQuantizationStart: Int = 0
+    /// Maximum rotating KV-cache length. Zero keeps the full cache.
+    var mlxKVCacheLimit: Int = 0
+    /// Prompt prefill chunk size used by mlx-swift-lm.
+    var mlxPrefillStepSize: Int = 512
     var tensorOverride: TensorOverridePreset = .none
+    var overfitMode: OverfitMode = .automatic
     /// Optional override for the number of experts to use when running MoE models.
     var moeActiveExperts: Int? = nil
     var etBackend: ETBackend = .xnnpack
@@ -192,12 +264,15 @@ struct ModelSettings: Codable, Equatable {
     /// so new installs *and* anyone updating from a build that persisted `.default`
     /// run with the lax content-transformation guardrails.
     var afmGuardrails: AFMGuardrailsMode = .permissiveContentTransformations
-    /// How Apple Foundation Model requests may use Private Cloud Compute (iOS 27+).
-    /// `.smart` (the default) keeps inference on-device but allows per-reply escalation;
-    /// `.always` routes everything through PCC; `.off` stays fully on-device.
-    var afmPrivateCloudComputeMode: AFMPrivateCloudComputeMode = .smart
+    /// Extended reasoning used only by the explicit Apple Private Cloud Compute model.
+    var pccReasoningLevel: PCCReasoningLevel = .moderate
     var systemPromptMode: SystemPromptMode = .inheritGlobal
     var systemPromptOverride: String? = nil
+    /// Whether the model is allowed to reason (emit a `<think>` block) before answering.
+    /// Per-request via `LLMGenerationOptions.reasoningEnabled`; a no-op for models whose
+    /// chat template doesn't honor it (see `ReasoningCapabilityDetector`). Default ON —
+    /// reasoning-capable models think by default.
+    var reasoningEnabled: Bool = true
 
     /// Default inference thread count. Reserves two cores so the UI, input handling,
     /// SwiftUI layout, and decode callbacks aren't starved while inference runs — on
@@ -213,12 +288,34 @@ struct ModelSettings: Codable, Equatable {
         max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
     }
 
+    static let minimumBatchSize = 32
+    static let maximumBatchSize = 8192
+    /// Conservative GGUF prompt-processing defaults. Larger batches remain available
+    /// in Model Settings for models and devices with enough compute-buffer headroom.
+    static let defaultEvaluationBatchSize = 512
+    static let defaultPhysicalBatchSize = 256
+    /// Version stamped into persisted settings so the one release that used much larger
+    /// implicit defaults can be migrated without rewriting deliberate future overrides.
+    static let batchSizingDefaultsVersion = 1
+    private static let legacyDefaultEvaluationBatchSize = 2048
+    private static let legacyDefaultPhysicalBatchSizes: Set<Int> = [512, 1024, 2048]
+    /// Version stamped into persisted settings after changing GGUF prompt reuse to
+    /// default-on. A missing version identifies an older saved `false`, including a
+    /// hand-tuned Custom configuration, that should adopt the new default once.
+    static let promptCacheDefaultsVersion = 1
+    /// Version stamped into persisted settings after disabling Noema's legacy
+    /// blanket repetition penalty. A missing version plus the old implicit 1.1
+    /// value identifies settings that should adopt the new neutral default once.
+    static let repetitionPenaltyDefaultsVersion = 1
+    private static let legacyDefaultRepetitionPenalty: Float = 1.1
+
     static func `default`(for format: ModelFormat) -> ModelSettings {
         var s = ModelSettings()
         switch format {
         case .mlx:
             s.gpuLayers = 0
             s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
+            s.mlxPromptCacheEnabled = true
         case .gguf:
             s.cpuThreads = ModelSettings.recommendedInferenceThreadCount
         case .et:
@@ -313,7 +410,12 @@ extension ModelSettings {
         case contextLength
         case gpuLayers
         case cpuThreads
+        case evaluationBatchSize
+        case physicalBatchSize
+        case batchSizingDefaultsVersion
+        case loadVisionProjector
         case kvCacheOffload
+        case unifiedKVCache
         case keepInMemory
         case useMmap
         case disableWarmup
@@ -325,6 +427,7 @@ extension ModelSettings {
         case promptTemplate
         case temperature
         case repetitionPenalty
+        case repetitionPenaltyDefaultsVersion
         case topK
         case topP
         case minP
@@ -336,67 +439,103 @@ extension ModelSettings {
         case ropeScaling
         case logitBias
         case promptCacheEnabled
+        case promptCacheDefaultsVersion
         case promptCachePath
         case promptCacheAll
+        case mlxPromptCacheEnabled
+        case mlxKVCacheQuantization
+        case mlxKVCacheGroupSize
+        case mlxKVCacheQuantizationStart
+        case mlxKVCacheLimit
+        case mlxPrefillStepSize
         case tensorOverride
+        case overfitMode
         case moeActiveExperts
         case etBackend
         case processingUnitConfiguration
         case afmGuardrails
-        case afmPrivateCloudComputeMode
-        /// Legacy boolean key; migrated to `afmPrivateCloudComputeMode` on decode.
-        case afmUsePrivateCloudCompute
+        case pccReasoningLevel
         case systemPromptMode
         case systemPromptOverride
+        case reasoningEnabled
     }
 
+    /// Decoding never throws on individual fields: any value this build can't read
+    /// (unknown enum raw value or changed type written by a newer version) falls back
+    /// to its default instead of failing the whole payload. A thrown decode here used
+    /// to make the durable store drop the entire entry — i.e. running an older build
+    /// once permanently erased settings saved by a newer one.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let defaults = ModelSettings()
 
-        self.contextLength = try container.decodeIfPresent(Double.self, forKey: .contextLength) ?? defaults.contextLength
-        self.gpuLayers = try container.decodeIfPresent(Int.self, forKey: .gpuLayers) ?? defaults.gpuLayers
-        self.cpuThreads = try container.decodeIfPresent(Int.self, forKey: .cpuThreads) ?? defaults.cpuThreads
-        self.kvCacheOffload = try container.decodeIfPresent(Bool.self, forKey: .kvCacheOffload) ?? defaults.kvCacheOffload
-        self.keepInMemory = try container.decodeIfPresent(Bool.self, forKey: .keepInMemory) ?? defaults.keepInMemory
-        self.useMmap = try container.decodeIfPresent(Bool.self, forKey: .useMmap) ?? defaults.useMmap
-        self.disableWarmup = try container.decodeIfPresent(Bool.self, forKey: .disableWarmup) ?? defaults.disableWarmup
-        self.flashAttention = try container.decodeIfPresent(Bool.self, forKey: .flashAttention) ?? defaults.flashAttention
-        self.seed = try container.decodeIfPresent(Int.self, forKey: .seed)
-        self.kCacheQuant = try container.decodeIfPresent(CacheQuant.self, forKey: .kCacheQuant) ?? defaults.kCacheQuant
-        self.vCacheQuant = try container.decodeIfPresent(CacheQuant.self, forKey: .vCacheQuant) ?? defaults.vCacheQuant
-        self.tokenizerPath = try container.decodeIfPresent(String.self, forKey: .tokenizerPath)
-        self.promptTemplate = try container.decodeIfPresent(String.self, forKey: .promptTemplate)
-        self.temperature = try container.decodeIfPresent(Double.self, forKey: .temperature) ?? defaults.temperature
-        self.repetitionPenalty = try container.decodeIfPresent(Float.self, forKey: .repetitionPenalty) ?? defaults.repetitionPenalty
-        self.topK = try container.decodeIfPresent(Int.self, forKey: .topK) ?? defaults.topK
-        self.topP = try container.decodeIfPresent(Double.self, forKey: .topP) ?? defaults.topP
-        self.minP = try container.decodeIfPresent(Double.self, forKey: .minP) ?? defaults.minP
-        self.repeatLastN = try container.decodeIfPresent(Int.self, forKey: .repeatLastN) ?? defaults.repeatLastN
-        self.presencePenalty = try container.decodeIfPresent(Float.self, forKey: .presencePenalty) ?? defaults.presencePenalty
-        self.frequencyPenalty = try container.decodeIfPresent(Float.self, forKey: .frequencyPenalty) ?? defaults.frequencyPenalty
-        self.stopSequences = try container.decodeIfPresent([String].self, forKey: .stopSequences)
-        self.speculativeDecoding = try container.decodeIfPresent(SpeculativeDecodingSettings.self, forKey: .speculativeDecoding) ?? defaults.speculativeDecoding
-        self.ropeScaling = try container.decodeIfPresent(RopeScalingSettings.self, forKey: .ropeScaling)
-        self.logitBias = try container.decodeIfPresent([Int: Double].self, forKey: .logitBias) ?? defaults.logitBias
-        self.promptCacheEnabled = try container.decodeIfPresent(Bool.self, forKey: .promptCacheEnabled) ?? defaults.promptCacheEnabled
-        self.promptCachePath = try container.decodeIfPresent(String.self, forKey: .promptCachePath) ?? defaults.promptCachePath
-        self.promptCacheAll = try container.decodeIfPresent(Bool.self, forKey: .promptCacheAll) ?? defaults.promptCacheAll
-        self.tensorOverride = try container.decodeIfPresent(TensorOverridePreset.self, forKey: .tensorOverride) ?? defaults.tensorOverride
-        self.moeActiveExperts = try container.decodeIfPresent(Int.self, forKey: .moeActiveExperts)
-        self.etBackend = try container.decodeIfPresent(ETBackend.self, forKey: .etBackend) ?? defaults.etBackend
-        self.processingUnitConfiguration = try container.decodeIfPresent(ProcessingUnitConfiguration.self, forKey: .processingUnitConfiguration)
-        self.afmGuardrails = try container.decodeIfPresent(AFMGuardrailsMode.self, forKey: .afmGuardrails) ?? defaults.afmGuardrails
-        if let pccMode = try container.decodeIfPresent(AFMPrivateCloudComputeMode.self, forKey: .afmPrivateCloudComputeMode) {
-            self.afmPrivateCloudComputeMode = pccMode
-        } else if let legacyUsePCC = try container.decodeIfPresent(Bool.self, forKey: .afmUsePrivateCloudCompute) {
-            // Migrate the old boolean: on → always, off → smart (the prior default behavior).
-            self.afmPrivateCloudComputeMode = legacyUsePCC ? .always : .smart
+        self.contextLength = (try? container.decodeIfPresent(Double.self, forKey: .contextLength)) ?? defaults.contextLength
+        self.gpuLayers = (try? container.decodeIfPresent(Int.self, forKey: .gpuLayers)) ?? defaults.gpuLayers
+        self.cpuThreads = (try? container.decodeIfPresent(Int.self, forKey: .cpuThreads)) ?? defaults.cpuThreads
+        let decodedEvaluationBatchSize = (try? container.decodeIfPresent(Int.self, forKey: .evaluationBatchSize)) ?? defaults.evaluationBatchSize
+        let decodedPhysicalBatchSize = (try? container.decodeIfPresent(Int.self, forKey: .physicalBatchSize)) ?? defaults.physicalBatchSize
+        let batchSizingDefaultsVersion = (try? container.decodeIfPresent(Int.self, forKey: .batchSizingDefaultsVersion)) ?? 0
+        if batchSizingDefaultsVersion < Self.batchSizingDefaultsVersion,
+           decodedEvaluationBatchSize == Self.legacyDefaultEvaluationBatchSize,
+           Self.legacyDefaultPhysicalBatchSizes.contains(decodedPhysicalBatchSize) {
+            self.evaluationBatchSize = defaults.evaluationBatchSize
+            self.physicalBatchSize = defaults.physicalBatchSize
         } else {
-            self.afmPrivateCloudComputeMode = defaults.afmPrivateCloudComputeMode
+            self.evaluationBatchSize = decodedEvaluationBatchSize
+            self.physicalBatchSize = decodedPhysicalBatchSize
         }
-        self.systemPromptMode = try container.decodeIfPresent(SystemPromptMode.self, forKey: .systemPromptMode) ?? defaults.systemPromptMode
-        self.systemPromptOverride = try container.decodeIfPresent(String.self, forKey: .systemPromptOverride)
+        self.loadVisionProjector = (try? container.decodeIfPresent(Bool.self, forKey: .loadVisionProjector)) ?? defaults.loadVisionProjector
+        self.kvCacheOffload = (try? container.decodeIfPresent(Bool.self, forKey: .kvCacheOffload)) ?? defaults.kvCacheOffload
+        self.unifiedKVCache = (try? container.decodeIfPresent(Bool.self, forKey: .unifiedKVCache)) ?? defaults.unifiedKVCache
+        self.keepInMemory = (try? container.decodeIfPresent(Bool.self, forKey: .keepInMemory)) ?? defaults.keepInMemory
+        self.useMmap = (try? container.decodeIfPresent(Bool.self, forKey: .useMmap)) ?? defaults.useMmap
+        self.disableWarmup = (try? container.decodeIfPresent(Bool.self, forKey: .disableWarmup)) ?? defaults.disableWarmup
+        self.flashAttention = (try? container.decodeIfPresent(Bool.self, forKey: .flashAttention)) ?? defaults.flashAttention
+        self.seed = (try? container.decodeIfPresent(Int.self, forKey: .seed)) ?? nil
+        self.kCacheQuant = (try? container.decodeIfPresent(CacheQuant.self, forKey: .kCacheQuant)) ?? defaults.kCacheQuant
+        self.vCacheQuant = (try? container.decodeIfPresent(CacheQuant.self, forKey: .vCacheQuant)) ?? defaults.vCacheQuant
+        self.tokenizerPath = (try? container.decodeIfPresent(String.self, forKey: .tokenizerPath)) ?? nil
+        self.promptTemplate = (try? container.decodeIfPresent(String.self, forKey: .promptTemplate)) ?? nil
+        self.temperature = (try? container.decodeIfPresent(Double.self, forKey: .temperature)) ?? defaults.temperature
+        let decodedRepetitionPenalty = (try? container.decodeIfPresent(Float.self, forKey: .repetitionPenalty)) ?? defaults.repetitionPenalty
+        let repetitionPenaltyDefaultsVersion = (try? container.decodeIfPresent(Int.self, forKey: .repetitionPenaltyDefaultsVersion)) ?? 0
+        self.repetitionPenalty = repetitionPenaltyDefaultsVersion < Self.repetitionPenaltyDefaultsVersion
+            && decodedRepetitionPenalty == Self.legacyDefaultRepetitionPenalty
+            ? defaults.repetitionPenalty
+            : decodedRepetitionPenalty
+        self.topK = (try? container.decodeIfPresent(Int.self, forKey: .topK)) ?? defaults.topK
+        self.topP = (try? container.decodeIfPresent(Double.self, forKey: .topP)) ?? defaults.topP
+        self.minP = (try? container.decodeIfPresent(Double.self, forKey: .minP)) ?? defaults.minP
+        self.repeatLastN = (try? container.decodeIfPresent(Int.self, forKey: .repeatLastN)) ?? defaults.repeatLastN
+        self.presencePenalty = (try? container.decodeIfPresent(Float.self, forKey: .presencePenalty)) ?? defaults.presencePenalty
+        self.frequencyPenalty = (try? container.decodeIfPresent(Float.self, forKey: .frequencyPenalty)) ?? defaults.frequencyPenalty
+        self.stopSequences = (try? container.decodeIfPresent([String].self, forKey: .stopSequences)) ?? nil
+        self.speculativeDecoding = (try? container.decodeIfPresent(SpeculativeDecodingSettings.self, forKey: .speculativeDecoding)) ?? defaults.speculativeDecoding
+        self.ropeScaling = (try? container.decodeIfPresent(RopeScalingSettings.self, forKey: .ropeScaling)) ?? nil
+        self.logitBias = (try? container.decodeIfPresent([Int: Double].self, forKey: .logitBias)) ?? defaults.logitBias
+        let decodedPromptCacheEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .promptCacheEnabled)) ?? defaults.promptCacheEnabled
+        let promptCacheDefaultsVersion = (try? container.decodeIfPresent(Int.self, forKey: .promptCacheDefaultsVersion)) ?? 0
+        self.promptCacheEnabled = promptCacheDefaultsVersion < Self.promptCacheDefaultsVersion
+            ? true
+            : decodedPromptCacheEnabled
+        self.promptCachePath = (try? container.decodeIfPresent(String.self, forKey: .promptCachePath)) ?? defaults.promptCachePath
+        self.promptCacheAll = (try? container.decodeIfPresent(Bool.self, forKey: .promptCacheAll)) ?? defaults.promptCacheAll
+        self.mlxPromptCacheEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .mlxPromptCacheEnabled)) ?? defaults.mlxPromptCacheEnabled
+        self.mlxKVCacheQuantization = (try? container.decodeIfPresent(MLXKVCacheQuantization.self, forKey: .mlxKVCacheQuantization)) ?? defaults.mlxKVCacheQuantization
+        self.mlxKVCacheGroupSize = (try? container.decodeIfPresent(Int.self, forKey: .mlxKVCacheGroupSize)) ?? defaults.mlxKVCacheGroupSize
+        self.mlxKVCacheQuantizationStart = (try? container.decodeIfPresent(Int.self, forKey: .mlxKVCacheQuantizationStart)) ?? defaults.mlxKVCacheQuantizationStart
+        self.mlxKVCacheLimit = (try? container.decodeIfPresent(Int.self, forKey: .mlxKVCacheLimit)) ?? defaults.mlxKVCacheLimit
+        self.mlxPrefillStepSize = (try? container.decodeIfPresent(Int.self, forKey: .mlxPrefillStepSize)) ?? defaults.mlxPrefillStepSize
+        self.tensorOverride = (try? container.decodeIfPresent(TensorOverridePreset.self, forKey: .tensorOverride)) ?? defaults.tensorOverride
+        self.overfitMode = (try? container.decodeIfPresent(OverfitMode.self, forKey: .overfitMode)) ?? defaults.overfitMode
+        self.moeActiveExperts = (try? container.decodeIfPresent(Int.self, forKey: .moeActiveExperts)) ?? nil
+        self.etBackend = (try? container.decodeIfPresent(ETBackend.self, forKey: .etBackend)) ?? defaults.etBackend
+        self.processingUnitConfiguration = (try? container.decodeIfPresent(ProcessingUnitConfiguration.self, forKey: .processingUnitConfiguration)) ?? nil
+        self.afmGuardrails = (try? container.decodeIfPresent(AFMGuardrailsMode.self, forKey: .afmGuardrails)) ?? defaults.afmGuardrails
+        self.pccReasoningLevel = (try? container.decodeIfPresent(PCCReasoningLevel.self, forKey: .pccReasoningLevel)) ?? defaults.pccReasoningLevel
+        self.systemPromptMode = (try? container.decodeIfPresent(SystemPromptMode.self, forKey: .systemPromptMode)) ?? defaults.systemPromptMode
+        self.systemPromptOverride = (try? container.decodeIfPresent(String.self, forKey: .systemPromptOverride)) ?? nil
+        self.reasoningEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .reasoningEnabled)) ?? defaults.reasoningEnabled
     }
 
     func encode(to encoder: Encoder) throws {
@@ -404,7 +543,12 @@ extension ModelSettings {
         try container.encode(contextLength, forKey: .contextLength)
         try container.encode(gpuLayers, forKey: .gpuLayers)
         try container.encode(cpuThreads, forKey: .cpuThreads)
+        try container.encode(evaluationBatchSize, forKey: .evaluationBatchSize)
+        try container.encode(physicalBatchSize, forKey: .physicalBatchSize)
+        try container.encode(Self.batchSizingDefaultsVersion, forKey: .batchSizingDefaultsVersion)
+        try container.encode(loadVisionProjector, forKey: .loadVisionProjector)
         try container.encode(kvCacheOffload, forKey: .kvCacheOffload)
+        try container.encode(unifiedKVCache, forKey: .unifiedKVCache)
         try container.encode(keepInMemory, forKey: .keepInMemory)
         try container.encode(useMmap, forKey: .useMmap)
         try container.encode(disableWarmup, forKey: .disableWarmup)
@@ -416,6 +560,7 @@ extension ModelSettings {
         try container.encodeIfPresent(promptTemplate, forKey: .promptTemplate)
         try container.encode(temperature, forKey: .temperature)
         try container.encode(repetitionPenalty, forKey: .repetitionPenalty)
+        try container.encode(Self.repetitionPenaltyDefaultsVersion, forKey: .repetitionPenaltyDefaultsVersion)
         try container.encode(topK, forKey: .topK)
         try container.encode(topP, forKey: .topP)
         try container.encode(minP, forKey: .minP)
@@ -427,22 +572,84 @@ extension ModelSettings {
         try container.encodeIfPresent(ropeScaling, forKey: .ropeScaling)
         try container.encode(logitBias, forKey: .logitBias)
         try container.encode(promptCacheEnabled, forKey: .promptCacheEnabled)
-        try container.encode(promptCachePath, forKey: .promptCachePath)
-        try container.encode(promptCacheAll, forKey: .promptCacheAll)
+        try container.encode(Self.promptCacheDefaultsVersion, forKey: .promptCacheDefaultsVersion)
+        try container.encode(mlxPromptCacheEnabled, forKey: .mlxPromptCacheEnabled)
+        try container.encode(mlxKVCacheQuantization, forKey: .mlxKVCacheQuantization)
+        try container.encode(mlxKVCacheGroupSize, forKey: .mlxKVCacheGroupSize)
+        try container.encode(mlxKVCacheQuantizationStart, forKey: .mlxKVCacheQuantizationStart)
+        try container.encode(mlxKVCacheLimit, forKey: .mlxKVCacheLimit)
+        try container.encode(mlxPrefillStepSize, forKey: .mlxPrefillStepSize)
         try container.encode(tensorOverride, forKey: .tensorOverride)
+        try container.encode(overfitMode, forKey: .overfitMode)
         try container.encodeIfPresent(moeActiveExperts, forKey: .moeActiveExperts)
         try container.encode(etBackend, forKey: .etBackend)
         try container.encodeIfPresent(processingUnitConfiguration, forKey: .processingUnitConfiguration)
         try container.encode(afmGuardrails, forKey: .afmGuardrails)
-        try container.encode(afmPrivateCloudComputeMode, forKey: .afmPrivateCloudComputeMode)
+        try container.encode(pccReasoningLevel, forKey: .pccReasoningLevel)
         try container.encode(systemPromptMode, forKey: .systemPromptMode)
         try container.encodeIfPresent(systemPromptOverride, forKey: .systemPromptOverride)
+        try container.encode(reasoningEnabled, forKey: .reasoningEnabled)
     }
 }
 
 extension ModelSettings {
+    /// Copies only request-time sampling controls, leaving load-time/runtime
+    /// fields (context, compute units, prompt template, and so on) untouched.
+    /// This is used by Chat's live sampling sidebar so moving a control cannot
+    /// accidentally undo a power-policy adjustment or another settings edit.
+    mutating func applySamplingSettings(from source: ModelSettings) {
+        seed = source.seed
+        temperature = source.temperature
+        repetitionPenalty = source.repetitionPenalty
+        topK = source.topK
+        topP = source.topP
+        minP = source.minP
+        repeatLastN = source.repeatLastN
+        presencePenalty = source.presencePenalty
+        frequencyPenalty = source.frequencyPenalty
+    }
+
     var resolvedProcessingUnitConfiguration: ProcessingUnitConfiguration {
         processingUnitConfiguration ?? .all
+    }
+
+    var resolvedEvaluationBatchSize: Int {
+        min(max(Self.minimumBatchSize, evaluationBatchSize), Self.maximumBatchSize)
+    }
+
+    var resolvedPhysicalBatchSize: Int {
+        min(
+            resolvedEvaluationBatchSize,
+            min(max(Self.minimumBatchSize, physicalBatchSize), Self.maximumBatchSize)
+        )
+    }
+
+    static let mlxKVCacheGroupSizes = [32, 64, 128]
+    static let mlxPrefillStepSizes = [128, 256, 512, 1024, 2048]
+
+    var resolvedMLXKVCacheGroupSize: Int {
+        Self.mlxKVCacheGroupSizes.min(by: {
+            abs(Double($0) - Double(mlxKVCacheGroupSize))
+                < abs(Double($1) - Double(mlxKVCacheGroupSize))
+        }) ?? 64
+    }
+
+    var resolvedMLXKVCacheQuantizationStart: Int {
+        let context = contextLength.isFinite
+            ? Int(max(0, min(contextLength, Double(Int.max))))
+            : 0
+        return min(max(0, mlxKVCacheQuantizationStart), context)
+    }
+
+    var resolvedMLXKVCacheLimit: Int? {
+        mlxKVCacheLimit > 0 ? max(128, mlxKVCacheLimit) : nil
+    }
+
+    var resolvedMLXPrefillStepSize: Int {
+        Self.mlxPrefillStepSizes.min(by: {
+            abs(Double($0) - Double(mlxPrefillStepSize))
+                < abs(Double($1) - Double(mlxPrefillStepSize))
+        }) ?? 512
     }
 
     func normalizedForLocalModel(_ model: LocalModel) -> ModelSettings {
@@ -451,6 +658,12 @@ extension ModelSettings {
         if let supportedMaxContextLength = Self.supportedMaxContextLength(for: model) {
             normalized.contextLength = min(normalized.contextLength, Double(supportedMaxContextLength))
         }
+        normalized.evaluationBatchSize = normalized.resolvedEvaluationBatchSize
+        normalized.physicalBatchSize = normalized.resolvedPhysicalBatchSize
+        normalized.mlxKVCacheGroupSize = normalized.resolvedMLXKVCacheGroupSize
+        normalized.mlxKVCacheQuantizationStart = normalized.resolvedMLXKVCacheQuantizationStart
+        normalized.mlxKVCacheLimit = normalized.resolvedMLXKVCacheLimit ?? 0
+        normalized.mlxPrefillStepSize = normalized.resolvedMLXPrefillStepSize
         normalized = normalized.normalizedSystemPromptSettings()
         return normalized
     }
@@ -478,7 +691,11 @@ extension ModelSettings {
         switch model.format {
         case .gguf:
             let canonicalURL = InstalledModelsStore.canonicalURL(for: model.url, format: .gguf)
-            return GGUFMetadata.contextLength(at: canonicalURL)
+            let modelLimit = GGUFMetadata.contextLength(at: canonicalURL)
+            guard PagedPackageLocator.isPagedInstall(canonicalURL) else {
+                return modelLimit
+            }
+            return min(modelLimit ?? Int.max, OverfitPlanResolver.pagedContextCapTokens)
         case .mlx, .et:
             return inferredConfigContextLength(for: model)
         case .coreai:
@@ -493,7 +710,10 @@ extension ModelSettings {
         case .ane:
             return inferredCMLContextLength(for: model)
         case .afm:
-            return 4096
+            let kind = AppleFoundationModelKind.resolve(modelID: model.modelID)
+            return kind == .privateCloudCompute
+                ? AppleFoundationModelKind.privateCloudContextLimit
+                : AFMLLMClient.onDeviceContextLimit()
         case .gguf, .mlx, .et, .coreai:
             return nil
         }
@@ -817,7 +1037,7 @@ extension ModelSettings {
             var title: String {
                 switch self {
                 case .tokens: return "Draft Tokens"
-                case .max: return "Draft Window"
+                case .max: return "Adaptive Draft Limit"
                 }
             }
         }
@@ -829,6 +1049,7 @@ extension ModelSettings {
         var mtpDraftNMax: Int = 2
         var mtpDraftNMin: Int = 0
         var mtpDraftPMin: Double = 0.1
+        var mtpAutoTune: Bool = true
 
         var hasSelection: Bool {
             switch selection {
@@ -854,13 +1075,80 @@ extension ModelSettings {
         var resolvedMTPDraftPMin: Double {
             min(1.0, max(0.0, mtpDraftPMin))
         }
+
+        var mtpAutoTuneActive: Bool { mtpEnabled && mtpAutoTune }
+
+        var effectiveMTPDraftNMax: Int {
+            mtpAutoTuneActive ? SpeculativeAutoTune.deviceDraftCap : resolvedMTPDraftNMax
+        }
+
+        var effectiveMTPDraftNMin: Int {
+            mtpAutoTuneActive ? 0 : resolvedMTPDraftNMin
+        }
+
+        var effectiveMTPDraftPMin: Double {
+            mtpAutoTuneActive ? SpeculativeAutoTune.pMin : resolvedMTPDraftPMin
+        }
     }
 
     struct RopeScalingSettings: Codable, Equatable {
         var factor: Double = 1.0
         var originalContext: Int = 4096
-        var lowFrequency: Double = 1.0
-        var highFrequency: Double = 1.0
+        var betaFast: Double = 1.0
+        var betaSlow: Double = 1.0
+
+        // Source compatibility for older callers; persistence now uses the
+        // accurately named YaRN beta fields.
+        var lowFrequency: Double {
+            get { betaFast }
+            set { betaFast = newValue }
+        }
+        var highFrequency: Double {
+            get { betaSlow }
+            set { betaSlow = newValue }
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case factor, originalContext, betaFast, betaSlow, lowFrequency, highFrequency
+        }
+
+        init(factor: Double = 1.0, originalContext: Int = 4096,
+             betaFast: Double = 1.0, betaSlow: Double = 1.0) {
+            self.factor = factor
+            self.originalContext = originalContext
+            self.betaFast = betaFast
+            self.betaSlow = betaSlow
+        }
+
+        init(factor: Double, originalContext: Int,
+             lowFrequency: Double, highFrequency: Double) {
+            self.init(
+                factor: factor,
+                originalContext: originalContext,
+                betaFast: lowFrequency,
+                betaSlow: highFrequency
+            )
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            factor = try container.decodeIfPresent(Double.self, forKey: .factor) ?? 1.0
+            originalContext = try container.decodeIfPresent(Int.self, forKey: .originalContext) ?? 4096
+            betaFast = try container.decodeIfPresent(Double.self, forKey: .betaFast)
+                ?? container.decodeIfPresent(Double.self, forKey: .lowFrequency)
+                ?? 1.0
+            betaSlow = try container.decodeIfPresent(Double.self, forKey: .betaSlow)
+                ?? container.decodeIfPresent(Double.self, forKey: .highFrequency)
+                ?? 1.0
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(factor, forKey: .factor)
+            try container.encode(originalContext, forKey: .originalContext)
+            try container.encode(betaFast, forKey: .betaFast)
+            try container.encode(betaSlow, forKey: .betaSlow)
+        }
     }
 
     enum TensorOverridePreset: String, Codable, CaseIterable, Identifiable {
@@ -895,6 +1183,18 @@ extension ModelSettings {
             }
         }
     }
+
+    /// Noema Overfit (paged experts) policy for GGUF installs.
+    /// `.automatic` runs paged packages paged and everything else resident;
+    /// `.off` refuses paged installs; `.forceExperimental` additionally
+    /// bypasses performance classification (never integrity checks).
+    enum OverfitMode: String, Codable, CaseIterable, Identifiable {
+        case off
+        case automatic
+        case forceExperimental
+
+        var id: String { rawValue }
+    }
 }
 
 extension ModelSettings.SpeculativeDecodingSettings {
@@ -906,19 +1206,24 @@ extension ModelSettings.SpeculativeDecodingSettings {
         case mtpDraftNMax
         case mtpDraftNMin
         case mtpDraftPMin
+        case mtpAutoTune
     }
 
+    /// Field-tolerant like `ModelSettings.init(from:)`: unknown raw values (e.g. a
+    /// selection written by a newer build) default instead of throwing, so the parent
+    /// entry survives version skew.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let defaults = ModelSettings.SpeculativeDecodingSettings()
 
-        self.selection = try container.decodeIfPresent(Selection.self, forKey: .selection) ?? defaults.selection
-        self.helperModelID = try container.decodeIfPresent(String.self, forKey: .helperModelID)
-        self.mode = try container.decodeIfPresent(Mode.self, forKey: .mode) ?? defaults.mode
-        self.value = try container.decodeIfPresent(Int.self, forKey: .value) ?? defaults.value
-        self.mtpDraftNMax = try container.decodeIfPresent(Int.self, forKey: .mtpDraftNMax) ?? defaults.mtpDraftNMax
-        self.mtpDraftNMin = try container.decodeIfPresent(Int.self, forKey: .mtpDraftNMin) ?? defaults.mtpDraftNMin
-        self.mtpDraftPMin = try container.decodeIfPresent(Double.self, forKey: .mtpDraftPMin) ?? defaults.mtpDraftPMin
+        self.selection = (try? container.decodeIfPresent(Selection.self, forKey: .selection)) ?? defaults.selection
+        self.helperModelID = (try? container.decodeIfPresent(String.self, forKey: .helperModelID)) ?? nil
+        self.mode = (try? container.decodeIfPresent(Mode.self, forKey: .mode)) ?? defaults.mode
+        self.value = (try? container.decodeIfPresent(Int.self, forKey: .value)) ?? defaults.value
+        self.mtpDraftNMax = (try? container.decodeIfPresent(Int.self, forKey: .mtpDraftNMax)) ?? defaults.mtpDraftNMax
+        self.mtpDraftNMin = (try? container.decodeIfPresent(Int.self, forKey: .mtpDraftNMin)) ?? defaults.mtpDraftNMin
+        self.mtpDraftPMin = (try? container.decodeIfPresent(Double.self, forKey: .mtpDraftPMin)) ?? defaults.mtpDraftPMin
+        self.mtpAutoTune = (try? container.decodeIfPresent(Bool.self, forKey: .mtpAutoTune)) ?? defaults.mtpAutoTune
         if !container.contains(.selection), helperModelID?.isEmpty == false {
             self.selection = .helperDraftModel
         }
@@ -933,32 +1238,6 @@ extension ModelSettings.SpeculativeDecodingSettings {
         try container.encode(mtpDraftNMax, forKey: .mtpDraftNMax)
         try container.encode(mtpDraftNMin, forKey: .mtpDraftNMin)
         try container.encode(mtpDraftPMin, forKey: .mtpDraftPMin)
-    }
-}
-
-extension ModelSettings.RopeScalingSettings {
-    private enum CodingKeys: String, CodingKey {
-        case factor
-        case originalContext
-        case lowFrequency
-        case highFrequency
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let defaults = ModelSettings.RopeScalingSettings()
-
-        self.factor = try container.decodeIfPresent(Double.self, forKey: .factor) ?? defaults.factor
-        self.originalContext = try container.decodeIfPresent(Int.self, forKey: .originalContext) ?? defaults.originalContext
-        self.lowFrequency = try container.decodeIfPresent(Double.self, forKey: .lowFrequency) ?? defaults.lowFrequency
-        self.highFrequency = try container.decodeIfPresent(Double.self, forKey: .highFrequency) ?? defaults.highFrequency
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(factor, forKey: .factor)
-        try container.encode(originalContext, forKey: .originalContext)
-        try container.encode(lowFrequency, forKey: .lowFrequency)
-        try container.encode(highFrequency, forKey: .highFrequency)
+        try container.encode(mtpAutoTune, forKey: .mtpAutoTune)
     }
 }

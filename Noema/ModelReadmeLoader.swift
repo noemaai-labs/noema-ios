@@ -1,4 +1,3 @@
-// ModelReadmeLoader.swift
 import Foundation
 import SwiftUI
 
@@ -13,23 +12,36 @@ final class ModelReadmeLoader: ObservableObject {
     private let repo: String
     private let branch: String
     private let token: String?
+    // Renderers that draw tables natively (ModelCardSection) opt out of the
+    // mobile table-to-list rewrite; the plain AttributedString paths keep it.
+    private let preserveTables: Bool
+    // The detail view's hero already shows the curated summary, so its model
+    // card fetches the real README even for ManualModelRegistry repos.
+    private let preferManualSummary: Bool
     private var task: Task<Void, Never>?
     // Static coordination to avoid duplicate network fetches for the same repo across multiple loader instances
     private static var fetchingRepos: Set<String> = []
     private static let fetchQueue = DispatchQueue(label: "ModelReadmeLoader.fetchQueue")
 
-    init(repo: String, branch: String = "main", token: String? = nil) {
+    init(repo: String,
+         branch: String = "main",
+         token: String? = nil,
+         preserveTables: Bool = false,
+         preferManualSummary: Bool = true) {
         self.repo = repo
         self.branch = branch
         self.token = token
+        self.preserveTables = preserveTables
+        self.preferManualSummary = preferManualSummary
     }
 
     func load(force: Bool = false) {
         // If this repo is provided manually in the app (curated), prefer the handwritten summary
-        if let manual = ManualModelRegistry.defaultEntries.first(where: { $0.record.id == repo || $0.details.id == repo }) {
+        if preferManualSummary,
+           let manual = ManualModelRegistry.defaultEntries.first(where: { $0.record.id == repo || $0.details.id == repo }) {
             // `summary` is optional on ModelDetails; prefer it, fall back to record.summary, then empty string
             let sourceSummary = manual.details.summary ?? manual.record.summary ?? ""
-            let formatted = ReadmeMobileFormatter.transform(sourceSummary)
+            let formatted = ReadmeMobileFormatter.transform(sourceSummary, keepTables: preserveTables)
             let cleaned = Self.preprocess(formatted, repo: repo)
             markdown = cleaned
             if fallbackSummary == nil { fallbackSummary = Self.firstSentence(from: cleaned) }
@@ -40,7 +52,7 @@ final class ModelReadmeLoader: ObservableObject {
             return
         }
         task?.cancel()
-        isLoading = true  // Set loading state immediately
+        isLoading = true
         task = Task { [weak self] in
             await self?.fetch(force: force)
         }
@@ -78,7 +90,7 @@ final class ModelReadmeLoader: ObservableObject {
            Date().timeIntervalSince(mod) < 86_400,
            let data = try? Data(contentsOf: cacheURL) {
             let originalContent = String(decoding: data, as: UTF8.self)
-            let formattedContent = ReadmeMobileFormatter.transform(originalContent)
+            let formattedContent = ReadmeMobileFormatter.transform(originalContent, keepTables: preserveTables)
             let cleaned = Self.preprocess(formattedContent, repo: repo)
             #if DEBUG
             print("[README] Cached content - Formatted length: \(formattedContent.count)")
@@ -133,8 +145,23 @@ final class ModelReadmeLoader: ObservableObject {
         }
     }
 
+    /// Displays whatever README copy is on disk, even past the freshness TTL.
+    /// Used when the network is unavailable so offline users keep the card.
+    @discardableResult
+    private func loadFromDiskCache(_ cacheURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: cacheURL) else { return false }
+        let formatted = ReadmeMobileFormatter.transform(String(decoding: data, as: UTF8.self), keepTables: preserveTables)
+        let cleaned = Self.preprocess(formatted, repo: repo)
+        markdown = cleaned
+        if fallbackSummary == nil { fallbackSummary = Self.firstSentence(from: cleaned) }
+        return true
+    }
+
     private func networkFetch(cacheURL: URL, etagURL: URL, etag: String?, force: Bool = false) async {
-        if NetworkKillSwitch.isEnabled { return }
+        if NetworkKillSwitch.isEnabled {
+            if markdown == nil { loadFromDiskCache(cacheURL) }
+            return
+        }
         // Try common README filenames and endpoints
         let names = ["README.md", "Readme.md", "readme.md", "README.MD", "README.txt", "readme.txt"]
         let endpoints: [(String) -> String] = [
@@ -169,7 +196,7 @@ final class ModelReadmeLoader: ObservableObject {
                     try? md.data(using: .utf8)?.write(to: cacheURL)
                     
                     // Apply mobile formatting first, then preprocessing
-                    let formattedContent = ReadmeMobileFormatter.transform(md)
+                    let formattedContent = ReadmeMobileFormatter.transform(md, keepTables: preserveTables)
                     let cleaned = Self.preprocess(formattedContent, repo: repo)
                     #if DEBUG
                     print("[README] Preprocessed content length: \(cleaned.count)")
@@ -199,7 +226,7 @@ final class ModelReadmeLoader: ObservableObject {
             try? md.data(using: .utf8)?.write(to: cacheURL)
             
             // Apply mobile formatting first, then preprocessing
-            let formattedContent = ReadmeMobileFormatter.transform(md)
+            let formattedContent = ReadmeMobileFormatter.transform(md, keepTables: preserveTables)
             let cleaned = Self.preprocess(formattedContent, repo: repo)
             #if DEBUG
             print("[README] API discovery - Formatted length: \(formattedContent.count)")
@@ -212,6 +239,10 @@ final class ModelReadmeLoader: ObservableObject {
         }
         
         print("[README] All methods failed for \(repo)")
+        if markdown == nil, loadFromDiskCache(cacheURL) {
+            print("[README] Falling back to stale disk cache for \(repo)")
+            return
+        }
         self.error = URLError(.fileDoesNotExist)
     }
 

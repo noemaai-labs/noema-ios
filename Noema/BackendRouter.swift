@@ -1,4 +1,3 @@
-// BackendRouter.swift
 import Foundation
 
 struct GenerateRequest: Sendable { let prompt: String }

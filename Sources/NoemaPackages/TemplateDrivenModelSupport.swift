@@ -77,53 +77,117 @@ public enum TemplateDrivenModelSupport {
                                                   speculativeType: String? = nil,
                                                   specDraftNMax: Int32? = nil,
                                                   specDraftNMin: Int32? = nil,
-                                                  specDraftPMin: Double? = nil) -> LlamaServerBridge.StartConfiguration {
+                                                  specDraftPMin: Double? = nil,
+                                                  specDynamic: Bool = false,
+                                                  contextSize: Int32 = 4096,
+                                                  contextShift: Bool = true,
+                                                  gpuLayers: Int32 = -1,
+                                                  threads: Int32 = 1,
+                                                  threadsBatch: Int32? = nil,
+                                                  batchSize: Int32 = 512,
+                                                  ubatchSize: Int32 = 256,
+                                                  useMmap: Bool = true,
+                                                  useMlock: Bool = false,
+                                                  warmup: Bool = true,
+                                                  kvOffload: Bool = true,
+                                                  unifiedKVCache: Bool = true,
+                                                  flashAttention: Bool = true,
+                                                  cacheTypeK: String = "f16",
+                                                  cacheTypeV: String = "f16",
+                                                  parallelSlots: Int32 = 1,
+                                                  tensorOverride: String? = nil,
+                                                  cpuMoE: Bool = false,
+                                                  moeExpertCount: Int32? = nil,
+                                                  yarnScale: Double? = nil,
+                                                  yarnOriginalContext: Int32? = nil,
+                                                  yarnBetaFast: Double? = nil,
+                                                  yarnBetaSlow: Double? = nil,
+                                                  promptCacheEnabled: Bool = true,
+                                                  ctxCheckpointsOverride: Int32? = nil,
+                                                  pagedMode: LlamaServerBridge.PagedMode = .off,
+                                                  pagedManifestPath: String? = nil,
+                                                  pagedTrace: Bool = false,
+                                                  pagedBankBudgetMiB: Int32 = 0,
+                                                  pagedPrefetch: Bool = false,
+                                                  pagedIOThreads: Int32 = 0,
+                                                  pagedIODepth: Int32 = 0,
+                                                  pagedWaves: Bool = false,
+                                                  pagedExpertMajor: Bool = false) -> LlamaServerBridge.StartConfiguration {
         let resolution = resolve(modelID: modelID, modelURL: modelURL)
-        if resolution.profile == .gemma4 {
-            return LlamaServerBridge.StartConfiguration(
-                host: host,
-                preferredPort: preferredPort,
-                ggufPath: ggufPath,
-                mmprojPath: mmprojPath,
-                mtpPath: mtpPath,
-                chatTemplateFile: resolution.chatTemplateFile,
-                cacheRamMiB: 2048,
-                ctxCheckpoints: 2,
-                speculativeType: speculativeType,
-                specDraftNMax: specDraftNMax,
-                specDraftNMin: specDraftNMin,
-                specDraftPMin: specDraftPMin,
-                useJinja: true
-            )
-        }
-        if resolution.profile == .qwen35 {
-            return LlamaServerBridge.StartConfiguration(
-                host: host,
-                preferredPort: preferredPort,
-                ggufPath: ggufPath,
-                mmprojPath: mmprojPath,
-                mtpPath: mtpPath,
-                chatTemplateFile: resolution.chatTemplateFile,
-                reasoningBudget: -1,
-                speculativeType: speculativeType,
-                specDraftNMax: specDraftNMax,
-                specDraftNMin: specDraftNMin,
-                specDraftPMin: specDraftPMin,
-                useJinja: true
-            )
-        }
+        // Bound the prompt/KV checkpoint cache. llama.cpp defaults to an 8 GiB
+        // cache-ram ceiling with 32 checkpoints per slot, which is a latent
+        // out-of-memory risk on iOS. Cap it platform-appropriately for every
+        // model (gemma4 keeps its own tighter cap below); reuse stays enabled.
+        #if os(macOS)
+        let defaultCacheRamMiB: Int32 = 4096
+        let defaultCtxCheckpoints: Int32 = 8
+        #else
+        let defaultCacheRamMiB: Int32 = 1024
+        let defaultCtxCheckpoints: Int32 = 4
+        #endif
+        let cacheRamMiB: Int32 = promptCacheEnabled
+            ? (resolution.profile == .gemma4 ? 2048 : defaultCacheRamMiB)
+            : 0
+        // Context checkpoints are independent of the cache-ram prompt cache:
+        // the server gates creation/restore solely on --ctx-checkpoints. The
+        // override lets paged launches keep cache-ram at 0 while still
+        // checkpointing the non-rollback-able (hybrid/recurrent) state, which
+        // is the only prefix-reuse mechanism those architectures have.
+        let ctxCheckpoints: Int32 = ctxCheckpointsOverride
+            ?? (promptCacheEnabled
+                ? (resolution.profile == .gemma4 ? 2 : defaultCtxCheckpoints)
+                : 0)
         return LlamaServerBridge.StartConfiguration(
-            host: host,
-            preferredPort: preferredPort,
-            ggufPath: ggufPath,
-            mmprojPath: mmprojPath,
-            mtpPath: mtpPath,
-            chatTemplateFile: resolution.chatTemplateFile,
-            speculativeType: speculativeType,
-            specDraftNMax: specDraftNMax,
-            specDraftNMin: specDraftNMin,
-            specDraftPMin: specDraftPMin
-        )
+                host: host,
+                preferredPort: preferredPort,
+                ggufPath: ggufPath,
+                mmprojPath: mmprojPath,
+                mtpPath: mtpPath,
+                chatTemplateFile: resolution.chatTemplateFile,
+                reasoningBudget: resolution.profile == .qwen35 ? -1 : nil,
+                contextSize: contextSize,
+                contextShift: contextShift,
+                gpuLayers: gpuLayers,
+                threads: threads,
+                threadsBatch: threadsBatch,
+                batchSize: batchSize,
+                ubatchSize: ubatchSize,
+                useMmap: useMmap,
+                useMlock: useMlock,
+                warmup: warmup,
+                kvOffload: kvOffload,
+                unifiedKVCache: unifiedKVCache,
+                flashAttention: flashAttention,
+                cacheTypeK: cacheTypeK,
+                cacheTypeV: cacheTypeV,
+                parallelSlots: parallelSlots,
+                tensorOverride: tensorOverride,
+                cpuMoE: cpuMoE,
+                moeExpertCount: moeExpertCount,
+                yarnScale: yarnScale,
+                yarnOriginalContext: yarnOriginalContext,
+                yarnBetaFast: yarnBetaFast,
+                yarnBetaSlow: yarnBetaSlow,
+                cacheRamMiB: cacheRamMiB,
+                ctxCheckpoints: ctxCheckpoints,
+                speculativeType: speculativeType,
+                specDraftNMax: specDraftNMax,
+                specDraftNMin: specDraftNMin,
+                specDraftPMin: specDraftPMin,
+                specDynamic: specDynamic,
+                // Native tool calling requires --jinja. It is safe for templates
+                // that do not branch on tool metadata.
+                useJinja: true,
+                pagedMode: pagedMode,
+                pagedManifestPath: pagedManifestPath,
+                pagedBankBudgetMiB: pagedBankBudgetMiB,
+                pagedIOThreads: pagedIOThreads,
+                pagedIODepth: pagedIODepth,
+                pagedPrefetch: pagedPrefetch,
+                pagedTrace: pagedTrace,
+                pagedWaves: pagedWaves,
+                pagedExpertMajor: pagedExpertMajor
+            )
     }
 
     public static func resolveChatTemplateFile(modelID: String? = nil, modelURL: URL? = nil) -> String? {
@@ -322,22 +386,30 @@ public enum TemplateDrivenModelSupport {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
 
+        func ensureCapacity(_ length: Int) -> Bool {
+            length >= 0 && offset <= data.count - length
+        }
+
         func readU32() -> UInt32? {
-            guard offset + 4 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            guard ensureCapacity(4) else { return nil }
+            let value = data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+            }
             offset += 4
             return UInt32(littleEndian: value)
         }
 
         func readU64() -> UInt64? {
-            guard offset + 8 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            guard ensureCapacity(8) else { return nil }
+            let value = data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)
+            }
             offset += 8
             return UInt64(littleEndian: value)
         }
 
         func readString(len: Int) -> String? {
-            guard offset + len <= data.count else { return nil }
+            guard ensureCapacity(len) else { return nil }
             let subdata = data.subdata(in: offset..<offset+len)
             offset += len
             return String(data: subdata, encoding: .utf8)
@@ -346,10 +418,10 @@ public enum TemplateDrivenModelSupport {
         guard let magic = readString(len: 4), magic == "GGUF" else { return nil }
         guard readU32() != nil else { return nil }
         guard readU64() != nil else { return nil }
-        guard let kvCount = readU64().map(Int.init) else { return nil }
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
 
         for _ in 0..<kvCount {
-            guard let keyLen = readU64().map(Int.init),
+            guard let keyLen = readU64().flatMap({ Int(exactly: $0) }),
                   let key = readString(len: keyLen),
                   let type = readU32() else {
                 return nil
@@ -357,10 +429,11 @@ public enum TemplateDrivenModelSupport {
 
             switch type {
             case 8:
-                guard let len = readU64().map(Int.init) else { return nil }
+                guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
                 if key.contains("chat_template") {
                     return readString(len: len)
                 }
+                guard ensureCapacity(len) else { return nil }
                 offset += len
             case 9:
                 guard let elementType = readU32(), let count = readU64() else { return nil }
@@ -377,11 +450,13 @@ public enum TemplateDrivenModelSupport {
         if elementType == 8 {
             guard count <= UInt64(Int.max) else { return false }
             for _ in 0..<Int(count) {
-                guard offset + 8 <= data.count else { return false }
-                let lenValue = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+                guard offset <= data.count - 8 else { return false }
+                let lenValue = data.withUnsafeBytes {
+                    $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)
+                }
                 offset += 8
-                let len = Int(UInt64(littleEndian: lenValue))
-                guard offset + len <= data.count else { return false }
+                guard let len = Int(exactly: UInt64(littleEndian: lenValue)),
+                      offset <= data.count - len else { return false }
                 offset += len
             }
             return true
@@ -401,9 +476,11 @@ public enum TemplateDrivenModelSupport {
             elementSize = 4
         }
 
-        guard count <= UInt64(Int.max / max(elementSize, 1)) else { return false }
-        guard offset + Int(count) * elementSize <= data.count else { return false }
-        offset += Int(count) * elementSize
+        guard count <= UInt64(Int.max / max(elementSize, 1)),
+              let elementCount = Int(exactly: count) else { return false }
+        let byteCount = elementCount * elementSize
+        guard offset <= data.count - byteCount else { return false }
+        offset += byteCount
         return true
     }
 
@@ -422,7 +499,7 @@ public enum TemplateDrivenModelSupport {
             size = 0
         }
         guard size > 0 else { return false }
-        guard offset + size <= data.count else { return false }
+        guard offset <= data.count - size else { return false }
         offset += size
         return true
     }

@@ -1,30 +1,11 @@
-// ExploreView.swift
 import Combine
+import NoemaPackages
 import SwiftUI
 import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #endif
 #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
-
-/// Simple badge label style used to display small status indicators.
-struct BadgeLabelStyle: LabelStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        Label {
-            configuration.title
-        } icon: {
-            configuration.icon
-        }
-        .padding(4)
-        .background(
-            Capsule().fill(Color(.systemGray5))
-        )
-    }
-}
-
-extension LabelStyle where Self == BadgeLabelStyle {
-    static var badge: BadgeLabelStyle { .init() }
-}
 
 enum ExploreImportRequest: Equatable {
     case ggufFiles
@@ -78,11 +59,12 @@ struct ExploreView: View {
     }
     @State private var selected: ModelDetails?
     @State private var selectedFormatFilter: ModelFormat?
-#if canImport(LeapSDK) && !os(macOS)
-    @State private var selectedSLMGroup: SLMModelGroup?
+#if os(macOS)
+    @State private var detailModalID: UUID?
 #endif
     @State private var loadingDetail = false
     @State private var openingModelId: String?
+    @State private var showAllCuratedModels = false
     // Import flow state
     @State private var showImportMenu = false
     @State private var activeImportRequest: ExploreImportRequest?
@@ -97,15 +79,6 @@ struct ExploreView: View {
 
     private enum ImportFormat: Equatable { case gguf, ggufFolder, mlx }
 
-#if canImport(LeapSDK) && !os(macOS)
-    private struct SLMModelGroup: Identifiable, Hashable {
-        let groupKey: String
-        let modelID: String
-        let displayName: String
-        let entries: [LeapCatalogEntry]
-        var id: String { groupKey }
-    }
-#endif
 
     var body: some View { contentView }
 
@@ -145,6 +118,11 @@ struct ExploreView: View {
                 vm.loadCachedRecords()
                 await vm.loadCurated()
                 vm.setFilterManager(filterManager)
+                await vm.loadTrending(format: trendingFormat)
+            }
+            .onChangeCompat(of: effectiveSearchMode) { _, _ in
+                showAllCuratedModels = false
+                Task { await vm.loadTrending(force: true, format: trendingFormat) }
             }
             .onAppear {
                 vm.loadCachedRecords()
@@ -170,7 +148,7 @@ struct ExploreView: View {
             .onChangeCompat(of: selected) { _, detail in
                 if let detail {
                     presentDetail(detail)
-                } else if macModalPresenter.isPresented {
+                } else if let id = macModalPresenter.presentation?.id, id == detailModalID {
                     selectedFormatFilter = nil
                     macModalPresenter.dismiss()
                 }
@@ -179,9 +157,6 @@ struct ExploreView: View {
             .sheet(item: $selected, onDismiss: {
                 selectedFormatFilter = nil
             }, content: detailSheet)
-#if canImport(LeapSDK)
-            .sheet(item: $selectedSLMGroup, content: slmDetailSheet)
-#endif
 #endif
             .overlay { if loadingDetail { ProgressView() } }
             .overlay { if vm.isLoadingSearch { ProgressView() } }
@@ -243,6 +218,9 @@ struct ExploreView: View {
                 chromeState.searchText = vm.searchText
                 chromeState.isSearchVisible = true
                 chromeState.searchSubmitAction = { vm.triggerSearch() }
+                chromeState.importGGUFAction = { presentImporter(.gguf) }
+                chromeState.importMLXAction = { presentImporter(.mlx) }
+                chromeState.isImportVisible = true
             }
             .onChange(of: vm.searchMode) { newValue in
                 _ = newValue
@@ -259,17 +237,14 @@ struct ExploreView: View {
                 }
             }
             .onDisappear {
+                chromeState.importGGUFAction = nil
+                chromeState.importMLXAction = nil
+                chromeState.isImportVisible = false
                 guard chromeState.activeSection == .models else { return }
                 chromeState.toggleAction = nil
                 chromeState.isSearchVisible = false
                 chromeState.searchSubmitAction = nil
                 chromeState.activeSection = nil
-            }
-            // Bring the import menu into the content area to avoid adding a toolbar that shifts layout.
-            .overlay(alignment: .topTrailing) {
-                importMenuButton
-                    .padding(.top, AppTheme.padding)
-                    .padding(.trailing, AppTheme.padding)
             }
 #endif
             .onReceive(walkthrough.$step) { step in
@@ -284,7 +259,7 @@ struct ExploreView: View {
                         vm.searchMode = .mlx
                         vm.triggerSearch()
                     }
-                case .exploreSLM:
+                case .exploreET:
                     if vm.searchMode != .et {
                         vm.searchMode = .et
                         vm.triggerSearch()
@@ -376,11 +351,17 @@ struct ExploreView: View {
     private func exploreCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         VStack(spacing: 0) {
             content()
-                .padding(.vertical, 12)
+                .padding(.vertical, exploreCardVerticalPadding)
                 .padding(.horizontal, AppTheme.padding)
             Divider()
         }
     }
+
+#if os(macOS)
+    private var exploreCardVerticalPadding: CGFloat { 8 }
+#else
+    private var exploreCardVerticalPadding: CGFloat { 12 }
+#endif
 
     private func updateRegistry(_ token: String) {
         vm.updateRegistry(CombinedRegistry(primary: HuggingFaceRegistry(token: token),
@@ -409,111 +390,6 @@ struct ExploreView: View {
         }
     }
 
-    private var slmListBottomInset: CGFloat {
-#if os(iOS)
-        // Height budget for the Explore switch bar plus a bit of breathing room
-        // so the final ET entry can scroll fully above the menubar.
-        UIConstants.defaultPadding * 2 + 40
-#else
-        0
-#endif
-    }
-
-    private var slmIPadCardHeight: CGFloat {
-#if os(iOS)
-        UIDevice.current.userInterfaceIdiom == .pad ? 126 : 0
-#else
-        0
-#endif
-    }
-
-#if canImport(LeapSDK) && !os(macOS)
-    private var groupedSLMModels: [SLMModelGroup] {
-        var order: [String] = []
-        var buckets: [String: [LeapCatalogEntry]] = [:]
-        for entry in vm.filteredLeap {
-            let key = slmSanitizedModelKey(for: entry)
-            if buckets[key] == nil {
-                order.append(key)
-                buckets[key] = []
-            }
-            buckets[key]?.append(entry)
-        }
-
-        return order.compactMap { key in
-            guard let entries = buckets[key], !entries.isEmpty else { return nil }
-            var quantIndexByKey: [String: Int] = [:]
-            var merged: [LeapCatalogEntry] = []
-            for entry in entries {
-                let quantKey = entry.quantization.lowercased()
-                if let idx = quantIndexByKey[quantKey] {
-                    if slmEntryIsPreferred(entry, over: merged[idx]) {
-                        merged[idx] = entry
-                    }
-                } else {
-                    quantIndexByKey[quantKey] = merged.count
-                    merged.append(entry)
-                }
-            }
-            guard !merged.isEmpty else { return nil }
-            let representative = entries.min(by: { slmEntrySortKey($0) < slmEntrySortKey($1) }) ?? merged[0]
-            return SLMModelGroup(
-                groupKey: key,
-                modelID: representative.modelID,
-                displayName: representative.displayName,
-                entries: merged
-            )
-        }
-    }
-
-    private var filteredSLMModelGroups: [SLMModelGroup] {
-        groupedSLMModels.filter(slmShouldIncludeGroup)
-    }
-
-    private func slmShouldIncludeGroup(_ group: SLMModelGroup) -> Bool {
-        guard UIConstants.showMultimodalUI else { return true }
-        switch filterManager.filter {
-        case .all:
-            return true
-        case .text:
-            return !slmGroupIsVision(group)
-        case .vision:
-            return slmGroupIsVision(group)
-        }
-    }
-
-    private func slmGroupIsVision(_ group: SLMModelGroup) -> Bool {
-        if group.entries.contains(where: { $0.isVision }) { return true }
-        if LeapCatalogService.isVisionQuantizationSlug(group.modelID) { return true }
-        return LeapCatalogService.isVisionQuantizationSlug(group.displayName)
-    }
-
-    private func slmSanitizedModelKey(for entry: LeapCatalogEntry) -> String {
-        let base = (LeapCatalogService.name(for: entry.modelID) ?? entry.displayName)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !base.isEmpty {
-            return slmSanitizeName(base)
-        }
-        return slmSanitizeName(entry.modelID)
-    }
-
-    private func slmSanitizeName(_ value: String) -> String {
-        let lowered = value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current).lowercased()
-        let decimalNormalized = lowered.replacingOccurrences(of: #"(?<=\d)[._](?=\d)"#, with: "p", options: .regularExpression)
-        let compact = decimalNormalized.replacingOccurrences(of: #"[^a-z0-9]+"#, with: "", options: .regularExpression)
-        return compact.isEmpty ? lowered.replacingOccurrences(of: " ", with: "") : compact
-    }
-
-    private func slmEntrySortKey(_ entry: LeapCatalogEntry) -> (Int, Int, String, String) {
-        let artifactRank = (entry.artifactKind == .manifest) ? 0 : 1
-        let underscorePenalty = entry.modelID.contains("_") ? 1 : 0
-        return (artifactRank, underscorePenalty, entry.modelID.lowercased(), entry.slug.lowercased())
-    }
-
-    private func slmEntryIsPreferred(_ lhs: LeapCatalogEntry, over rhs: LeapCatalogEntry) -> Bool {
-        slmEntrySortKey(lhs) < slmEntrySortKey(rhs)
-    }
-#endif
 
     private func handleNavigation(_ detail: ModelDetails?) {
         if let d = detail {
@@ -542,50 +418,6 @@ struct ExploreView: View {
 #endif
     }
 
-#if canImport(LeapSDK) && !os(macOS)
-    @ViewBuilder
-    private func slmDetailSheet(_ group: SLMModelGroup) -> some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    exploreCard {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(group.displayName)
-                                .font(FontTheme.largeTitle)
-                                .foregroundStyle(AppTheme.text)
-                            Text(group.modelID)
-                                .font(FontTheme.caption)
-                                .foregroundStyle(AppTheme.secondaryText)
-                        }
-                    }
-
-                    exploreCard {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(LocalizedStringKey("Available Quantizations"))
-                                .font(FontTheme.heading)
-                                .foregroundStyle(AppTheme.text)
-                            ForEach(group.entries) { entry in
-                                LeapRowView(entry: entry, openAction: { e, url, runner in
-                                    selectedSLMGroup = nil
-                                    openLeap(entry: e, url: url, runner: runner)
-                                })
-                                .environmentObject(downloadController)
-                            }
-                        }
-                    }
-                }
-                .padding(.vertical, 24)
-                .padding(.horizontal, AppTheme.padding)
-            }
-            .background(Color.detailSheetBackground.ignoresSafeArea())
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(LocalizedStringKey("Close")) { selectedSLMGroup = nil }
-                }
-            }
-        }
-    }
-#endif
 
 #if os(macOS)
     private func presentDetail(_ detail: ModelDetails) {
@@ -605,6 +437,7 @@ struct ExploreView: View {
             onDismiss: {
                 selected = nil
                 selectedFormatFilter = nil
+                detailModalID = nil
             }
         ) {
             ExploreDetailView(
@@ -617,6 +450,7 @@ struct ExploreView: View {
                 .environmentObject(chatVM)
                 .environmentObject(tabRouter)
         }
+        detailModalID = macModalPresenter.presentation?.id
     }
 #endif
 
@@ -658,15 +492,7 @@ struct ExploreView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: AppTheme.padding, bottom: 8, trailing: AppTheme.padding))
 #endif
         }
-#if canImport(LeapSDK) && !os(macOS) && !os(visionOS)
-        if effectiveSearchMode == .et {
-            slmSections
-        } else {
-            standardSections
-        }
-#else
         standardSections
-#endif
     }
 
     @ViewBuilder
@@ -688,7 +514,7 @@ struct ExploreView: View {
                 Button(LocalizedStringKey("Clear")) {
                     modelManager.clearLMStudioRemoteDownloadTarget()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.industrial(.quiet))
                 .controlSize(.small)
             }
         }
@@ -721,142 +547,11 @@ struct ExploreView: View {
         return afmAvailabilityState.unavailableReason?.message
     }
 
-#if canImport(LeapSDK) && !os(macOS)
-    @ViewBuilder
-    private var slmSections: some View {
-        let visibleGroups = filteredSLMModelGroups
-
-        slmListRow(bottom: 12) {
-            exploreCard {
-                HStack(spacing: 10) {
-                    Text(LocalizedStringKey("ET Models - ExecuTorch"))
-                        .font(FontTheme.heading(size: 20))
-                        .foregroundStyle(AppTheme.text)
-                    Spacer(minLength: 8)
-                    Text(effectiveSearchMode.displayName)
-                        .font(FontTheme.caption.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(searchModeGradient, in: Capsule())
-                        .foregroundStyle(.white)
-                }
-            }
-        }
-
-        if UIDevice.current.userInterfaceIdiom == .pad {
-            slmListRow(horizontal: 0, bottom: 0) {
-                if visibleGroups.isEmpty {
-                    slmEmptyStateCard
-                } else {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 16)], spacing: 16) {
-                        ForEach(visibleGroups) { group in
-                            exploreCard {
-                                slmGroupRow(group, titleLineLimit: 2)
-                            }
-                            .frame(height: slmIPadCardHeight, alignment: .topLeading)
-                        }
-                    }
-                    .padding(.horizontal, AppTheme.padding)
-                    .padding(.top, 4)
-                    .padding(.bottom, 8)
-                }
-            }
-        } else {
-            if visibleGroups.isEmpty {
-                slmListRow(bottom: 12) {
-                    slmEmptyStateCard
-                }
-            } else {
-                ForEach(visibleGroups) { group in
-                    slmListRow(bottom: 12) {
-                        exploreCard {
-                            slmGroupRow(group)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func slmListRow<Content: View>(
-        horizontal: CGFloat = AppTheme.padding,
-        bottom: CGFloat,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        content()
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
-            .listRowInsets(EdgeInsets(top: 0, leading: horizontal, bottom: bottom, trailing: horizontal))
-    }
-
-    @ViewBuilder
-    private var slmEmptyStateCard: some View {
-        exploreCard {
-            VStack(spacing: 8) {
-                Text(String.localizedStringWithFormat(String(localized: "No models found for '%@'"), vm.searchText))
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                Text(emptyStateSuggestion)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            .frame(maxWidth: .infinity)
-        }
-    }
-
-    @ViewBuilder
-    private func slmGroupRow(_ group: SLMModelGroup, titleLineLimit: Int? = nil) -> some View {
-        Button(action: { selectedSLMGroup = group }) {
-            HStack(alignment: .center, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text(group.displayName)
-                            .font(FontTheme.body)
-                            .fontWeight(.medium)
-                            .foregroundStyle(AppTheme.text)
-                            .lineLimit(titleLineLimit)
-
-                        if UIConstants.showMultimodalUI && slmGroupIsVision(group) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.yellow, lineWidth: 2)
-                                    .frame(width: 22, height: 22)
-                                Image(systemName: "eye.fill")
-                                    .foregroundColor(Color.yellow)
-                                    .font(.system(size: 11, weight: .semibold))
-                            }
-                            .accessibilityLabel(LocalizedStringKey("Vision-capable model"))
-                            .help(LocalizedStringKey("Vision-capable model"))
-                        }
-                    }
-                    Text(group.modelID)
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(1)
-                }
-                Spacer()
-                Text("\(group.entries.count)")
-                    .font(FontTheme.caption.weight(.semibold))
-                    .foregroundStyle(AppTheme.text)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color(.systemGray5), in: Capsule())
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundStyle(AppTheme.secondaryText)
-            }
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .buttonStyle(.plain)
-    }
-#endif
-
     @ViewBuilder
     private var heroSection: some View {
         if vm.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
             VStack(alignment: .leading, spacing: 24) {
+#if !os(macOS)
                 VStack(alignment: .leading, spacing: 8) {
                     Text(LocalizedStringKey("Discover Intelligence"))
                         .font(FontTheme.largeTitle)
@@ -866,25 +561,170 @@ struct ExploreView: View {
                         .foregroundStyle(AppTheme.secondaryText)
                 }
                 .padding(.bottom, 8)
-                
+#endif
+
+                let allFeaturedModels = allFilteredRecommended
                 let featuredModels = filteredRecommended
-                if !featuredModels.isEmpty {
-                    VStack(spacing: 0) {
+                if !allFeaturedModels.isEmpty {
+#if os(macOS)
+                    VStack(alignment: .leading, spacing: 0) {
+                        curatedCatalogHeader(
+                            visibleCount: featuredModels.count,
+                            totalCount: allFeaturedModels.count
+                        )
                         ForEach(Array(featuredModels.enumerated()), id: \.element.id) { index, featured in
-                            featuredCard(featured)
+                            IndustrialHoverRow {
+                                featuredCard(featured)
+                            }
                             if index < featuredModels.count - 1 {
-                                Divider().padding(.leading, 56)
+                                IndustrialHairline().padding(.leading, 10)
                             }
                         }
                     }
+#else
+                    VStack(alignment: .leading, spacing: 8) {
+                        curatedCatalogHeader(
+                            visibleCount: featuredModels.count,
+                            totalCount: allFeaturedModels.count
+                        )
+                        VStack(spacing: 0) {
+                            ForEach(Array(featuredModels.enumerated()), id: \.element.id) { index, featured in
+                                featuredCard(featured)
+                                if index < featuredModels.count - 1 {
+                                    Divider().padding(.leading, 56)
+                                }
+                            }
+                        }
+                    }
+#endif
+                }
+
+                if effectiveSearchMode == .gguf {
+                    OverfitModelCollectionLink {
+                        Task { await open(Self.overfitCatalogRecord) }
+                    }
+                }
+
+                let trendingModels = filteredTrending
+                if !trendingModels.isEmpty {
+#if os(macOS)
+                    VStack(alignment: .leading, spacing: 0) {
+                        IndustrialSectionHeader("Trending this week", detail: "\(trendingModels.count)")
+                        ForEach(Array(trendingModels.enumerated()), id: \.element.id) { index, record in
+                            IndustrialHoverRow {
+                                featuredCard(record)
+                            }
+                            if index < trendingModels.count - 1 {
+                                IndustrialHairline().padding(.leading, 10)
+                            }
+                        }
+                    }
+#else
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(LocalizedStringKey("Trending this week"))
+                            .font(FontTheme.body.weight(.semibold))
+                            .foregroundStyle(AppTheme.text)
+                        VStack(spacing: 0) {
+                            ForEach(Array(trendingModels.enumerated()), id: \.element.id) { index, record in
+                                featuredCard(record)
+                                if index < trendingModels.count - 1 {
+                                    Divider().padding(.leading, 56)
+                                }
+                            }
+                        }
+                    }
+#endif
                 }
             }
             .padding(.bottom, 12)
         }
     }
 
+    @ViewBuilder
+    private func curatedCatalogHeader(visibleCount: Int, totalCount: Int) -> some View {
+        let countText = String.localizedStringWithFormat(
+            String(localized: "Showing %d of %d models"),
+            visibleCount,
+            totalCount
+        )
+        let title: LocalizedStringKey = showAllCuratedModels ? "Featured" : "Fits on your device"
+
+#if os(macOS)
+        IndustrialSectionHeader(title, detail: countText) {
+            curatedVisibilityButton
+        }
+#else
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(FontTheme.body.weight(.semibold))
+                    .foregroundStyle(AppTheme.text)
+                Text(countText)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+            Spacer(minLength: 8)
+            curatedVisibilityButton
+        }
+#endif
+    }
+
+    private var curatedVisibilityButton: some View {
+        Button {
+            withAnimation(.snappy) {
+                showAllCuratedModels.toggle()
+            }
+        } label: {
+            Label(
+                showAllCuratedModels
+                    ? LocalizedStringKey("Show only models that fit")
+                    : LocalizedStringKey("Show all models"),
+                systemImage: showAllCuratedModels ? "line.3.horizontal.decrease.circle.fill" : "eye.fill"
+            )
+            .font(.caption.weight(.semibold))
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .accessibilityValue(showAllCuratedModels ? LocalizedStringKey("Show all models") : LocalizedStringKey("Fits on your device"))
+    }
+
     private func featuredCard(_ featured: ModelRecord) -> some View {
         Button { Task { await open(featured) } } label: {
+#if os(macOS)
+            HStack(alignment: .center, spacing: 10) {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: 6, height: 6)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(featured.displayName)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(AppTheme.text)
+                        .lineLimit(1)
+                    Text(featured.publisher)
+                        .textCase(.uppercase)
+                        .industrialStat()
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if featured.pipeline_tag == "image-text-to-text" {
+                    ExploreVisionCapabilityBadge()
+                }
+                if showsFitsBadge(for: featured) {
+                    IndustrialBadge("Fits", tint: .green)
+                } else if showAllCuratedModels && curatedFitStatus(for: featured) == .tooLarge {
+                    IndustrialBadge("May not fit", tint: .orange)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Color.primary.opacity(0.3))
+            }
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+#else
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "sparkles")
                     .font(.callout.weight(.semibold))
@@ -906,16 +746,15 @@ struct ExploreView: View {
                 Spacer(minLength: 8)
 
                 if featured.pipeline_tag == "image-text-to-text" {
-                    Image(systemName: "eye.fill")
-                        .font(.caption2)
-                        .foregroundStyle(Color.purple)
-                        .help(LocalizedStringKey("Vision"))
+                    ExploreVisionCapabilityBadge()
                 }
                 if showsFitsBadge(for: featured) {
                     Image(systemName: "checkmark.seal.fill")
                         .font(.caption)
                         .foregroundStyle(Color.green)
                         .help(LocalizedStringKey("Fits on your device"))
+                } else if showAllCuratedModels && curatedFitStatus(for: featured) == .tooLarge {
+                    recordBadge(LocalizedStringKey("May not fit"), tint: .orange)
                 }
                 Image(systemName: "chevron.right")
                     .font(.caption)
@@ -924,6 +763,7 @@ struct ExploreView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
+#endif
         }
         .visionHoverHighlight(cornerRadius: 14)
         .buttonStyle(.plain)
@@ -937,7 +777,6 @@ struct ExploreView: View {
                 heroSection
             }
             #else
-            // iOS implementation
             Section {
                 heroSection
                     .padding(.horizontal, 0)
@@ -947,7 +786,26 @@ struct ExploreView: View {
             .listRowInsets(EdgeInsets(top: 0, leading: AppTheme.padding, bottom: 0, trailing: AppTheme.padding))
             #endif
         } else {
-            #if os(macOS) || os(visionOS)
+            #if os(macOS)
+            VStack(alignment: .leading, spacing: 8) {
+                IndustrialSectionHeader(
+                    "Results",
+                    detail: filteredSearchResults.isEmpty ? nil : "\(filteredSearchResults.count)"
+                )
+                LazyVStack(spacing: 0) {
+                    ForEach(filteredSearchResults, id: \._stableKey) { record in
+                        exploreCard {
+                            IndustrialHoverRow {
+                                recordButton(record, context: .search).buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    if vm.canLoadMore {
+                        ProgressView().onAppear { vm.loadNextPage() }
+                    }
+                }
+            }
+            #elseif os(visionOS)
             VStack(alignment: .leading, spacing: 16) {
                 Text(LocalizedStringKey("Results"))
                     .font(FontTheme.heading)
@@ -976,10 +834,32 @@ struct ExploreView: View {
 
     // MARK: - Filtered Results
     
-    private var filteredRecommended: [ModelRecord] {
+    private var trendingFormat: ModelFormat? {
+        switch effectiveSearchMode {
+        case .gguf: return .gguf
+        case .mlx: return .mlx
+        default: return nil
+        }
+    }
+
+    /// Trending Hub repos for the active format, minus anything already
+    /// featured, capped so the section stays a shelf rather than a feed.
+    private var filteredTrending: [ModelRecord] {
+        let featuredIDs = Set(allFilteredRecommended.map(\.id))
+        let mode = effectiveSearchMode
+        var seen = Set<String>()
+        let matches = vm.trendingRecords.filter { rec in
+            guard seen.insert(rec.id).inserted else { return false }
+            guard !featuredIDs.contains(rec.id) else { return false }
+            return mode.includes(rec) && filterManager.shouldIncludeModel(rec)
+        }
+        return Array(matches.prefix(8))
+    }
+
+    private var allFilteredRecommended: [ModelRecord] {
         var seen = Set<String>()
         let mode = effectiveSearchMode
-        return vm.recommended.filter { rec in
+        let matches = vm.recommended.filter { rec in
             guard seen.insert(rec.id).inserted else { return false }
             if rec.formats.contains(.afm) {
                 return filterManager.shouldIncludeModel(rec)
@@ -992,12 +872,29 @@ struct ExploreView: View {
                 return mode == .coreai && filterManager.shouldIncludeModel(rec)
             }
 
-            // Respect the GGUF/MLX toggle when showing curated recommendations
-            // on iOS/iPadOS so formats don’t mix across modes.
-            let matchesMode = mode == .et ? true : mode.includes(rec)
-
-            return matchesMode
+            return mode.includes(rec)
                 && filterManager.shouldIncludeModel(rec)
+        }
+        return matches.sorted { lhs, rhs in
+            let lhsIsNoema = lhs.id == "NoemaAI-labs/Noema-2B-GGUF"
+            let rhsIsNoema = rhs.id == "NoemaAI-labs/Noema-2B-GGUF"
+            if lhsIsNoema != rhsIsNoema { return lhsIsNoema }
+
+            let lhsRAM = lhs.minimumRAMBytes(for: mode.formatFilter) ?? Int64.max
+            let rhsRAM = rhs.minimumRAMBytes(for: mode.formatFilter) ?? Int64.max
+            if lhsRAM != rhsRAM { return lhsRAM < rhsRAM }
+            return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private var filteredRecommended: [ModelRecord] {
+        let matches = allFilteredRecommended
+        guard !showAllCuratedModels else { return matches }
+        return matches.filter {
+            CuratedModelDeviceFit.shouldShowByDefault(
+                $0,
+                format: effectiveSearchMode.formatFilter
+            )
         }
     }
 
@@ -1057,11 +954,11 @@ struct ExploreView: View {
     /// device’s per‑app budget. This avoids promising a fit when the detailed
     /// quant estimates in the detail sheet would later show a red X.
     private func showsFitsBadge(for record: ModelRecord) -> Bool {
-        guard record.hasInstallableQuant, let minRAM = record.minRAMBytes else { return false }
-        guard let budget = DeviceRAMInfo.current().conservativeLimitBytes() else { return false }
+        curatedFitStatus(for: record) == .fits
+    }
 
-        let safetyMargin = 0.92
-        return Double(minRAM) <= Double(budget) * safetyMargin
+    private func curatedFitStatus(for record: ModelRecord) -> CuratedModelDeviceFit.Status {
+        CuratedModelDeviceFit.status(for: record, format: effectiveSearchMode.formatFilter)
     }
 
     @ViewBuilder
@@ -1070,7 +967,12 @@ struct ExploreView: View {
         let showsVisionLabel = context == .curated
 
         Button { Task { await open(record) } } label: {
-            HStack(alignment: .center, spacing: 14) {
+            HStack(alignment: .center, spacing: recordRowIconSpacing) {
+#if os(macOS)
+                Circle()
+                    .fill(context == .cached ? Color.orange : Color.accentColor)
+                    .frame(width: 6, height: 6)
+#else
                 Image(systemName: context == .cached ? "clock.arrow.circlepath" : "cube.fill")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(context == .cached ? Color.orange : Color.accentColor)
@@ -1079,6 +981,7 @@ struct ExploreView: View {
                         (context == .cached ? Color.orange : Color.accentColor).opacity(0.12),
                         in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
+#endif
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
@@ -1090,10 +993,7 @@ struct ExploreView: View {
                         if UIConstants.showMultimodalUI && !record.formats.contains(.afm) {
                             if record.pipeline_tag == "image-text-to-text" {
                                 if showsVisionEye {
-                                    Image(systemName: "eye.fill")
-                                        .font(.caption2)
-                                        .foregroundStyle(Color.purple)
-                                        .help(LocalizedStringKey("Vision-capable model"))
+                                    ExploreVisionCapabilityBadge()
                                 }
                             } else {
                                 VisionBadge(repoId: record.id, token: huggingFaceToken, showsIcon: showsVisionEye)
@@ -1101,30 +1001,15 @@ struct ExploreView: View {
                         }
                         
                         if showsFitsBadge(for: record) {
-                            Text(LocalizedStringKey("Fits"))
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.green)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.green.opacity(0.15), in: Capsule())
+                            recordBadge(LocalizedStringKey("Fits"), tint: .green)
                         }
-                        
+
                         if context == .cached {
-                            Text(LocalizedStringKey("Offline cache"))
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.orange)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.15), in: Capsule())
+                            recordBadge(LocalizedStringKey("Offline cache"), tint: .orange)
                         }
-                        
+
                         if showsVisionLabel && record.pipeline_tag == "image-text-to-text" {
-                            Text(LocalizedStringKey("Vision"))
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.purple)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.purple.opacity(0.15), in: Capsule())
+                            recordBadge(LocalizedStringKey("Vision"), tint: .purple)
                         }
                         
                         if !record.formats.contains(.afm) {
@@ -1163,6 +1048,26 @@ struct ExploreView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+#if os(macOS)
+    private var recordRowIconSpacing: CGFloat { 10 }
+#else
+    private var recordRowIconSpacing: CGFloat { 14 }
+#endif
+
+    @ViewBuilder
+    private func recordBadge(_ title: LocalizedStringKey, tint: Color) -> some View {
+#if os(macOS)
+        IndustrialBadge(title, tint: tint)
+#else
+        Text(title)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(tint.opacity(0.15), in: Capsule())
+#endif
     }
 
     private func authorListText(for record: ModelRecord) -> String {
@@ -1256,27 +1161,6 @@ struct ExploreView: View {
         }
         #endif
     }
-
-    #if os(macOS)
-    private var importMenuButton: some View {
-        Menu {
-            Button(action: { presentImporter(.gguf) }) {
-                Label(LocalizedStringKey("Import GGUF"), systemImage: "tray.and.arrow.down.fill")
-            }
-            if supportsMLXImport {
-                Button(action: { presentImporter(.mlx) }) {
-                    Label(LocalizedStringKey("Import MLX"), systemImage: "bolt.fill")
-                }
-            }
-        } label: {
-            Label(LocalizedStringKey("Import"), systemImage: "square.and.arrow.down")
-                .labelStyle(.titleAndIcon)
-        }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.small)
-        .help(LocalizedStringKey("Import"))
-    }
-    #endif
 
     private var supportsMLXImport: Bool {
         #if os(iOS) || os(visionOS) || os(tvOS)
@@ -1382,6 +1266,20 @@ struct ExploreView: View {
         loadingDetail = false
     }
 
+    private static let overfitCatalogRecord = ModelRecord(
+        id: "NoemaAI-labs/Noema-Overfit",
+        displayName: "Noema Overfit",
+        publisher: "Noema",
+        summary: nil,
+        hasInstallableQuant: true,
+        formats: [.gguf],
+        installed: false,
+        tags: ["gguf", "noema", "paged", "moe"],
+        pipeline_tag: "text-generation",
+        minRAMBytes: nil,
+        supportsVision: false
+    )
+
     private var afmUnavailableReasonForOpen: String? {
         guard afmAvailabilityState.isSupportedDevice else {
             return String(localized: "Apple Foundation Models are not supported on this device.")
@@ -1390,38 +1288,197 @@ struct ExploreView: View {
         return afmAvailabilityState.unavailableReason?.message
     }
 
-#if canImport(LeapSDK)
-    @MainActor
-    private func openLeap(entry: LeapCatalogEntry, url: URL, runner: ModelRunner) {
-        let architectureLabels = LocalModel.architectureLabels(for: url, format: .et, modelID: entry.modelID)
-        let isVision = entry.isVision || LeapCatalogService.bundleLikelyVision(at: url)
-        let local = modelManager.downloadedModels.first(where: { $0.modelID == entry.modelID && $0.quant == entry.quantization }) ??
-            LocalModel(
-                modelID: entry.modelID,
-                name: entry.displayName,
-                url: url,
-                quant: entry.quantization,
-                architecture: architectureLabels.display,
-                architectureFamily: architectureLabels.family,
-                format: .et,
-                sizeGB: Double(entry.sizeBytes) / 1_073_741_824.0,
-                isMultimodal: isVision,
-                isToolCapable: true,
-                isDownloaded: true,
-                downloadDate: Date(),
-                lastUsedDate: nil,
-                isFavourite: false,
-                totalLayers: 0,
-                moeInfo: nil
-            )
-        var settings = modelManager.settings(for: local)
-        settings.contextLength = max(1, settings.contextLength)
-        chatVM.activate(runner: runner, url: url, settings: settings)
-        modelManager.updateSettings(settings, for: local)
-        modelManager.markModelUsed(local)
-        tabRouter.selection = .chat
+}
+
+/// A single, deliberate entry point for the paged-model catalog. It opens the
+/// live Hub repo inside Explore so its packages use Noema's download pipeline.
+private struct OverfitModelCollectionLink: View {
+    let onOpen: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isRevealed = false
+#if os(macOS)
+    @State private var isHovering = false
+#endif
+
+    var body: some View {
+        Button(action: onOpen) {
+#if os(macOS)
+            macContent
+#else
+            touchContent
+#endif
+        }
+        .buttonStyle(OverfitCollectionLinkStyle(reduceMotion: reduceMotion))
+        .opacity(isRevealed ? 1 : 0)
+        .offset(y: isRevealed || reduceMotion ? 0 : 6)
+        .onAppear {
+            guard !isRevealed else { return }
+            withAnimation(AppMotion.resolve(AppMotion.submenu, reduceMotion: reduceMotion)) {
+                isRevealed = true
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(LocalizedStringKey("Open in Explore"))
+    }
+
+#if os(macOS)
+    private var macContent: some View {
+        HStack(alignment: .center, spacing: 14) {
+            OverfitExpertBankMark(isRevealed: isRevealed, reduceMotion: reduceMotion)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(LocalizedStringKey("Paged model collection"))
+                    .textCase(.uppercase)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .tracking(0.4)
+                    .foregroundStyle(Color.indigo)
+                Text(LocalizedStringKey("Noema Overfit"))
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.text)
+                Text(LocalizedStringKey("Run larger models by paging experts from storage."))
+                    .font(.system(size: 12))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+
+            Spacer(minLength: 16)
+
+            VStack(alignment: .trailing, spacing: 8) {
+                IndustrialBadge("Mixture-of-Experts", tint: .indigo, dot: true)
+                Label(LocalizedStringKey("Open in Explore"), systemImage: "chevron.right")
+                    .textCase(.uppercase)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(0.35)
+                    .foregroundStyle(Color.indigo)
+                    .offset(x: isHovering && !reduceMotion ? 2 : 0)
+                    .animation(AppMotion.resolve(AppMotion.snappy, reduceMotion: reduceMotion), value: isHovering)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.indigo.opacity(isHovering ? 0.10 : 0.065))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.indigo.opacity(isHovering ? 0.32 : 0.20), lineWidth: 0.5)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .onHover { isHovering = $0 }
+        .animation(AppMotion.resolve(AppMotion.snappy, reduceMotion: reduceMotion), value: isHovering)
+    }
+#else
+    private var touchContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                OverfitExpertBankMark(isRevealed: isRevealed, reduceMotion: reduceMotion)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(LocalizedStringKey("Paged model collection"))
+                        .textCase(.uppercase)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .tracking(0.45)
+                        .foregroundStyle(Color.indigo)
+                    Text(LocalizedStringKey("Noema Overfit"))
+                        .font(FontTheme.heading)
+                        .foregroundStyle(AppTheme.text)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.right")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Color.indigo)
+            }
+
+            Text(LocalizedStringKey("Run larger models by paging experts from storage."))
+                .font(FontTheme.body)
+                .foregroundStyle(AppTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Text(LocalizedStringKey("Mixture-of-Experts"))
+                    .textCase(.uppercase)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color.indigo)
+                Spacer(minLength: 8)
+                Text(LocalizedStringKey("Open in Explore"))
+                    .font(FontTheme.caption.weight(.semibold))
+                    .foregroundStyle(Color.indigo)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.indigo.opacity(0.09))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.indigo.opacity(0.22), lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .visionHoverHighlight(cornerRadius: 14)
     }
 #endif
+}
+
+private struct OverfitExpertBankMark: View {
+    let isRevealed: Bool
+    let reduceMotion: Bool
+
+    private let heights: [CGFloat] = [13, 22, 29, 19, 25]
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 3) {
+            ForEach(Array(heights.enumerated()), id: \.offset) { index, height in
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(index == 2 ? Color.indigo : Color.indigo.opacity(0.38))
+                    .frame(width: 4, height: height)
+                    .scaleEffect(y: isRevealed || reduceMotion ? 1 : 0.2, anchor: .bottom)
+                    .animation(
+                        reduceMotion
+                            ? nil
+                            : .spring(response: 0.42, dampingFraction: 0.78)
+                                .delay(Double(index) * 0.035),
+                        value: isRevealed
+                    )
+            }
+        }
+        .frame(width: 48, height: 48)
+        .background(Color.indigo.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.indigo.opacity(0.18), lineWidth: 0.5)
+        )
+        .accessibilityHidden(true)
+    }
+}
+
+private struct OverfitCollectionLinkStyle: ButtonStyle {
+    let reduceMotion: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.99 : 1)
+            .opacity(configuration.isPressed ? 0.84 : 1)
+            .animation(AppMotion.resolve(.easeOut(duration: 0.10), reduceMotion: reduceMotion), value: configuration.isPressed)
+    }
+}
+
+private struct ExploreVisionCapabilityBadge: View {
+    var body: some View {
+        Group {
+#if os(macOS)
+            IndustrialBadge("Vision", tint: .purple)
+#else
+            Image(systemName: "eye.fill")
+                .font(.caption2)
+                .foregroundStyle(Color.purple)
+#endif
+        }
+        .accessibilityLabel(LocalizedStringKey("Vision-capable model"))
+        .help(LocalizedStringKey("Vision-capable model"))
+    }
 }
 
 private struct VisionBadge: View {
@@ -1434,15 +1491,7 @@ private struct VisionBadge: View {
     var body: some View {
         Group {
             if isVision && showsIcon {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.yellow, lineWidth: 2)
-                        .frame(width: 22, height: 22)
-                    Image(systemName: "eye.fill")
-                        .foregroundColor(Color.yellow)
-                        .font(.system(size: 11, weight: .semibold))
-                }
-                .help(LocalizedStringKey("Vision-capable model"))
+                ExploreVisionCapabilityBadge()
             } else if isVision {
                 Color.clear.frame(width: 0, height: 0)
             }
@@ -1487,6 +1536,9 @@ private struct ToolBadge: View {
     var body: some View {
         Group {
             if isToolCapable {
+#if os(macOS)
+                IndustrialBadge("Tools", tint: .secondary)
+#else
                 HStack(spacing: 2) {
                     Image(systemName: "wrench.fill")
                         .font(.caption2)
@@ -1500,6 +1552,7 @@ private struct ToolBadge: View {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color(.systemGray5))
                 )
+#endif
             }
         }
         .task(id: repoId) {
@@ -1527,6 +1580,7 @@ struct ExploreDetailView: View, Identifiable {
     @EnvironmentObject var chatVM: ChatVM
     @EnvironmentObject var tabRouter: TabRouter
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 #if os(macOS)
     @Environment(\.macModalDismiss) private var macModalDismiss
 #endif
@@ -1540,6 +1594,26 @@ struct ExploreDetailView: View, Identifiable {
     @AppStorage("offGrid") private var offGrid = false
     @State private var quantSort: QuantSortOption = .quant
     @State private var metaVersion: Int = 0
+    @State private var pendingProjectorChoice: PendingProjectorChoice?
+    @State private var availableProjectorArtifacts: [VisionProjectorArtifact] = []
+    @State private var selectedProjectorArtifactID = "__app_default__"
+
+    private static let appDefaultProjectorSelectionID = "__app_default__"
+    private static let projectorByteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter
+    }()
+
+    private struct PendingProjectorChoice: Identifiable {
+        let id = UUID()
+        let quant: QuantInfo
+        let preference: VisionProjectorDownloadPreference
+        let alternatives: [VisionProjectorArtifact]
+    }
 
     var body: some View {
         NavigationStack {
@@ -1570,18 +1644,31 @@ struct ExploreDetailView: View, Identifiable {
                         moeGuidanceCard(guidance)
                     }
 
-                    infoCard(title: LocalizedStringKey("Available Quantizations"), trailing: {
+                    if shouldShowModelCard {
+                        ModelCardSection(
+                            repoID: detail.id,
+                            token: huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? nil
+                                : huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                    }
+
+                    projectorQualityOverrideRow
+
+                    infoCard(title: artifactSectionTitle, trailing: {
                         Picker(LocalizedStringKey("Sort"), selection: $quantSort) {
                             ForEach(QuantSortOption.allCases, id: \.self) { opt in
-                                Text(opt.titleKey).tag(opt)
+                                Text(opt.titleKey(isModelCatalog: isPagedModelCatalog)).tag(opt)
                             }
                         }
                         .pickerStyle(.menu)
                         .fixedSize()
-                        .accessibilityLabel(LocalizedStringKey("Sort quantizations"))
+                        .accessibilityLabel(
+                            LocalizedStringKey(isPagedModelCatalog ? "Sort models" : "Sort quantizations")
+                        )
                     }) {
                         if eligibleQuants.isEmpty {
-                            Text(LocalizedStringKey("No quant files available"))
+                            Text(LocalizedStringKey(isPagedModelCatalog ? "No models yet" : "No quant files available"))
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         } else {
@@ -1601,7 +1688,14 @@ struct ExploreDetailView: View, Identifiable {
                 .frame(maxWidth: 720, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
+            // On macOS this view lives inside a fixed-frame MacModalHost card, so
+            // ignoring the safe area only lets the opaque fill bleed past the card's
+            // rounded edge. Keep the extension on iOS where it's a full-screen sheet.
+            #if os(macOS)
+            .background(Color.detailSheetBackground)
+            #else
             .background(Color.detailSheetBackground.ignoresSafeArea())
+            #endif
             #if !os(macOS)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button(LocalizedStringKey("Close")) { close() } }
@@ -1624,6 +1718,9 @@ struct ExploreDetailView: View, Identifiable {
                 _ = await HuggingFaceMetadataCache.fetchAndCache(repoId: detail.id, token: token.isEmpty ? nil : token)
                 metaVersion &+= 1
             }
+            .task(id: projectorOptionsTaskID) {
+                await refreshProjectorOptions()
+            }
             .onDisappear {
                 if !downloadController.items.isEmpty {
                     downloadController.showOverlay = true
@@ -1631,6 +1728,45 @@ struct ExploreDetailView: View, Identifiable {
                 cancelAllRemotePolling()
             }
         }
+        .sheet(item: $pendingProjectorChoice) { choice in
+            VisionProjectorFallbackSheet(
+                modelID: detail.id,
+                preference: choice.preference,
+                alternatives: choice.alternatives,
+                onSelect: { artifact in
+                    pendingProjectorChoice = nil
+                    beginLocalDownload(
+                        info: choice.quant,
+                        projectorDecision: .selected(artifact)
+                    )
+                },
+                onWithoutVision: {
+                    pendingProjectorChoice = nil
+                    beginLocalDownload(info: choice.quant, projectorDecision: .skip)
+                },
+                onCancel: {
+                    pendingProjectorChoice = nil
+                }
+            )
+        }
+    }
+
+    /// README fetching only makes sense for Hugging Face repos: an
+    /// "owner/name" id with at least one HTTP-downloadable artifact. Apple
+    /// Foundation and local CoreAI catalog entries have no hub model card.
+    private var shouldShowModelCard: Bool {
+        guard !detail.quants.contains(where: { $0.format == .afm }) else { return false }
+        let parts = detail.id.split(separator: "/")
+        guard parts.count == 2, parts.allSatisfy({ !$0.isEmpty }) else { return false }
+        return detail.quants.isEmpty || detail.quants.contains { $0.downloadURL.scheme?.hasPrefix("http") == true }
+    }
+
+    private var isPagedModelCatalog: Bool {
+        !detail.quants.isEmpty && detail.quants.allSatisfy(\.isPagedPackage)
+    }
+
+    private var artifactSectionTitle: LocalizedStringKey {
+        isPagedModelCatalog ? "Models" : "Available Quantizations"
     }
 
     private var eligibleQuants: [QuantInfo] {
@@ -1693,6 +1829,10 @@ struct ExploreDetailView: View, Identifiable {
     private func quantSortKey(_ q: QuantInfo) -> (Int, Int, Int, Int, Int, String) {
         // Lower tuple compares first; smaller values rank higher
         let label = q.label.uppercased()
+        if isPagedModelCatalog {
+            let modelName = (q.pagedModelDisplayName ?? q.label).uppercased()
+            return (0, 0, 0, 0, 0, modelName)
+        }
         // Core AI bundles are platform targets, not a quality ladder — rank by
         // fit for the current device, then by size (smaller first).
         if q.format == .coreai {
@@ -1766,13 +1906,209 @@ struct ExploreDetailView: View, Identifiable {
             return
         }
         if isRemoteDownloadMode {
+            guard !info.isPagedPackage else {
+                remoteDownloadErrorMap[info.label] = String(
+                    localized: "Paged packages can only be downloaded to this device."
+                )
+                return
+            }
             await startRemoteDownload(info: info)
             return
         }
+        guard info.format == .gguf else {
+            beginLocalDownload(info: info)
+            return
+        }
+
+        // The multipart installer already owns the complete manifest,
+        // resident-GGUF, and expert-bank plan. Paged packages do not carry a
+        // vision projector, so do not run the unrelated projector probe.
+        if info.isPagedPackage {
+            beginLocalDownload(info: info, projectorDecision: .skip)
+            return
+        }
+
+        if let projectorOverrideArtifact {
+            beginLocalDownload(
+                info: info,
+                projectorDecision: .selected(projectorOverrideArtifact)
+            )
+            return
+        }
+
         downloading.insert(info.label)
         progressMap[info.label] = 0
         speedMap[info.label] = 0
-        downloadController.start(detail: detail, quant: info)
+
+        let token = huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let plan = await VisionModelDetector.projectorDownloadPlan(
+            repoIDs: VisionModelDetector.repositoryCandidates(
+                modelID: detail.id,
+                downloadURL: info.downloadURL
+            ),
+            token: token.isEmpty ? nil : token,
+            preference: .current
+        )
+        guard !Task.isCancelled else {
+            downloading.remove(info.label)
+            return
+        }
+
+        if plan.requiresUserChoice {
+            downloading.remove(info.label)
+            pendingProjectorChoice = PendingProjectorChoice(
+                quant: info,
+                preference: plan.preference,
+                alternatives: plan.alternatives
+            )
+            return
+        }
+
+        let decision: DownloadController.ProjectorDownloadDecision = plan.selected
+            .map { .selected($0) }
+            ?? .automatic
+        downloadController.start(
+            detail: detail,
+            quant: info,
+            projectorDecision: decision
+        )
+    }
+
+    @MainActor
+    private func beginLocalDownload(
+        info: QuantInfo,
+        projectorDecision: DownloadController.ProjectorDownloadDecision = .automatic
+    ) {
+        downloading.insert(info.label)
+        progressMap[info.label] = 0
+        speedMap[info.label] = 0
+        downloadController.start(
+            detail: detail,
+            quant: info,
+            projectorDecision: projectorDecision
+        )
+    }
+
+    @ViewBuilder
+    private var projectorQualityOverrideRow: some View {
+        if !isRemoteDownloadMode, !availableProjectorArtifacts.isEmpty {
+            Group {
+                if horizontalSizeClass == .compact {
+                    VStack(alignment: .leading, spacing: 10) {
+                        projectorOverrideLabel
+                        projectorOverridePicker
+                    }
+                } else {
+                    HStack(alignment: .center, spacing: 12) {
+                        projectorOverrideLabel
+                        Spacer(minLength: 12)
+                        projectorOverridePicker
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var projectorOverrideLabel: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.visionAccent)
+                .frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("mmproj File for This Model")
+                    .font(FontTheme.caption.weight(.semibold))
+                    .foregroundStyle(AppTheme.text)
+                Text("Overrides only this model's companion mmproj download.")
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+        }
+    }
+
+    private var projectorOverridePicker: some View {
+        Picker("mmproj File for This Model", selection: $selectedProjectorArtifactID) {
+            Text(appDefaultProjectorLabel)
+                .tag(Self.appDefaultProjectorSelectionID)
+            ForEach(availableProjectorArtifacts) { artifact in
+                Text(projectorOptionLabel(artifact))
+                    .tag(artifact.id)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityLabel(LocalizedStringKey("mmproj File for This Model"))
+    }
+
+    private var projectorOverrideArtifact: VisionProjectorArtifact? {
+        guard selectedProjectorArtifactID != Self.appDefaultProjectorSelectionID else { return nil }
+        return availableProjectorArtifacts.first { $0.id == selectedProjectorArtifactID }
+    }
+
+    private var appDefaultProjectorLabel: String {
+        let preference = VisionProjectorDownloadPreference.current
+        let title = String(localized: String.LocalizationValue(preference.mmprojTitleKey))
+        return String.localizedStringWithFormat(String(localized: "App Default (%@)"), title)
+    }
+
+    private func projectorOptionLabel(_ artifact: VisionProjectorArtifact) -> String {
+        var components = ["\(artifact.qualityLabel) mmproj"]
+        if artifact.size > 0 {
+            components.append(Self.projectorByteFormatter.string(fromByteCount: artifact.size))
+        }
+        return components.joined(separator: " · ")
+    }
+
+    private var projectorOptionsTaskID: String {
+        let token = huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let format = formatFilter?.rawValue ?? "all"
+        return "\(detail.id)|\(format)|\(token)"
+    }
+
+    private var projectorRepositoryCandidates: [String] {
+        var candidates: [String] = []
+        for quant in eligibleQuants where quant.format == .gguf {
+            for repositoryID in VisionModelDetector.repositoryCandidates(
+                modelID: detail.id,
+                downloadURL: quant.downloadURL
+            ) where !candidates.contains(repositoryID) {
+                candidates.append(repositoryID)
+            }
+        }
+        return candidates
+    }
+
+    @MainActor
+    private func refreshProjectorOptions() async {
+        guard !isRemoteDownloadMode, !projectorRepositoryCandidates.isEmpty else {
+            availableProjectorArtifacts = []
+            selectedProjectorArtifactID = Self.appDefaultProjectorSelectionID
+            return
+        }
+
+        let token = huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let plan = await VisionModelDetector.projectorDownloadPlan(
+            repoIDs: projectorRepositoryCandidates,
+            token: token.isEmpty ? nil : token,
+            preference: .highestQuality
+        )
+        guard !Task.isCancelled else { return }
+
+        let ordered = [plan.selected].compactMap { $0 } + plan.alternatives
+        var seenQualities: Set<String> = []
+        let uniqueQualities = ordered.filter {
+            seenQualities.insert($0.qualityLabel.uppercased()).inserted
+        }
+        availableProjectorArtifacts = uniqueQualities
+
+        if selectedProjectorArtifactID != Self.appDefaultProjectorSelectionID,
+           !uniqueQualities.contains(where: { $0.id == selectedProjectorArtifactID }) {
+            selectedProjectorArtifactID = Self.appDefaultProjectorSelectionID
+        }
     }
 
     private func cancelDownload(label: String) {
@@ -1941,22 +2277,6 @@ struct ExploreDetailView: View, Identifiable {
         return "https://huggingface.co/\(trimmedModelID)"
     }
 
-    private func remoteStatusText(for quantLabel: String) -> String? {
-        guard let status = remoteDownloadStatusMap[quantLabel]?.status else { return nil }
-        switch status {
-        case .downloading:
-            return String(localized: "Downloading")
-        case .paused:
-            return String(localized: "Paused")
-        case .completed:
-            return String(localized: "Downloaded")
-        case .failed:
-            return String(localized: "Failed")
-        case .alreadyDownloaded:
-            return String(localized: "Downloaded")
-        }
-    }
-
     private func close() {
 #if os(macOS)
         macModalDismiss()
@@ -1986,7 +2306,7 @@ struct ExploreDetailView: View, Identifiable {
                 isVision = MLXBridge.isVLMModel(at: url)
             case .et:
                 let slug = detail.id.isEmpty ? url.deletingPathExtension().lastPathComponent : detail.id
-                isVision = LeapCatalogService.isVisionQuantizationSlug(slug)
+                isVision = ETModelResolver.isVisionIdentifier(slug)
             case .ane:
                 isVision = false
             case .afm:
@@ -2069,11 +2389,29 @@ extension ExploreView {
                 }
             }
 
+            // Paged Overfit packages (`.noema-paged` directories) import as one
+            // unit: resident.gguf deliberately lacks the expert tensors that live
+            // in the sibling expert banks, so copying it alone orphans the model.
+            var pagedPackageDirs: [URL] = []
+            var seenPagedPackagePaths = Set<String>()
+            for url in urls {
+                for dir in GGUFImportSupport.pagedPackageDirectories(near: url, fileManager: fm) {
+                    if seenPagedPackagePaths.insert(dir.standardizedFileURL.path).inserted {
+                        pagedPackageDirs.append(dir)
+                    }
+                }
+            }
+
             let importPlans = GGUFImportSupport.modelImportPlans(from: urls, fileManager: fm)
 
-            guard !importPlans.isEmpty else {
+            guard !importPlans.isEmpty || !pagedPackageDirs.isEmpty else {
                 importError = String(localized: "No GGUF model files found in selection.")
                 return
+            }
+
+            for packageDir in pagedPackageDirs {
+                let installed = try await importPagedPackage(at: packageDir, installDate: now)
+                modelManager.install(installed)
             }
 
             for plan in importPlans {
@@ -2170,9 +2508,10 @@ extension ExploreView {
                 modelManager.install(installed)
             }
 
-            importSuccess = importPlans.count == 1
+            let importedCount = importPlans.count + pagedPackageDirs.count
+            importSuccess = importedCount == 1
                 ? String(localized: "Imported 1 model. Find it in the Stored tab.")
-                : String(localized: "Imported \(importPlans.count) models. Find them in the Stored tab.")
+                : String(localized: "Imported \(importedCount) models. Find them in the Stored tab.")
         } catch {
             if let err = error as? CocoaError,
                (err.code == .fileReadNoPermission || err.code == .fileWriteNoPermission) {
@@ -2182,6 +2521,53 @@ extension ExploreView {
                 importError = String(localized: "Import failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// Installs a `.noema-paged` package directory as a single model. The copy
+    /// and validation run off the main actor: expert banks reach tens of
+    /// gigabytes and the importing overlay must stay live meanwhile.
+    @MainActor
+    private func importPagedPackage(at sourceDir: URL, installDate now: Date) async throws -> InstalledModel {
+        let stem = sourceDir.deletingPathExtension().lastPathComponent
+        let modelID = "local/\(stem)"
+        let destBase = InstalledModelsStore.baseDir(for: .gguf, modelID: modelID)
+
+        let pkg = try await Task.detached(priority: .userInitiated) {
+            try GGUFImportSupport.installPagedPackage(from: sourceDir, into: destBase)
+        }.value
+
+        let canonical = InstalledModelsStore.canonicalURL(for: pkg.residentGGUFURL, format: .gguf)
+        let quantLabel = GGUFShardNaming.normalizedQuantLabel(for: stem + ".gguf", repoID: nil) + " · Paged"
+        let layers = ModelScanner.layerCount(for: canonical, format: .gguf)
+        var isVision = ProjectorLocator.hasProjectorFile(in: canonical.deletingLastPathComponent())
+        if !isVision {
+            isVision = ModelVisionDetector.guessLlamaVisionModel(from: canonical)
+        }
+        let isToolCap = ToolCapabilityDetector.isToolCapableLocal(url: canonical, format: .gguf)
+        let moeInfo = ModelScanner.moeInfo(for: canonical, format: .gguf) ?? .denseFallback
+        Task { await MoEDetectionStore.shared.update(info: moeInfo, modelID: modelID, quantLabel: quantLabel) }
+        Task {
+            await logger.log("[GGUFImport] paged package=\(sourceDir.lastPathComponent) fingerprint=\(pkg.manifest.fingerprint)")
+        }
+
+        let packageBytes = Int64(clamping: pkg.totalSizeBytes)
+        return InstalledModel(
+            modelID: modelID,
+            quantLabel: quantLabel,
+            url: canonical,
+            format: .gguf,
+            sizeBytes: packageBytes,
+            lastUsed: nil,
+            installDate: now,
+            checksum: nil,
+            isFavourite: false,
+            totalLayers: layers,
+            isMultimodal: isVision,
+            isToolCapable: isToolCap,
+            moeInfo: moeInfo,
+            pagedPackageFingerprint: pkg.manifest.fingerprint,
+            pagedPackageBytes: packageBytes
+        )
     }
 
     @MainActor
@@ -2353,7 +2739,7 @@ enum GGUFImportSupport {
     }
 
     private static let projectorKeywords = ["mmproj", "projector", "image_proj"]
-    private static let mtpKeywords = ["mtp", "draft", "nextn"]
+    private static let mtpKeywords = ["mtp", "nextn"]
     private static let sidecarExtensions = Set(["json", "jinja"])
     private static let sidecarFilenames = Set(["chat_template.txt"])
     private static let excludedSidecarNames = Set(["artifacts.json", "ds_markers.cache.json"])
@@ -2432,7 +2818,10 @@ enum GGUFImportSupport {
             let orderedWeights = orderedWeightFiles(weights)
             guard let primaryWeight = orderedWeights.first else { return nil }
             let scopeDirectory = primaryWeight.deletingLastPathComponent()
+            // A neighboring `.noema-paged` directory must not leak its
+            // manifest.json (or anything else) into this plan's sidecars.
             let scopeFiles = scopeFiles(in: scopeDirectory, fileManager: fileManager)
+                .filter { !isInsidePagedPackage($0) }
             let projectors = scopeFiles.filter(isProjector)
             let projector = matchedProjector(for: orderedWeights, among: projectors, directory: scopeDirectory)
             let mtp = matchedMTP(for: orderedWeights, among: scopeFiles.filter(isMTP), directory: scopeDirectory)
@@ -2465,7 +2854,122 @@ enum GGUFImportSupport {
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
             try? data.write(to: artifactsURL, options: [.atomic])
         }
+        if let primary = weightFiles.first {
+            MtpLocator.invalidateCache(alongside: primary)
+        }
         return artifactsURL
+    }
+
+    // MARK: - Paged (.noema-paged) packages
+
+    /// True when `url` lives inside a `.noema-paged` directory. Name-based on
+    /// purpose: members must be excluded from per-file import plans even when
+    /// sandbox scope stops us from reading the package's manifest.
+    static func isInsidePagedPackage(_ url: URL) -> Bool {
+        let suffix = "." + NoemaPagedPackageManifest.packageDirectoryExtension
+        return url.standardizedFileURL.pathComponents.dropLast().contains { $0.lowercased().hasSuffix(suffix) }
+    }
+
+    /// Resolves one picked URL to the `.noema-paged` package directories it
+    /// denotes: the URL itself when it is a package, packages sitting at the
+    /// top level of a picked folder, or the enclosing package when the user
+    /// picked a file from inside one.
+    static func pagedPackageDirectories(near root: URL, fileManager fm: FileManager = .default) -> [URL] {
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory) else { return [] }
+
+        if !isDirectory.boolValue {
+            guard let package = enclosingPagedPackageByName(for: root) else { return [] }
+            return [package]
+        }
+        if root.pathExtension.lowercased() == NoemaPagedPackageManifest.packageDirectoryExtension {
+            return [root]
+        }
+        if let package = PagedPackageLocator.enclosingPackage(for: root) {
+            return [package]
+        }
+        let children = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        return children
+            .filter { child in
+                (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                    && child.pathExtension.lowercased() == NoemaPagedPackageManifest.packageDirectoryExtension
+            }
+            .sorted { $0.path < $1.path }
+    }
+
+    /// Walks up by directory name only — unlike `PagedPackageLocator` it does
+    /// not require the manifest to be readable, so a bare resident.gguf pick
+    /// still redirects to its package and fails with a package error (not a
+    /// silently orphaned copy) when the manifest is inaccessible.
+    private static func enclosingPagedPackageByName(for url: URL) -> URL? {
+        var current = url.standardizedFileURL.deletingLastPathComponent()
+        for _ in 0..<16 {
+            if current.pathExtension.lowercased() == NoemaPagedPackageManifest.packageDirectoryExtension {
+                return current
+            }
+            let parent = current.deletingLastPathComponent()
+            if parent.path.count >= current.path.count { return nil }
+            current = parent
+        }
+        return nil
+    }
+
+    /// Copies a whole `.noema-paged` package into `baseDir` and returns the
+    /// validated destination package. Copying (not moving) matches the MLX
+    /// folder importer — the user's original stays put — and FileManager
+    /// clones on same-volume APFS, so no second copy of the payload is
+    /// written. Runs synchronously; call off the main actor.
+    static func installPagedPackage(from sourceDir: URL, into baseDir: URL, fileManager fm: FileManager = .default) throws -> NoemaPagedPackage {
+        // Fail before a potentially multi-minute copy, not after.
+        let source = try NoemaPagedPackage.load(at: sourceDir)
+
+        try fm.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        let destination = baseDir.appendingPathComponent(sourceDir.lastPathComponent, isDirectory: true)
+
+        if fm.fileExists(atPath: destination.path) {
+            // Re-import of the identical package: keep the installed copy
+            // rather than re-copying tens of gigabytes.
+            if let existing = try? NoemaPagedPackage.load(at: destination),
+               existing.manifest.fingerprint == source.manifest.fingerprint {
+                try existing.validate(level: .structural)
+                PagedPackageLocator.excludeFromBackupIfNeeded(destination)
+                writePagedArtifactsJSON(in: baseDir, package: existing)
+                return existing
+            }
+            try fm.removeItem(at: destination)
+        }
+
+        do {
+            try fm.copyItem(at: sourceDir, to: destination)
+            let package = try NoemaPagedPackage.load(at: destination)
+            try package.validate(level: .structural)
+            PagedPackageLocator.excludeFromBackupIfNeeded(destination)
+            writePagedArtifactsJSON(in: baseDir, package: package)
+            return package
+        } catch {
+            // A package that fails validation is unusable as a unit; drop the
+            // partial copy so a retry starts clean.
+            try? fm.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    /// `artifacts.json` for a paged install must point at the resident GGUF
+    /// through the package directory (mirrors the download pipeline), not at
+    /// a bare filename in the model root like `writeArtifactsJSON` records.
+    private static func writePagedArtifactsJSON(in baseDir: URL, package: NoemaPagedPackage) {
+        let payload: [String: Any] = [
+            "weights": package.directoryURL.lastPathComponent + "/" + package.manifest.resident.path,
+            "mmproj": NSNull(),
+            "mmprojChecked": true,
+            "mtp": NSNull(),
+            "mtpChecked": true
+        ]
+        let artifactsURL = baseDir.appendingPathComponent("artifacts.json")
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
+            try? data.write(to: artifactsURL, options: [.atomic])
+        }
+        MtpLocator.invalidateCache(alongside: package.residentGGUFURL)
     }
 
     private static func collectSelectedWeightFiles(from roots: [URL], fileManager: FileManager) -> [URL] {
@@ -2488,14 +2992,15 @@ enum GGUFImportSupport {
                 while let next = enumerator?.nextObject() as? URL {
                     if let values = try? next.resourceValues(forKeys: [.isRegularFileKey]),
                        values.isRegularFile == true,
-                       isWeightFile(next) {
+                       isWeightFile(next),
+                       !isInsidePagedPackage(next) {
                         add(next)
                     }
                 }
                 continue
             }
 
-            guard isWeightFile(root) else { continue }
+            guard isWeightFile(root), !isInsidePagedPackage(root) else { continue }
             for expanded in siblingWeights(for: root, fileManager: fileManager) {
                 add(expanded)
             }
@@ -2596,25 +3101,32 @@ enum GGUFImportSupport {
     }
 
     private static func matchedMTP(for weights: [URL], among mtpFiles: [URL], directory: URL) -> URL? {
-        guard !mtpFiles.isEmpty else { return nil }
+        guard let target = weights.first else { return nil }
+        let validated = mtpFiles.filter {
+            if case .sidecarValidated = GGUFMetadata.mtpCapability(targetURL: target, sidecarURL: $0) {
+                return true
+            }
+            return false
+        }
+        guard !validated.isEmpty else { return nil }
 
-        if let hinted = hintedMTP(in: directory, among: mtpFiles) {
+        if let hinted = hintedMTP(in: directory, among: validated) {
             return hinted
         }
-        if mtpFiles.count == 1 {
-            return mtpFiles[0]
+        if validated.count == 1 {
+            return validated[0]
         }
 
         let weightTokens = Set(normalizedTokens(for: weights.first))
         let weightStem = normalizedStem(for: weights.first)
-        return mtpFiles.sorted { lhs, rhs in
-            let leftScore = mtpScore(lhs, weightTokens: weightTokens, weightStem: weightStem)
-            let rightScore = mtpScore(rhs, weightTokens: weightTokens, weightStem: weightStem)
-            if leftScore != rightScore {
-                return leftScore > rightScore
-            }
-            return lhs.lastPathComponent.localizedCaseInsensitiveCompare(rhs.lastPathComponent) == .orderedAscending
-        }.first
+        let scored = validated.map {
+            ($0, mtpScore($0, weightTokens: weightTokens, weightStem: weightStem))
+        }
+        guard let best = scored.max(by: { $0.1 < $1.1 }),
+              scored.filter({ $0.1 == best.1 }).count == 1 else {
+            return nil
+        }
+        return best.0
     }
 
     private static func hintedProjector(in directory: URL, among projectors: [URL]) -> URL? {
@@ -2681,7 +3193,6 @@ enum GGUFImportSupport {
         let lower = candidate.lastPathComponent.lowercased()
         if lower.contains("mtp-") || lower.contains("-mtp") { score += 30 }
         if lower.contains("nextn") { score += 20 }
-        if lower.contains("draft") { score += 10 }
         if lower.contains("f16") || lower.contains("f32") { score += 5 }
         return score
     }
@@ -2725,18 +3236,28 @@ private extension ExploreDetailView {
         let owner = (detail.id.split(separator: "/").first).map(String.init)
 
         return VStack(alignment: .leading, spacing: 12) {
+#if os(macOS)
+            Text(name)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(AppTheme.text)
+#else
             Text(name)
                 .font(FontTheme.largeTitle)
                 .foregroundStyle(AppTheme.text)
+#endif
 
             if lowBitOnlyRepository {
                 VStack(alignment: .leading, spacing: 6) {
+#if os(macOS)
+                    IndustrialBadge("Low-quality quantizations", tint: .orange, systemImage: "exclamationmark.triangle.fill")
+#else
                     Label(LocalizedStringKey("Low-quality quantizations"), systemImage: "exclamationmark.triangle.fill")
                         .font(FontTheme.caption.weight(.semibold))
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
                         .background(Color.orange.opacity(0.16), in: Capsule())
                         .foregroundStyle(Color.orange)
+#endif
 
                     Text(LocalizedStringKey("This repository only includes 1-bit or 2-bit quantizations. They may be degraded compared with higher-bit builds."))
                         .font(FontTheme.caption)
@@ -2757,6 +3278,25 @@ private extension ExploreDetailView {
                     .foregroundStyle(AppTheme.secondaryText)
             }
 
+#if os(macOS)
+            HStack(spacing: 6) {
+                if let parameterCountLabel = detail.parameterCountLabel, !parameterCountLabel.isEmpty {
+                    IndustrialBadge(verbatim: parameterCountLabel, tint: .orange)
+                }
+                if ExploreModelDetailCache.cachedAt(repoID: detail.id) != nil {
+                    IndustrialBadge("Available offline", tint: .green, systemImage: "externaldrive.fill")
+                        .accessibilityLabel(LocalizedStringKey("Available offline"))
+                }
+                if UIConstants.showMultimodalUI && detail.isVision {
+                    IndustrialBadge("Vision-capable", tint: Color.visionAccent, systemImage: "eye.fill")
+                        .accessibilityLabel("Vision-capable model")
+                }
+                if isMoE {
+                    IndustrialBadge("Mixture-of-Experts", tint: Color.moeAccent)
+                        .accessibilityLabel(LocalizedStringKey("Mixture-of-Experts model"))
+                }
+            }
+#else
             if let parameterCountLabel = detail.parameterCountLabel, !parameterCountLabel.isEmpty {
                 Text(parameterCountLabel)
                     .font(FontTheme.caption)
@@ -2795,6 +3335,7 @@ private extension ExploreDetailView {
                     .foregroundStyle(Color.moeAccent)
                     .accessibilityLabel(LocalizedStringKey("Mixture-of-Experts model"))
             }
+#endif
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2884,17 +3425,15 @@ private extension ExploreDetailView {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 Text(title)
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .textCase(.uppercase)
-                    .tracking(1.1)
+                    .tracking(0.3)
                     .foregroundStyle(AppTheme.secondaryText)
                 Spacer(minLength: 16)
                 trailing()
             }
 
-            Rectangle()
-                .fill(AppTheme.cardStroke)
-                .frame(height: 1)
+            IndustrialHairline()
 
             content()
         }
@@ -2916,6 +3455,9 @@ private extension ExploreDetailView {
             if quant.format != .gguf {
                 return String(localized: "Remote endpoint downloads currently support GGUF quantizations only.")
             }
+            if quant.isPagedPackage {
+                return String(localized: "Paged packages can only be downloaded to this device.")
+            }
             if let unavailable = remoteModeUnavailableReason {
                 return unavailable
             }
@@ -2923,6 +3465,10 @@ private extension ExploreDetailView {
         }()
         let afmOpenUnavailableReason: String? = {
             guard quant.format == .afm else { return nil }
+            if detail.id == AppleFoundationModelRegistry.privateCloudModelID {
+                let status = ApplePrivateCloudComputeAvailability.status
+                return status.isAvailableForRequests ? nil : status.message
+            }
             let state = AppleFoundationModelAvailability.current
             guard state.isSupportedDevice, !state.isAvailableNow else { return nil }
             return state.unavailableReason?.message
@@ -2950,7 +3496,8 @@ private extension ExploreDetailView {
             ),
             downloading: downloading.contains(quant.label),
             remoteMode: isRemoteDownloadMode,
-            remoteStatusText: remoteStatusText(for: quant.label),
+            remoteStatusText: nil,
+            remotePaused: remoteStatus?.status == .paused,
             remoteErrorText: remoteDownloadErrorMap[quant.label],
             remoteUnsupportedReason: remoteUnsupportedReason,
             remoteCompleted: remoteCompleted,
@@ -2959,10 +3506,139 @@ private extension ExploreDetailView {
             downloadController: downloadController,
             openAction: { await useModel(info: quant) },
             downloadAction: { await download(info: quant) },
-            cancelAction: { cancelDownload(label: quant.label) }
+            cancelAction: { cancelDownload(label: quant.label) },
+            hubToken: huggingFaceToken
         )
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct VisionProjectorFallbackSheet: View {
+    let modelID: String
+    let preference: VisionProjectorDownloadPreference
+    let alternatives: [VisionProjectorArtifact]
+    let onSelect: (VisionProjectorArtifact) -> Void
+    let onWithoutVision: () -> Void
+    let onCancel: () -> Void
+
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useMB, .useGB]
+        return formatter
+    }()
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Preferred Projector Unavailable")
+                                .font(.title2.weight(.semibold))
+                            Text(
+                                String.localizedStringWithFormat(
+                                    String(localized: "No %@ projector is available for %@."),
+                                    String(localized: String.LocalizationValue(preference.titleKey)),
+                                    modelID
+                                )
+                            )
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "photo.badge.exclamationmark")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                    }
+
+                    Text("Choose an available mmproj alternative. This only changes the projector downloaded with this model; your default preference stays the same.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Available Projectors")
+                            .font(.headline)
+
+                        ForEach(Array(alternatives.enumerated()), id: \.element.id) { index, artifact in
+                            Button {
+                                onSelect(artifact)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.title3)
+                                        .foregroundStyle(Color.accentColor)
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack(spacing: 8) {
+                                            Text(verbatim: artifact.qualityLabel)
+                                                .font(.headline)
+                                            if index == 0 {
+                                                Text("Best Available")
+                                                    .font(.caption2.weight(.semibold))
+                                                    .padding(.horizontal, 7)
+                                                    .padding(.vertical, 3)
+                                                    .background(Color.accentColor.opacity(0.14), in: Capsule())
+                                            }
+                                        }
+                                        Text(verbatim: artifact.filename)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                        if artifact.size > 0 {
+                                            Text(verbatim: Self.byteFormatter.string(fromByteCount: artifact.size))
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+
+                                    Spacer(minLength: 8)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(14)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(
+                                String.localizedStringWithFormat(
+                                    String(localized: "Download %@ projector"),
+                                    artifact.qualityLabel
+                                )
+                            )
+                        }
+                    }
+
+                    Button(role: .destructive, action: onWithoutVision) {
+                        Label("Continue Without Vision", systemImage: "photo.slash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Text("The model weights will still download and work for text. You can add an mmproj later or download the model again with another default projector preference.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(24)
+                .frame(maxWidth: 620, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+            .navigationTitle("Vision Projector")
+#if !os(macOS)
+            .navigationBarTitleDisplayMode(.inline)
+#endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
+            }
+        }
+#if os(macOS)
+        .frame(minWidth: 560, idealWidth: 620, minHeight: 520, idealHeight: 650)
+#endif
     }
 }
 
@@ -3031,7 +3707,9 @@ struct QuantRow: View {
     @Binding var speed: Double
     let downloading: Bool
     let remoteMode: Bool
+    // Unread; kept so Onboarding/GuidedWalkthrough call sites keep compiling.
     let remoteStatusText: String?
+    var remotePaused: Bool = false
     let remoteErrorText: String?
     let remoteUnsupportedReason: String?
     let remoteCompleted: Bool
@@ -3041,11 +3719,17 @@ struct QuantRow: View {
     let openAction: () async -> Void
     let downloadAction: () async -> Void
     let cancelAction: () -> Void
+    var hubToken: String = ""
     @EnvironmentObject var modelManager: AppModelManager
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @StateObject private var localDownloadObserver = QuantRowDownloadObserver()
     @State private var showQuantTypeInfo = false
     @State private var showDownloadPlan = false
+    @State private var remotePagedManifest: NoemaPagedPackageManifest?
+    @State private var remotePagedManifestFailed = false
+    // Flips the row to its active state the instant Download is tapped; the
+    // observer's snapshot lags ~0.5s behind (coalesced + throttled publisher).
+    @State private var pendingDownloadStart = false
 
     private static let byteCountFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -3076,6 +3760,12 @@ struct QuantRow: View {
         .onChangeCompat(of: itemID) { _, newValue in
             localDownloadObserver.observe(downloadController: downloadController, itemID: newValue)
         }
+        .onChangeCompat(of: localDownloadSnapshot.isPresent) { _, present in
+            if present { pendingDownloadStart = false }
+        }
+        .task(id: pagedManifestTaskID) {
+            await loadRemotePagedManifestIfNeeded()
+        }
     }
 
     private var regularLayout: some View {
@@ -3085,7 +3775,16 @@ struct QuantRow: View {
                     .layoutPriority(1)
                 Spacer(minLength: 8)
                 suitabilityBadge
-                trailingControls
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(3)
+                if !isDownloadActive {
+                    trailingControls
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(4)
+                }
+            }
+            if isDownloadActive {
+                activeDownloadRow
             }
             if showDownloadPlan {
                 DownloadPlanPreview(rootTitle: info.label, plan: downloadPlan, byteCountFormatter: Self.byteCountFormatter)
@@ -3096,7 +3795,13 @@ struct QuantRow: View {
     private var compactLayout: some View {
         VStack(alignment: .leading, spacing: 10) {
             metadataBlock
-            if remoteMode && remoteStatusNeedsStackedLayout {
+            if isDownloadActive {
+                HStack(alignment: .center, spacing: 10) {
+                    suitabilityBadge
+                    Spacer(minLength: 8)
+                }
+                activeDownloadRow
+            } else if remoteMode && remoteStatusNeedsStackedLayout {
                 HStack(alignment: .center, spacing: 10) {
                     suitabilityBadge
                     Spacer(minLength: 8)
@@ -3142,6 +3847,10 @@ struct QuantRow: View {
                 downloadPlanToggle
             }
 
+            if info.isPagedPackage {
+                pagedEstimateSummary
+            }
+
             if let coreAIFamily {
                 Text(coreAIFamily.caption)
                     .font(FontTheme.caption)
@@ -3154,6 +3863,9 @@ struct QuantRow: View {
     /// Core AI labels carry the family as a "family/" prefix; the meta line
     /// already names the family, so the title shows just the bundle stem.
     private var displayTitle: String {
+        if let modelName = info.pagedModelDisplayName {
+            return modelName
+        }
         guard info.format == .coreai, let slash = info.label.lastIndex(of: "/") else {
             return info.label
         }
@@ -3185,6 +3897,9 @@ struct QuantRow: View {
     }
 
     private var lowQualityQuantBadge: some View {
+#if os(macOS)
+        IndustrialBadge("Low quality", tint: .orange, systemImage: "exclamationmark.triangle.fill")
+#else
         Label(LocalizedStringKey("Low quality"), systemImage: "exclamationmark.triangle.fill")
             .font(.caption2.weight(.semibold))
             .lineLimit(1)
@@ -3193,37 +3908,178 @@ struct QuantRow: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .background(Color.orange.opacity(0.12), in: Capsule())
+#endif
     }
 
     @ViewBuilder
     private var suitabilityBadge: some View {
+        // A resident-fit estimate reads "doesn't fit" for a model the paged
+        // plan runs on purpose, so an installed paged copy shows its canary
+        // verdict instead. Until one exists, the neutral PAGED marker rides
+        // beside the estimate rather than guessing a classification.
+        if let pagedURL = installedPagedModelURL {
+            if let classification = OverfitPagedFitCache.classification(forModelAt: pagedURL) {
+                OverfitClassificationChip(classification: classification)
+            } else {
+                HStack(spacing: 6) {
+                    assessmentBadge
+                    OverfitPagedChip()
+                }
+            }
+        } else if info.isPagedPackage {
+            HStack(spacing: 6) {
+                if let estimate = remotePagedEstimate {
+                    fitBadge(
+                        status: estimate.status,
+                        architectureSupported: estimate.architectureSupported
+                    )
+                }
+                OverfitPagedChip()
+            }
+        } else {
+            assessmentBadge
+        }
+    }
+
+    /// URL of the locally installed copy of this quant when it is a paged
+    /// install. The paged probe is memoized per URL, so row bodies never
+    /// stat the disk.
+    private var installedPagedModelURL: URL? {
+        guard !remoteMode, info.format == .gguf,
+              let url = modelManager.downloadedModels.first(where: {
+                  $0.modelID == canonicalID && $0.quant == info.label
+              })?.url,
+              OverfitPagedInstallCache.isPaged(url) else {
+            return nil
+        }
+        return url
+    }
+
+    private var remotePagedEstimate: OverfitRemotePackageEstimate? {
+        guard let manifest = remotePagedManifest else { return nil }
+        return OverfitRemotePackageAdvisor.assess(
+            manifest: manifest,
+            manifestBytes: info.pagedManifestDownloadPart?.sizeBytes ?? 0
+        )
+    }
+
+    private var pagedManifestTaskID: String {
+        guard installedPagedModelURL == nil,
+              let url = info.pagedManifestDownloadPart?.downloadURL else {
+            return "none"
+        }
+        return "\(url.absoluteString)|\(hubToken.hashValue)"
+    }
+
+    @MainActor
+    private func loadRemotePagedManifestIfNeeded() async {
+        remotePagedManifest = nil
+        remotePagedManifestFailed = false
+        guard installedPagedModelURL == nil,
+              let url = info.pagedManifestDownloadPart?.downloadURL else { return }
+        let trimmed = hubToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let manifest = try await OverfitRemoteManifestStore.shared.manifest(
+                at: url,
+                token: trimmed.isEmpty ? nil : trimmed
+            )
+            guard !Task.isCancelled else { return }
+            remotePagedManifest = manifest
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            remotePagedManifestFailed = true
+        }
+    }
+
+    @ViewBuilder
+    private var pagedEstimateSummary: some View {
+        if let estimate = remotePagedEstimate {
+            let resident = Self.byteCountFormatter.string(fromByteCount: estimate.residentBytes)
+            let bank = Self.byteCountFormatter.string(fromByteCount: estimate.expertBankBytes)
+            let workingSet = Self.byteCountFormatter.string(fromByteCount: estimate.workingSetBytes)
+            let budget = estimate.budgetBytes.map {
+                Self.byteCountFormatter.string(fromByteCount: $0)
+            } ?? String(localized: "Budget unknown")
+            let context = String.localizedStringWithFormat(
+                String(localized: "%lld tokens"),
+                Int64(estimate.contextCapTokens)
+            )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(String.localizedStringWithFormat(
+                    String(localized: "Resident %@ · Expert bank %@ · Context %@"),
+                    resident,
+                    bank,
+                    context
+                ))
+                Text(String.localizedStringWithFormat(
+                    String(localized: "Estimated for this device: %@ working set against %@ memory budget."),
+                    workingSet,
+                    budget
+                ))
+            }
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(AppTheme.secondaryText)
+            .fixedSize(horizontal: false, vertical: true)
+        } else if !remotePagedManifestFailed && installedPagedModelURL == nil {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text(LocalizedStringKey("Loading paged estimate…"))
+            }
+            .font(.caption2)
+            .foregroundStyle(AppTheme.secondaryText)
+        } else if remotePagedManifestFailed {
+            Label(LocalizedStringKey("Paged estimate unavailable"), systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(AppTheme.secondaryText)
+        }
+    }
+
+    @ViewBuilder
+    private var assessmentBadge: some View {
         let defaultCtx = 4096
+        // An installed paged copy is judged by the paged runtime's working set
+        // (resident + bank + staging), never by the quant's download size.
         let assessment = ModelDeviceFitAdvisor.assess(
             format: info.format,
             sizeBytes: info.sizeBytes,
             contextLength: defaultCtx,
             layerCount: nil,
+            modelURL: installedPagedModelURL,
             benchmark: installedBenchmarkResult
         )
         
+        fitBadge(status: assessment.status, architectureSupported: true)
+    }
+
+    private func fitBadge(
+        status: ModelDeviceFitAssessment.Status,
+        architectureSupported: Bool
+    ) -> some View {
         let labelText: String = {
-            switch assessment.status {
+            guard architectureSupported else { return "UNSUPPORTED" }
+            switch status {
             case .works: return "FITS"
             case .tight: return "TIGHT FIT"
             case .unlikely: return "DOESN'T FIT"
             }
         }()
-        
+
         let color: Color = {
-            switch assessment.status {
+            guard architectureSupported else { return Color.gray }
+            switch status {
             case .works: return Color.green
             case .tight: return Color.orange
             case .unlikely: return Color.red
             }
         }()
 
-        Text(LocalizedStringKey(labelText))
+        return Text(LocalizedStringKey(labelText))
             .font(.system(.caption2, design: .monospaced, weight: .bold))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .foregroundStyle(color.opacity(0.85))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
@@ -3240,70 +4096,9 @@ struct QuantRow: View {
     private var trailingControls: some View {
         if remoteMode {
             remoteTrailingControls
-        } else if localDownloadSnapshot.isPresent && !localDownloadSnapshot.completed {
-            VStack(spacing: 8) {
-                if let error = localDownloadSnapshot.errorDescription {
-                    // Show error state
-                    VStack {
-                        Text(error)
-                            .font(.caption2)
-                            .foregroundStyle(.red)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(width: downloadColumnWidth)
-                    .padding(.leading, 4)
-                } else {
-                    // Show normal progress
-                    // Give the macOS layout extra width so the progress bar matches the tile span.
-                    VStack(alignment: .trailing, spacing: 4) {
-                        if let localStatusText, !localStatusText.isEmpty {
-                            Text(localStatusText)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .frame(maxWidth: .infinity, alignment: .trailing)
-                        }
-                        ModernDownloadProgressView(progress: displayedProgress, speed: displayedSpeed)
-                    }
-                    .frame(width: downloadColumnWidth)
-                    .padding(.leading, 4)
-                }
-                HStack {
-                    Spacer()
-                    
-                    if localDownloadSnapshot.isRetryableError {
-                        // Show retry button for network errors
-                        Button(action: { downloadController.resume(itemID: itemID) }) {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .buttonStyle(.borderless)
-                        .help(LocalizedStringKey("Retry download"))
-                    } else if localDownloadSnapshot.status == .paused || localDownloadSnapshot.canResume {
-                        // Show resume button for intentionally paused downloads
-                        Button(action: { downloadController.resume(itemID: itemID) }) {
-                            Image(systemName: "play.fill")
-                        }
-                        .buttonStyle(.borderless)
-                    } else if localDownloadSnapshot.canPause {
-                        // Show pause button for active downloads
-                        Button(action: { downloadController.pause(itemID: itemID) }) {
-                            Image(systemName: "pause.fill")
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    
-                    Button(action: cancelAction) {
-                        Image(systemName: "stop.fill")
-                            .foregroundStyle(.red)
-                    }
-                    .buttonStyle(.borderless)
-                }
-            }
         } else if isDownloaded {
             VStack {
-                Label(LocalizedStringKey("Ready"), systemImage: "checkmark.circle.fill")
-                    .labelStyle(.badge)
-                    .foregroundColor(.green)
+                IndustrialBadge("Ready", tint: .green, systemImage: "checkmark")
                 if let reason = openUnavailableReason, !reason.isEmpty {
                     Text(reason)
                         .font(.caption2)
@@ -3312,12 +4107,22 @@ struct QuantRow: View {
                         .multilineTextAlignment(.center)
                 }
                 Button(LocalizedStringKey("Open")) { Task { await openAction() } }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.industrial(.prominent))
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(openUnavailableReason != nil)
             }
         } else {
-            Button(LocalizedStringKey("Download")) { Task { await downloadAction() } }
-                .buttonStyle(.borderedProminent)
+            Button(LocalizedStringKey("Download")) {
+                pendingDownloadStart = true
+                Task { @MainActor in
+                    await downloadAction()
+                    if !downloadController.items.contains(where: { $0.id == itemID }) {
+                        pendingDownloadStart = false
+                    }
+                }
+            }
+                .buttonStyle(.industrial(.prominent))
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -3336,21 +4141,6 @@ struct QuantRow: View {
                     .lineLimit(3)
                     .multilineTextAlignment(textAlignment)
             }
-        } else if downloading {
-            VStack(alignment: alignment, spacing: 6) {
-                if let remoteStatusText, !remoteStatusText.isEmpty {
-                    Text(remoteStatusText)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(textAlignment)
-                }
-                ModernDownloadProgressView(progress: displayedProgress, speed: displayedSpeed)
-                    .frame(
-                        maxWidth: (isCompactLayout && remoteStatusNeedsStackedLayout) ? .infinity : downloadColumnWidth,
-                        alignment: (isCompactLayout && remoteStatusNeedsStackedLayout) ? .leading : .trailing
-                    )
-            }
         } else if let remoteErrorText, !remoteErrorText.isEmpty {
             VStack(alignment: alignment, spacing: 6) {
                 Text(remoteErrorText)
@@ -3359,15 +4149,80 @@ struct QuantRow: View {
                     .lineLimit(3)
                     .multilineTextAlignment(textAlignment)
                 Button(LocalizedStringKey("Retry")) { Task { await downloadAction() } }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.industrial(.tinted))
+                    .fixedSize(horizontal: true, vertical: false)
             }
         } else if remoteCompleted {
-            Label(LocalizedStringKey("Downloaded on Remote Endpoint"), systemImage: "checkmark.circle.fill")
-                .labelStyle(.badge)
-                .foregroundColor(.green)
+            IndustrialBadge("Downloaded on Remote Endpoint", tint: .green, systemImage: "checkmark")
         } else {
             Button(LocalizedStringKey("Download")) { Task { await downloadAction() } }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.industrial(.prominent))
+                .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    private var isDownloadActive: Bool {
+        if remoteMode {
+            return downloading && remoteUnsupportedReason == nil
+        }
+        if localDownloadSnapshot.isPresent {
+            return !localDownloadSnapshot.completed
+        }
+        return pendingDownloadStart
+    }
+
+    @ViewBuilder
+    private var activeDownloadRow: some View {
+        if !remoteMode, let error = localDownloadSnapshot.errorDescription {
+            HStack(alignment: .center, spacing: 12) {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                localActionCluster
+            }
+        } else {
+            HStack(alignment: .center, spacing: 12) {
+                DownloadProgressCluster(
+                    progress: displayedProgress,
+                    speed: displayedSpeed,
+                    statusKey: activeStatusKey
+                )
+                if !remoteMode {
+                    localActionCluster
+                }
+            }
+        }
+    }
+
+    private var localActionCluster: DownloadActionCluster {
+        let snapshot = localDownloadSnapshot
+        let resume = { downloadController.resume(itemID: itemID) }
+        let showRetry = snapshot.isRetryableError
+        let showResume = !showRetry && (snapshot.status == .paused || snapshot.canResume)
+        let showPause = !showRetry && !showResume && snapshot.canPause
+        return DownloadActionCluster(
+            onResume: showResume ? resume : nil,
+            onPause: showPause ? { downloadController.pause(itemID: itemID) } : nil,
+            onRetry: showRetry ? resume : nil,
+            onCancel: {
+                pendingDownloadStart = false
+                cancelAction()
+            }
+        )
+    }
+
+    private var activeStatusKey: LocalizedStringKey? {
+        if remoteMode {
+            return remotePaused ? "Paused" : nil
+        }
+        guard let status = localDownloadSnapshot.status else { return nil }
+        switch status {
+        case .queued, .scheduled, .preparing, .paused, .waitingForConnectivity, .retrying, .verifying, .finalizing:
+            return LocalizedStringKey(status.statusLabelKey)
+        case .downloading, .completed, .failed, .cancelled:
+            return nil
         }
     }
 
@@ -3398,11 +4253,6 @@ struct QuantRow: View {
         remoteMode ? speed : localDownloadSnapshot.speed
     }
 
-    private var localStatusText: String? {
-        guard localDownloadSnapshot.errorDescription == nil else { return nil }
-        return localDownloadSnapshot.status?.statusLabelKey
-    }
-
     private var downloadColumnWidth: CGFloat {
 #if os(macOS)
         return 320
@@ -3422,21 +4272,16 @@ struct QuantRow: View {
     private var remoteStatusNeedsStackedLayout: Bool {
         if let reason = remoteUnsupportedReason, !reason.isEmpty { return true }
         if let error = remoteErrorText, !error.isEmpty { return true }
-        return downloading
+        return false
     }
 
     private var sizeText: String {
         guard info.sizeBytes > 0 else {
             return String(localized: "Unknown size")
         }
-        return Self.byteCountFormatter.string(fromByteCount: info.sizeBytes)
-    }
-
-    private var speedText: String {
-        guard speed > 0 else { return "--" }
-        let kb = speed / 1024
-        if kb > 1024 { return String(format: "%.1f MB/s", kb / 1024) }
-        return String(format: "%.0f KB/s", kb)
+        let formatted = Self.byteCountFormatter.string(fromByteCount: info.sizeBytes)
+        guard info.isPagedPackage else { return formatted }
+        return "\(String(localized: "Download")) \(formatted)"
     }
 
     private var downloadPlan: ModelDownloadPlan {
@@ -3469,6 +4314,13 @@ struct QuantRow: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(AppTheme.secondaryText)
                 }
+
+                if let pagedQuant = info.pagedQuantDisplayLabel {
+                    Text(pagedQuant)
+                        .font(.system(.caption, design: .monospaced, weight: .semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
                 
                 Text(sizeText)
                     .font(.system(.caption, design: .monospaced))
@@ -3496,17 +4348,26 @@ struct QuantRow: View {
                 }
                 .frame(maxHeight: 280)
 
+                if info.isPagedPackage {
+                    Divider()
+                    Text(LocalizedStringKey("Overfit (Paged Experts)"))
+                        .font(.subheadline.weight(.semibold))
+                    pagedEstimateSummary
+                }
+
                 HStack {
                     Spacer()
                     Button(LocalizedStringKey("OK")) { showQuantTypeInfo = false }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.industrial(.tinted))
                 }
             }
             .padding(12)
             .lineLimit(nil)
             .frame(maxWidth: 360, alignment: .leading)
+#if !os(macOS)
             .presentationDetents([.medium])
             .presentationDragIndicator(.visible)
+#endif
         }
     }
 
@@ -3824,256 +4685,6 @@ private struct DownloadPlanEntryView: View {
     }
 }
 
-#if canImport(LeapSDK)
-struct LeapRowView: View {
-    let entry: LeapCatalogEntry
-    let titleLineLimit: Int?
-    let openAction: (LeapCatalogEntry, URL, ModelRunner) -> Void
-    @EnvironmentObject var downloadController: DownloadController
-    @EnvironmentObject var modelManager: AppModelManager
-    @EnvironmentObject var chatVM: ChatVM
-    @EnvironmentObject var tabRouter: TabRouter
-    @State private var state: LeapBundleDownloader.State = .notInstalled
-    @State private var progress = 0.0
-    @State private var speed = 0.0
-    @State private var expectedBytes: Int64 = 0
-    private let downloader = LeapBundleDownloader.shared
-
-    init(
-        entry: LeapCatalogEntry,
-        titleLineLimit: Int? = nil,
-        openAction: @escaping (LeapCatalogEntry, URL, ModelRunner) -> Void
-    ) {
-        self.entry = entry
-        self.titleLineLimit = titleLineLimit
-        self.openAction = openAction
-    }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(entry.displayName)
-                    .font(FontTheme.body)
-                    .fontWeight(.medium)
-                    .foregroundStyle(AppTheme.text)
-                    .lineLimit(titleLineLimit)
-                
-                HStack(spacing: 6) {
-                    formatPill(entry.sourceFormatLabel)
-
-                    Text(subtitleText)
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                    
-                    if entry.sizeBytes > 0 {
-                        Text("•")
-                            .font(.caption2)
-                            .foregroundStyle(AppTheme.secondaryText)
-                        
-                        ModelRAMAdvisor.badge(format: .et, sizeBytes: entry.sizeBytes, contextLength: 4096, layerCount: nil)
-                            .scaleEffect(0.9)
-                    }
-                }
-            }
-            
-            Spacer()
-            
-            actionButton
-        }
-        .padding(.vertical, 8)
-        .onAppear { refresh() }
-        .onReceive(downloadController.leapItemsPublisher) { _ in
-            if let item = downloadController.leapItems.first(where: { $0.id == entry.slug }) {
-                progress = item.progress
-                speed = item.speed
-                if item.expectedBytes > 0 { expectedBytes = item.expectedBytes }
-                state = .downloading(progress)
-            } else {
-                refresh()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var actionButton: some View {
-        switch state {
-        case .notInstalled:
-            Button(action: { start() }) {
-                Image(systemName: "arrow.down.circle")
-                    .font(.system(size: 20))
-                    .foregroundStyle(Color.accentColor)
-            }
-            .buttonStyle(.plain)
-            .help(LocalizedStringKey("Download"))
-            
-        case .failed(let msg):
-            Button(action: { start() }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.clockwise")
-                    if msg == "Paused" {
-                        Text("Resume")
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(Color.red)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.red.opacity(0.1), in: Capsule())
-            }
-            .buttonStyle(.plain)
-            
-        case .downloading(let p):
-            HStack(spacing: 12) {
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("\(Int(p * 100))%")
-                        .font(FontTheme.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(AppTheme.secondaryText)
-                    Text(speedText(speed))
-                        .font(.caption2)
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
-                
-                ZStack {
-                    Circle()
-                        .stroke(Color.gray.opacity(0.2), lineWidth: 3)
-                    Circle()
-                        .trim(from: 0, to: CGFloat(max(0.01, p)))
-                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                }
-                .frame(width: 24, height: 24)
-                
-                Button(action: { downloadController.cancel(itemID: entry.slug) }) {
-                    Image(systemName: "stop.fill")
-                        .font(.caption)
-                        .foregroundStyle(Color.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            
-        case .installed:
-            Button(action: { load() }) {
-                Text("Open")
-                    .font(FontTheme.caption)
-                    .fontWeight(.medium)
-                    .foregroundStyle(Color.accentColor)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Color.accentColor.opacity(0.1), in: Capsule())
-            }
-            .buttonStyle(.plain)
-        }
-    }
-
-    private func refresh() {
-        Task { @MainActor in
-            state = await downloader.statusAsync(for: entry)
-            if case .downloading(let p) = state { progress = p }
-        }
-    }
-
-    private var sizeText: String {
-        let bytes = expectedBytes > 0 ? expectedBytes : entry.sizeBytes
-        if bytes <= 0 { return "" }
-        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
-
-    private var subtitleText: String {
-        var parts: [String] = []
-        if !entry.quantization.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(entry.quantization)
-        }
-        let size = sizeText
-        if !size.isEmpty { parts.append(size) }
-        if !parts.isEmpty { return parts.joined(separator: " • ") }
-        return entry.slug
-    }
-
-    private func speedText(_ speed: Double) -> String {
-        guard speed > 0 else { return "--" }
-        let kb = speed / 1024
-        if kb > 1024 { return String(format: "%.1f MB/s", kb / 1024) }
-        return String(format: "%.0f KB/s", kb)
-    }
-
-    @ViewBuilder
-    private func formatPill(_ label: String) -> some View {
-        Text(label)
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
-            .background(Color.secondary.opacity(0.14), in: Capsule())
-            .foregroundStyle(AppTheme.secondaryText)
-    }
-
-    private func start() {
-        downloadController.startLeap(entry: entry)
-    }
-
-    private func load() {
-        guard case .installed(let url) = state else { return }
-        Task { @MainActor in
-            var settings = modelManager
-                .downloadedModels
-                .first(where: {
-                    $0.modelID == entry.modelID
-                    && $0.quant.caseInsensitiveCompare(entry.quantization) == .orderedSame
-                })
-                .map { modelManager.settings(for: $0) }
-            ?? ModelSettings.default(for: .et)
-            settings.contextLength = max(1, settings.contextLength)
-
-            if let slmGGUF = SLMArtifactResolver.ggufURLIfPresent(for: url) {
-                let success = await chatVM.load(url: slmGGUF, settings: settings, format: .gguf, forceReload: true)
-                if success {
-                    let architectureLabels = LocalModel.architectureLabels(for: slmGGUF, format: .et, modelID: entry.modelID)
-                    let local = modelManager.downloadedModels.first(where: { $0.modelID == entry.modelID && $0.quant.caseInsensitiveCompare(entry.quantization) == .orderedSame }) ??
-                        LocalModel(
-                            modelID: entry.modelID,
-                            name: entry.displayName,
-                            url: slmGGUF,
-                            quant: entry.quantization,
-                            architecture: architectureLabels.display,
-                            architectureFamily: architectureLabels.family,
-                            format: .et,
-                            sizeGB: Double(entry.sizeBytes) / 1_073_741_824.0,
-                            isMultimodal: entry.isVision,
-                            isToolCapable: true,
-                            isDownloaded: true,
-                            downloadDate: Date(),
-                            lastUsedDate: nil,
-                            isFavourite: false,
-                            totalLayers: 0,
-                            moeInfo: nil
-                        )
-                    modelManager.updateSettings(settings, for: local)
-                    modelManager.markModelUsed(local)
-                    tabRouter.selection = .chat
-                } else {
-                    state = .failed(chatVM.loadError ?? "Load failed")
-                }
-                return
-            }
-
-            chatVM.loadingProgressTracker.startLoading(for: .et)
-            chatVM.loadingProgressTracker.reportBackendProgress(0.12)
-            defer { chatVM.loadingProgressTracker.completeLoading() }
-            do {
-                LeapBundleDownloader.sanitizeBundleIfNeeded(at: url)
-                chatVM.loadingProgressTracker.reportBackendProgress(0.25)
-                let runner = try await LeapRunnerLoader.load(url: url, settings: settings)
-                chatVM.loadingProgressTracker.reportBackendProgress(0.88)
-                openAction(entry, url, runner)
-                chatVM.loadingProgressTracker.reportBackendProgress(0.95)
-            } catch {
-                state = .failed(error.localizedDescription)
-            }
-        }
-    }
-}
-#endif
-
 private enum QuantSortOption: String, CaseIterable, Identifiable {
     case quant
     case sizeSmall
@@ -4081,9 +4692,9 @@ private enum QuantSortOption: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var titleKey: LocalizedStringKey {
+    func titleKey(isModelCatalog: Bool) -> LocalizedStringKey {
         switch self {
-        case .quant: return LocalizedStringKey("Quant")
+        case .quant: return LocalizedStringKey(isModelCatalog ? "Model" : "Quant")
         case .sizeSmall: return LocalizedStringKey("Size ↑")
         case .sizeLarge: return LocalizedStringKey("Size ↓")
         }
@@ -4095,16 +4706,19 @@ struct ReadmeCollapseView: View {
     let loading: Bool
     let retry: () -> Void
     @State private var expanded = false
+    @State private var blocks: [ReadmeMarkdown.Block] = []
+
+    private let collapsedBlockLimit = 3
 
     var body: some View {
         VStack(alignment: .leading) {
-            if let md = markdown {
-                if expanded {
-                    Text((try? AttributedString(markdown: md, options: .init(interpretedSyntax: .full))) ?? AttributedString(md))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            if let md = markdown, !md.isEmpty {
+                if blocks.isEmpty {
+                    ProgressView()
+                } else if expanded || blocks.count <= collapsedBlockLimit {
+                    ReadmeMarkdownView(blocks: blocks)
                 } else {
-                    Text((try? AttributedString(markdown: preview(from: md), options: .init(interpretedSyntax: .full))) ?? AttributedString(preview(from: md)))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ReadmeMarkdownView(blocks: Array(blocks.prefix(collapsedBlockLimit)))
                         .overlay(
                             LinearGradient(colors: [.clear, Color(.systemBackground)],
                                            startPoint: .center, endPoint: .bottom)
@@ -4118,11 +4732,15 @@ struct ReadmeCollapseView: View {
             }
         }
         .onTapGesture { withAnimation { expanded.toggle() } }
-    }
-
-    private func preview(from md: String) -> String {
-        let lines = md.split(separator: "\n")
-        return lines.prefix(3).joined(separator: "\n")
+        .task(id: markdown) {
+            guard let markdown, !markdown.isEmpty else {
+                blocks = []
+                return
+            }
+            blocks = await Task.detached(priority: .userInitiated) {
+                ReadmeMarkdown.parse(markdown)
+            }.value
+        }
     }
 }
 

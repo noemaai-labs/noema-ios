@@ -2,6 +2,51 @@ import XCTest
 @testable import Noema
 
 final class ModelDeviceFitAdvisorTests: XCTestCase {
+    func testCuratedFitUsesRuntimeSpecificHint() {
+        let record = ModelRecord(
+            id: "owner/model",
+            displayName: "Model",
+            publisher: "Owner",
+            summary: nil,
+            hasInstallableQuant: true,
+            formats: [.gguf, .ane],
+            installed: false,
+            tags: nil,
+            pipeline_tag: nil,
+            minRAMBytes: 1_000_000_000,
+            minRAMBytesByFormat: [
+                .gguf: 1_000_000_000,
+                .ane: 8_000_000_000
+            ]
+        )
+
+        XCTAssertEqual(
+            CuratedModelDeviceFit.status(for: record, format: .gguf, budgetBytes: 4_000_000_000),
+            .fits
+        )
+        XCTAssertEqual(
+            CuratedModelDeviceFit.status(for: record, format: .ane, budgetBytes: 4_000_000_000),
+            .tooLarge
+        )
+    }
+
+    func testCuratedFitKeepsUnknownDevicesVisible() {
+        let record = ModelRecord(
+            id: "owner/model",
+            displayName: "Model",
+            publisher: "Owner",
+            summary: nil,
+            hasInstallableQuant: true,
+            formats: [.gguf],
+            installed: false,
+            tags: nil,
+            pipeline_tag: nil,
+            minRAMBytes: 2_000_000_000
+        )
+
+        XCTAssertTrue(CuratedModelDeviceFit.shouldShowByDefault(record, budgetBytes: nil))
+    }
+
     func testUsesBenchmarkWhenAvailable() {
         let result = benchmarkResult(generationRate: 28, timeToFirstToken: 0.7)
 

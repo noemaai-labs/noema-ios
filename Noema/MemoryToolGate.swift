@@ -1,7 +1,9 @@
 import Foundation
 
 struct MemoryToolGate {
-    static func isAvailable(currentFormat: ModelFormat? = nil) -> Bool {
+    /// `afmKind` lets an AFM client gate on its own variant; other callers fall back to
+    /// the persisted kind of the loaded model.
+    static func isAvailable(currentFormat: ModelFormat? = nil, afmKind: AppleFoundationModelKind? = nil) -> Bool {
         guard EnterprisePolicyGate.allowsTool("noema.memory") else { return false }
         let defaults = UserDefaults.standard
         let enabled = defaults.object(forKey: "memoryEnabled") as? Bool ?? true
@@ -17,9 +19,17 @@ struct MemoryToolGate {
                 fmt = f
             }
         }
-        // AFM uses its own FoundationModels tool system; the loopback memory tool
-        // is incompatible with it and would also balloon the limited AFM context.
-        if fmt == .afm { return false }
+        // AFM never uses the loopback loop. The PCC server model (32K context) calls
+        // the native FoundationModels memory tool, so it passes; the on-device model
+        // stays excluded — the snapshot would balloon its small context.
+        if fmt == .afm {
+            let kind = afmKind ?? AppleFoundationModelKind.persistedCurrentKind()
+            if kind != .privateCloudCompute { return false }
+        }
+        // Local MLX tool calling is unreliable — same rejection as every other gate
+        // (web/python/deterministic/on-device) so the chips, Tool Store, and prompt
+        // guidance all agree. Remote was already rejected above.
+        if fmt == .mlx { return false }
 
         let supportsFunctionCalling = defaults.object(forKey: "currentModelSupportsFunctionCalling") as? Bool ?? false
         guard supportsFunctionCalling else { return false }

@@ -1,5 +1,4 @@
 #if ((os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS) || (os(macOS) && !targetEnvironment(macCatalyst)))
-// EmbeddedPythonExecutor.swift
 import Foundation
 
 struct EmbeddedPythonExecutor: PythonExecutor, Sendable {

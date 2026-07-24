@@ -243,3 +243,114 @@ struct LiveMemoryPressureMeter: View {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .memory)
     }
 }
+
+#if os(macOS)
+/// A deliberately low-frequency toolbar readout for Noema's current physical
+/// footprint. Mach sampling is inexpensive, but the relaxed timer keeps it off
+/// hot rendering and inference paths.
+struct MacRAMUsageIndicator: View {
+    private static let sampleInterval: TimeInterval = 3
+    private static let physicalMemoryBytes = max(0, Int64(ProcessInfo.processInfo.physicalMemory))
+
+    // Start sampling only once SwiftUI mounts the toolbar item. Keeping the
+    // state initializer inert avoids Mach calls during ordinary view rebuilds.
+    @State private var footprintBytes: Int64 = 0
+    @State private var timer: Timer?
+
+    private var progress: Double {
+        guard Self.physicalMemoryBytes > 0 else { return 0 }
+        return min(1, max(0, Double(footprintBytes) / Double(Self.physicalMemoryBytes)))
+    }
+
+    private var tint: Color {
+        switch progress {
+        case 0..<0.70: return ChatTheme.readyTint
+        case 0.70..<0.88: return Color.yellow
+        case 0.88..<0.96: return ChatTheme.busyTint
+        default: return Color.red
+        }
+    }
+
+    private var usedText: String {
+        memoryString(footprintBytes)
+    }
+
+    private var totalText: String {
+        memoryString(Self.physicalMemoryBytes)
+    }
+
+    private var accessibilitySummary: String {
+        let usage = String.localizedStringWithFormat(
+            String(localized: "%@ used, %@ available"),
+            usedText,
+            totalText
+        )
+        return "\(String(localized: "App Memory Usage (estimated)")): \(usage)"
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(tint)
+                .frame(width: 6, height: 6)
+
+            Text(LocalizedStringKey("RAM"))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .tracking(0.3)
+                .foregroundStyle(.secondary)
+
+            Rectangle()
+                .fill(ChatTheme.hairlineStrong)
+                .frame(width: 1, height: 12)
+
+            Text(verbatim: "\(usedText) / \(totalText)")
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(Color.primary.opacity(0.82))
+        }
+        .frame(height: 30)
+        .padding(.horizontal, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(ChatTheme.quietSurface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(ChatTheme.hairline, lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(LocalizedStringKey("RAM")))
+        .accessibilityValue(Text(verbatim: accessibilitySummary))
+        .help(accessibilitySummary)
+        .onAppear(perform: startSampling)
+        .onDisappear(perform: stopSampling)
+    }
+
+    private func startSampling() {
+        refresh()
+        guard timer == nil else { return }
+
+        let timer = Timer(timeInterval: Self.sampleInterval, repeats: true) { _ in
+            Task { @MainActor in
+                refresh()
+            }
+        }
+        timer.tolerance = 0.5
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stopSampling() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func refresh() {
+        footprintBytes = max(0, Int64(live_memory_footprint_bytes()))
+    }
+
+    private func memoryString(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .memory)
+    }
+}
+#endif

@@ -3,19 +3,34 @@ import Foundation
 // Simple async semaphore to bound concurrent background work.
 actor AsyncSemaphore {
     private var value: Int
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+    private var waiters: [Waiter] = []
 
     init(value: Int) {
         self.value = max(1, value)
     }
 
-    func acquire() async {
+    func acquire() async throws {
+        try Task.checkCancellation()
         if value > 0 {
             value -= 1
             return
         }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            waiters.append(cont)
+
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters.append(Waiter(id: id, continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
         }
     }
 
@@ -23,9 +38,15 @@ actor AsyncSemaphore {
         if waiters.isEmpty {
             value += 1
         } else {
-            let cont = waiters.removeFirst()
-            cont.resume()
+            let waiter = waiters.removeFirst()
+            waiter.continuation.resume()
         }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
     }
 }
 
@@ -44,4 +65,3 @@ actor InFlightTracker<Key: Hashable> {
         set.remove(key)
     }
 }
-

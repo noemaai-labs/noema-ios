@@ -165,8 +165,8 @@ struct PassSigningClient {
         case 409:
             throw PassSigningError.duplicate
         default:
-            let message = (responseText?.isEmpty == false)
-                ? responseText!
+            let message = responseText?.isEmpty == false
+                ? (responseText ?? String(localized: "Wallet signer failed."))
                 : String.localizedStringWithFormat(String(localized: "Wallet signer failed with status %d."), http.statusCode)
             throw PassSigningError.server(message)
         }

@@ -25,6 +25,7 @@ enum ExploreModelDetailCache {
         let url = directory(for: details.id, root: root).appendingPathComponent(detailsFilename)
         guard let data = try? JSONEncoder.noemaCacheEncoder.encode(snapshot) else { return }
         try? data.write(to: url, options: .atomic)
+        invalidateRecordsCache()
     }
 
     static func snapshot(repoID: String, root: URL? = nil) -> ExploreModelDetailSnapshot? {
@@ -37,7 +38,30 @@ enum ExploreModelDetailCache {
         snapshot(repoID: repoID, root: root)?.cachedAt
     }
 
+    private static let recordsLock = NSLock()
+    nonisolated(unsafe) private static var cachedRecords: [ModelRecord]? = nil
+
+    static func invalidateRecordsCache() {
+        recordsLock.lock(); cachedRecords = nil; recordsLock.unlock()
+    }
+
     static func records(root: URL? = nil) -> [ModelRecord] {
+        // In-memory cache for the default-root scan. records() recursively walks Documents/ModelCards
+        // and Data(contentsOf:)+decodes every details.json — and it's called twice (.task + .onAppear)
+        // on every Explore open, and that directory grows unbounded with use. Cache it; save()
+        // invalidates when a new card is written.
+        if root == nil {
+            recordsLock.lock(); let hit = cachedRecords; recordsLock.unlock()
+            if let hit { return hit }
+        }
+        let result = computeRecords(root: root)
+        if root == nil {
+            recordsLock.lock(); cachedRecords = result; recordsLock.unlock()
+        }
+        return result
+    }
+
+    private static func computeRecords(root: URL? = nil) -> [ModelRecord] {
         let base = modelCardsRoot(root: root, create: false)
         guard let enumerator = FileManager.default.enumerator(
             at: base,

@@ -63,9 +63,6 @@ enum DownloadArtifactRole: String, Codable, CaseIterable, Sendable {
     case importanceMatrix
     case mtp
     case modelSidecar
-    case leapBundle
-    case leapManifest
-    case leapManifestAsset
     case datasetFile
     case embeddingModel
     case whisperModel
@@ -74,10 +71,6 @@ enum DownloadArtifactRole: String, Codable, CaseIterable, Sendable {
 struct ModelDownloadOwner: Codable, Hashable, Sendable {
     let detail: ModelDetails
     let quant: QuantInfo
-}
-
-struct LeapDownloadOwner: Codable, Hashable, Sendable {
-    let entry: LeapCatalogEntry
 }
 
 struct DatasetDownloadOwner: Codable, Hashable, Sendable {
@@ -160,7 +153,6 @@ struct WhisperDownloadOwner: Codable, Hashable, Sendable {
 
 enum DownloadOwner: Hashable, Sendable {
     case model(ModelDownloadOwner)
-    case leap(LeapDownloadOwner)
     case dataset(DatasetDownloadOwner)
     case embedding(EmbeddingDownloadOwner)
     case whisper(WhisperDownloadOwner)
@@ -170,7 +162,6 @@ extension DownloadOwner: Codable {
     private enum CodingKeys: String, CodingKey {
         case kind
         case model
-        case leap
         case dataset
         case embedding
         case whisper
@@ -178,7 +169,6 @@ extension DownloadOwner: Codable {
 
     private enum Kind: String, Codable {
         case model
-        case leap
         case dataset
         case embedding
         case whisper
@@ -190,8 +180,6 @@ extension DownloadOwner: Codable {
         switch kind {
         case .model:
             self = .model(try container.decode(ModelDownloadOwner.self, forKey: .model))
-        case .leap:
-            self = .leap(try container.decode(LeapDownloadOwner.self, forKey: .leap))
         case .dataset:
             self = .dataset(try container.decode(DatasetDownloadOwner.self, forKey: .dataset))
         case .embedding:
@@ -207,9 +195,6 @@ extension DownloadOwner: Codable {
         case .model(let owner):
             try container.encode(Kind.model, forKey: .kind)
             try container.encode(owner, forKey: .model)
-        case .leap(let owner):
-            try container.encode(Kind.leap, forKey: .kind)
-            try container.encode(owner, forKey: .leap)
         case .dataset(let owner):
             try container.encode(Kind.dataset, forKey: .kind)
             try container.encode(owner, forKey: .dataset)
@@ -228,8 +213,6 @@ extension DownloadOwner {
         switch self {
         case .model(let owner):
             return "\(owner.detail.id)-\(owner.quant.label)"
-        case .leap(let owner):
-            return owner.entry.slug
         case .dataset(let owner):
             return owner.detail.id
         case .embedding(let owner):
@@ -383,19 +366,29 @@ struct DownloadJob: Identifiable, Codable, Hashable, Sendable {
     var externalID: String { owner.externalID }
 
     var totalExpectedBytes: Int64 {
-        artifacts.reduce(into: Int64(0)) { partial, artifact in
-            partial += max(artifact.expectedBytes ?? 0, artifact.downloadedBytes)
+        artifacts.reduce(into: Int64(0)) { total, artifact in
+            total = Self.saturatingAdd(
+                total,
+                max(0, artifact.expectedBytes ?? 0, artifact.downloadedBytes)
+            )
         }
     }
 
     var totalDownloadedBytes: Int64 {
-        artifacts.reduce(into: Int64(0)) { $0 += max(0, $1.downloadedBytes) }
+        artifacts.reduce(into: Int64(0)) {
+            $0 = Self.saturatingAdd($0, max(0, $1.downloadedBytes))
+        }
     }
 
     var progress: Double {
         let total = totalExpectedBytes
         guard total > 0 else { return 0 }
         return min(1, max(0, Double(totalDownloadedBytes) / Double(total)))
+    }
+
+    private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : value
     }
 
     var canPause: Bool {
@@ -413,9 +406,9 @@ struct DownloadJob: Identifiable, Codable, Hashable, Sendable {
 extension DownloadJobState {
     var autoResumeEligible: Bool {
         switch self {
-        case .downloading, .waitingForConnectivity, .retrying, .verifying, .finalizing:
+        case .queued, .preparing, .downloading, .waitingForConnectivity, .retrying, .verifying, .finalizing:
             return true
-        case .queued, .scheduled, .preparing, .paused, .completed, .failed, .cancelled:
+        case .scheduled, .paused, .completed, .failed, .cancelled:
             return false
         }
     }
@@ -456,8 +449,11 @@ actor DownloadEngine {
     private var jobs: [String: DownloadJob] = [:]
     private var bootstrapped = false
     private let fm = FileManager.default
-    private var lastProgressPersistenceAt: [String: Date] = [:]
-    private let progressPersistenceInterval: TimeInterval = 0.8
+    // persistQueue() writes every job, so progress persistence must be throttled
+    // globally rather than once per artifact. Multipart downloads otherwise cluster
+    // several pretty-printed atomic rewrites at the same cadence.
+    private var lastProgressPersistenceAt: Date = .distantPast
+    private let progressPersistenceInterval: TimeInterval = 5.0
 
     init() {
         jobs = Self.loadPersistedJobs()
@@ -678,7 +674,7 @@ actor DownloadEngine {
     }
 
     private func mergeArtifacts(existing: [DownloadArtifact], incoming: [DownloadArtifact]) -> [DownloadArtifact] {
-        var mergedByID: [String: DownloadArtifact] = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        var mergedByID = Dictionary(existing.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         for artifact in incoming {
             if var existing = mergedByID[artifact.id] {
                 existing.remoteURL = artifact.remoteURL ?? existing.remoteURL
@@ -698,7 +694,9 @@ actor DownloadEngine {
     private func persistQueue() {
         let queueURL = DownloadPersistencePaths.queueFileURL
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        // This is an internal crash-recovery file. Compact JSON materially reduces
+        // encode and atomic-write work for queues containing many multipart artifacts.
+        encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         let ordered = snapshots()
         if let data = try? encoder.encode(ordered) {
@@ -762,15 +760,13 @@ actor DownloadEngine {
         NotificationCenter.default.post(name: .downloadEngineDidChange, object: nil)
     }
 
-    private func shouldPersistProgress(for externalID: String, artifactID: String, force: Bool) -> Bool {
+    private func shouldPersistProgress(force: Bool) -> Bool {
         if force { return true }
-        let key = "\(externalID)::\(artifactID)"
         let now = Date()
-        if let last = lastProgressPersistenceAt[key],
-           now.timeIntervalSince(last) < progressPersistenceInterval {
+        if now.timeIntervalSince(lastProgressPersistenceAt) < progressPersistenceInterval {
             return false
         }
-        lastProgressPersistenceAt[key] = now
+        lastProgressPersistenceAt = now
         return true
     }
 
@@ -813,7 +809,7 @@ actor DownloadEngine {
                                     written: Int64,
                                     expected: Int64?,
                                     forcePersistence: Bool = false) async {
-        let persistNow = shouldPersistProgress(for: externalID, artifactID: artifactID, force: forcePersistence)
+        let persistNow = shouldPersistProgress(force: forcePersistence)
         await updateArtifactProgressInternal(
             externalID: externalID,
             artifactID: artifactID,
@@ -822,6 +818,14 @@ actor DownloadEngine {
             persistNow: persistNow,
             notify: false
         )
+    }
+
+    /// Force the latest in-memory counters to disk at a lifecycle boundary.
+    /// Terminal state transitions already persist synchronously through their
+    /// dedicated update methods.
+    func checkpointProgress() {
+        persistQueue()
+        lastProgressPersistenceAt = Date()
     }
 
     private func migrateRecoveredJobsIfNeeded() async {
@@ -868,8 +872,17 @@ actor DownloadEngine {
         guard let data = try? Data(contentsOf: queueURL) else { return [:] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard let decoded = try? decoder.decode([DownloadJob].self, from: data) else { return [:] }
-        return Dictionary(uniqueKeysWithValues: decoded.map { ($0.id, $0) })
+        guard let decoded = try? decoder.decode([LossyDownloadJob].self, from: data) else { return [:] }
+        let jobs = decoded.compactMap(\.value)
+        return Dictionary(jobs.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+private struct LossyDownloadJob: Decodable {
+    let value: DownloadJob?
+
+    init(from decoder: Decoder) throws {
+        value = try? DownloadJob(from: decoder)
     }
 }
 

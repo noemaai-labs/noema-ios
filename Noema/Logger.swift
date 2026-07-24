@@ -1,4 +1,3 @@
-// Logger.swift
 import Foundation
 #if canImport(Darwin)
 import Darwin

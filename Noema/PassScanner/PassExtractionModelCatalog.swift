@@ -109,8 +109,8 @@ enum PassExtractionModelCatalog {
             return model.isMultimodal || MLXBridge.isVLMModel(at: model.url)
         case .et:
             return model.isMultimodal
-                || LeapCatalogService.isVisionQuantizationSlug(model.modelID)
-                || LeapCatalogService.bundleLikelyVision(at: model.url)
+                || ETModelResolver.isVisionIdentifier(model.modelID)
+                || ETModelResolver.isLikelyVisionModel(at: model.url)
         case .ane, .afm, .coreai:
             return false
         }

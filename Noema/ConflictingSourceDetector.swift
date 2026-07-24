@@ -33,8 +33,9 @@ struct SourceSnippet: Equatable, Sendable {
 
     init(id: String, sourceName: String?, text: String) {
         self.id = id
-        self.sourceName = sourceName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? sourceName!.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSource = sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.sourceName = normalizedSource?.isEmpty == false
+            ? (normalizedSource ?? String(localized: "Unknown Source"))
             : String(localized: "Unknown Source")
         self.text = text
     }

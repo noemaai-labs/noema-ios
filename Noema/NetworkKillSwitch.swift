@@ -1,4 +1,3 @@
-// NetworkKillSwitch.swift
 import Foundation
 
 final class LockIsolated<Value>: @unchecked Sendable {
@@ -104,7 +103,12 @@ enum NetworkKillSwitch {
 
     /// Replace the enterprise allowlist (empty set clears it). HTTPS only.
     static func setEnterpriseAllowedHosts(_ hosts: Set<String>) {
-        enterpriseAllowedHosts.withMutableValue { $0 = Set(hosts.map { $0.lowercased() }) }
+        enterpriseAllowedHosts.withMutableValue {
+            $0 = Set(hosts.compactMap { host in
+                let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return normalized.isEmpty ? nil : normalized
+            })
+        }
     }
 
     static func shouldBlock(url: URL?) -> Bool {
@@ -148,11 +152,21 @@ enum NetworkKillSwitch {
 
     /// Enable or disable the global kill switch.
     static func setEnabled(_ enabled: Bool) {
-        let wasEnabled = enabledState.withValue { $0 }
-        guard enabled != wasEnabled else { return }
-        enabledState.withMutableValue { $0 = enabled }
+        let changed = enabledState.withMutableValue { current in
+            guard current != enabled else { return false }
+            current = enabled
+            return true
+        }
+        guard changed else { return }
 
         if enabled {
+#if os(macOS)
+            // Arbitrary local MCP processes are not presumed network-isolated.
+            // Stop them synchronously with the user-visible Off-Grid transition.
+            Task { @MainActor in
+                await MCPServerManager.shared.disconnectAllForOffGrid()
+            }
+#endif
             URLProtocol.registerClass(NetworkBlockedURLProtocol.self)
 
             // Cancel tasks on shared session
@@ -170,6 +184,11 @@ enum NetworkKillSwitch {
                         shouldBlock(url: $0.currentRequest?.url ?? $0.originalRequest?.url)
                     }
                     blockedTasks.forEach { $0.cancel() }
+                    // Defense-in-depth: when every task on a tracked session is blocked,
+                    // invalidate the session so it cannot accept NEW requests while the
+                    // kill switch is on (cancelling tasks alone leaves the session live).
+                    // Sessions carrying allowed (enterprise-allowlisted) traffic are left
+                    // intact.
                     if !blockedTasks.isEmpty, blockedTasks.count == tasks.count {
                         session.invalidateAndCancel()
                     }
@@ -179,10 +198,13 @@ enum NetworkKillSwitch {
             // Cancel inflight hub requests
             Task { await HFHubRequestManager.shared.cancelAll() }
 
-            // Cancel Leap polling tasks (LeapModelDownloader handles its own lifecycle)
-            Task { LeapBundleDownloader.shared.cancelAll() }
         } else {
             URLProtocol.unregisterClass(NetworkBlockedURLProtocol.self)
+#if os(macOS)
+            Task { @MainActor in
+                MCPServerManager.shared.connectConfiguredServers()
+            }
+#endif
         }
     }
 

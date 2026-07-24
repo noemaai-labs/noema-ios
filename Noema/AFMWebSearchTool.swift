@@ -1,11 +1,44 @@
 import Foundation
 
+enum AFMToolCallPhase: Equatable, Sendable {
+    case executing
+    case completed
+    case failed
+
+    var isTerminal: Bool {
+        self == .completed || self == .failed
+    }
+}
+
 struct AFMToolCallSummary: Sendable {
+    let id: String
     let toolName: String
     let requestParams: [String: AnyCodable]
+    let phase: AFMToolCallPhase
     let result: String?
     let error: String?
     let timestamp: Date
+    let completedAt: Date?
+
+    init(
+        id: String = UUID().uuidString,
+        toolName: String,
+        requestParams: [String: AnyCodable],
+        phase: AFMToolCallPhase = .completed,
+        result: String?,
+        error: String?,
+        timestamp: Date,
+        completedAt: Date? = nil
+    ) {
+        self.id = id
+        self.toolName = toolName
+        self.requestParams = requestParams
+        self.phase = phase
+        self.result = result
+        self.error = error
+        self.timestamp = timestamp
+        self.completedAt = completedAt ?? (phase.isTerminal ? timestamp : nil)
+    }
 }
 
 struct AFMToolExecutionSummary: Sendable {
@@ -15,13 +48,16 @@ struct AFMToolExecutionSummary: Sendable {
 }
 
 struct AFMResolvedToolCall: Sendable {
+    let id: String
     let toolName: String
     let displayName: String
     let iconName: String
     let requestParams: [String: AnyCodable]
+    let phase: AFMToolCallPhase
     let result: String?
     let error: String?
     let timestamp: Date
+    let completedAt: Date?
 }
 
 struct AFMResolvedToolExecution: Sendable {
@@ -33,13 +69,29 @@ struct AFMResolvedToolExecution: Sendable {
 
 actor AFMToolRecorder {
     private var calls: [AFMToolCallSummary] = []
+    private let onRecord: (@Sendable (AFMToolCallSummary) async -> Void)?
+
+    init(onRecord: (@Sendable (AFMToolCallSummary) async -> Void)? = nil) {
+        self.onRecord = onRecord
+    }
 
     func reset() {
         calls.removeAll()
     }
 
-    func record(_ summary: AFMToolCallSummary) {
-        calls.append(summary)
+    func record(_ summary: AFMToolCallSummary) async {
+        if summary.phase.isTerminal {
+            if let index = calls.firstIndex(where: { $0.id == summary.id }) {
+                calls[index] = summary
+            } else {
+                calls.append(summary)
+            }
+        }
+        // Native FoundationModels tools execute inside the response stream.
+        // Publish both the executing event and its terminal update. The tool
+        // awaits this callback before doing/returning work, so the chat can show
+        // the card while execution is actually in progress.
+        await onRecord?(summary)
     }
 
     func drain() -> AFMToolExecutionSummary? {
@@ -188,37 +240,37 @@ enum AFMToolExecutionMapper {
 
         for call in summary.calls {
             let isWebSearch = call.toolName == "noema.web.retrieve"
-            let isPython = call.toolName == "noema.python.execute"
-            let isMemory = call.toolName == "noema.memory"
-            // Legacy only: the escalation tool was removed in favor of the
-            // Dynamic Profile baton-pass (AFMDynamicProfileRouting.swift),
-            // which is never recorded. This mapping keeps any old recorded
-            // summaries rendering correctly.
-            let isPCC = call.toolName == "noema.afm.escalateToPrivateCloudCompute"
-            let displayName: String = {
-                if isWebSearch { return "Web Search" }
-                if isPython { return "Python" }
-                if isMemory { return "Memory" }
-                if isPCC { return "Private Cloud Compute" }
-                return "Tool"
-            }()
-            let iconName: String = {
-                if isWebSearch { return "globe" }
-                if isPython { return "chevron.left.forwardslash.chevron.right" }
-                if isMemory { return "bookmark" }
-                if isPCC { return "cloud" }
-                return "wrench.and.screwdriver"
+            let (displayName, iconName): (String, String) = {
+                switch call.toolName {
+                case "noema.web.retrieve": return ("Web Search", "globe")
+                case "noema.python.execute": return ("Python", "chevron.left.forwardslash.chevron.right")
+                case "noema.memory": return ("Memory", "bookmark")
+                case "noema.rag.search": return ("Dataset Search", "doc.text.magnifyingglass")
+                case "noema.pdf.read": return ("PDF Reader", "doc.richtext")
+                case "noema.chart.render": return ("Chart", "chart.bar")
+                case "noema.calendar.events": return ("Calendar", "calendar")
+                case "noema.calendar.addEvent": return ("Add Event", "calendar.badge.plus")
+                case "noema.math.calculate": return ("Calculator", "function")
+                case "noema.units.convert": return ("Unit Converter", "arrow.left.arrow.right")
+                // Legacy only: the hidden AFM escalation tool has been removed.
+                // Keep old recorded summaries rendering correctly.
+                case "noema.afm.escalateToPrivateCloudCompute": return ("Private Cloud Compute", "cloud")
+                default: return ("Tool", "wrench.and.screwdriver")
+                }
             }()
 
             resolvedCalls.append(
                 AFMResolvedToolCall(
+                    id: call.id,
                     toolName: call.toolName,
                     displayName: displayName,
                     iconName: iconName,
                     requestParams: call.requestParams,
+                    phase: call.phase,
                     result: call.result,
                     error: call.error,
-                    timestamp: call.timestamp
+                    timestamp: call.timestamp,
+                    completedAt: call.completedAt
                 )
             )
 
@@ -245,61 +297,10 @@ enum AFMToolExecutionMapper {
 #if canImport(FoundationModels)
 import FoundationModels
 
-@available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
-final class AFMWebSearchTool: FoundationModels.Tool {
-    let name = "noema.web.retrieve"
-    let description = "Search the web for fresh information and return results with title, url, and snippet."
-
-    private let recorder: AFMToolRecorder?
-
-    init(recorder: AFMToolRecorder? = nil) {
-        self.recorder = recorder
-    }
-
-    @Generable
-    struct Arguments {
-        @Guide(description: "Search query to look up on the web")
-        var query: String
-
-        @Guide(description: "Number of results to return", .range(1...5))
-        var count: Int
-
-        @Guide(description: "Content filtering level: off, moderate, or strict")
-        var safesearch: String
-    }
-
-    func call(arguments: Arguments) async throws -> String {
-        let normalizedQuery = arguments.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let clampedCount = max(1, min(arguments.count, 5))
-        let normalizedSafeSearch = {
-            switch arguments.safesearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "off", "strict":
-                return arguments.safesearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            default:
-                return "moderate"
-            }
-        }()
-        let payload = await AFMWebSearchExecution.perform(
-            query: normalizedQuery,
-            count: clampedCount,
-            safesearch: normalizedSafeSearch
-        )
-        await recorder?.record(
-            AFMToolCallSummary(
-                toolName: name,
-                requestParams: [
-                    "query": AnyCodable(normalizedQuery),
-                    "count": AnyCodable(clampedCount),
-                    "safesearch": AnyCodable(normalizedSafeSearch)
-                ],
-                result: payload,
-                error: AFMWebSearchExecution.errorMessage(from: payload),
-                timestamp: Date()
-            )
-        )
-        return AFMWebSearchExecution.modelReadableOutput(from: payload, query: normalizedQuery)
-    }
-}
+// The AFM web tool is now `AFMLoopbackToolAdapter(wrapping: WebRetrieveTool())`
+// so PCC runs the same research/open/find pipeline as the loopback models.
+// `AFMWebSearchExecution` above remains: its payload parsing serves the mapper
+// and the legacy-result fallback.
 
 @available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
 final class AFMPythonTool: FoundationModels.Tool {
@@ -323,17 +324,53 @@ final class AFMPythonTool: FoundationModels.Tool {
             let code: String
         }
 
-        let payloadData = try await PythonTool().call(
-            args: JSONEncoder().encode(PythonArgumentsPayload(code: arguments.code))
-        )
-        let payload = String(data: payloadData, encoding: .utf8) ?? "{\"error\":\"Python execution failed.\"}"
+        let callID = UUID().uuidString
+        let startedAt = Date()
+        let requestParams = ["code": AnyCodable(arguments.code)]
         await recorder?.record(
             AFMToolCallSummary(
+                id: callID,
                 toolName: name,
-                requestParams: ["code": AnyCodable(arguments.code)],
+                requestParams: requestParams,
+                phase: .executing,
+                result: nil,
+                error: nil,
+                timestamp: startedAt
+            )
+        )
+        let payloadData: Data
+        do {
+            payloadData = try await PythonTool().call(
+                args: JSONEncoder().encode(PythonArgumentsPayload(code: arguments.code))
+            )
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            await recorder?.record(
+                AFMToolCallSummary(
+                    id: callID,
+                    toolName: name,
+                    requestParams: requestParams,
+                    phase: .failed,
+                    result: nil,
+                    error: message,
+                    timestamp: startedAt,
+                    completedAt: Date()
+                )
+            )
+            throw error
+        }
+        let payload = String(data: payloadData, encoding: .utf8) ?? "{\"error\":\"Python execution failed.\"}"
+        let error = AFMWebSearchExecution.errorMessage(from: payload)
+        await recorder?.record(
+            AFMToolCallSummary(
+                id: callID,
+                toolName: name,
+                requestParams: requestParams,
+                phase: error == nil ? .completed : .failed,
                 result: payload,
-                error: AFMWebSearchExecution.errorMessage(from: payload),
-                timestamp: Date()
+                error: error,
+                timestamp: startedAt,
+                completedAt: Date()
             )
         )
         if let result = try? JSONDecoder().decode(PythonExecutionResult.self, from: payloadData) {
@@ -410,8 +447,6 @@ final class AFMMemoryTool: FoundationModels.Tool {
             insert_at: arguments.insert_at
         )
 
-        let payloadData = try await MemoryTool().call(args: JSONEncoder().encode(payload))
-        let payloadString = String(data: payloadData, encoding: .utf8) ?? "{\"error\":\"Memory tool failed.\"}"
         var requestParams: [String: AnyCodable] = [
             "operation": AnyCodable(arguments.operation)
         ]
@@ -433,13 +468,51 @@ final class AFMMemoryTool: FoundationModels.Tool {
         if let insertAt = arguments.insert_at {
             requestParams["insert_at"] = AnyCodable(insertAt)
         }
+        let callID = UUID().uuidString
+        let startedAt = Date()
         await recorder?.record(
             AFMToolCallSummary(
+                id: callID,
                 toolName: name,
                 requestParams: requestParams,
-                result: payloadString,
+                phase: .executing,
+                result: nil,
                 error: nil,
-                timestamp: Date()
+                timestamp: startedAt
+            )
+        )
+
+        let payloadData: Data
+        do {
+            payloadData = try await MemoryTool().call(args: JSONEncoder().encode(payload))
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            await recorder?.record(
+                AFMToolCallSummary(
+                    id: callID,
+                    toolName: name,
+                    requestParams: requestParams,
+                    phase: .failed,
+                    result: nil,
+                    error: message,
+                    timestamp: startedAt,
+                    completedAt: Date()
+                )
+            )
+            throw error
+        }
+        let payloadString = String(data: payloadData, encoding: .utf8) ?? "{\"error\":\"Memory tool failed.\"}"
+        let error = AFMWebSearchExecution.errorMessage(from: payloadString)
+        await recorder?.record(
+            AFMToolCallSummary(
+                id: callID,
+                toolName: name,
+                requestParams: requestParams,
+                phase: error == nil ? .completed : .failed,
+                result: payloadString,
+                error: error,
+                timestamp: startedAt,
+                completedAt: Date()
             )
         )
 

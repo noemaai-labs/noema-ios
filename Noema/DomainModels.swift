@@ -1,5 +1,5 @@
-// DomainModels.swift
 import Foundation
+import NoemaPackages
 import SwiftUI
 
 public enum ModelFormat: String, CaseIterable, Hashable, Sendable {
@@ -78,6 +78,31 @@ struct MoEInfo: Codable, Hashable, Sendable {
     var feedForwardSize: Int?
     /// Reported vocabulary size.
     var vocabSize: Int?
+    /// Number of attention heads (`*.attention.head_count`).
+    var headCount: Int? = nil
+    /// Number of key/value heads (`*.attention.head_count_kv`). Equals `headCount`
+    /// for multi-head attention and is smaller for grouped-query attention (GQA);
+    /// this is the term that actually drives KV-cache size.
+    var headCountKV: Int? = nil
+    /// Per-head key dimension (`*.attention.key_length`). When absent, head dim is
+    /// derived as `hiddenSize / headCount`.
+    var keyLength: Int? = nil
+    /// Per-head value dimension (`*.attention.value_length`). When absent, falls back to `keyLength`.
+    var valueLength: Int? = nil
+    /// GGUF architecture identifier (`general.architecture`), when available.
+    /// This lets memory planning distinguish dense attention from hybrid/recurrent stacks.
+    var architecture: String? = nil
+    /// Number of transformer blocks that allocate a conventional KV cache. Hybrid models
+    /// such as Qwen3.5/3.6 use full attention in only part of the stack.
+    var attentionLayerCount: Int? = nil
+    /// Number of recurrent/linear-attention blocks that keep fixed-size state instead of
+    /// a context-length-dependent KV cache.
+    var recurrentLayerCount: Int? = nil
+    /// Recurrent-state dimensions exposed by GGUF metadata.
+    var ssmConvKernel: Int? = nil
+    var ssmInnerSize: Int? = nil
+    var ssmStateSize: Int? = nil
+    var ssmGroupCount: Int? = nil
 }
 
 extension MoEInfo {
@@ -93,6 +118,145 @@ extension MoEInfo {
             feedForwardSize: nil,
             vocabSize: nil
         )
+    }
+}
+
+struct PagedModelCompatibility: Codable, Hashable, Sendable {
+    enum Status: String, Codable, Sendable {
+        case supported
+        case unsupportedArchitecture
+        case noRoutedExperts
+        case incompatibleSidecarScales
+        case unknown
+    }
+    let status: Status
+    let architecture: String?
+    let routingWidthK: Int?          // experts used per token (MoEInfo.defaultUsed)
+    let expertCount: Int?
+    let moeLayerCount: Int?
+    let bytesPerExpertPerLayer: UInt64?  // sum of per-expert slice bytes across families for one layer (uniform-layer assumption; use layer 0's families)
+    let minBankBytes: UInt64?        // (K + 2) slots × bytesPerExpertPerLayer × moeLayerCount
+}
+
+extension PagedModelCompatibility {
+    static func assess(moeInfo: MoEInfo?, inventory: GGUFMetadata.ExpertTensorInventory?) -> PagedModelCompatibility {
+        let architecture = moeInfo?.architecture?.lowercased()
+        guard let architecture, NoemaPagedPackage.supportedArchitectures.contains(architecture) else {
+            return PagedModelCompatibility(
+                status: .unsupportedArchitecture,
+                architecture: architecture,
+                routingWidthK: nil,
+                expertCount: nil,
+                moeLayerCount: nil,
+                bytesPerExpertPerLayer: nil,
+                minBankBytes: nil
+            )
+        }
+        guard let inventory, !inventory.isEmpty else {
+            return PagedModelCompatibility(
+                status: .noRoutedExperts,
+                architecture: architecture,
+                routingWidthK: nil,
+                expertCount: nil,
+                moeLayerCount: nil,
+                bytesPerExpertPerLayer: nil,
+                minBankBytes: nil
+            )
+        }
+        guard inventory.unsupportedSidecarCount == 0 else {
+            return PagedModelCompatibility(
+                status: .incompatibleSidecarScales,
+                architecture: architecture,
+                routingWidthK: nil,
+                expertCount: nil,
+                moeLayerCount: nil,
+                bytesPerExpertPerLayer: nil,
+                minBankBytes: nil
+            )
+        }
+
+        let routingWidthK = moeInfo?.defaultUsed
+        let moeLayerCount = Set(inventory.records.map(\.layer)).count
+
+        // Some MoE stacks lead with dense blocks, so the lowest routed layer
+        // stands in for "layer 0" of the uniform-layer assumption.
+        let referenceLayer = inventory.records.map(\.layer).min()
+        let referenceRecords = inventory.records.filter { $0.layer == referenceLayer }
+
+        var expertCount = moeInfo.flatMap { $0.expertCount > 0 ? $0.expertCount : nil }
+        if expertCount == nil,
+           let dim = referenceRecords.first(where: { $0.ne.count >= 3 })?.ne[2],
+           let value = Int(exactly: dim), value > 0 {
+            expertCount = value
+        }
+
+        // nil (not a guess) when any family uses a quant type outside the local
+        // table — the manifest is the authority for those later.
+        let bytesPerExpertPerLayer: UInt64? = {
+            var total: UInt64 = 0
+            for record in referenceRecords {
+                guard let bytes = perExpertSliceBytes(of: record) else { return nil }
+                let (sum, overflow) = total.addingReportingOverflow(bytes)
+                guard !overflow else { return nil }
+                total = sum
+            }
+            return total > 0 ? total : nil
+        }()
+
+        let minBankBytes: UInt64? = {
+            guard let bytes = bytesPerExpertPerLayer, let k = routingWidthK, k > 0, moeLayerCount > 0 else { return nil }
+            let (perLayer, slotOverflow) = UInt64(k + 2).multipliedReportingOverflow(by: bytes)
+            guard !slotOverflow else { return nil }
+            let (bank, bankOverflow) = perLayer.multipliedReportingOverflow(by: UInt64(moeLayerCount))
+            guard !bankOverflow else { return nil }
+            return bank
+        }()
+
+        return PagedModelCompatibility(
+            status: .supported,
+            architecture: architecture,
+            routingWidthK: routingWidthK,
+            expertCount: expertCount,
+            moeLayerCount: moeLayerCount,
+            bytesPerExpertPerLayer: bytesPerExpertPerLayer,
+            minBankBytes: minBankBytes
+        )
+    }
+
+    private static func perExpertSliceBytes(of record: GGUFMetadata.ExpertTensorRecord) -> UInt64? {
+        guard record.ne.count >= 2,
+              record.ne[0] > 0, record.ne[1] > 0,
+              let layout = ggmlBlockLayout(record.ggmlType) else { return nil }
+        let ne0 = UInt64(record.ne[0])
+        let ne1 = UInt64(record.ne[1])
+        guard ne0 % layout.blockSize == 0 else { return nil }
+        let rowBytes = ne0 / layout.blockSize * layout.typeSize
+        let (slice, overflow) = rowBytes.multipliedReportingOverflow(by: ne1)
+        return overflow ? nil : slice
+    }
+
+    /// (blockSize, typeSize) for the ggml tensor types the paged rewriter can size.
+    private static func ggmlBlockLayout(_ type: Int32) -> (blockSize: UInt64, typeSize: UInt64)? {
+        switch type {
+        case 0: return (1, 4)      // F32
+        case 1: return (1, 2)      // F16
+        case 2: return (32, 18)    // Q4_0
+        case 3: return (32, 20)    // Q4_1
+        case 6: return (32, 22)    // Q5_0
+        case 7: return (32, 24)    // Q5_1
+        case 8: return (32, 34)    // Q8_0
+        case 10: return (256, 84)  // Q2_K
+        case 11: return (256, 110) // Q3_K
+        case 12: return (256, 144) // Q4_K
+        case 13: return (256, 176) // Q5_K
+        case 14: return (256, 210) // Q6_K
+        case 15: return (256, 292) // Q8_K
+        case 20: return (32, 18)   // IQ4_NL
+        case 23: return (256, 136) // IQ4_XS
+        case 30: return (1, 2)     // BF16
+        case 39: return (32, 17)   // MXFP4
+        default: return nil
+        }
     }
 }
 
@@ -121,8 +285,6 @@ extension ModelFormat {
 
     init?(compatibleRawValue raw: String) {
         switch raw.uppercased() {
-        case "SLM":
-            self = .et
         case "APPLE", "CML":
             self = .ane
         default:
@@ -231,6 +393,68 @@ public struct QuantInfo: Identifiable, Hashable, Codable, Sendable {
 }
 
 extension QuantInfo {
+    /// Relative directory that encloses a Hub-hosted `.noema-paged` package.
+    /// The manifest is deliberately the primary download part, but discovery
+    /// remains order-independent so hand-authored catalog entries are safe.
+    var pagedPackageRelativeDirectory: String? {
+        for part in allDownloadParts {
+            let path = Self.relativeDownloadPath(path: part.path, fallbackURL: part.downloadURL)
+            let components = path.split(separator: "/", omittingEmptySubsequences: true)
+            guard components.count > 1 else { continue }
+            for index in components.indices.dropLast()
+            where components[index].lowercased().hasSuffix(".noema-paged") {
+                return components[components.startIndex...index].map(String.init).joined(separator: "/")
+            }
+        }
+        return nil
+    }
+
+    var pagedManifestDownloadPart: DownloadPart? {
+        guard let root = pagedPackageRelativeDirectory else { return nil }
+        let manifestPath = root + "/" + NoemaPagedPackageManifest.manifestFileName
+        return allDownloadParts.first { part in
+            Self.relativeDownloadPath(path: part.path, fallbackURL: part.downloadURL)
+                .caseInsensitiveCompare(manifestPath) == .orderedSame
+        }
+    }
+
+    var isPagedPackage: Bool {
+        pagedManifestDownloadPart != nil
+    }
+
+    /// Model identity encoded by the enclosing `.noema-paged` directory.
+    /// Paged Hub repositories are catalogs of model packages, not one model
+    /// with a conventional quantization ladder.
+    var pagedModelDisplayName: String? {
+        guard let root = pagedPackageRelativeDirectory else { return nil }
+        let directory = root.split(separator: "/").last.map(String.init) ?? root
+        guard directory.lowercased().hasSuffix(".noema-paged") else { return nil }
+        let stem = String(directory.dropLast(".noema-paged".count))
+        guard let quant = pagedQuantDisplayLabel else { return stem }
+
+        var suffixCandidates = [quant]
+        if quant.uppercased().hasPrefix("UD_") {
+            suffixCandidates.append("UD-" + String(quant.dropFirst(3)))
+        }
+        for candidate in suffixCandidates {
+            let suffix = "-\(candidate)"
+            if stem.lowercased().hasSuffix(suffix.lowercased()) {
+                let modelName = String(stem.dropLast(suffix.count))
+                if !modelName.isEmpty { return modelName }
+            }
+        }
+        return stem
+    }
+
+    /// Quantization remains useful package metadata, but it is secondary to
+    /// the model name for paged catalogs.
+    var pagedQuantDisplayLabel: String? {
+        guard isPagedPackage else { return nil }
+        let component = label.components(separatedBy: " · ").first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return component?.isEmpty == false ? component : nil
+    }
+
     private static func normalizedRelativePath(raw: String, fallback: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let candidate = trimmed.isEmpty ? fallback : trimmed
@@ -686,6 +910,9 @@ public struct ModelRecord: Identifiable, Hashable, Codable, Sendable {
     public let tags: [String]?
     public let pipeline_tag: String?
     public let minRAMBytes: Int64?
+    /// Optional curated fit hints per runtime. Falls back to `minRAMBytes` when
+    /// a format-specific estimate is unavailable.
+    public let minRAMBytesByFormat: [ModelFormat: Int64]?
     public let recommendedETBackend: ETBackend?
     public let supportsVision: Bool
 
@@ -701,6 +928,7 @@ public struct ModelRecord: Identifiable, Hashable, Codable, Sendable {
         tags: [String]?,
         pipeline_tag: String?,
         minRAMBytes: Int64? = nil,
+        minRAMBytesByFormat: [ModelFormat: Int64]? = nil,
         recommendedETBackend: ETBackend? = nil,
         supportsVision: Bool = false
     ) {
@@ -715,8 +943,14 @@ public struct ModelRecord: Identifiable, Hashable, Codable, Sendable {
         self.tags = tags
         self.pipeline_tag = pipeline_tag
         self.minRAMBytes = minRAMBytes
+        self.minRAMBytesByFormat = minRAMBytesByFormat
         self.recommendedETBackend = recommendedETBackend
         self.supportsVision = supportsVision
+    }
+
+    public func minimumRAMBytes(for format: ModelFormat?) -> Int64? {
+        guard let format else { return minRAMBytes }
+        return minRAMBytesByFormat?[format] ?? minRAMBytes
     }
 }
 
@@ -806,6 +1040,40 @@ extension QuantInfo: DownloadableModel {
 
 // MARK: - Dataset support
 
+/// High-level category for curated Knowledge Packs. Used to group and badge
+/// packs in Explore. `nil` on a record means it is an ordinary HF/OTL dataset,
+/// not a curated pack.
+public enum DatasetCategory: String, Codable, Sendable, Hashable, CaseIterable {
+    case survival
+    case medical
+    case preparedness
+    case travel
+    case reference
+
+    /// Localized, user-facing label.
+    public var displayName: String {
+        let locale = LocalizationManager.preferredLocale()
+        switch self {
+        case .survival: return String(localized: "Survival", locale: locale)
+        case .medical: return String(localized: "First Aid & Medical", locale: locale)
+        case .preparedness: return String(localized: "Preparedness", locale: locale)
+        case .travel: return String(localized: "Travel", locale: locale)
+        case .reference: return String(localized: "Reference", locale: locale)
+        }
+    }
+
+    /// SF Symbol used on category headers and pack cards.
+    public var systemImage: String {
+        switch self {
+        case .survival: return "tent"
+        case .medical: return "cross.case"
+        case .preparedness: return "shield.lefthalf.filled"
+        case .travel: return "globe"
+        case .reference: return "books.vertical"
+        }
+    }
+}
+
 /// Lightweight metadata used when listing available datasets.
 public struct DatasetRecord: Identifiable, Hashable, Codable, Sendable {
     public let id: String
@@ -813,6 +1081,12 @@ public struct DatasetRecord: Identifiable, Hashable, Codable, Sendable {
     public let publisher: String
     public let summary: String?
     public let installed: Bool
+    /// Curated Knowledge Pack metadata. `nil` for ordinary HF/OTL records.
+    public var category: DatasetCategory?
+    /// Human-readable license label (e.g. "Public Domain (U.S. Gov)").
+    public var license: String?
+    /// Estimated chunk count once indexed; drives the on-device setup-time estimate.
+    public var chunkCount: Int?
 }
 
 /// Represents a file that belongs to a dataset.
@@ -830,10 +1104,16 @@ public struct DatasetDetails: Identifiable, Hashable, Codable, Sendable {
     public let files: [DatasetFile]
     /// Optional human-readable display name (e.g., OTL title). When present, it will be persisted alongside the dataset.
     public let displayName: String?
+    /// Curated Knowledge Pack metadata (nil for ordinary HF/OTL details).
+    public var category: DatasetCategory?
+    public var license: String?
+    public var attribution: String?
+    public var chunkCount: Int?
+    public var snapshotDate: String?
 }
 
 /// Installed dataset stored on disk.
-struct LocalDataset: Identifiable, Hashable {
+struct LocalDataset: Identifiable, Hashable, Sendable {
     // Use stable identifier derived from datasetID to prevent List re-creation and scroll jumps
     var id: String { datasetID }
     let datasetID: String
@@ -847,6 +1127,9 @@ struct LocalDataset: Identifiable, Hashable {
     var isSelected: Bool = false
     var isIndexed: Bool = false
     var requiresReindex: Bool = false
+    /// Index is valid and usable, but was built by an older RAG pipeline revision
+    /// — re-embedding is recommended (not required) to pick up the improvements.
+    var ragIndexOutdated: Bool = false
 }
 
 // MARK: - Dataset processing / indexing status (UI + pipeline)

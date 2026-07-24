@@ -318,6 +318,11 @@ private final class RelayHTTPConnection {
         case streaming
     }
 
+    /// Hard caps so a malformed or hostile peer can't exhaust memory: an endless header
+    /// without a CRLFCRLF terminator, an enormous Content-Length, or a giant chunk size.
+    private static let maxHeaderBytes = 64 * 1024
+    private static let maxBodyBytes = 64 * 1024 * 1024
+
     private let connection: NWConnection
     private var state: RequestState = .waiting
     private let configuration: RelayServerConfiguration
@@ -433,11 +438,22 @@ private final class RelayHTTPConnection {
     private func processBuffer() {
         switch state {
         case .waiting:
-            guard let range = buffer.range(of: Data("\r\n\r\n".utf8)) else { return }
+            guard let range = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+                // No header terminator yet — bail out if the peer is flooding us with an
+                // unterminated header so the buffer can't grow without bound.
+                if buffer.count > Self.maxHeaderBytes {
+                    send(status: 431, json: ["error": "Request header fields too large"])
+                }
+                return
+            }
             let headerData = buffer.subdata(in: 0..<range.lowerBound)
             buffer.removeSubrange(0..<range.upperBound)
             guard let request = HTTPRequest(headerData: headerData) else {
                 send(status: 400, json: ["error": "Malformed request"])
+                return
+            }
+            guard request.contentLength <= Self.maxBodyBytes else {
+                send(status: 413, json: ["error": "Payload too large"])
                 return
             }
             expectedBodyLength = request.contentLength
@@ -468,8 +484,14 @@ private final class RelayHTTPConnection {
                     .split(separator: ";").first
                     .map(String.init)?
                     .trimmingCharacters(in: .whitespaces) ?? ""
-                guard let chunkSize = Int(sizeToken, radix: 16) else {
+                guard let chunkSize = Int(sizeToken, radix: 16), chunkSize >= 0 else {
                     send(status: 400, json: ["error": "Malformed chunk size"])
+                    return
+                }
+                // Reject absurd chunk sizes before they can overflow `needed` or grow the
+                // accumulated body past the cap.
+                guard chunkSize <= Self.maxBodyBytes, body.count + chunkSize <= Self.maxBodyBytes else {
+                    send(status: 413, json: ["error": "Payload too large"])
                     return
                 }
                 if chunkSize == 0 {

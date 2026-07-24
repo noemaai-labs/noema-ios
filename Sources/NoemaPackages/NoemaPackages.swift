@@ -1,5 +1,3 @@
-// NoemaPackages.swift
-// Re-export the RollingThought module
 @_exported import RollingThought
 
 // Resources:

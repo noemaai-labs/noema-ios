@@ -2718,6 +2718,7 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
         auto * result_ctx = (llama_sampler_penalties *) result->ctx;
 
         result_ctx->prev = ctx->prev;
+        result_ctx->token_count = ctx->token_count;
     }
 
     return result;
@@ -2813,8 +2814,6 @@ static void llama_sampler_top_n_sigma_apply(struct llama_sampler * smpl, llama_t
             cur_p->data[i].logit = -INFINITY;
         }
     }
-
-    llama_sampler_softmax_impl(cur_p, true);
 }
 
 static struct llama_sampler * llama_sampler_top_n_sigma_clone(const struct llama_sampler * smpl) {

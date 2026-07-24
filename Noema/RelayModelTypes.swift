@@ -24,6 +24,11 @@ struct RelayModelDescriptor: Identifiable, Equatable {
     let sizeBytes: Int64?
     let tags: [String]
     let settings: ModelSettings?
+    // Overfit (paged GGUF) advertisement. Defaulted so the builders in
+    // RelayManagementView stay source-compatible; the relay engine backfills
+    // from the paged install's canary record.
+    var overfitClassification: String? = nil
+    var overfitMeasuredGenerationRate: Double? = nil
 
     var isLocal: Bool {
         if case .local = origin { return true }
@@ -53,6 +58,9 @@ struct RelayCatalogEntry: Identifiable, Codable, Equatable {
     var exposed: Bool
     var health: RelayModelHealth
     var lastChecked: Date?
+    // Optional so persisted catalogs from builds without Overfit decode as-is.
+    var overfitClassification: String?
+    var overfitMeasuredGenerationRate: Double?
 
     var provider: RelayProviderKind {
         RelayProviderKind(rawValue: providerRaw) ?? .local
@@ -71,7 +79,9 @@ struct RelayCatalogEntry: Identifiable, Codable, Equatable {
          tags: [String] = [],
          exposed: Bool = false,
          health: RelayModelHealth = .available,
-         lastChecked: Date? = nil) {
+         lastChecked: Date? = nil,
+         overfitClassification: String? = nil,
+         overfitMeasuredGenerationRate: Double? = nil) {
         self.id = id
         self.modelID = modelID
         self.originIdentifier = originIdentifier
@@ -86,5 +96,7 @@ struct RelayCatalogEntry: Identifiable, Codable, Equatable {
         self.exposed = exposed
         self.health = health
         self.lastChecked = lastChecked
+        self.overfitClassification = overfitClassification
+        self.overfitMeasuredGenerationRate = overfitMeasuredGenerationRate
     }
 }

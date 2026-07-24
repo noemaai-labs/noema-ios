@@ -99,4 +99,52 @@ final class ChatMarkdownRenderPlannerTests: XCTestCase {
             .textMathBlock("After")
         ])
     }
+
+    func testMacOSPlannerHeadingAfterThematicBreakStartsBlockCleanly() {
+        // "---\n\n### Heading" — the blank after the rule must not become a
+        // leading "\n" in the folded block, or the renderer collapses it into
+        // " ### Heading" and the heading renders as literal body text.
+        let entries: [ChatMarkdownPlannerEntry] = [
+            .thematicBreak,
+            .blank,
+            .heading(level: 3, content: "1. Equations of motion"),
+            .blank,
+            .text("Body")
+        ]
+
+        let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: true)
+
+        XCTAssertEqual(units, [
+            .entryIndex(0),
+            .textMathBlock("### 1. Equations of motion\n\nBody")
+        ])
+    }
+
+    func testMacOSPlannerCollapsesBlankRuns() {
+        let entries: [ChatMarkdownPlannerEntry] = [
+            .text("A"),
+            .blank,
+            .blank,
+            .text("B")
+        ]
+
+        let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: true)
+
+        XCTAssertEqual(units, [.textMathBlock("A\n\nB")])
+    }
+
+    func testIOSPlannerSkipsLeadingBlankAfterStandaloneEntry() {
+        let entries: [ChatMarkdownPlannerEntry] = [
+            .heading(level: 2, content: "Section"),
+            .blank,
+            .text("Body")
+        ]
+
+        let units = ChatMarkdownRenderPlanner.renderUnits(for: entries, isMacOS: false)
+
+        XCTAssertEqual(units, [
+            .entryIndex(0),
+            .textMathBlock("Body")
+        ])
+    }
 }

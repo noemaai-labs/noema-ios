@@ -7,24 +7,35 @@ struct DatasetIndexMetadata: Codable, Equatable, Sendable {
 
     static let currentSchemaVersion = 3
 
+    /// Revision of the RAG extraction/chunking pipeline that produced this index.
+    /// Bumped when on-device extraction or chunking improves (OCR fallback,
+    /// de-hyphenation, paragraph-aware chunking, …). Unlike `schemaVersion`, this
+    /// is NOT part of `isValidReadyIndex`: an older revision stays usable, we just
+    /// *recommend* re-embedding. Bump this whenever those improvements change.
+    static let currentPipelineRevision = 2
+
     let schemaVersion: Int
     let sourceLabelMode: SourceLabelMode
     let chunkCount: Int
     let embeddingFingerprint: EmbeddingIndexFingerprint?
     let createdAt: Date
+    /// `nil` for indexes written before this field existed (treated as outdated).
+    let pipelineRevision: Int?
 
     init(
         schemaVersion: Int = Self.currentSchemaVersion,
         sourceLabelMode: SourceLabelMode = .relativePath,
         chunkCount: Int,
         embeddingFingerprint: EmbeddingIndexFingerprint? = EmbeddingModelCatalog.currentIndexFingerprint(),
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        pipelineRevision: Int? = Self.currentPipelineRevision
     ) {
         self.schemaVersion = schemaVersion
         self.sourceLabelMode = sourceLabelMode
         self.chunkCount = chunkCount
         self.embeddingFingerprint = embeddingFingerprint
         self.createdAt = createdAt
+        self.pipelineRevision = pipelineRevision
     }
 
     var isValidReadyIndex: Bool {
@@ -207,6 +218,13 @@ enum DatasetIndexIO {
         return false
     }
 
+    /// True when an existing index was built by an older RAG pipeline revision
+    /// than the current build (so re-embedding is *recommended*, not required).
+    static func isPipelineOutdated(at datasetURL: URL) -> Bool {
+        guard let metadata = loadMetadata(from: datasetURL) else { return false }
+        return (metadata.pipelineRevision ?? 0) < DatasetIndexMetadata.currentPipelineRevision
+    }
+
     static func hasIndexArtifacts(at datasetURL: URL) -> Bool {
         let fm = FileManager.default
         return fm.fileExists(atPath: vectorsURL(for: datasetURL).path) ||
@@ -236,6 +254,18 @@ enum DatasetIndexIO {
         let fm = FileManager.default
         try? fm.removeItem(at: vectorsURL(for: datasetURL))
         try? fm.removeItem(at: metadataURL(for: datasetURL))
+    }
+
+    /// Removes ALL regenerable index artifacts — vectors, metadata, AND the
+    /// extracted/compacted text — so a re-index re-extracts from source (picking
+    /// up improved OCR/de-hyphenation) instead of re-chunking stale text. Never
+    /// touches source documents.
+    static func clearAllIndexArtifacts(at datasetURL: URL) {
+        let fm = FileManager.default
+        try? fm.removeItem(at: vectorsURL(for: datasetURL))
+        try? fm.removeItem(at: metadataURL(for: datasetURL))
+        try? fm.removeItem(at: extractedURL(for: datasetURL))
+        try? fm.removeItem(at: compactURL(for: datasetURL))
     }
 }
 

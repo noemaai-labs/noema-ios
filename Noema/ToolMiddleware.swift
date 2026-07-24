@@ -1,4 +1,3 @@
-// ToolMiddleware.swift
 #if os(iOS) || os(visionOS) || os(macOS)
 import Foundation
 
@@ -85,6 +84,7 @@ private let toolMetadataMap: [String: ToolMetadata] = [
     "noema.image.analyze": ToolMetadata(displayName: "Image Analysis", iconName: "photo"),
     "noema.file.read": ToolMetadata(displayName: "File Reader", iconName: "doc"),
     "noema.system.info": ToolMetadata(displayName: "System Info", iconName: "info.circle"),
+    PhoneAFriendTool.toolName: ToolMetadata(displayName: "Phone a Friend", iconName: "phone.arrow.up.right"),
 ]
 
 // Normalize various aliases emitted by different models to our canonical names
@@ -123,15 +123,163 @@ private func normalizeToolName(_ raw: String) -> String {
         || lower == "units_convert" || lower == "units.convert" || lower == "convert_units" {
         return "noema.units.convert"
     }
+    if lower == "noema_assist_handoff" || lower == "assist_handoff" || lower == "assist.handoff"
+        || lower == "handoff" || lower == "hand_off" || lower == "phone_a_friend"
+        || lower == "phone-a-friend" || lower == "phoneafriend" {
+        return PhoneAFriendTool.toolName
+    }
     return raw
 }
 
+/// Cheap, side-effect-free peek at which tool a `TOOL_CALL:` token targets and
+/// its arguments. Lets ChatVM divert phone-a-friend calls to the escalation
+/// path before the normal execute-and-restart machinery runs.
+func peekToolCallTarget(_ line: String) -> (tool: String, arguments: [String: Any])? {
+    guard line.hasPrefix(toolPrefix) else { return nil }
+    return parseToolCallTarget(from: String(line.dropFirst(toolPrefix.count)))
+}
+
+/// Removes fully-closed `<think>…</think>` spans so a tool call quoted inside
+/// the model's reasoning can never be mistaken for a real call. An unclosed
+/// trailing `<think>` (reasoning still in progress) is left intact — callers
+/// bail on it separately.
+private func strippingClosedThinkSpans(_ text: String) -> String {
+    var result = text
+    while let open = result.range(of: "<think>"),
+          let close = result.range(of: "</think>", range: open.upperBound..<result.endIndex) {
+        result.removeSubrange(open.lowerBound..<close.upperBound)
+    }
+    return result
+}
+
+/// Buffer-level peek for the prose path: the first complete tool-call payload
+/// outside any `<think>` block. Accepts every syntax the dispatcher
+/// (`interceptEmbeddedToolCallIfPresent`) handles — `TOOL_CALL:` sentinels,
+/// `<tool_call>{json}`, Qwen `<function=…>` XML, and bare JSON with a name +
+/// arguments key — so a hand-off is never missed on those model families.
+/// Side-effect-free.
+func peekEmbeddedToolCallTarget(in textBuffer: String) -> (tool: String, arguments: [String: Any])? {
+    // Bail while a think block is still open (reasoning in progress).
+    let lastThinkOpen = textBuffer.range(of: "<think>", options: .backwards)
+    let lastThinkClose = textBuffer.range(of: "</think>", options: .backwards)
+    if let open = lastThinkOpen {
+        if let close = lastThinkClose {
+            if open.lowerBound > close.lowerBound { return nil }
+        } else {
+            return nil
+        }
+    }
+    // Search only the non-reasoning text so quoted example markup inside a
+    // closed <think> can't trigger a hand-off.
+    let scan = strippingClosedThinkSpans(textBuffer)
+
+    for marker in [toolPrefix, "<tool_call>"] {
+        if let range = scan.range(of: marker),
+           let target = parseToolCallTarget(from: String(scan[range.upperBound...])) {
+            return target
+        }
+    }
+    // Qwen XML function-call form: <function=name><parameter=…>…</function>.
+    if let target = parseQwenFunctionCall(in: scan) {
+        return target
+    }
+    // Bare JSON object carrying a tool name + arguments key.
+    if let target = parseBareJSONToolCall(in: scan) {
+        return target
+    }
+    return nil
+}
+
+/// Nonisolated peek-side parser for the Qwen `<function=name>` XML form. Only
+/// needs the tool name + arguments for the divert decision, so it does a light
+/// parse rather than reusing the @MainActor dispatch-path JSON builder.
+private func parseQwenFunctionCall(in text: String) -> (tool: String, arguments: [String: Any])? {
+    guard let fnRange = text.range(of: "<function=") else { return nil }
+    let afterFn = text[fnRange.upperBound...]
+    guard let nameEnd = afterFn.firstIndex(of: ">") else { return nil }
+    let name = String(afterFn[..<nameEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else { return nil }
+
+    var arguments: [String: Any] = [:]
+    var cursor = afterFn[afterFn.index(after: nameEnd)...]
+    while let paramOpen = cursor.range(of: "<parameter=") {
+        let afterParam = cursor[paramOpen.upperBound...]
+        guard let keyEnd = afterParam.firstIndex(of: ">") else { break }
+        let key = String(afterParam[..<keyEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let afterKey = afterParam[afterParam.index(after: keyEnd)...]
+        guard let close = afterKey.range(of: "</parameter>") else { break }
+        let value = String(afterKey[..<close.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty { arguments[key] = value }
+        cursor = afterKey[close.upperBound...]
+    }
+    // Require a fully-closed block or at least one parsed parameter so we don't
+    // trigger on a half-streamed call.
+    guard !arguments.isEmpty || text.contains("</function>") else { return nil }
+    return (normalizeToolName(name), arguments)
+}
+
+/// Scans for the first balanced `{…}` that names a tool AND carries an args
+/// key — the bare-JSON form some models emit without any wrapper.
+private func parseBareJSONToolCall(in text: String) -> (tool: String, arguments: [String: Any])? {
+    var searchStart = text.startIndex
+    while let open = text.range(of: "{", range: searchStart..<text.endIndex)?.lowerBound {
+        if let close = findMatchingBrace(in: text, startingFrom: open),
+           let data = String(text[open...close]).data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           (obj["tool"] ?? obj["toolName"] ?? obj["name"]) is String,
+           obj["arguments"] != nil || obj["args"] != nil {
+            return parseToolCallTarget(from: String(text[open...close]))
+        }
+        searchStart = text.index(after: open)
+    }
+    return nil
+}
+
+private func parseToolCallTarget(from afterPrefix: String) -> (tool: String, arguments: [String: Any])? {
+    guard let open = afterPrefix.firstIndex(of: "{"),
+          let close = findMatchingBrace(in: afterPrefix, startingFrom: open),
+          let data = String(afterPrefix[open...close]).data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return nil
+    }
+    guard let rawName = (obj["tool"] ?? obj["toolName"] ?? obj["name"]) as? String else { return nil }
+    let arguments: [String: Any] = {
+        if let args = obj["args"] as? [String: Any] { return args }
+        if let args = obj["arguments"] as? [String: Any] { return args }
+        if let argsString = (obj["args"] ?? obj["arguments"]) as? String,
+           let argsData = argsString.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
+            return parsed
+        }
+        return [:]
+    }()
+    return (normalizeToolName(rawName), arguments)
+}
+
+@MainActor
 private func getToolMetadata(_ toolName: String) -> ToolMetadata {
     let canonical = normalizeToolName(toolName)
+#if os(macOS)
+    if canonical.hasPrefix("mcp_"),
+       let descriptor = MCPServerManager.shared.descriptor(alias: canonical) {
+        return ToolMetadata(
+            displayName: descriptor.tool.title ?? descriptor.tool.originalName,
+            iconName: "point.3.connected.trianglepath.dotted"
+        )
+    }
+#endif
     return toolMetadataMap[canonical] ?? ToolMetadata(
         displayName: canonical.components(separatedBy: ".").last?.capitalized ?? "Tool",
         iconName: "wrench.and.screwdriver"
     )
+}
+
+private func startsAwaitingUserApproval(_ toolName: String) -> Bool {
+#if os(macOS)
+    toolName.hasPrefix("mcp_") || toolName == MCPCallTool.toolName
+#else
+    false
+#endif
 }
 
 private enum ToolRequestStatus {
@@ -296,6 +444,28 @@ private func insertToolPlaceholderIfNeeded(
     await logger.log("[Tool] Placeholder tool box inserted for \(toolName)")
 }
 
+/// Phone-a-friend handoffs bypass the normal execute-and-restart path, so
+/// ChatVM records their activity row through this narrow hook instead of the
+/// private upsert.
+@MainActor
+@discardableResult
+func recordPhoneAFriendHandoffCall(
+    messageIndex: Int?,
+    chatVM: ChatVM?,
+    reason: String,
+    phase: ChatVM.Msg.ToolCallPhase,
+    error: String? = nil
+) -> ChatVM.Msg.ToolCall? {
+    upsertToolCall(
+        messageIndex: messageIndex,
+        chatVM: chatVM,
+        toolName: PhoneAFriendTool.toolName,
+        requestParams: reason.isEmpty ? [:] : ["reason": AnyCodable(reason)],
+        phase: phase,
+        error: error
+    )
+}
+
 @MainActor
 @discardableResult
 private func upsertToolCall(
@@ -353,6 +523,11 @@ private func upsertToolCall(
         mergedParams[key] = value
     }
 
+    // Stamp the completion moment exactly once, when the call first reaches a
+    // terminal phase, so the UI can freeze its elapsed-time readout. Preserve an
+    // already-recorded value across re-renders / re-upserts.
+    let completedAt: Date? = phase.isInFlight ? nil : (existing?.completedAt ?? Date())
+
     let updated = ChatVM.Msg.ToolCall(
         id: existing?.id ?? UUID(),
         toolName: toolName,
@@ -363,7 +538,8 @@ private func upsertToolCall(
         externalToolCallID: externalToolCallID ?? existing?.externalToolCallID,
         result: result,
         error: error,
-        timestamp: existing?.timestamp ?? Date()
+        timestamp: existing?.timestamp ?? Date(),
+        completedAt: completedAt
     )
 
     if let existingIndex {
@@ -389,6 +565,27 @@ private func normalizedDisplayArguments(_ arguments: [String: Any]) -> [String: 
     return normalizedArgs
 }
 
+/// The most recent user message at or before `messageIndex` — the fallback
+/// `query` when a model calls a search tool with empty arguments (small local
+/// models and some cloud providers do this; the user's own question is almost
+/// always the intended query).
+@MainActor
+private func latestUserMessageText(chatVM: ChatVM?, messageIndex: Int?) -> String? {
+    guard let chatVM, let idx = messageIndex else { return nil }
+    var i = idx
+    while i >= 0 {
+        if chatVM.streamMsgs.indices.contains(i) {
+            let role = chatVM.streamMsgs[i].role.lowercased()
+            if role == "user" || role == "🧑‍💻" {
+                let text = chatVM.streamMsgs[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return text.isEmpty ? nil : text
+            }
+        }
+        i -= 1
+    }
+    return nil
+}
+
 @MainActor
 private func finalizedExecutionArguments(
     for canonicalTool: String,
@@ -399,34 +596,45 @@ private func finalizedExecutionArguments(
     var normalizedArgs = displayArguments
 
     if canonicalTool == "noema.web.retrieve" {
-        if normalizedArgs["count"] == nil { normalizedArgs["count"] = 3 }
-        if normalizedArgs["safesearch"] == nil { normalizedArgs["safesearch"] = "moderate" }
-        if let s = normalizedArgs["safesearch"] as? String {
-            let allowed = ["off", "moderate", "strict"]
-            if !allowed.contains(s.lowercased()) { normalizedArgs["safesearch"] = "moderate" }
-        }
-        if normalizedArgs["query"] == nil || (normalizedArgs["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
-            if let chatVM, let idx = messageIndex {
-                var i = idx
-                var priorUser = ""
-                while i >= 0 {
-                    if chatVM.streamMsgs.indices.contains(i) {
-                        let role = chatVM.streamMsgs[i].role.lowercased()
-                        if role == "user" || role == "🧑‍💻" {
-                            priorUser = chatVM.streamMsgs[i].text
-                            break
-                        }
-                    }
-                    i -= 1
-                }
-                if !priorUser.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let rawOperation = (normalizedArgs["operation"] as? String)?.lowercased() ?? "research"
+        let operation = ["research", "open", "find"].contains(rawOperation) ? rawOperation : "research"
+        normalizedArgs["operation"] = operation
+        if operation == "research" {
+            if normalizedArgs["count"] == nil { normalizedArgs["count"] = 3 }
+            if normalizedArgs["safesearch"] == nil { normalizedArgs["safesearch"] = "moderate" }
+            if let s = normalizedArgs["safesearch"] as? String {
+                let allowed = ["off", "moderate", "strict"]
+                if !allowed.contains(s.lowercased()) { normalizedArgs["safesearch"] = "moderate" }
+            }
+            if normalizedArgs["query"] == nil || (normalizedArgs["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+                if let priorUser = latestUserMessageText(chatVM: chatVM, messageIndex: messageIndex) {
                     normalizedArgs["query"] = priorUser
                 }
             }
+            if let q = normalizedArgs["query"] as? String {
+                let trimmed = q.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty || trimmed == "..." { return nil }
+            }
+        } else {
+            let sourceRef = (normalizedArgs["source_ref"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if sourceRef?.isEmpty != false { return nil }
+            if operation == "find" {
+                let pattern = (normalizedArgs["pattern"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if pattern?.isEmpty != false { return nil }
+            }
         }
-        if let q = normalizedArgs["query"] as? String {
-            let trimmed = q.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed == "..." { return nil }
+    }
+
+    if canonicalTool == "noema.rag.search" {
+        // Same rescue as web search: models regularly call this with `{}`
+        // (observed from small local models and cloud providers alike). The
+        // user's own question is the right retrieval query, so search with it
+        // instead of failing the call with a decode error.
+        let query = (normalizedArgs["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query == nil || query?.isEmpty == true || query == "..." {
+            if let priorUser = latestUserMessageText(chatVM: chatVM, messageIndex: messageIndex) {
+                normalizedArgs["query"] = priorUser
+            }
         }
     }
 
@@ -473,7 +681,14 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
             case arguments
             case id
             case toolCallID
+            // RemoteChatService.makeToolCallJSON emits the snake_case forms.
+            // When these stopped decoding, every intermediate "requesting"
+            // progress token (arguments still streaming in) was treated as
+            // ready and EXECUTED with partial/empty args — the observed
+            // noema.rag.search {} failures on escalated turns.
+            case toolCallIDSnake = "tool_call_id"
             case requestStatus
+            case requestStatusSnake = "request_status"
             case phase
             case error
         }
@@ -490,11 +705,13 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
 
             let externalToolCallID =
                 try container.decodeIfPresent(String.self, forKey: .toolCallID)
+                ?? container.decodeIfPresent(String.self, forKey: .toolCallIDSnake)
                 ?? container.decodeIfPresent(String.self, forKey: .id)
             self.externalToolCallID = externalToolCallID
 
             let statusRaw =
                 try container.decodeIfPresent(String.self, forKey: .requestStatus)
+                ?? container.decodeIfPresent(String.self, forKey: .requestStatusSnake)
                 ?? container.decodeIfPresent(String.self, forKey: .phase)
             requestStatus = normalizedRequestStatus(from: statusRaw)
             error = try container.decodeIfPresent(String.self, forKey: .error)
@@ -579,7 +796,7 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
             chatVM: chatVM,
             toolName: canonicalTool,
             requestParams: displayParamsForExecution,
-            phase: .executing,
+            phase: startsAwaitingUserApproval(canonicalTool) ? .awaitingApproval : .executing,
             externalToolCallID: call.externalToolCallID,
             result: nil,
             error: nil
@@ -601,6 +818,37 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
             return ("TOOL_RESULT: {\"code\":\"UNKNOWN_TOOL\",\"message\":\"Tool not registered\"}", trailing.isEmpty ? nil : trailing)
         }
         
+        // Enforce toggles/policy at execution time, not just at advertisement time.
+        // This local streaming path dispatches straight from the registry, and
+        // registration is unconditional — without this check a model could still fire
+        // a tool whose master toggle is off or that Teams policy blocks. Web and
+        // Python self-gate inside call() with more specific error messages (offline,
+        // runtime missing), so they are left to their own gates.
+        let selfGatedTools: Set<String> = ["noema.web.retrieve", "noema.python.execute"]
+        let blockedByPDFOnlyAccess = canonicalTool == "noema.rag.search"
+            && chatVM?.isPDFOnlyDocumentAccess == true
+        let blockedByToolAvailability: Bool
+        if selfGatedTools.contains(canonicalTool) {
+            blockedByToolAvailability = false
+        } else {
+            blockedByToolAvailability = !(await ToolManager.shared.isToolAvailable(canonicalTool))
+        }
+        if blockedByPDFOnlyAccess || blockedByToolAvailability {
+            await logger.log("[Tool] Blocked \(canonicalTool): disabled or not permitted")
+            _ = upsertToolCall(
+                messageIndex: messageIndex,
+                chatVM: chatVM,
+                toolName: canonicalTool,
+                requestParams: displayParamsForExecution,
+                phase: .failed,
+                externalToolCallID: call.externalToolCallID,
+                result: nil,
+                error: "Tool is disabled"
+            )
+            await ToolScanRegistry.shared.clearPlaceholder(placeholderSig, for: messageIndex)
+            return ("TOOL_RESULT: {\"code\":\"TOOL_DISABLED\",\"message\":\"This tool is currently disabled. Answer without it and do not call it again.\"}", trailing.isEmpty ? nil : trailing)
+        }
+
         // Use normalized args for execution; clamp web search count to a hard maximum of 5 regardless of input
         var clampedArgs = normalizedArgs
         if canonicalTool == "noema.web.retrieve" {
@@ -647,7 +895,7 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
         await Task.yield()
 
         // Check for direct handler for faster execution
-        let outData: Data
+        var outData: Data
         if canonicalTool == "noema.web.retrieve" {
             let contextLimit = chatVM?.contextLimit ?? 4096
             outData = await handle_noema_web_retrieve(argsData, contextLimit: contextLimit)
@@ -655,6 +903,30 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
             outData = try await tool.call(args: argsData)
         } else {
             outData = try await tool.call(args: argsData)
+        }
+        if canonicalTool == "noema.web.retrieve",
+           var envelope = WebToolResultDecoder.envelope(from: outData),
+           let messageIndex,
+           let chatVM,
+           chatVM.streamMsgs.indices.contains(messageIndex) {
+            let merged = WebEvidenceMessageMapper.merging(
+                existing: chatVM.streamMsgs[messageIndex].webHits,
+                envelope: envelope
+            )
+            let assignedByReference = Dictionary(uniqueKeysWithValues: merged.compactMap { hit -> (String, Int)? in
+                guard let sourceRef = hit.sourceRef, let index = Int(hit.id) else { return nil }
+                return (sourceRef, index)
+            })
+            envelope.sources = envelope.sources.map { source in
+                var adjusted = source
+                if let sourceRef = source.sourceRef, let assigned = assignedByReference[sourceRef] {
+                    adjusted.citationIndex = assigned
+                }
+                return adjusted
+            }
+            if let normalized = try? JSONEncoder().encode(envelope) {
+                outData = normalized
+            }
         }
         let outString = String(data: outData, encoding: .utf8) ?? "{\"code\":\"ENCODE\",\"message\":\"Failed to encode\"}"
         let preview = outString.count > 400 ? String(outString.prefix(400)) + "…" : outString
@@ -664,8 +936,13 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
            let signature = String(data: sigData, encoding: .utf8) {
             await ToolScanRegistry.shared.markDispatched(signature, for: messageIndex)
         }
-        
-        // Update tool call with result
+
+        // The run may have been stopped while the tool executed (executors don't all
+        // observe cancellation). After stop() the streamMsgs proxy can point at a
+        // different session, so writing at messageIndex now would mutate an unrelated
+        // message. The call stays marked dispatched above; stop() marks it interrupted.
+        if Task.isCancelled { return nil }
+
         _ = upsertToolCall(
             messageIndex: messageIndex,
             chatVM: chatVM,
@@ -687,54 +964,33 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
            chatVM.streamMsgs.indices.contains(messageIndex) {
             await logger.log("[Tool][UI] Applying web search result to message state")
             chatVM.streamMsgs[messageIndex].usedWebSearch = true
-            // Milestone: record web search usage for in‑app review gating
-            ReviewPrompter.shared.noteWebSearchUsed()
             if let data = outString.data(using: .utf8) {
-                struct SimpleWebHit: Decodable {
-                    let title: String
-                    let url: String
-                    let snippet: String
-                    let engine: String?
-                    let score: Double?
-                }
-                if let hits = try? JSONDecoder().decode([SimpleWebHit].self, from: data) {
-                    if hits.isEmpty {
+                if let envelope = WebToolResultDecoder.envelope(from: data) {
+                    if envelope.sources.isEmpty {
                         chatVM.streamMsgs[messageIndex].webError = "No results found"
                         chatVM.streamMsgs[messageIndex].webHits = nil
                     } else {
                         chatVM.streamMsgs[messageIndex].webError = nil
-                        chatVM.streamMsgs[messageIndex].webHits = hits.enumerated().map { (i, h) in
-                            let engine = h.engine?.trimmingCharacters(in: .whitespacesAndNewlines)
-                            let resolvedEngine = engine?.isEmpty == false ? engine! : "searxng"
-                            return .init(
-                                id: String(i+1),
-                                title: h.title,
-                                snippet: h.snippet,
-                                url: h.url,
-                                engine: resolvedEngine,
-                                score: h.score ?? 0
-                            )
-                        }
+                        chatVM.streamMsgs[messageIndex].webHits = WebEvidenceMessageMapper.merging(
+                            existing: chatVM.streamMsgs[messageIndex].webHits,
+                            envelope: envelope
+                        )
                     }
-                } else if let any = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    let err: String? = {
-                        if let e = any["error"] as? String { return e }
-                        if let msg = any["message"] as? String { return msg }
-                        if let code = any["code"] { return "Error: \(code)" }
-                        return nil
-                    }()
-                    if let err = err, !err.isEmpty {
+                } else if let error = WebToolResultDecoder.error(from: data) {
+                    if !error.error.isEmpty {
+                        let err = error.error
                         chatVM.streamMsgs[messageIndex].webError = err
                         chatVM.streamMsgs[messageIndex].webHits = nil
                     }
                 }
             }
-            // Try prompting after success moments (guarded: never during active streaming)
-            ReviewPrompter.shared.safeMaybePromptIfEligible(chatVM: chatVM)
         }
         
         if Task.isCancelled { return nil }
-        return ("TOOL_RESULT: \(outString)", trailing.isEmpty ? nil : trailing)
+        // Keep the full result (incl. any rendered image base64) for the UI, but strip
+        // heavy base64 out of the model-facing TOOL_RESULT so it can't blow the context.
+        let modelFacingResult = stripHeavyBase64ForModel(outString)
+        return ("TOOL_RESULT: \(modelFacingResult)", trailing.isEmpty ? nil : trailing)
     } catch {
         if (error as? CancellationError) != nil { return nil }
         await logger.log("[Tool] Parse/dispatch error: \(error.localizedDescription)")
@@ -755,7 +1011,38 @@ func interceptToolCallIfPresent(_ line: String, messageIndex: Int? = nil, chatVM
         }
         
         if Task.isCancelled { return nil }
-        return ("TOOL_RESULT: {\"code\":\"PARSE\",\"message\":\"\(error)\"}", trailing.isEmpty ? nil : trailing)
+        // Argument-shape failures get a corrective message the model can act
+        // on ("The data couldn't be read because it is missing" told it
+        // nothing, and models then hallucinated results). Everything else
+        // keeps the raw description for diagnosability.
+        if error is DecodingError,
+           let toolName = extractToolName(from: jsonPart).map(normalizeToolName) {
+            let requiredList: String = {
+                guard let tool = ToolRegistry.shared.tool(named: toolName),
+                      let schemaObj = try? JSONSerialization.jsonObject(with: Data(tool.schema.utf8)) as? [String: Any],
+                      let required = schemaObj["required"] as? [String],
+                      !required.isEmpty else { return "" }
+                return " Required arguments: \(required.joined(separator: ", "))."
+            }()
+            let payload: [String: Any] = [
+                "code": "BAD_ARGUMENTS",
+                "message": "The call to \(toolName) was missing or had invalid arguments.\(requiredList) Call it again with all required arguments filled in, or answer without it — do not invent tool results."
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+               let json = String(data: data, encoding: .utf8) {
+                return ("TOOL_RESULT: \(json)", trailing.isEmpty ? nil : trailing)
+            }
+        }
+        // Escape the error before embedding it in the JSON string — an unescaped quote,
+        // backslash, or newline in the description would otherwise produce malformed
+        // TOOL_RESULT JSON that the model then mis-parses.
+        let safeMessage = "\(error)"
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        return ("TOOL_RESULT: {\"code\":\"PARSE\",\"message\":\"\(safeMessage)\"}", trailing.isEmpty ? nil : trailing)
     }
 }
 
@@ -1609,6 +1896,36 @@ private func normalizeSingleQuotedJSON(_ s: String) -> String {
         result = valueRegex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: ": \"$1\"")
     }
     return result
+}
+
+/// Replaces heavy base64 image payloads in a tool result with a short placeholder so
+/// the model-facing TOOL_RESULT stays small. Used for rendered charts (image_base64)
+/// and Python image artifacts (artifacts[].base64Data). Returns the input unchanged
+/// when there's nothing to strip.
+func stripHeavyBase64ForModel(_ json: String) -> String {
+    guard json.contains("base64") || json.contains("image_base64") else { return json }
+    guard let data = json.data(using: .utf8),
+          var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return json
+    }
+    var changed = false
+    if object["image_base64"] is String {
+        object["image_base64"] = "[image rendered and shown to the user]"
+        changed = true
+    }
+    if var artifacts = object["artifacts"] as? [[String: Any]] {
+        for index in artifacts.indices where artifacts[index]["base64Data"] is String {
+            artifacts[index]["base64Data"] = "[image data omitted]"
+            changed = true
+        }
+        if changed { object["artifacts"] = artifacts }
+    }
+    guard changed,
+          let out = try? JSONSerialization.data(withJSONObject: object),
+          let string = String(data: out, encoding: .utf8) else {
+        return json
+    }
+    return string
 }
 
 #endif

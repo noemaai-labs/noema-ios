@@ -1,4 +1,3 @@
-// UsageLimiter.swift
 import Foundation
 import CryptoKit
 import Security
@@ -382,8 +381,8 @@ public final class UsageLimiter: @unchecked Sendable {
         // Load tamper cooldown marker if any
         if tamperCooldownUntilEpoch == nil {
             if let data = try KeychainStore.read(service: config.service, account: Self.tamperAccount(for: config.account)), data.count >= 8 {
-                let until = data.withUnsafeBytes { $0.load(as: Int64.self) }
-                tamperCooldownUntilEpoch = Int(until)
+                let rawUntil = data.withUnsafeBytes { $0.loadUnaligned(as: Int64.self) }
+                tamperCooldownUntilEpoch = Int(Int64(littleEndian: rawUntil))
             }
         }
 
@@ -507,16 +506,12 @@ public final class UsageLimiter: @unchecked Sendable {
         let fm = FileManager.default
         let dir = url.deletingLastPathComponent()
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let tmp = dir.appendingPathComponent(".state.dat.tmp-\(UUID().uuidString)")
         do {
-            try data.write(to: tmp, options: [.atomic])
-            if fm.fileExists(atPath: url.path) {
-                try fm.removeItem(at: url)
-            }
-            try fm.moveItem(at: tmp, to: url)
+            // Foundation's atomic write performs a same-directory replace,
+            // avoiding the remove-then-move window where a crash could leave
+            // the limiter with no mirror state at all.
+            try data.write(to: url, options: [.atomic])
         } catch {
-            // Cleanup temp on failure
-            try? fm.removeItem(at: tmp)
             throw UsageLimiterError.ioFailure
         }
     }
@@ -567,7 +562,7 @@ public final class UsageLimiter: @unchecked Sendable {
     private func enterTamperCooldown(now: Date) throws {
         let until = Int(now.timeIntervalSince1970 + 900) // 15 minutes
         tamperCooldownUntilEpoch = until
-        var until64 = Int64(until)
+        var until64 = Int64(until).littleEndian
         let data = Data(bytes: &until64, count: MemoryLayout<Int64>.size)
         try KeychainStore.write(service: config.service, account: Self.tamperAccount(for: config.account), data: data)
     }

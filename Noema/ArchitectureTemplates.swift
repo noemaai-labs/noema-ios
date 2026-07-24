@@ -1,4 +1,3 @@
-// ArchitectureTemplates.swift
 import Foundation
 import NoemaPackages
 

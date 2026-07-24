@@ -1,7 +1,3 @@
-// EnterpriseModelsExploreView.swift
-// Replaces the Explore models tab when a Noema Teams policy carries an explicit model
-// allowlist: a curated list of company-approved models, no search. Rows open the same
-// ExploreDetailView used by the regular Explore flow, so downloads work identically.
 import SwiftUI
 
 struct EnterpriseModelsExploreView: View {
@@ -10,6 +6,10 @@ struct EnterpriseModelsExploreView: View {
     @EnvironmentObject var modelManager: AppModelManager
     @EnvironmentObject var chatVM: ChatVM
     @EnvironmentObject var downloadController: DownloadController
+#if os(macOS)
+    @EnvironmentObject var macModalPresenter: MacModalPresenter
+    @EnvironmentObject var tabRouter: TabRouter
+#endif
     @ObservedObject private var enterpriseManager = EnterprisePolicyManager.shared
 
     @State private var selected: ModelDetails?
@@ -21,6 +21,9 @@ struct EnterpriseModelsExploreView: View {
     }
 
     var body: some View {
+#if os(macOS)
+        macBody
+#else
         List {
             Section {
                 ForEach(allowedModelIDs, id: \.self) { modelID in
@@ -47,11 +50,72 @@ struct EnterpriseModelsExploreView: View {
             )
             .environmentObject(modelManager)
             .environmentObject(chatVM)
-#if os(macOS)
-            .frame(minWidth: 640, idealWidth: 720, minHeight: 640, idealHeight: 760)
+        }
 #endif
+    }
+
+#if os(macOS)
+    private var macBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                IndustrialSectionHeader(LocalizedStringKey("Managed by your organization")) {
+                    Image(systemName: "building.2.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.primary.opacity(0.5))
+                }
+                if allowedModelIDs.isEmpty {
+                    Text(LocalizedStringKey("No models are approved for your roles yet."))
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 14)
+                } else {
+                    VStack(spacing: 2) {
+                        ForEach(allowedModelIDs, id: \.self) { modelID in
+                            IndustrialHoverRow {
+                                modelRow(modelID)
+                                    .padding(.vertical, 8)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+                Text(LocalizedStringKey("Your organization limits Explore to these approved models."))
+                    .industrialStat()
+                    .padding(.top, 12)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+
+    private func presentDetail(_ detail: ModelDetails) {
+        macModalPresenter.present(
+            title: nil,
+            subtitle: nil,
+            showCloseButton: true,
+            dimensions: MacModalDimensions(
+                minWidth: 660,
+                idealWidth: 720,
+                maxWidth: 800,
+                minHeight: 620,
+                idealHeight: 700,
+                maxHeight: 820
+            ),
+            contentInsets: EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
+        ) {
+            ExploreDetailView(
+                detail: detail,
+                downloadController: downloadController,
+                remoteDownloadTargetBackendID: nil,
+                formatFilter: nil
+            )
+            .environmentObject(modelManager)
+            .environmentObject(chatVM)
+            .environmentObject(tabRouter)
+        }
+    }
+#endif
 
     private func isDownloaded(_ modelID: String) -> Bool {
         modelManager.downloadedModels.contains { $0.modelID.caseInsensitiveCompare(modelID) == .orderedSame }
@@ -83,6 +147,9 @@ struct EnterpriseModelsExploreView: View {
                 Spacer()
                 if loadingID == modelID {
                     ProgressView()
+#if os(macOS)
+                        .controlSize(.small)
+#endif
                 } else if isDownloaded(modelID) {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
@@ -103,7 +170,12 @@ struct EnterpriseModelsExploreView: View {
         loadingID = modelID
         defer { loadingID = nil }
         do {
-            selected = try await registry.details(for: modelID)
+            let detail = try await registry.details(for: modelID)
+#if os(macOS)
+            presentDetail(detail)
+#else
+            selected = detail
+#endif
         } catch {
             failedID = modelID
         }

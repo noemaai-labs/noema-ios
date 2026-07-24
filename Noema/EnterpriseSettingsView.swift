@@ -1,6 +1,3 @@
-// EnterpriseSettingsView.swift
-// Settings → Enterprise: connect to a Noema Teams workspace, verify the work email,
-// wait for approval when required, and inspect/disconnect the active connection.
 import QuickLook
 import SwiftUI
 
@@ -14,7 +11,6 @@ struct EnterpriseSettingsView: View {
     @State private var isRefreshing = false
     @State private var refreshDone = false
     @State private var approvalPollTask: Task<Void, Never>?
-    // Company dataset browsing
     @State private var expandedDatasetID: String?
     @State private var datasetFiles: [String: [EnterpriseDatasetFile]] = [:]
     @State private var loadingFilesID: String?
@@ -23,6 +19,52 @@ struct EnterpriseSettingsView: View {
     @State private var previewErrorDatasetID: String?
 
     var body: some View {
+        platformContent
+            .quickLookPreview($previewURL)
+            .animation(.snappy(duration: 0.3), value: manager.state)
+            .onAppear { startApprovalPollingIfNeeded() }
+            .onDisappear { approvalPollTask?.cancel() }
+            .onChange(of: manager.state) { _, _ in startApprovalPollingIfNeeded() }
+            .confirmationDialog(
+                LocalizedStringKey("Disconnect from this workspace?"),
+                isPresented: $confirmDisconnect,
+                titleVisibility: .visible
+            ) {
+                if isDatasetOnlyWorkspace {
+                    Button(LocalizedStringKey("Keep company datasets")) {
+                        Task { await manager.disconnect(keepDatasets: true) }
+                    }
+                    Button(LocalizedStringKey("Remove company datasets"), role: .destructive) {
+                        Task { await manager.disconnect() }
+                    }
+                } else {
+                    Button(LocalizedStringKey("Leave & delete company data"), role: .destructive) {
+                        Task { await manager.disconnect() }
+                    }
+                }
+                Button(LocalizedStringKey("Cancel"), role: .cancel) {}
+            } message: {
+                if isDatasetOnlyWorkspace {
+                    Text(LocalizedStringKey("You can keep saved company datasets on this device as personal datasets, or remove them now."))
+                } else {
+                    Text(LocalizedStringKey("Your organization uses Full Noema Control: all company datasets on this device are deleted when you leave."))
+                }
+            }
+    }
+
+    /// macOS rebuilds the Form as industrial cards inside the settings sheet;
+    /// iOS keeps the native Form plus its navigation title. Shared behaviour
+    /// (polling, QuickLook, the disconnect dialog) lives on `body`.
+    private var platformContent: some View {
+#if os(macOS)
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Enterprise"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             switch manager.state {
             case .none, .disconnected:
@@ -41,39 +83,6 @@ struct EnterpriseSettingsView: View {
                 pendingApprovalSection
             case .connected, .policyExpired, .deviceRevoked, .policyInvalid:
                 connectedSections
-            }
-        }
-#if !os(macOS)
-        .navigationTitle(LocalizedStringKey("Enterprise"))
-#endif
-        .quickLookPreview($previewURL)
-        .animation(.snappy(duration: 0.3), value: manager.state)
-        .onAppear { startApprovalPollingIfNeeded() }
-        .onDisappear { approvalPollTask?.cancel() }
-        .onChange(of: manager.state) { _, _ in startApprovalPollingIfNeeded() }
-        .confirmationDialog(
-            LocalizedStringKey("Disconnect from this workspace?"),
-            isPresented: $confirmDisconnect,
-            titleVisibility: .visible
-        ) {
-            if isDatasetOnlyWorkspace {
-                Button(LocalizedStringKey("Keep company datasets")) {
-                    Task { await manager.disconnect(keepDatasets: true) }
-                }
-                Button(LocalizedStringKey("Remove company datasets"), role: .destructive) {
-                    Task { await manager.disconnect() }
-                }
-            } else {
-                Button(LocalizedStringKey("Leave & delete company data"), role: .destructive) {
-                    Task { await manager.disconnect() }
-                }
-            }
-            Button(LocalizedStringKey("Cancel"), role: .cancel) {}
-        } message: {
-            if isDatasetOnlyWorkspace {
-                Text(LocalizedStringKey("You can keep saved company datasets on this device as personal datasets, or remove them now."))
-            } else {
-                Text(LocalizedStringKey("Your organization uses Full Noema Control: all company datasets on this device are deleted when you leave."))
             }
         }
     }
@@ -528,10 +537,10 @@ struct EnterpriseSettingsView: View {
                     }
                 }
                 .font(.callout.weight(.medium))
-                .frame(maxWidth: .infinity)
+                .industrialCTAWidth()
                 .padding(.vertical, 9)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.industrial(.prominent))
             .disabled(isInstalling)
         }
     }
@@ -684,6 +693,326 @@ struct EnterpriseSettingsView: View {
             }
         }
     }
+
+#if os(macOS)
+    // MARK: - macOS industrial layout
+
+    private var macBody: some View {
+        MacSettingsPage {
+            switch manager.state {
+            case .none, .disconnected:
+                macConnectForm
+            case .connecting:
+                MacSettingsCard(LocalizedStringKey("Connect to company")) {
+                    MacSettingsRowContainer(divider: false) {
+                        HStack(spacing: 12) {
+                            ProgressView().controlSize(.small)
+                            Text(LocalizedStringKey("Contacting your workspace…"))
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(Color.primary.opacity(0.6))
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+            case .awaitingEmailVerification:
+                macVerificationForm
+            case .pendingApproval:
+                macPendingApproval
+            case .connected, .policyExpired, .deviceRevoked, .policyInvalid:
+                macConnectedSections
+            }
+        }
+    }
+
+    private var macConnectForm: some View {
+        MacSettingsCard(LocalizedStringKey("Connect to company")) {
+            MacSettingsControlRow(LocalizedStringKey("Company code"), divider: false) {
+                TextField(LocalizedStringKey("Company code"), text: $companyCode)
+                    .labelsHidden()
+                    .autocorrectionDisabled()
+                    .industrialField(width: 220)
+            }
+            MacSettingsControlRow(LocalizedStringKey("Work email")) {
+                TextField(LocalizedStringKey("Work email"), text: $email)
+                    .labelsHidden()
+                    .autocorrectionDisabled()
+                    .industrialField(width: 220)
+            }
+            MacSettingsNoteRow(LocalizedStringKey("Your administrator shares the company code. We'll email you a verification code."))
+            MacSettingsActionRow {
+                Button {
+                    tapHaptic()
+                    Task { await manager.connect(companyCode: companyCode, email: email) }
+                } label: {
+                    if manager.isBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text(LocalizedStringKey("Connect"))
+                    }
+                }
+                .buttonStyle(.industrial(.prominent))
+                .disabled(manager.isBusy || companyCode.trimmingCharacters(in: .whitespaces).isEmpty || !email.contains("@"))
+            }
+            macErrorNote
+        }
+    }
+
+    private var macVerificationForm: some View {
+        MacSettingsCard(LocalizedStringKey("Check your email")) {
+            MacSettingsControlRow(LocalizedStringKey("Verification code"), divider: false) {
+                TextField(LocalizedStringKey("Verification code"), text: $verificationCode)
+                    .labelsHidden()
+                    .autocorrectionDisabled()
+                    .industrialField(width: 160)
+            }
+            if let devCode = manager.devVerificationCode {
+                MacEnterpriseNoteRow(text: "dev code: \(devCode)")
+            }
+            if let context = manager.storedContext {
+                MacEnterpriseNoteRow(text: String(
+                    format: String(localized: "We sent a 6-digit code to %@.", locale: LocalizationManager.preferredLocale()),
+                    context.email
+                ))
+            }
+            MacSettingsActionRow {
+                Button {
+                    tapHaptic()
+                    Task {
+                        await manager.submitVerificationCode(verificationCode.trimmingCharacters(in: .whitespaces))
+                        verificationCode = ""
+                        if case .connected = manager.state { Haptics.success() }
+                    }
+                } label: {
+                    if manager.isBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text(LocalizedStringKey("Verify"))
+                    }
+                }
+                .buttonStyle(.industrial(.prominent))
+                .disabled(manager.isBusy || verificationCode.trimmingCharacters(in: .whitespaces).count < 4)
+
+                Button(role: .destructive) {
+                    manager.cancelEnrollment()
+                } label: {
+                    Text(LocalizedStringKey("Cancel"))
+                }
+                .buttonStyle(.industrial(.destructive))
+            }
+            macErrorNote
+        }
+    }
+
+    private var macPendingApproval: some View {
+        MacSettingsCard(LocalizedStringKey("Waiting for admin approval")) {
+            MacSettingsRowContainer(divider: false) {
+                HStack(spacing: 12) {
+                    ProgressView().controlSize(.small)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(LocalizedStringKey("Waiting for admin approval"))
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color.primary.opacity(0.7))
+                        if let context = manager.storedContext, let name = context.tenantName {
+                            Text(verbatim: name)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(Color.primary.opacity(0.45))
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            MacSettingsNoteRow(LocalizedStringKey("An administrator needs to approve your request. You can leave this screen — Noema connects automatically once approved."))
+            MacSettingsActionRow {
+                Button(role: .destructive) {
+                    manager.cancelEnrollment()
+                } label: {
+                    Text(LocalizedStringKey("Cancel request"))
+                }
+                .buttonStyle(.industrial(.destructive))
+            }
+            macErrorNote
+        }
+    }
+
+    @ViewBuilder
+    private var macConnectedSections: some View {
+        if let policy = manager.policy {
+            macWorkspaceCard(policy)
+            if let countdown = reconnectCountdown {
+                macOfflineAccessCard(policy, countdown)
+            }
+            macPolicyCard(policy)
+            macRolesCard(policy)
+            macDatasetsCard()
+        } else if manager.state != .connected {
+            MacSettingsCard(LocalizedStringKey("Policy")) {
+                macStatusBanner(divider: false)
+            }
+        }
+        macActionsCard
+    }
+
+    private func macWorkspaceCard(_ policy: EnterprisePolicy) -> some View {
+        MacSettingsCard(LocalizedStringKey("Workspace"), detail: policy.tenantName) {
+            macStatusBanner(divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Work email"), value: policy.userEmail, divider: manager.state != .connected)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Company code"), value: policy.companyCode)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Roles"), value: policy.roleNames.joined(separator: ", "))
+        }
+    }
+
+    private func macOfflineAccessCard(_ policy: EnterprisePolicy, _ countdown: (deadline: Date, days: Int)) -> some View {
+        MacSettingsCard(LocalizedStringKey("Offline access")) {
+            MacSettingsRowContainer(divider: false) {
+                ReconnectCountdownView(deadline: countdown.deadline, intervalDays: countdown.days)
+            }
+            MacEnterpriseNoteRow(text: String(
+                format: String(
+                    localized: "This device must reconnect to %@ at least once every %lld days. If it stays offline past the deadline, all company data is removed from this device automatically. Going back online resets the countdown.",
+                    locale: LocalizationManager.preferredLocale()
+                ),
+                policy.tenantName, Int64(countdown.days)
+            ))
+        }
+    }
+
+    private func macPolicyCard(_ policy: EnterprisePolicy) -> some View {
+        MacSettingsCard(LocalizedStringKey("Policy")) {
+            MacSettingsStatusRow(title: LocalizedStringKey("Policy"), value: macStatusValue, systemImage: macStatusIcon, tint: heroTint, divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Version"), value: "\(policy.policyVersion)")
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Expires"), value: policy.expiresAt.formatted(date: .abbreviated, time: .shortened))
+            if let lastSync = manager.lastSyncAt {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Last sync"), value: lastSync.formatted(date: .abbreviated, time: .shortened))
+            }
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Device ID"), value: String(policy.deviceID.prefix(8)))
+        }
+    }
+
+    @ViewBuilder
+    private func macRolesCard(_ policy: EnterprisePolicy) -> some View {
+        MacSettingsCard(LocalizedStringKey("What your roles allow")) {
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Tools"), value: allowSummary(policy.allowedToolNames), divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Model formats"), value: allowSummary(policy.allowedModelFormats))
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Remote backends"), value: remoteSummary(policy))
+            if policy.requiresOffGrid {
+                MacSettingsRowContainer {
+                    HStack(spacing: 10) {
+                        Image(systemName: "wifi.slash")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.orange)
+                            .frame(width: 18)
+                        Text(LocalizedStringKey("Off-grid mode is required by your organization"))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+    }
+
+    private func macDatasetsCard() -> some View {
+        MacSettingsCard(LocalizedStringKey("Company datasets")) {
+            if manager.availableDatasets.isEmpty {
+                MacSettingsNoteRow(LocalizedStringKey("No datasets are shared with your roles yet."), divider: false)
+            } else {
+                ForEach(Array(manager.availableDatasets.enumerated()), id: \.element.enterpriseDatasetID) { index, manifest in
+                    MacSettingsRowContainer(divider: index != 0) {
+                        datasetCard(manifest)
+                    }
+                }
+            }
+        }
+    }
+
+    private var macActionsCard: some View {
+        MacSettingsCard(LocalizedStringKey("Disconnect")) {
+            MacSettingsActionRow(divider: false) {
+                Button {
+                    runRefresh()
+                } label: {
+                    if isRefreshing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label(refreshDone ? LocalizedStringKey("Up to date") : LocalizedStringKey("Refresh policy"),
+                              systemImage: refreshDone ? "checkmark.circle.fill" : "arrow.clockwise")
+                    }
+                }
+                .buttonStyle(.industrial(.tinted, tint: refreshDone ? .green : .accentColor))
+                .disabled(isRefreshing)
+
+                Button {
+                    tapHaptic()
+                    confirmDisconnect = true
+                } label: {
+                    Label(LocalizedStringKey("Disconnect"), systemImage: "xmark.circle")
+                }
+                .buttonStyle(.industrial(.destructive))
+            }
+            macErrorNote
+        }
+    }
+
+    @ViewBuilder
+    private func macStatusBanner(divider: Bool) -> some View {
+        if let info = statusBannerInfo() {
+            MacSettingsRowContainer(divider: divider) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: info.icon)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(info.tint)
+                        .frame(width: 18)
+                    Text(info.message)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(info.tint)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private func statusBannerInfo() -> (icon: String, tint: Color, message: LocalizedStringKey)? {
+        switch manager.state {
+        case .policyExpired:
+            return ("clock.badge.exclamationmark", .orange, "Policy expired — Noema keeps enforcing the last policy and will sync when the workspace is reachable.")
+        case .deviceRevoked:
+            return ("nosign", .red, "This device's access was revoked by your organization. Company datasets were removed.")
+        case .policyInvalid:
+            return ("exclamationmark.shield", .red, "The last policy from your workspace couldn't be trusted. Restrictions stay active; company datasets are unavailable.")
+        default:
+            return nil
+        }
+    }
+
+    @ViewBuilder
+    private var macErrorNote: some View {
+        if let message = manager.lastErrorMessage {
+            MacEnterpriseNoteRow(text: message, tint: .red)
+        }
+    }
+
+    private var macStatusValue: String {
+        switch manager.state {
+        case .connected: return String(localized: "Active", locale: LocalizationManager.preferredLocale())
+        case .policyExpired: return String(localized: "Expired", locale: LocalizationManager.preferredLocale())
+        case .deviceRevoked: return String(localized: "Revoked", locale: LocalizationManager.preferredLocale())
+        case .policyInvalid: return String(localized: "Invalid", locale: LocalizationManager.preferredLocale())
+        default: return String(localized: "Active", locale: LocalizationManager.preferredLocale())
+        }
+    }
+
+    private var macStatusIcon: String {
+        switch manager.state {
+        case .connected: return "checkmark.seal.fill"
+        case .policyExpired: return "clock.badge.exclamationmark"
+        case .deviceRevoked: return "nosign"
+        case .policyInvalid: return "exclamationmark.shield"
+        default: return "checkmark.seal.fill"
+        }
+    }
+#endif
 }
 
 
@@ -787,3 +1116,25 @@ private struct ReconnectCountdownView: View {
         return .green
     }
 }
+
+
+#if os(macOS)
+/// Mono note row for runtime-interpolated copy on the Mac Enterprise screen —
+/// `MacSettingsNoteRow` only takes a `LocalizedStringKey`, but these lines arrive
+/// already formatted (verification email, reconnect deadline, error messages).
+private struct MacEnterpriseNoteRow: View {
+    let text: String
+    var tint: Color = Color.primary.opacity(0.45)
+    var divider: Bool = true
+
+    var body: some View {
+        MacSettingsRowContainer(divider: divider) {
+            Text(verbatim: text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(tint)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+#endif

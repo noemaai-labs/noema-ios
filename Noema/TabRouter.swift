@@ -1,4 +1,3 @@
-// TabRouter.swift
 import SwiftUI
 
 @MainActor
@@ -9,6 +8,7 @@ enum MainTab: Hashable {
 #if os(macOS)
     case relay
 #endif
+    case tools
     case settings
 }
 

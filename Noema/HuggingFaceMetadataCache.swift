@@ -1,4 +1,3 @@
-// HuggingFaceMetadataCache.swift
 import Foundation
 
 struct ModelHubMeta: Codable {
@@ -61,10 +60,43 @@ enum HuggingFaceMetadataCache {
         return base
     }
 
+    private final class MemCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var map: [String: (meta: ModelHubMeta?, mtime: TimeInterval)] = [:]
+        func get(_ k: String, mtime: TimeInterval) -> ModelHubMeta?? {
+            lock.lock(); defer { lock.unlock() }
+            if let e = map[k], e.mtime == mtime { return .some(e.meta) }
+            return nil
+        }
+        func set(_ k: String, _ v: ModelHubMeta?, mtime: TimeInterval) {
+            lock.lock(); defer { lock.unlock() }
+            map[k] = (v, mtime)
+        }
+    }
+    private static let mem = MemCache()
+
+    /// Read-only path to the cached hub.json — does NOT create the directory (unlike cacheDir).
+    private static func hubJSONURL(repoId: String) -> URL {
+        var base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        base.appendPathComponent("ModelCards", isDirectory: true)
+        for comp in repoId.split(separator: "/") { base.appendPathComponent(String(comp), isDirectory: true) }
+        return base.appendingPathComponent("hub.json")
+    }
+
     static func cached(repoId: String) -> ModelHubMeta? {
-        let url = cacheDir(repoId: repoId).appendingPathComponent("hub.json")
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(ModelHubMeta.self, from: data)
+        // In-memory cache keyed by repoId + file mtime. The Explore Text/Vision filter calls this
+        // per record inside the view body; without this it did a createDirectory + Data(contentsOf:)
+        // + JSONDecode on the main thread for every record on every render. Also caches the "no
+        // hub.json" (nil) result so models without a card don't re-hit the disk each pass.
+        let url = hubJSONURL(repoId: repoId)
+        let mtime = ((try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate)?.timeIntervalSince1970 ?? -1
+        if let hit = mem.get(repoId, mtime: mtime) { return hit }
+        let result: ModelHubMeta? = {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode(ModelHubMeta.self, from: data)
+        }()
+        mem.set(repoId, result, mtime: mtime)
+        return result
     }
 
     static func fetch(repoId: String, token: String?) async -> ModelHubMeta? {
@@ -76,7 +108,6 @@ enum HuggingFaceMetadataCache {
                                                                          accept: "application/json",
                                                                          timeout: 10)
             if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) { return nil }
-            // Minimal decode mapping the few fields we need
             let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let id = (raw?["id"] as? String) ?? repoId
             let author = raw?["author"] as? String

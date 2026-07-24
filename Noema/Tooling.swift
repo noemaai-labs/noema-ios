@@ -1,4 +1,3 @@
-// Tooling.swift
 import Foundation
 
 public protocol Tool: Sendable {
@@ -7,6 +6,10 @@ public protocol Tool: Sendable {
     var schema: String { get } // JSON Schema string (for tool-calling models)
     func call(args: Data) async throws -> Data // JSON in → JSON out
 }
+
+/// Alias for files that also import FoundationModels, whose own `Tool`
+/// protocol shadows the bare name.
+public typealias LoopbackTool = Tool
 
 enum ToolDryRunSupport {
     static let defaultsKey = "toolDryRunEnabled"
@@ -35,76 +38,72 @@ enum ToolDryRunSupport {
 @MainActor
 public final class ToolRegistry {
     public static let shared = ToolRegistry()
-    private var tools: [String: Tool] = [:]
+    private struct Entry {
+        let tool: Tool
+        let source: String
+    }
+    private var entries: [String: Entry] = [:]
+    private static let builtInSource = "noema.builtin"
     
     public func register(_ tool: Tool) {
-        tools[tool.name] = tool
+        register(tool, source: Self.builtInSource)
+    }
+
+    /// Atomically installs a complete source-owned catalog. This is used by MCP
+    /// connections so a list-change notification can never leave a half-old catalog.
+    public func replaceTools(from source: String, with tools: [Tool]) {
+        entries = entries.filter { $0.value.source != source }
+        for tool in tools { entries[tool.name] = Entry(tool: tool, source: source) }
+        Task { await logger.log("[ToolRegistry] Replaced source \(source) with \(tools.count) tools") }
+    }
+
+    public func unregisterTools(from source: String) {
+        entries = entries.filter { $0.value.source != source }
+        Task { await logger.log("[ToolRegistry] Unregistered tool source: \(source)") }
+    }
+
+    public func register(_ tool: Tool, source: String) {
+        entries[tool.name] = Entry(tool: tool, source: source)
         Task {
             await logger.log("[ToolRegistry] Registered tool: \(tool.name)")
         }
     }
     
     public func tool(named name: String) -> Tool? {
-        return tools[name]
+        entries[name]?.tool
     }
+
+    public func source(forToolNamed name: String) -> String? { entries[name]?.source }
     
     public var registeredToolNames: [String] {
-        return Array(tools.keys).sorted()
+        Array(entries.keys).sorted()
     }
     
     // MARK: - OpenAI-style Tool Specs Generation
     
     public func generateToolSpecs() throws -> [ToolSpec] {
-        return try tools.values.map { tool in
-            let schemaData = Data(tool.schema.utf8)
-            let jsonObject = try JSONSerialization.jsonObject(with: schemaData)
-            
-            guard let schemaDict = jsonObject as? [String: Any],
-                  let type = schemaDict["type"] as? String,
-                  type == "object",
-                  let properties = schemaDict["properties"] as? [String: Any] else {
-                throw ToolError.invalidArguments("Invalid schema for tool \(tool.name)")
+        // Name-sorted, never dictionary-enumeration order: the spec array's order
+        // reaches the rendered prompt verbatim (llama.cpp parses request JSON as
+        // ordered_json), and catalog rebuilds (MCP replaceTools, cache
+        // invalidation) would otherwise reshuffle it — breaking the prompt's
+        // stable prefix and with it slot-KV reuse across turns and launches.
+        try entries.values
+            .sorted { $0.tool.name < $1.tool.name }
+            .map { entry in
+                let schemaData = Data(entry.tool.schema.utf8)
+                let schema = try JSONDecoder().decode(ToolSpec.JSONSchema.self, from: schemaData)
+                return ToolSpec(name: entry.tool.name, description: entry.tool.description, parameters: schema)
             }
-            
-            let required = schemaDict["required"] as? [String] ?? []
-            
-            let parameters = try properties.mapValues { propValue -> ToolSpec.JSONSchema.Parameter in
-                guard let propDict = propValue as? [String: Any],
-                      let propType = propDict["type"] as? String,
-                      let description = propDict["description"] as? String else {
-                    throw ToolError.invalidArguments("Invalid property in schema for tool \(tool.name)")
-                }
-                
-                let maximum = propDict["maximum"] as? Int
-                let minimum = propDict["minimum"] as? Int
-                let defaultValue = propDict["default"].map { AnyCodable($0) }
-                let enumValues = propDict["enum"] as? [String]
-                
-                return ToolSpec.JSONSchema.Parameter(
-                    type: propType,
-                    description: description,
-                    maximum: maximum,
-                    minimum: minimum,
-                    defaultValue: defaultValue,
-                    enumValues: enumValues
-                )
-            }
-            
-            let jsonSchema = ToolSpec.JSONSchema(
-                type: "object",
-                properties: parameters,
-                required: required
-            )
-            
-            return ToolSpec(name: tool.name, description: tool.description, parameters: jsonSchema)
-        }
     }
     
     // MARK: - Tool Catalog for Prompting
     
     public func generateToolCatalog() -> String {
-        let toolDescriptions = tools.values.map { tool in
-            """
+        // Same determinism contract as generateToolSpecs: prose catalogs land in
+        // the system prompt, which is the prompt's leading KV segment.
+        let toolDescriptions = entries.values.sorted { $0.tool.name < $1.tool.name }.map { entry in
+            let tool = entry.tool
+            return """
             Tool: \(tool.name)
             Description: \(tool.description)
             Schema: \(tool.schema)
@@ -126,7 +125,7 @@ public final class ToolRegistry {
     // MARK: - Tool Execution with Validation
     
     public func executetool(name: String, arguments: [String: Any]) async throws -> String {
-        guard let tool = tools[name] else {
+        guard let tool = entries[name]?.tool else {
             throw ToolError.unknownTool(name)
         }
         
@@ -140,7 +139,6 @@ public final class ToolRegistry {
             }
         }
 
-        // Validate arguments against schema
         try validateArguments(sanitizedArguments, against: tool.schema, for: name)
         
         let argsData = try JSONSerialization.data(withJSONObject: sanitizedArguments)
@@ -166,11 +164,11 @@ public final class ToolRegistry {
     
     private func validateArguments(_ arguments: [String: Any], against schemaString: String, for toolName: String) throws {
         let schemaData = Data(schemaString.utf8)
-        guard let schemaObject = try JSONSerialization.jsonObject(with: schemaData) as? [String: Any],
-              let properties = schemaObject["properties"] as? [String: Any],
-              let required = schemaObject["required"] as? [String] else {
+        guard let schemaObject = try JSONSerialization.jsonObject(with: schemaData) as? [String: Any] else {
             throw ToolError.invalidArguments("Invalid schema format for tool \(toolName)")
         }
+        let properties = schemaObject["properties"] as? [String: Any] ?? [:]
+        let required = schemaObject["required"] as? [String] ?? []
         
         // Check required parameters
         for requiredParam in required {
@@ -181,33 +179,46 @@ public final class ToolRegistry {
         
         // Validate parameter types (basic validation)
         for (paramName, paramValue) in arguments {
-            guard let paramSchema = properties[paramName] as? [String: Any],
-                  let expectedType = paramSchema["type"] as? String else {
+            guard let paramSchema = properties[paramName] as? [String: Any] else {
+                if schemaObject["additionalProperties"] as? Bool == false {
+                    throw ToolError.invalidArguments("Parameter '\(paramName)' is not allowed for tool \(toolName)")
+                }
                 continue
             }
+            let expectedTypes: [String]
+            if let expected = paramSchema["type"] as? String { expectedTypes = [expected] }
+            else if let expected = paramSchema["type"] as? [String] { expectedTypes = expected }
+            else { expectedTypes = [] }
             
-            let isValidType: Bool
-            switch expectedType {
+            func matches(_ expectedType: String) -> Bool {
+                switch expectedType {
             case "string":
-                isValidType = paramValue is String
+                    return paramValue is String
             case "integer":
-                isValidType = paramValue is Int
+                    if let number = paramValue as? NSNumber { return number.doubleValue.rounded() == number.doubleValue }
+                    return paramValue is Int
             case "number":
-                isValidType = paramValue is NSNumber
+                    return paramValue is NSNumber
             case "boolean":
-                isValidType = paramValue is Bool
+                    return paramValue is Bool
             case "array":
-                isValidType = paramValue is [Any]
+                    return paramValue is [Any]
             case "object":
-                isValidType = paramValue is [String: Any]
+                    return paramValue is [String: Any]
+            case "null":
+                    return paramValue is NSNull
             default:
-                isValidType = true // Unknown type, skip validation
+                    return true // Future JSON Schema types remain forward-compatible.
+                }
             }
             
-            if !isValidType {
-                throw ToolError.invalidArguments("Parameter '\(paramName)' should be of type \(expectedType) for tool \(toolName)")
+            if !expectedTypes.isEmpty, !expectedTypes.contains(where: matches) {
+                throw ToolError.invalidArguments("Parameter '\(paramName)' has the wrong type for tool \(toolName)")
+            }
+            if let allowed = paramSchema["enum"] as? [Any],
+               !allowed.contains(where: { String(describing: $0) == String(describing: paramValue) }) {
+                throw ToolError.invalidArguments("Parameter '\(paramName)' is not one of the allowed values for tool \(toolName)")
             }
         }
     }
 }
-

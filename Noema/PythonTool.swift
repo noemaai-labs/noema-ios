@@ -1,4 +1,3 @@
-// PythonTool.swift
 import Foundation
 
 public struct PythonTool: Tool {
@@ -17,6 +16,12 @@ public struct PythonTool: Tool {
 
         let input = try JSONDecoder().decode(PythonArgs.self, from: args)
 
+        let maxCodeLength = 100_000
+        guard input.code.count <= maxCodeLength else {
+            let errorPayload = ["error": "The code is too long (max \(maxCodeLength) characters). Send a shorter script."]
+            return try JSONSerialization.data(withJSONObject: errorPayload)
+        }
+
         #if DEBUG
         await logger.log(
             """
@@ -29,7 +34,6 @@ public struct PythonTool: Tool {
 
         let runtimeStatus = PythonRuntime.status()
 
-        // Guard global availability
         guard PythonToolGate.isAvailable() else {
             if runtimeStatus.isAvailable == false, let reason = runtimeStatus.reason, !reason.isEmpty {
                 let errorPayload = ["error": reason]
@@ -60,7 +64,21 @@ public struct PythonTool: Tool {
             )
             #endif
 
-            return try JSONEncoder().encode(result)
+            // Cap stdout/stderr before the result enters the transcript and the model
+            // context — a single print('x' * 10**7) would otherwise persist megabytes
+            // into the session and blow the prompt budget on the continuation turn.
+            let maxStdout = 20_000
+            let maxStderr = 8_000
+            let bounded = PythonExecutionResult(
+                stdout: Self.truncated(result.stdout, limit: maxStdout),
+                stderr: Self.truncated(result.stderr, limit: maxStderr),
+                exitCode: result.exitCode,
+                executionTimeMs: result.executionTimeMs,
+                error: result.error,
+                timedOut: result.timedOut,
+                artifacts: result.artifacts
+            )
+            return try JSONEncoder().encode(bounded)
 
         } catch {
             #if DEBUG
@@ -83,5 +101,10 @@ public struct PythonTool: Tool {
             let errorPayload = ["error": message]
             return try JSONSerialization.data(withJSONObject: errorPayload)
         }
+    }
+
+    private static func truncated(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return String(text.prefix(limit)) + "\n… [output truncated: \(text.count - limit) more characters]"
     }
 }

@@ -1,4 +1,3 @@
-// HuggingFaceRegistry.swift
 import Foundation
 
 public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
@@ -29,6 +28,83 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
 
     // MARK: - ModelRegistry
     public func curated() async throws -> [ModelRecord] { [] }
+
+    public func trending(format: ModelFormat?) async throws -> [ModelRecord] {
+        // Only formats with a Hub tag Noema can run directly.
+        let filterTag: String? = {
+            switch format {
+            case .gguf: return "gguf"
+            case .mlx: return "mlx"
+            default: return nil
+            }
+        }()
+        guard let filterTag else { return [] }
+
+        var c = URLComponents(string: "https://huggingface.co/api/models")!
+        c.queryItems = [
+            URLQueryItem(name: "sort", value: "trendingScore"),
+            URLQueryItem(name: "direction", value: "-1"),
+            URLQueryItem(name: "limit", value: "20"),
+            URLQueryItem(name: "filter", value: filterTag),
+            URLQueryItem(name: "cardData", value: "true")
+        ]
+
+        struct TrendingEntry: Decodable {
+            let modelId: String
+            let author: String?
+            let tags: [String]?
+            let pipeline_tag: String?
+            let cardData: Card?
+            struct Card: Decodable { let summary: String?; let pipeline_tag: String? }
+
+            enum CodingKeys: String, CodingKey { case modelId, id, author, tags, pipeline_tag, cardData }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                if let mid = try container.decodeIfPresent(String.self, forKey: .modelId) {
+                    self.modelId = mid
+                } else {
+                    self.modelId = try container.decode(String.self, forKey: .id)
+                }
+                self.author = try container.decodeIfPresent(String.self, forKey: .author)
+                self.tags = try container.decodeIfPresent([String].self, forKey: .tags)
+                let topPipeline = try container.decodeIfPresent(String.self, forKey: .pipeline_tag)
+                self.cardData = try container.decodeIfPresent(Card.self, forKey: .cardData)
+                self.pipeline_tag = topPipeline ?? self.cardData?.pipeline_tag
+            }
+        }
+
+        let (raw, _) = try await data(from: c.url!)
+        guard let entries = try? JSONDecoder().decode([TrendingEntry].self, from: raw) else { return [] }
+
+        var seen = Set<String>()
+        var records: [ModelRecord] = []
+        for entry in entries {
+            guard seen.insert(entry.modelId).inserted else { continue }
+            let tags = entry.tags ?? []
+            let formats = Self.inferFormats(
+                tags: tags,
+                id: entry.modelId,
+                pipelineTag: entry.pipeline_tag,
+                forcedFormat: nil
+            )
+            let owner = entry.modelId.split(separator: "/").first.map(String.init) ?? (entry.author ?? "")
+            records.append(ModelRecord(
+                id: entry.modelId,
+                displayName: Self.prettyName(from: entry.modelId),
+                publisher: owner,
+                summary: entry.cardData?.summary,
+                hasInstallableQuant: true,
+                formats: formats,
+                installed: false,
+                tags: tags,
+                pipeline_tag: entry.pipeline_tag,
+                recommendedETBackend: nil,
+                supportsVision: Self.inferSupportsVision(tags: tags, pipelineTag: entry.pipeline_tag)
+            ))
+        }
+        return records
+    }
 
     public func searchStream(query: String, page: Int, format: ModelFormat? = nil, includeVisionModels: Bool = true, visionOnly: Bool = false) -> AsyncThrowingStream<ModelRecord, Error> {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
@@ -120,14 +196,12 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
                     }
                     
                     var combinedData: [Data] = []
-                    
-                    // Fetch from all specified URLs
+
                     for url in urlsToFetch {
                         let data = try await self.data(from: url)
                         combinedData.append(data.0)
                     }
                     
-                    // Process both result sets
                     var seen = Set<String>()
                     for rawData in combinedData {
                         guard let pageResults = try? JSONDecoder().decode([Entry].self, from: rawData) else {
@@ -293,8 +367,8 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
             )
         }()
 
-        let mtpFile: QuantInfo.AuxiliaryFile? = {
-            let candidates = files.filter { file in
+        let mtpFiles: [RepoFile] = {
+            files.filter { file in
                 let lower = file.path.lowercased()
                 guard lower.hasSuffix(".gguf") || lower.hasSuffix(".gguf_file") else { return false }
                 guard !lower.contains("mmproj"), !lower.contains("projector"), !lower.contains("image_proj") else {
@@ -302,17 +376,9 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
                 }
                 return lower.contains("mtp-") || lower.contains("-mtp") || lower.contains("nextn")
             }
-            guard let match = candidates.sorted(by: { lhs, rhs in
-                let l = lhs.path.lowercased()
-                let r = rhs.path.lowercased()
-                let lScore = (l.contains("mtp-") || l.contains("-mtp") ? 2 : 0) + (l.contains("nextn") ? 1 : 0)
-                let rScore = (r.contains("mtp-") || r.contains("-mtp") ? 2 : 0) + (r.contains("nextn") ? 1 : 0)
-                if lScore != rScore { return lScore > rScore }
-                return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
-            }).first else {
-                return nil
-            }
+        }()
 
+        func mtpAuxiliaryFile(_ match: RepoFile) -> QuantInfo.AuxiliaryFile? {
             let escapedRepo = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
             let encodedPath = match.path
                 .split(separator: "/", omittingEmptySubsequences: false)
@@ -323,22 +389,59 @@ public final class HuggingFaceRegistry: ModelRegistry, @unchecked Sendable {
             guard let url = URL(string: "https://huggingface.co/\(escapedRepo)/resolve/main/\(encodedPath)?download=1") else {
                 return nil
             }
-
             return QuantInfo.AuxiliaryFile(
                 path: match.path,
                 sizeBytes: match.size,
                 sha256: match.sha256,
                 downloadURL: url
             )
-        }()
+        }
+
+        func associationTokens(_ path: String) -> Set<String> {
+            let ignored = Set([
+                "gguf", "file", "model", "weights", "mtp", "nextn", "draft", "f16", "f32",
+                "q2", "q3", "q4", "q5", "q6", "q8", "k", "m", "s", "l", "iq", "quantized"
+            ])
+            let tokens = Set(path.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
+                .subtracting(ignored)
+                .filter { token in
+                    !token.allSatisfy { $0.isNumber } && !token.hasPrefix("q4_") && !token.hasPrefix("q5_")
+                }
+            return Set(tokens)
+        }
+
+        func matchedMTP(for quant: QuantInfo) -> QuantInfo.AuxiliaryFile? {
+            let quantPath = quant.downloadURL.path.removingPercentEncoding ?? quant.downloadURL.path
+            let repositoryPath = quantPath.components(separatedBy: "/resolve/main/").last ?? quantPath
+            let quantTokens = associationTokens(repositoryPath)
+            let quantDirectory = URL(fileURLWithPath: repositoryPath).deletingLastPathComponent().path.lowercased()
+            let scored = mtpFiles.compactMap { candidate -> (RepoFile, Int)? in
+                let common = quantTokens.intersection(associationTokens(candidate.path)).count
+                let candidateDirectory = URL(fileURLWithPath: candidate.path).deletingLastPathComponent().path.lowercased()
+                let sameDirectory = candidateDirectory == quantDirectory
+                guard common > 0 || sameDirectory else { return nil }
+                return (candidate, common * 100 + (sameDirectory ? 20 : 0))
+            }
+            guard let best = scored.sorted(by: { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                return lhs.0.path.localizedCaseInsensitiveCompare(rhs.0.path) == .orderedAscending
+            }).first else { return nil }
+
+            // A tie means the repository does not identify which base variant
+            // owns the sidecar; do not silently attach an arbitrary one.
+            if scored.filter({ $0.1 == best.1 }).count > 1 {
+                return nil
+            }
+            return mtpAuxiliaryFile(best.0)
+        }
 
         if let importanceMatrix {
             for i in quants.indices where quants[i].format == .gguf && quants[i].isIQQuant {
                 quants[i] = quants[i].copying(importanceMatrix: .some(importanceMatrix))
             }
         }
-        if let mtpFile {
-            for i in quants.indices where quants[i].format == .gguf {
+        for i in quants.indices where quants[i].format == .gguf {
+            if let mtpFile = matchedMTP(for: quants[i]) {
                 quants[i] = quants[i].copying(mtp: .some(mtpFile))
             }
         }

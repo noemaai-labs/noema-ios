@@ -45,7 +45,7 @@ struct MainView: View {
         .exploreSwitchToModels,
         .exploreModelTypes,
         .exploreMLX,
-        .exploreSLM,
+        .exploreET,
         .settingsIntro,
         .settingsHighlights,
         .completed
@@ -96,6 +96,7 @@ struct MainView: View {
         .onAppear {
             modelManager.bind(datasetManager: datasetManager)
             downloadController.configure(modelManager: modelManager, datasetManager: datasetManager)
+            downloadController.bootstrapIfNeeded()
             datasetManager.bind(downloadController: downloadController)
             chatVM.modelManager = modelManager
             chatVM.datasetManager = datasetManager
@@ -199,6 +200,10 @@ struct MainView: View {
                     .tabItem { Label(tabTitle(for: .explore), systemImage: tabSystemImage(for: .explore)) }
             }
 
+            tabContent(for: .tools)
+                .tag(MainTab.tools)
+                .tabItem { Label(tabTitle(for: .tools), systemImage: tabSystemImage(for: .tools)) }
+
             tabContent(for: .settings)
                 .tag(MainTab.settings)
                 .tabItem { Label(tabTitle(for: .settings), systemImage: tabSystemImage(for: .settings)) }
@@ -232,6 +237,14 @@ struct MainView: View {
                 .environmentObject(tabRouter)
                 .environmentObject(downloadController)
                 .environmentObject(walkthrough)
+        case .tools:
+            ToolsHubView()
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(downloadController)
+                .environmentObject(walkthrough)
         case .settings:
             SettingsView()
                 .environmentObject(chatVM)
@@ -251,6 +264,8 @@ struct MainView: View {
             return "Stored"
         case .explore:
             return "Explore"
+        case .tools:
+            return "Tools"
         case .settings:
             return "Settings"
         }
@@ -264,6 +279,8 @@ struct MainView: View {
             return "externaldrive"
         case .explore:
             return "safari"
+        case .tools:
+            return "wrench.and.screwdriver"
         case .settings:
             return "gearshape"
         }

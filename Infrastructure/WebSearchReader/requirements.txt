@@ -1,0 +1,8 @@
+aiohttp==3.12.15
+cachetools==6.1.0
+fastapi==0.116.1
+pydantic==2.11.7
+pypdf==5.9.0
+rank-bm25==0.2.2
+trafilatura==2.0.0
+uvicorn==0.35.0

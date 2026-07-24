@@ -1,4 +1,3 @@
-// PythonExecutor.swift
 import Foundation
 
 /// Generated file metadata captured from a Python execution sandbox.

@@ -112,6 +112,12 @@ final class BackendPromptFormattingTests: XCTestCase {
         settings.minP = 0.05
         settings.repetitionPenalty = 1.2
         settings.repeatLastN = 128
+        settings.seed = 73
+        settings.mlxKVCacheQuantization = .fourBit
+        settings.mlxKVCacheGroupSize = 32
+        settings.mlxKVCacheQuantizationStart = 256
+        settings.mlxKVCacheLimit = 4096
+        settings.mlxPrefillStepSize = 1024
 
         let parameters = MLXBridge.generateParameters(settings: settings, maxOutputTokens: 256)
 
@@ -121,7 +127,34 @@ final class BackendPromptFormattingTests: XCTestCase {
         XCTAssertEqual(parameters.minP, 0.05, accuracy: 1e-6)
         XCTAssertEqual(parameters.repetitionPenalty, 1.2)
         XCTAssertEqual(parameters.repetitionContextSize, 128)
+        XCTAssertEqual(parameters.presenceContextSize, 128)
+        XCTAssertEqual(parameters.frequencyContextSize, 128)
+        XCTAssertEqual(parameters.seed, 73)
+        XCTAssertEqual(parameters.kvBits, 4)
+        XCTAssertEqual(parameters.kvGroupSize, 32)
+        XCTAssertEqual(parameters.quantizedKVStart, 256)
+        XCTAssertEqual(parameters.maxKVSize, 4096)
+        XCTAssertEqual(parameters.prefillStepSize, 1024)
         XCTAssertEqual(parameters.maxTokens, 256)
+    }
+
+    func testGenerateParametersForwardEverySupportedMLXKVBitWidth() {
+        let expectedBits = Set([2, 3, 4, 5, 6, 8])
+        XCTAssertEqual(Set(MLXKVCacheQuantization.allCases.compactMap(\.bits)), expectedBits)
+        XCTAssertFalse(MLXKVCacheQuantization.allCases.compactMap(\.bits).contains(7))
+
+        for quantization in MLXKVCacheQuantization.allCases {
+            var settings = ModelSettings.default(for: .mlx)
+            settings.mlxKVCacheQuantization = quantization
+
+            let parameters = MLXBridge.generateParameters(settings: settings, maxOutputTokens: nil)
+
+            XCTAssertEqual(
+                parameters.kvBits,
+                quantization.bits,
+                "MLX KV precision \(quantization.rawValue) should reach GenerateParameters unchanged"
+            )
+        }
     }
 
     func testGenerateParametersDisableNeutralPenalties() {
@@ -136,6 +169,43 @@ final class BackendPromptFormattingTests: XCTestCase {
         XCTAssertNil(parameters.presencePenalty)
         XCTAssertNil(parameters.frequencyPenalty)
         XCTAssertNil(parameters.maxTokens)
+    }
+
+    func testGenerateParametersPreferRequestScopedSamplingOverrides() {
+        var settings = ModelSettings()
+        settings.temperature = 0.7
+        settings.topP = 0.95
+        settings.topK = 40
+        settings.repetitionPenalty = 1.1
+
+        let overrides = LLMGenerationOptions(
+            maxOutputTokens: 96,
+            seed: 99,
+            temperature: 0.2,
+            topK: 12,
+            topP: 0.75,
+            minP: 0.03,
+            repeatPenalty: 0.9,
+            repeatLastN: 48,
+            presencePenalty: 0.4,
+            frequencyPenalty: 0.25
+        )
+        let parameters = MLXBridge.generateParameters(
+            settings: settings,
+            maxOutputTokens: nil,
+            generationOptions: overrides
+        )
+
+        XCTAssertEqual(parameters.temperature, 0.2, accuracy: 1e-6)
+        XCTAssertEqual(parameters.topP, 0.75, accuracy: 1e-6)
+        XCTAssertEqual(parameters.topK, 12)
+        XCTAssertEqual(parameters.minP, 0.03, accuracy: 1e-6)
+        XCTAssertEqual(parameters.repetitionPenalty, 0.9)
+        XCTAssertEqual(parameters.repetitionContextSize, 48)
+        XCTAssertEqual(parameters.presencePenalty, 0.4)
+        XCTAssertEqual(parameters.frequencyPenalty, 0.25)
+        XCTAssertEqual(parameters.seed, 99)
+        XCTAssertEqual(parameters.maxTokens, 96)
     }
     #endif
 }

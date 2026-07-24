@@ -37,8 +37,8 @@ struct VisionAttachmentButton: View {
 #if os(iOS)
     @State private var showAttachmentTray = false
     @State private var showMediaSourceDialog = false
+    @State private var showDocumentImporter = false
     @State private var showCameraCapture = false
-    @State private var showPassScanner = false
     @State private var recentAssets: [PHAsset] = []
     @State private var thumbnailCache: [String: UIImage] = [:]
     @State private var recentAssetAttachmentURLs: [String: URL] = [:]
@@ -50,6 +50,7 @@ struct VisionAttachmentButton: View {
     @State private var showDisabledReason = false
     @State private var showWebSearchDisabledReason = false
     @State private var showPythonDisabledReason = false
+    @State private var showDatasetPicker = false
     @AppStorage("hasSeenWebSearchNotice") private var hasSeenWebSearchNotice = false
     @State private var showWebSearchNotice = false
 #if os(macOS) || os(visionOS)
@@ -108,9 +109,12 @@ struct VisionAttachmentButton: View {
                     pythonDisabled: pythonDisabled,
                     pythonDisabledReason: pythonDisabledReason,
                     isRecordingAudio: vm.isRecordingAudio,
+                    activeDatasetName: vm.activeSessionDataset?.name,
                     onPhotos: selectPhotosFromMacMenu,
                     onRecordAudio: selectRecordAudioFromMacMenu,
                     onAttachMedia: selectAttachMediaFromMacMenu,
+                    onAttachDocument: selectAttachDocumentFromMacMenu,
+                    onDataset: presentDatasetPicker,
                     onWebSearch: selectWebSearchFromMacMenu,
                     onPython: selectPythonFromMacMenu
                 )
@@ -142,7 +146,9 @@ struct VisionAttachmentButton: View {
 #if os(iOS)
             .sheet(isPresented: $showAttachmentTray) {
                 AttachmentTray(
-                    showsPhotoSection: UIConstants.showMultimodalUI && vm.supportsImageInput,
+                    showsPhotoSection: UIConstants.showMultimodalUI,
+                    photosDisabled: attachmentsDisabled,
+                    photosDisabledReason: disabledReason,
                     recentAssets: recentAssets,
                     thumbnails: thumbnailCache,
                     selectedAssetIDs: Set(recentAssetAttachmentURLs.keys),
@@ -158,6 +164,7 @@ struct VisionAttachmentButton: View {
                     pythonDisabled: pythonDisabled,
                     pythonDisabledReason: pythonDisabledReason,
                     isRecordingAudio: vm.isRecordingAudio,
+                    activeDatasetName: vm.activeSessionDataset?.name,
                     onCamera: {
                         showAttachmentTray = false
                         openCamera()
@@ -174,10 +181,8 @@ struct VisionAttachmentButton: View {
                         showAttachmentTray = false
                         showMediaSourceDialog = true
                     },
-                    onScanPass: {
-                        showAttachmentTray = false
-                        showPassScanner = true
-                    },
+                    onAttachDocument: presentDocumentImporter,
+                    onDataset: presentDatasetPicker,
                     onWebSearchTap: {
                         showAttachmentTray = false
                         toggleWebSearch()
@@ -206,9 +211,6 @@ struct VisionAttachmentButton: View {
                 )
                 .ignoresSafeArea()
             }
-            .sheet(isPresented: $showPassScanner) {
-                PassScannerFlowView()
-            }
             .confirmationDialog("Attach Audio/Video", isPresented: $showMediaSourceDialog, titleVisibility: .visible) {
                 Button("Photos") {
                     showVideoPicker = true
@@ -223,7 +225,7 @@ struct VisionAttachmentButton: View {
         }
 #if os(visionOS)
         .confirmationDialog("Actions", isPresented: $showActionMenu, titleVisibility: .hidden) {
-            if UIConstants.showMultimodalUI && vm.supportsImageInput {
+            if UIConstants.showMultimodalUI {
                 Button("Add Photos") {
                     showPicker = true
                 }
@@ -238,6 +240,11 @@ struct VisionAttachmentButton: View {
                 showMediaImporter = true
             } label: {
                 Text(LocalizedStringKey("Attach Audio/Video"))
+            }
+            Button {
+                presentDatasetPicker()
+            } label: {
+                Text(verbatim: vm.activeSessionDataset?.name ?? String(localized: "Use Dataset"))
             }
             if showWebSearchOption {
                 if settings.webSearchArmed {
@@ -260,6 +267,18 @@ struct VisionAttachmentButton: View {
             Button("Cancel", role: .cancel) { }
         }
 #endif
+        .sheet(isPresented: $showDatasetPicker) {
+            ChatDatasetPicker()
+                .environmentObject(vm)
+                .environmentObject(datasetManager)
+                .environmentObject(modelManager)
+#if os(iOS)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+#elseif os(visionOS)
+                .frame(minWidth: 520, idealWidth: 620, minHeight: 520, idealHeight: 650)
+#endif
+        }
 #if !os(macOS)
         .fileImporter(
             isPresented: $showMediaImporter,
@@ -267,6 +286,15 @@ struct VisionAttachmentButton: View {
             allowsMultipleSelection: true
         ) { result in
             Task { await handleMediaImportResult(result) }
+        }
+#endif
+#if os(iOS)
+        .fileImporter(
+            isPresented: $showDocumentImporter,
+            allowedContentTypes: DatasetDocumentSupport.allowedUTTypes(),
+            allowsMultipleSelection: true
+        ) { result in
+            handleDocumentImportResult(result)
         }
 #endif
         .buttonStyle(.plain)
@@ -351,7 +379,7 @@ struct VisionAttachmentButton: View {
 #if os(iOS)
             .frame(width: controlSize, height: controlSize)
 #elseif os(macOS)
-            .frame(width: 40, height: 40)
+            .frame(width: 32, height: 32)
 #else
             .padding(10)
 #endif
@@ -384,7 +412,7 @@ struct VisionAttachmentButton: View {
     private var attachmentTrayHeight: CGFloat {
         let hasPhotos = UIConstants.showMultimodalUI && vm.supportsImageInput
         let toolRowCount = (showWebSearchOption ? 1 : 0) + (showPythonOption ? 1 : 0)
-        let mediaRows = 3
+        let mediaRows = 4
         if hasPhotos {
             return 200 + CGFloat((toolRowCount + mediaRows) * 80)
         } else {
@@ -408,6 +436,9 @@ struct VisionAttachmentButton: View {
     }
 
     private var isDisabled: Bool {
+        // The "+" opens a mixed actions surface. Keep it reachable for text-only
+        // models; only its photo action should follow vision support.
+        if showPlusIcon { return false }
         if showWebSearchOption || showPythonOption {
 #if os(iOS)
             if showPlusIcon { return false }
@@ -419,7 +450,11 @@ struct VisionAttachmentButton: View {
 
     private var foregroundColor: Color {
         if isDisabled { return .secondary }
+#if os(macOS)
+        return hasActiveState ? activeTintColor : .secondary
+#else
         return hasActiveState ? .white : .primary
+#endif
     }
 
     private var vividPlusMenuYellow: Color {
@@ -506,32 +541,17 @@ struct VisionAttachmentButton: View {
         shape
             .fill(
                 hasActiveState
-                    ? activeTintColor.opacity(showPlusIcon ? 0.24 : 0.20)
-                    : Color.primary.opacity(isDisabled ? 0.035 : 0.055)
+                    ? activeTintColor.opacity(0.12)
+                    : ChatTheme.quietSurface
             )
             .overlay(
                 shape.strokeBorder(
                     hasActiveState
-                        ? activeTintColor.opacity(showPlusIcon ? 0.52 : 0.36)
-                        : Color.primary.opacity(isDisabled ? 0.08 : 0.14),
+                        ? activeTintColor.opacity(0.28)
+                        : Color.clear,
                     lineWidth: 0.8
                 )
             )
-            .overlay(
-                shape
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(isDisabled ? 0.02 : 0.08),
-                                Color.white.opacity(0.0)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .allowsHitTesting(false)
-            )
-            .shadow(color: hasActiveState ? glowColor.opacity(0.7) : .clear, radius: 7, y: 3)
 #endif
     }
 #endif
@@ -542,6 +562,9 @@ struct VisionAttachmentButton: View {
         }
         if !hasActiveChatModel {
             return String(localized: "Load a model before attaching images.")
+        }
+        if vm.loadedFormat == .gguf, vm.loadedSettings?.loadVisionProjector == false {
+            return String(localized: "Vision projector loading is disabled for this model. Enable it in Model Settings and load the model again to attach images.")
         }
         if !vm.supportsImageInput {
             return String(localized: "The active model can't process images.")
@@ -559,7 +582,7 @@ struct VisionAttachmentButton: View {
             }
             return String.localizedStringWithFormat(String(localized: "Disabled: %@"), disabledReason)
         }
-        if showWebSearchOption || showPythonOption {
+        if showPlusIcon || showWebSearchOption || showPythonOption {
             return String(localized: "Open quick actions for tools and attachments.")
         }
         return vm.pendingImageURLs.isEmpty ? String(localized: "Add photos to your next message.") : String(localized: "Add more photos or review attached images.")
@@ -572,18 +595,18 @@ struct VisionAttachmentButton: View {
             }
             return disabledReason
         }
-        if showWebSearchOption || showPythonOption {
+        if showPlusIcon || showWebSearchOption || showPythonOption {
             return String(localized: "Open quick actions for tools and attachments.")
         }
         return String.localizedStringWithFormat(String(localized: "Attach up to %d images (order preserved). No resizing needed — llama.cpp preprocesses images automatically."), maxImages)
     }
 
     private var accessibilityLabelText: String {
-        (showWebSearchOption || showPythonOption) ? String(localized: "More actions") : String(localized: "Attach Photos")
+        (showPlusIcon || showWebSearchOption || showPythonOption) ? String(localized: "More actions") : String(localized: "Attach Photos")
     }
 
     private var accessibilityIdentifierText: String {
-        (showWebSearchOption || showPythonOption) ? "chat-more-actions-button" : "chat-attachment-button"
+        (showPlusIcon || showWebSearchOption || showPythonOption) ? "chat-more-actions-button" : "chat-attachment-button"
     }
 
     private func handleTap() {
@@ -614,17 +637,50 @@ struct VisionAttachmentButton: View {
 #endif
         }
 #if os(macOS)
-        if !isProcessingImport {
+        // The composer "+" opens the action popover (Add Photos / Record Audio /
+        // Attach Audio·Video / Attach Document) so documents and PDFs are reachable.
+        // Without this it fell straight through to presentOpenPanel(), the image-only
+        // picker, making the document/PDF option unreachable. Callers without the plus
+        // icon keep the direct image picker.
+        if showPlusIcon {
+            showActionMenu = true
+        } else if !isProcessingImport {
             isProcessingImport = true
             Task { await presentOpenPanel() }
         }
 #elseif os(iOS)
-        Task { await loadRecentsIfNeeded() }
+        if UIConstants.showMultimodalUI && vm.supportsImageInput {
+            Task { await loadRecentsIfNeeded() }
+        }
         showAttachmentTray = true
 #else
         showPicker = true
 #endif
     }
+
+    private func presentDatasetPicker() {
+#if os(iOS)
+        showAttachmentTray = false
+#elseif os(macOS) || os(visionOS)
+        showActionMenu = false
+#endif
+        // Let the action sheet/popover finish dismissing before presenting the
+        // chooser, avoiding competing presentations on compact devices.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            showDatasetPicker = true
+        }
+    }
+
+#if os(iOS)
+    private func presentDocumentImporter() {
+        showAttachmentTray = false
+        // Let the attachment tray dismiss before presenting Files. Presenting both
+        // surfaces in the same update can cause the importer request to be dropped.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            showDocumentImporter = true
+        }
+    }
+#endif
 
     private var datasetActive: Bool {
         if modelManager.activeDataset != nil { return true }
@@ -645,7 +701,9 @@ struct VisionAttachmentButton: View {
     }
 
     private var webSearchBlockedByModelFormat: Bool {
-        isMLXModel || isAFMModel
+        // PCC-backed AFM runs the native FoundationModels web tool, so only the
+        // on-device AFM variant stays blocked.
+        isMLXModel || (isAFMModel && vm.afmChatToolsUnavailable)
     }
 
     private var webSearchDisabled: Bool {
@@ -662,7 +720,7 @@ struct VisionAttachmentButton: View {
         if isMLXModel {
             return String(localized: "Web Search is currently unreliable with MLX models due to MLX limitations.")
         }
-        if isAFMModel {
+        if isAFMModel && vm.afmChatToolsUnavailable {
             return String(localized: "Web search is disabled for Apple Foundation Models because their context budget cannot reliably accommodate tool input.")
         }
         if functionCallingSupport == false {
@@ -835,6 +893,26 @@ struct VisionAttachmentButton: View {
             await vm.savePendingMediaFile(from: url)
         }
     }
+
+    private func selectAttachDocumentFromMacMenu() {
+        showActionMenu = false
+        Task { await presentDocumentOpenPanel() }
+    }
+
+    @MainActor
+    private func presentDocumentOpenPanel() async {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = DatasetDocumentSupport.allowedUTTypes()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.prompt = String(localized: "Attach")
+
+        let response = panel.runModal()
+        guard response == .OK else { return }
+        let urls = panel.urls.filter { ChatVM.attachedDocumentExtensions.contains($0.pathExtension.lowercased()) }
+        guard !urls.isEmpty else { return }
+        vm.attachDocument(urls: urls)
+    }
 #else
 #if os(iOS)
     @MainActor
@@ -921,12 +999,16 @@ struct VisionAttachmentButton: View {
         let manager = PHImageManager.default()
         let options = PHImageRequestOptions()
         options.deliveryMode = .highQualityFormat
-        options.isSynchronous = true
+        // Async, not isSynchronous=true: a synchronous request blocks the main actor while the
+        // full-resolution image is fetched/decoded, freezing the tray on tap.
+        options.isSynchronous = false
+        options.isNetworkAccessAllowed = true
         let targetSize = CGSize(width: 1600, height: 1600)
 
-        var selected: UIImage?
-        manager.requestImage(for: asset, targetSize: targetSize, contentMode: .aspectFit, options: options) { image, _ in
-            selected = image
+        let selected: UIImage? = await withCheckedContinuation { continuation in
+            manager.requestImage(for: asset, targetSize: targetSize, contentMode: .aspectFit, options: options) { image, _ in
+                continuation.resume(returning: image)
+            }
         }
         if let selected {
             await vm.savePendingImage(selected)
@@ -983,6 +1065,18 @@ struct VisionAttachmentButton: View {
             await vm.savePendingMediaFile(from: url)
         }
     }
+
+#if os(iOS)
+    private func handleDocumentImportResult(_ result: Result<[URL], Error>) {
+        guard case .success(let urls) = result else { return }
+        let documents = urls.filter {
+            ChatVM.attachedDocumentExtensions.contains($0.pathExtension.lowercased())
+        }
+        guard !documents.isEmpty else { return }
+        vm.attachDocument(urls: documents)
+    }
+#endif
+
 #endif
 }
 
@@ -1040,9 +1134,12 @@ private struct MacQuickActionPopover: View {
     let pythonDisabled: Bool
     let pythonDisabledReason: String
     let isRecordingAudio: Bool
+    let activeDatasetName: String?
     let onPhotos: () -> Void
     let onRecordAudio: () -> Void
     let onAttachMedia: () -> Void
+    let onAttachDocument: () -> Void
+    let onDataset: () -> Void
     let onWebSearch: () -> Void
     let onPython: () -> Void
 
@@ -1078,6 +1175,26 @@ private struct MacQuickActionPopover: View {
                 isUnavailable: false,
                 unavailableReason: "",
                 action: onAttachMedia
+            )
+
+            MacQuickActionRow(
+                icon: "doc.text",
+                title: String(localized: "Attach Document"),
+                stateText: nil,
+                isArmed: false,
+                isUnavailable: false,
+                unavailableReason: "",
+                action: onAttachDocument
+            )
+
+            MacQuickActionRow(
+                icon: "books.vertical",
+                title: activeDatasetName ?? String(localized: "Use Dataset"),
+                stateText: activeDatasetName == nil ? nil : String(localized: "Active"),
+                isArmed: activeDatasetName != nil,
+                isUnavailable: false,
+                unavailableReason: "",
+                action: onDataset
             )
 
             if showsWebSearchAction {
@@ -1174,6 +1291,8 @@ private struct MacQuickActionRow: View {
 #if os(iOS)
 private struct AttachmentTray: View {
     let showsPhotoSection: Bool
+    let photosDisabled: Bool
+    let photosDisabledReason: String
     let recentAssets: [PHAsset]
     let thumbnails: [String: UIImage]
     let selectedAssetIDs: Set<String>
@@ -1189,11 +1308,13 @@ private struct AttachmentTray: View {
     let pythonDisabled: Bool
     let pythonDisabledReason: String
     let isRecordingAudio: Bool
+    let activeDatasetName: String?
     let onCamera: () -> Void
     let onAllPhotos: () -> Void
     let onRecordAudio: () -> Void
     let onAttachMedia: () -> Void
-    let onScanPass: () -> Void
+    let onAttachDocument: () -> Void
+    let onDataset: () -> Void
     let onWebSearchTap: () -> Void
     let onPythonTap: () -> Void
     let onAssetTap: (PHAsset) -> Void
@@ -1201,57 +1322,80 @@ private struct AttachmentTray: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if showsPhotoSection {
-                HStack {
-                    Spacer()
-                    Button(action: onAllPhotos) {
-                        Text("All Photos")
-                            .font(.subheadline.weight(.semibold))
+                VStack(alignment: .leading, spacing: 10) {
+                    if photosDisabled {
+                        Label(photosDisabledReason, systemImage: "photo.badge.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(remainingSlots == 0)
-                    .accessibilityIdentifier("chat-attachments-all-photos")
-                }
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 14) {
-                        cameraTile
+                    HStack {
+                        Spacer()
+                        Button(action: onAllPhotos) {
+                            Text("All Photos")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(remainingSlots == 0 || photosDisabled)
+                        .accessibilityIdentifier("chat-attachments-all-photos")
+                    }
 
-                        if isLoading {
-                            ForEach(0..<6, id: \.self) { _ in placeholderTile() }
-                        } else if photoAccessGranted {
-                            if recentAssets.isEmpty {
-                                emptyTile
-                            } else {
-                                ForEach(Array(recentAssets.enumerated()), id: \.element.localIdentifier) { index, asset in
-                                    let isSelected = selectedAssetIDs.contains(asset.localIdentifier)
-                                    if let image = thumbnails[asset.localIdentifier] {
-                                        thumbnailTile(
-                                            image: image,
-                                            index: index,
-                                            isSelected: isSelected
-                                        ) {
-                                            onAssetTap(asset)
-                                        }
-                                    } else {
-                                        thumbnailPlaceholderTile(
-                                            index: index,
-                                            isSelected: isSelected
-                                        ) {
-                                            onAssetTap(asset)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 14) {
+                            cameraTile
+
+                            if isLoading {
+                                ForEach(0..<6, id: \.self) { _ in placeholderTile() }
+                            } else if photoAccessGranted {
+                                if recentAssets.isEmpty {
+                                    emptyTile
+                                } else {
+                                    ForEach(Array(recentAssets.enumerated()), id: \.element.localIdentifier) { index, asset in
+                                        let isSelected = selectedAssetIDs.contains(asset.localIdentifier)
+                                        if let image = thumbnails[asset.localIdentifier] {
+                                            thumbnailTile(
+                                                image: image,
+                                                index: index,
+                                                isSelected: isSelected
+                                            ) {
+                                                onAssetTap(asset)
+                                            }
+                                        } else {
+                                            thumbnailPlaceholderTile(
+                                                index: index,
+                                                isSelected: isSelected
+                                            ) {
+                                                onAssetTap(asset)
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                permissionTile
                             }
-                        } else {
-                            permissionTile
                         }
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 6)
                     }
-                    .padding(.horizontal, 6)
-                    .padding(.bottom, 6)
                 }
+                .disabled(photosDisabled)
+                .opacity(photosDisabled ? 0.55 : 1)
             }
 
             if showsPhotoSection { Divider().padding(.top, 2) }
+
+            toolRow(
+                icon: "books.vertical",
+                title: activeDatasetName ?? String(localized: "Datasets"),
+                subtitle: activeDatasetName == nil
+                    ? String(localized: "Choose Dataset")
+                    : String(localized: "Dataset retrieval is active"),
+                isArmed: activeDatasetName != nil,
+                isDisabled: false,
+                identifier: "chat-tool-dataset",
+                action: onDataset
+            )
 
             toolRow(
                 icon: isRecordingAudio ? "stop.circle.fill" : "mic",
@@ -1274,13 +1418,13 @@ private struct AttachmentTray: View {
             )
 
             toolRow(
-                icon: "wallet.pass",
-                title: String(localized: "Scan Pass"),
-                subtitle: String(localized: "Extract trip details and add a confirmed pass to Wallet."),
+                icon: "doc.text",
+                title: String(localized: "Attach Document"),
+                subtitle: String(localized: "Import PDFs, EPUBs, or text files to build local knowledge bases."),
                 isArmed: false,
                 isDisabled: false,
-                identifier: "chat-tool-scan-pass",
-                action: onScanPass
+                identifier: "chat-tool-attach-document",
+                action: onAttachDocument
             )
 
             if showsWebSearchAction {

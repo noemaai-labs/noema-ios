@@ -1,11 +1,3 @@
-// MathViews.swift
-//  MathViews.swift
-//  Noema
-//
-//  SwiftUI bridges for SwiftMath (MTMathUILabel) with optional image caching
-//  for performance. Provides inline and block math rendering with baseline
-//  alignment and accessibility labels.
-
 import SwiftUI
 import SwiftMath
 #if os(macOS)
@@ -30,19 +22,68 @@ import UIKit
     }
 }
 
+/// Shared metrics for the border drawn around `\boxed{...}` math. SwiftMath
+/// cannot typeset the box itself, so hosts draw it: SwiftUI overlays on
+/// iOS/visionOS, composited into the attachment image on macOS.
+enum MathBoxStyle {
+    static let lineWidth: CGFloat = 1
+    static let cornerRadius: CGFloat = 5
+    static let strokeOpacity: CGFloat = 0.35
+    static func padding(for fontSize: CGFloat) -> (h: CGFloat, v: CGFloat) {
+        (max(5, ceil(fontSize * 0.30)), max(3, ceil(fontSize * 0.18)))
+    }
+}
+
+/// Draws the `\boxed{...}` border around an already-rendered math view.
+private struct MathBoxBorder: ViewModifier {
+    let enabled: Bool
+    let fontSize: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            let pad = MathBoxStyle.padding(for: fontSize)
+            content
+                .padding(.horizontal, pad.h)
+                .padding(.vertical, pad.v)
+                .overlay(
+                    RoundedRectangle(cornerRadius: MathBoxStyle.cornerRadius, style: .continuous)
+                        .stroke(Color.primary.opacity(MathBoxStyle.strokeOpacity),
+                                lineWidth: MathBoxStyle.lineWidth)
+                )
+        } else {
+            content
+        }
+    }
+}
+
+/// A rendered math bitmap plus the metric hosts need to sit it on the text
+/// baseline: the distance from the image's bottom edge up to the typeset
+/// baseline. Derived from the real per-expression descent, so `m` and `y_b`
+/// both align exactly instead of sharing one approximate offset.
+struct RenderedMathImage {
+    let image: UIImage
+    let baselineFromBottom: CGFloat
+}
+
 @MainActor final class MathImageCache {
     @MainActor static let shared = MathImageCache()
-    private let cache = NSCache<NSString, UIImage>()
+    private final class Entry {
+        let rendered: RenderedMathImage
+        init(_ rendered: RenderedMathImage) { self.rendered = rendered }
+    }
+    private let cache = NSCache<NSString, Entry>()
     private init() {
         cache.countLimit = 256
         cache.totalCostLimit = 32 * 1024 * 1024
     }
-    func image(for key: String) -> UIImage? {
-        cache.object(forKey: key as NSString)
+    func rendered(for key: String) -> RenderedMathImage? {
+        cache.object(forKey: key as NSString)?.rendered
     }
-    func insert(_ image: UIImage, for key: String) {
+    func insert(_ rendered: RenderedMathImage, for key: String) {
+        let image = rendered.image
         let cost = Int(image.size.width * image.size.height * (image.scale * image.scale))
-        cache.setObject(image, forKey: key as NSString, cost: max(cost, 1))
+        cache.setObject(Entry(rendered), forKey: key as NSString, cost: max(cost, 1))
     }
 }
 
@@ -84,48 +125,42 @@ private func colorSignature(for color: UIColor) -> String {
     return "\(spaceName)|\(rounded)"
 }
 
-@MainActor func renderMathImage(latex: String, fontSize: CGFloat, isDisplayMode: Bool, color: UIColor, insets: UIEdgeInsets = .zero) -> UIImage? {
+/// SwiftMath centers the glyphs inside the (inset) content box, so the
+/// baseline's distance from the image bottom depends on the expression's own
+/// ascent/descent. This mirrors the positioning in `MTMathUILabel`/`MathImage`
+/// (`textY = (availableHeight - height)/2 + descent + insets.bottom`, with
+/// `height` clamped to `fontSize/2` for tiny spans).
+private func mathBaselineFromBottom(ascent: CGFloat, descent: CGFloat,
+                                    imageHeight: CGFloat, fontSize: CGFloat,
+                                    insets: UIEdgeInsets) -> CGFloat {
+    let availableHeight = imageHeight - insets.top - insets.bottom
+    var glyphHeight = ascent + descent
+    if glyphHeight < fontSize / 2 { glyphHeight = fontSize / 2 }
+    return (availableHeight - glyphHeight) / 2 + descent + insets.bottom
+}
+
+@MainActor func renderMathImage(latex: String, fontSize: CGFloat, isDisplayMode: Bool, color: UIColor, insets: UIEdgeInsets = .zero) -> RenderedMathImage? {
     // Cache key includes mode, font size, insets and a resolved color signature so
     // light/dark appearance swaps never reuse stale glyph images.
     let insetKey = "t:\(Int(insets.top))|l:\(Int(insets.left))|b:\(Int(insets.bottom))|r:\(Int(insets.right))"
     let colorKey = colorSignature(for: color)
-    let renderVersion = "v2"
+    // v4 switches every platform to SwiftMath's unconstrained MathImage path.
+    // The old macOS MTMathUILabel snapshot measured the formula without a
+    // width constraint, then laid it out again inside a finite-width view. The
+    // second pass could activate SwiftMath's line fitter and push the tail of
+    // an equation onto another row while the bitmap still had the first-pass
+    // height, clipping expressions such as long energy equations.
+    let renderVersion = "v4-unconstrained"
     let key = "\(renderVersion):\(isDisplayMode ? "D" : "I"):\(Int(fontSize)):\(colorKey):\(insetKey):\(latex)"
-    if let img = MathImageCache.shared.image(for: key) { return img }
+    if let hit = MathImageCache.shared.rendered(for: key) { return hit }
 
-#if os(macOS)
-    let label = MTMathUILabel()
-    label.latex = latex
-    label.labelMode = isDisplayMode ? MTMathUILabelMode.display : MTMathUILabelMode.text
-    label.textAlignment = .left
-    label.fontSize = fontSize
-    label.textColor = color
-    label.contentInsets = insets
-    label.font = MTFontManager().termesFont(withSize: fontSize)
-
-    let fittingSize = label.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude))
-    let size = CGSize(width: ceil(fittingSize.width), height: ceil(fittingSize.height))
-    guard size.width > 0, size.height > 0 else { return nil }
-
-    let view = MTMathUILabel(frame: CGRect(origin: .zero, size: size))
-    view.latex = latex
-    view.labelMode = isDisplayMode ? MTMathUILabelMode.display : MTMathUILabelMode.text
-    view.fontSize = fontSize
-    view.textColor = color
-    view.contentInsets = insets
-    view.font = MTFontManager().termesFont(withSize: fontSize)
-    view.layoutSubtreeIfNeeded()
-    guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
-    view.cacheDisplay(in: view.bounds, to: rep)
-    let image = NSImage(size: size)
-    image.addRepresentation(rep)
-    MathImageCache.shared.insert(image, for: key)
-    return image
-#else
-    // SwiftMath's MTMathImage renders via the internal display list and applies
-    // the correct CoreText coordinate transforms, avoiding flipped superscripts
-    // that can occur when snapshotting MTMathUILabel offscreen.
-    let img = MTMathImage(
+    // SwiftMath's MathImage typesets with maxWidth == 0 (explicitly meaning
+    // unconstrained), creates the bitmap from that same display list, and
+    // reports its ascent/descent. Keeping measurement and drawing in one pass
+    // prevents display math from being internally reflowed and then cropped.
+    // The enclosing chat renderer remains responsible for fitting an oversized
+    // block attachment to the available transcript width.
+    var img = MathImage(
         latex: latex,
         fontSize: fontSize,
         textColor: color,
@@ -133,13 +168,16 @@ private func colorSignature(for color: UIColor) -> String {
         textAlignment: .left
     )
     img.contentInsets = insets
-    img.font = MTFontManager().termesFont(withSize: fontSize)
+    img.font = .termesFont
 
-    let (_, rendered) = img.asImage()
-    guard let rendered else { return nil }
-    MathImageCache.shared.insert(rendered, for: key)
-    return rendered
-#endif
+    let (_, rendered, layout) = img.asImage()
+    guard let rendered, let layout else { return nil }
+    let baseline = mathBaselineFromBottom(ascent: layout.ascent, descent: layout.descent,
+                                          imageHeight: rendered.size.height, fontSize: fontSize,
+                                          insets: insets)
+    let result = RenderedMathImage(image: rendered, baselineFromBottom: baseline)
+    MathImageCache.shared.insert(result, for: key)
+    return result
 }
 
 struct InlineMathView: View {
@@ -150,22 +188,41 @@ struct InlineMathView: View {
     @Environment(\.colorScheme) private var colorScheme
     private var uiColor: UIColor { resolvedMathColor(for: colorScheme) }
     private var inlineInsets: UIEdgeInsets { MathRenderTuning.inlineInsets(for: fontSize) }
-    private var baselineOffset: CGFloat { inlineInsets.bottom + fontSize * 0.22 }
+    /// Approximation for the live-label path, where no typeset metrics are
+    /// available. The cached-image path uses the exact per-expression baseline.
+    private var heuristicBaseline: CGFloat { inlineInsets.bottom + fontSize * 0.22 }
 
     var body: some View {
-        if useCache, let img = renderMathImage(latex: latex, fontSize: fontSize, isDisplayMode: false, color: uiColor, insets: inlineInsets) {
-            cachedMathImage(img)
-        } else {
-            liveMathLabel
-        }
+        let (inner, boxed) = MathTokenizer.unwrapBoxed(latex)
+        let rendered = useCache
+            ? renderMathImage(latex: inner, fontSize: fontSize, isDisplayMode: false, color: uiColor, insets: inlineInsets)
+            : nil
+        // The box padding extends the view below the glyphs, so the baseline
+        // moves up by the same amount relative to the (padded) bottom edge.
+        let offset = (rendered?.baselineFromBottom ?? heuristicBaseline)
+            + (boxed ? MathBoxStyle.padding(for: fontSize).v : 0)
+        content(rendered: rendered, inner: inner, boxed: boxed)
+            .alignmentGuide(.firstTextBaseline) { d in
+                d[VerticalAlignment.bottom] - offset
+            }
+            .accessibilityLabel(Text(plainAccessibilityLabel(from: inner)))
     }
 
-    private var liveMathLabel: some View {
-        InlineMathUILabel(latex: latex, fontSize: fontSize, color: uiColor, insets: inlineInsets)
-            .alignmentGuide(.firstTextBaseline) { d in
-                d[VerticalAlignment.bottom] - baselineOffset
-            }
-            .accessibilityLabel(Text(plainAccessibilityLabel(from: latex)))
+    @ViewBuilder
+    private func content(rendered: RenderedMathImage?, inner: String, boxed: Bool) -> some View {
+        if let rendered {
+            cachedMathImage(rendered.image)
+                .modifier(MathBoxBorder(enabled: boxed, fontSize: fontSize))
+        } else {
+            // The image renderer and live label use the same SwiftMath parser.
+            // If parsing failed, the live label can measure as an empty view and
+            // silently hide the model's formula. Keep the source visible so an
+            // unsupported command never turns into a blank line.
+            Text(verbatim: latex)
+                .font(.system(size: fontSize))
+                .foregroundStyle(Color.red)
+                .modifier(MathBoxBorder(enabled: boxed, fontSize: fontSize))
+        }
     }
 
     private func cachedMathImage(_ img: UIImage) -> some View {
@@ -183,11 +240,6 @@ struct InlineMathView: View {
 
         return base
             .frame(width: size.width, height: size.height, alignment: .leading)
-            // Approximate baseline alignment; keep a small descent tweak.
-            .alignmentGuide(.firstTextBaseline) { d in
-                d[VerticalAlignment.bottom] - baselineOffset
-            }
-            .accessibilityLabel(Text(plainAccessibilityLabel(from: latex)))
     }
 }
 
@@ -276,7 +328,9 @@ struct BlockMathView: View {
     }
 
     var body: some View {
-        content
+        let (inner, boxed) = MathTokenizer.unwrapBoxed(latex)
+        Group { content(inner: inner, boxed: boxed) }
+            .accessibilityLabel(Text(plainAccessibilityLabel(from: inner)))
             // Align leading without forcing full-width occupation and avoid extra vertical padding
             .frame(maxWidth: .infinity, alignment: .leading)
             .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.top] }
@@ -284,33 +338,37 @@ struct BlockMathView: View {
     }
 
     @ViewBuilder
-    private var content: some View {
+    private func content(inner: String, boxed: Bool) -> some View {
         switch widthBehavior {
         case .intrinsic:
-            if useCache, let img = renderMathImage(latex: latex, fontSize: fontSize, isDisplayMode: true, color: uiColor, insets: blockInsets) {
-                cachedMathImage(img)
+            if useCache, let rendered = renderMathImage(latex: inner, fontSize: fontSize, isDisplayMode: true, color: uiColor, insets: blockInsets) {
+                cachedMathImage(rendered.image)
+                    .modifier(MathBoxBorder(enabled: boxed, fontSize: fontSize))
             } else {
-                liveMathLabel(preferredMaxLayoutWidth: nil)
+                liveMathLabel(inner, preferredMaxLayoutWidth: nil)
+                    .modifier(MathBoxBorder(enabled: boxed, fontSize: fontSize))
             }
         case .wrapThenScroll:
-            wrappedScrollableMathLabel
+            wrappedScrollableMathLabel(inner: inner, boxed: boxed)
         }
     }
 
-    private func liveMathLabel(preferredMaxLayoutWidth: CGFloat?) -> some View {
+    private func liveMathLabel(_ inner: String, preferredMaxLayoutWidth: CGFloat?) -> some View {
         BlockMathUILabel(
-            latex: latex,
+            latex: inner,
             fontSize: fontSize,
             color: uiColor,
             insets: blockInsets,
             preferredMaxLayoutWidth: preferredMaxLayoutWidth
         )
-            .accessibilityLabel(Text(plainAccessibilityLabel(from: latex)))
     }
 
-    private var wrappedScrollableMathLabel: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            liveMathLabel(preferredMaxLayoutWidth: availableWidth)
+    private func wrappedScrollableMathLabel(inner: String, boxed: Bool) -> some View {
+        // Wrap a bit narrower when boxed so the border still fits the bubble.
+        let boxPadH = boxed ? MathBoxStyle.padding(for: fontSize).h * 2 : 0
+        return ScrollView(.horizontal, showsIndicators: false) {
+            liveMathLabel(inner, preferredMaxLayoutWidth: max(availableWidth - boxPadH, 1))
+                .modifier(MathBoxBorder(enabled: boxed, fontSize: fontSize))
                 .fixedSize(horizontal: true, vertical: false)
                 .frame(minWidth: availableWidth, alignment: .leading)
         }
@@ -338,7 +396,6 @@ struct BlockMathView: View {
 
         return base
             .frame(width: size.width, height: size.height, alignment: .leading)
-            .accessibilityLabel(Text(plainAccessibilityLabel(from: latex)))
     }
 }
 

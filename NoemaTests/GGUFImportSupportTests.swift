@@ -25,7 +25,7 @@ final class GGUFImportSupportTests: XCTestCase {
         XCTAssertFalse(GGUFImportSupport.isProjector(URL(fileURLWithPath: "/tmp/model-q4_k_m.gguf")))
     }
 
-    func testMTPDetectionHandlesDraftSidecarsWithoutTreatingThemAsWeights() {
+    func testMTPDetectionDoesNotTreatGenericDraftModelsAsMTP() {
         let mtp = URL(fileURLWithPath: "/tmp/qwen3-mtp-f16.gguf")
         let draft = URL(fileURLWithPath: "/tmp/qwen3-draft.gguf")
         let nextn = URL(fileURLWithPath: "/tmp/qwen3-nextn.gguf")
@@ -33,11 +33,12 @@ final class GGUFImportSupportTests: XCTestCase {
         let projector = URL(fileURLWithPath: "/tmp/qwen3-mtp-mmproj.gguf")
 
         XCTAssertTrue(GGUFImportSupport.isMTP(mtp))
-        XCTAssertTrue(GGUFImportSupport.isMTP(draft))
+        XCTAssertFalse(GGUFImportSupport.isMTP(draft))
         XCTAssertTrue(GGUFImportSupport.isMTP(nextn))
         XCTAssertFalse(GGUFImportSupport.isMTP(main))
         XCTAssertFalse(GGUFImportSupport.isMTP(projector))
         XCTAssertFalse(GGUFImportSupport.isWeightFile(mtp))
+        XCTAssertTrue(GGUFImportSupport.isWeightFile(draft))
         XCTAssertTrue(GGUFImportSupport.isWeightFile(main))
     }
 
@@ -47,16 +48,23 @@ final class GGUFImportSupportTests: XCTestCase {
         let preferredProjector = root.appendingPathComponent("next2.5-projector.mmproj")
         let otherProjector = root.appendingPathComponent("other-model-projector.mmproj")
         let preferredMTP = root.appendingPathComponent("next2.5-mtp-f16.gguf")
-        let otherMTP = root.appendingPathComponent("other-draft.gguf")
+        let otherMTP = root.appendingPathComponent("other-mtp.gguf")
         let tokenizerConfig = root.appendingPathComponent("tokenizer_config.json")
         let chatTemplate = root.appendingPathComponent("chat_template.jinja")
         let config = root.appendingPathComponent("config.json")
         let artifacts = root.appendingPathComponent("artifacts.json")
 
-        FileManager.default.createFile(atPath: weight.path, contents: Data("GGUF".utf8))
+        try writeMTPFixture(to: weight, tensors: [])
         FileManager.default.createFile(atPath: preferredProjector.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: otherProjector.path, contents: Data("GGUF".utf8))
-        FileManager.default.createFile(atPath: preferredMTP.path, contents: Data("GGUF".utf8))
+        try writeMTPFixture(
+            to: preferredMTP,
+            tensors: [
+                "blk.35.nextn.eh_proj.weight",
+                "blk.35.nextn.enorm.weight",
+                "blk.35.nextn.hnorm.weight"
+            ]
+        )
         FileManager.default.createFile(atPath: otherMTP.path, contents: Data("GGUF".utf8))
         FileManager.default.createFile(atPath: tokenizerConfig.path, contents: Data("{}".utf8))
         FileManager.default.createFile(atPath: chatTemplate.path, contents: Data("{{ enable_thinking }}".utf8))
@@ -124,6 +132,42 @@ final class GGUFImportSupportTests: XCTestCase {
         XCTAssertEqual(payload["mtpChecked"] as? Bool, true)
     }
 
+    func testMtpLocatorRejectsArtifactsPathOutsideModelDirectory() throws {
+        let root = try makeTemporaryDirectory()
+        let modelDirectory = root.appendingPathComponent("model", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        let target = modelDirectory.appendingPathComponent("qwen-target.gguf")
+        let outside = root.appendingPathComponent("qwen-mtp.gguf")
+        try writeMTPFixture(to: target, tensors: [])
+        try writeMTPFixture(
+            to: outside,
+            tensors: [
+                "blk.35.nextn.eh_proj.weight",
+                "blk.35.nextn.enorm.weight",
+                "blk.35.nextn.hnorm.weight"
+            ]
+        )
+        let artifacts = try JSONSerialization.data(withJSONObject: ["mtp": "../qwen-mtp.gguf"])
+        try artifacts.write(to: modelDirectory.appendingPathComponent("artifacts.json"))
+
+        XCTAssertNil(MtpLocator.mtpPath(alongside: target))
+    }
+
+    func testMtpLocatorRejectsAmbiguousValidatedSidecars() throws {
+        let root = try makeTemporaryDirectory()
+        let target = root.appendingPathComponent("qwen-target.gguf")
+        try writeMTPFixture(to: target, tensors: [])
+        let tensors = [
+            "blk.35.nextn.eh_proj.weight",
+            "blk.35.nextn.enorm.weight",
+            "blk.35.nextn.hnorm.weight"
+        ]
+        try writeMTPFixture(to: root.appendingPathComponent("qwen-mtp-a.gguf"), tensors: tensors)
+        try writeMTPFixture(to: root.appendingPathComponent("qwen-mtp-b.gguf"), tensors: tensors)
+
+        XCTAssertNil(MtpLocator.mtpPath(alongside: target))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -132,5 +176,54 @@ final class GGUFImportSupportTests: XCTestCase {
             try? FileManager.default.removeItem(at: root)
         }
         return root
+    }
+
+    private func writeMTPFixture(to url: URL, tensors: [String]) throws {
+        var data = Data("GGUF".utf8)
+        append(UInt32(3), to: &data)
+        append(UInt64(tensors.count), to: &data)
+        append(UInt64(5), to: &data)
+
+        appendString("general.architecture", to: &data)
+        append(UInt32(8), to: &data)
+        appendString("qwen35", to: &data)
+
+        for (key, value) in [
+            ("qwen35.nextn_predict_layers", UInt32(1)),
+            ("qwen35.embedding_length", UInt32(2_048)),
+            ("qwen35.vocab_size", UInt32(3))
+        ] {
+            appendString(key, to: &data)
+            append(UInt32(4), to: &data)
+            append(value, to: &data)
+        }
+
+        appendString("tokenizer.ggml.tokens", to: &data)
+        append(UInt32(9), to: &data)
+        append(UInt32(8), to: &data)
+        append(UInt64(3), to: &data)
+        for token in ["a", "b", "c"] {
+            appendString(token, to: &data)
+        }
+
+        for tensor in tensors {
+            appendString(tensor, to: &data)
+            append(UInt32(1), to: &data)
+            append(UInt64(1), to: &data)
+            append(UInt32(0), to: &data)
+            append(UInt64(0), to: &data)
+        }
+        try data.write(to: url)
+    }
+
+    private func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private func appendString(_ value: String, to data: inout Data) {
+        let bytes = Data(value.utf8)
+        append(UInt64(bytes.count), to: &data)
+        data.append(bytes)
     }
 }

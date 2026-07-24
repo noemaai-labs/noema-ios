@@ -1,6 +1,3 @@
-// MoEDetectionStore.swift
-// Persists detected MoE metadata so scans are not repeated unnecessarily.
-
 import Foundation
 
 actor MoEDetectionStore {

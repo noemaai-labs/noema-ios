@@ -1,4 +1,3 @@
-// MLXMetadata.swift
 import Foundation
 
 enum MLXMetadata {

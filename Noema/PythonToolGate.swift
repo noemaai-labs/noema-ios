@@ -1,9 +1,10 @@
-// PythonToolGate.swift
 import Foundation
 
 struct PythonToolGate {
     /// Background-safe gate that avoids MainActor by reading persisted defaults directly.
-    static func isAvailable(currentFormat: ModelFormat? = nil) -> Bool {
+    /// `afmKind` lets an AFM client gate on its own variant; other callers fall back to
+    /// the persisted kind of the loaded model.
+    static func isAvailable(currentFormat: ModelFormat? = nil, afmKind: AppleFoundationModelKind? = nil) -> Bool {
         guard EnterprisePolicyGate.allowsTool("noema.python.execute") else { return false }
         let d = UserDefaults.standard
 
@@ -14,8 +15,6 @@ struct PythonToolGate {
         // Chat-level arm toggle
         let armed = d.object(forKey: "pythonArmed") as? Bool ?? false
         guard armed else { return false }
-
-        let isRemote = d.object(forKey: "currentModelIsRemote") as? Bool ?? false
 
         // Datasets take precedence: when a dataset is selected or indexing, tools are disabled.
         let selectedDatasetID = d.string(forKey: "selectedDatasetID") ?? ""
@@ -31,11 +30,13 @@ struct PythonToolGate {
             }
         }
 
-        // MLX local models are unreliable with tool calling; AFM has its own
-        // tool system (FoundationModels) and must not use the loopback tool loop.
-        if let f = fmt {
-            if f == .mlx && !isRemote { return false }
-            if f == .afm { return false }
+        // MLX local models now call tools natively via their own chat template, so they
+        // are no longer excluded here (supportsFunctionCalling still gates capability).
+        // AFM never uses the loopback loop: the PCC server model calls FoundationModels
+        // tools natively so it passes; the on-device model stays excluded.
+        if let f = fmt, f == .afm {
+            let kind = afmKind ?? AppleFoundationModelKind.persistedCurrentKind()
+            if kind != .privateCloudCompute { return false }
         }
 
         // Only allow when the loaded model supports function calling

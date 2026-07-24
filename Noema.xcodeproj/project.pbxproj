@@ -45,6 +45,46 @@
 		64ABE8DF2E494DC700821D00 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64ABE8DE2E494DC600821D00 /* Accelerate.framework */; };
 		64ABE8E22E494DCE00821D00 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64ABE8E02E494DCE00821D00 /* Metal.framework */; };
 		64ABE8E32E494DCE00821D00 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64ABE8E12E494DCE00821D00 /* MetalKit.framework */; };
+		64D0C0DE2FA0000000000002 /* TTSKit in Frameworks */ = {isa = PBXBuildFile; productRef = 64D0C0DE2FA0000000000001 /* TTSKit */; };
+		64D0C0DE2FA0000000000003 /* TTSKit in Frameworks */ = {isa = PBXBuildFile; productRef = 64D0C0DE2FA0000000000001 /* TTSKit */; };
+		64D3EC7730067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7830067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7930067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7A30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7B30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7C30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7D30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7E30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC7F30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8030067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8130067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8230067C0400A6A30E /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64ABE8E02E494DCE00821D00 /* Metal.framework */; };
+		64D3EC8330067C0400A6A30E /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64ABE8E12E494DCE00821D00 /* MetalKit.framework */; };
+		64D3EC8430067C0400A6A30E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64ABE8DE2E494DC600821D00 /* Accelerate.framework */; };
+		64D3EC8530067C0400A6A30E /* CryptoKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64D5069D2E53BFB30022E586 /* CryptoKit.framework */; };
+		64D3EC8630067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8730067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8830067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8930067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8A30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8B30067C0400A6A30E /* (null) in Frameworks */ = {isa = PBXBuildFile; };
+		64D3EC8C30067C0400A6A30E /* MCP in Frameworks */ = {isa = PBXBuildFile; productRef = A3C000022F50000000000002 /* MCP */; };
+		64D3EC8D30067C0400A6A30E /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = 647D618E2E955AEA003DC7F3 /* MLX */; };
+		64D3EC8E30067C0400A6A30E /* MLXFFT in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61902E955AEA003DC7F3 /* MLXFFT */; };
+		64D3EC8F30067C0400A6A30E /* MLXFast in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61912E955AEA003DC7F3 /* MLXFast */; };
+		64D3EC9030067C0400A6A30E /* MLXLinalg in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61922E955AEA003DC7F3 /* MLXLinalg */; };
+		64D3EC9130067C0400A6A30E /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61932E955AEA003DC7F3 /* MLXNN */; };
+		64D3EC9230067C0400A6A30E /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 035AB236448800F41072CFF7 /* MLXLMCommon */; };
+		64D3EC9330067C0400A6A30E /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = B6CF4E9B49381B893090A7F0 /* MLXLLM */; };
+		64D3EC9430067C0400A6A30E /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 9671064702E2AE64A359AADF /* MLXVLM */; };
+		64D3EC9530067C0400A6A30E /* MLXOptimizers in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61942E955AEA003DC7F3 /* MLXOptimizers */; };
+		64D3EC9630067C0400A6A30E /* MLXRandom in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61952E955AEA003DC7F3 /* MLXRandom */; };
+		64D3EC9730067C0400A6A30E /* NoemaPackages in Frameworks */ = {isa = PBXBuildFile; productRef = 647D61962E955AEA003DC7F3 /* NoemaPackages */; };
+		64D3EC9830067C0400A6A30E /* RelayKit in Frameworks */ = {isa = PBXBuildFile; productRef = 64F1A0B82F00000000000000 /* RelayKit */; };
+		64D3EC9930067C0400A6A30E /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = 647D619D2E955AEA003DC7F3 /* SwiftMath */; };
+		64D3EC9A30067C0400A6A30E /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 640890F42F9AC8C400BCB53E /* WhisperKit */; };
+		64D3EC9B30067C0400A6A30E /* TTSKit in Frameworks */ = {isa = PBXBuildFile; productRef = 64D0C0DE2FA0000000000001 /* TTSKit */; };
+		64D3EC9C30067C0400A6A30E /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 6A5D1F102F35A00000A10001 /* Tokenizers */; };
 		64D5069E2E53BFB30022E586 /* CryptoKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 64D5069D2E53BFB30022E586 /* CryptoKit.framework */; };
 		64E1C0012FA0000000000001 /* CoreAILM in Frameworks */ = {isa = PBXBuildFile; productRef = 64E1C0022FA0000000000001 /* CoreAILM */; };
 		64EA10022F42000000000002 /* NoemaEmbeddingActivity.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 64EA10012F42000000000001 /* NoemaEmbeddingActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -57,6 +97,7 @@
 		6A5D1F072F35A00000A10001 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = 6A5D1F032F35A00000A10001 /* Transformers */; };
 		6A5D1F082F35A00000A10001 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 6A5D1F042F35A00000A10001 /* Tokenizers */; };
 		6A5D1F092F35A00000A10001 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = 6A5D1F052F35A00000A10001 /* Transformers */; };
+		6A5D1F112F35A00000A10001 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 6A5D1F102F35A00000A10001 /* Tokenizers */; };
 		761B93CC43210A77C5F2C3EF /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 9671064702E2AE64A359AADF /* MLXVLM */; };
 		7BF8CC40DD072A43B16A07C2 /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 417AB310C4DB5F8DFE71956C /* MLXVLM */; };
 		88B93A66A8F06F7EAA21C91A /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = B6CF4E9B49381B893090A7F0 /* MLXLLM */; };
@@ -66,8 +107,12 @@
 		A10000012F40000100000021 /* Frameworks/Python-iOS.xcframework in Embed Python Frameworks */ = {isa = PBXBuildFile; fileRef = A10000012F40000100000001 /* Frameworks/Python-iOS.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A10000012F40000100000022 /* Frameworks/Python-visionOS.xcframework in Embed Python Frameworks */ = {isa = PBXBuildFile; fileRef = A10000012F40000100000002 /* Frameworks/Python-visionOS.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A10000012F40000100000023 /* Frameworks/Python-macOS.xcframework in Embed Python Frameworks */ = {isa = PBXBuildFile; fileRef = A10000012F40000100000003 /* Frameworks/Python-macOS.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		A3C000032F50000000000003 /* MCP in Frameworks */ = {isa = PBXBuildFile; productRef = A3C000022F50000000000002 /* MCP */; };
 		A8259F0A2A424CF1B4856CCF /* NoemaPackages in Frameworks */ = {isa = PBXBuildFile; productRef = 21FF187598A740D3901EFE90 /* NoemaPackages */; };
 		BFDB12BA4EAF40FB69496641 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 06EF816A0080BF19C8D0E0E4 /* MLXLLM */; };
+		D10000012F50000000000010 /* NoemaMCPHost.xpc in Embed XPC Services */ = {isa = PBXBuildFile; fileRef = D10000012F50000000000002 /* NoemaMCPHost.xpc */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		D10000012F50000000000011 /* Frameworks/Python-macOS.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000012F40000100000003 /* Frameworks/Python-macOS.xcframework */; };
+		D10000012F50000000000012 /* Frameworks/Python-macOS.xcframework in Embed Python Frameworks */ = {isa = PBXBuildFile; fileRef = A10000012F40000100000003 /* Frameworks/Python-macOS.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -98,6 +143,20 @@
 			proxyType = 1;
 			remoteGlobalIDString = 642CDB342E231965009017C6;
 			remoteInfo = Noema;
+		};
+		D10000012F50000000000019 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 642CDB2D2E231965009017C6 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D10000012F50000000000004;
+			remoteInfo = NoemaMCPHost;
+		};
+		D10000012F50000000000026 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 642CDB2D2E231965009017C6 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 647D618D2E955AEA003DC7F3;
+			remoteInfo = NoemaMac;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -166,6 +225,28 @@
 			name = "Embed Python Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D10000012F5000000000000C /* Embed Python Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				D10000012F50000000000012 /* Frameworks/Python-macOS.xcframework in Embed Python Frameworks */,
+			);
+			name = "Embed Python Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F5000000000000E /* Embed XPC Services */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				D10000012F50000000000010 /* NoemaMCPHost.xpc in Embed XPC Services */,
+			);
+			name = "Embed XPC Services";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -180,9 +261,9 @@
 		644183FF2E4CE8AD00C5E265 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
 		644184012E4CE8AD00C5E265 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		646E49FA2E8EDF51004C5BD8 /* Noema.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Noema.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		646E49FB2E8EDF51004C5BD8 /* Noema copy-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = "Noema copy-Info.plist"; path = "/Users/arminstamate/Desktop/untitled folder 3/untitled folder/Noema/Noema/Noema copy-Info.plist"; sourceTree = "<absolute>"; };
+		646E49FB2E8EDF51004C5BD8 /* NoemaVisionOS-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "NoemaVisionOS-Info.plist"; sourceTree = "<group>"; };
 		647D61BF2E955AEA003DC7F3 /* Noema.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Noema.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		647D61C02E955AEA003DC7F3 /* Noema copy2-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = "Noema copy2-Info.plist"; path = "/Users/arminstamate/Desktop/untitled folder 3/untitled folder/Noema/Noema/Noema copy2-Info.plist"; sourceTree = "<absolute>"; };
+		647D61C02E955AEA003DC7F3 /* NoemaMac-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "NoemaMac-Info.plist"; sourceTree = "<group>"; };
 		64ABE8DE2E494DC600821D00 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		64ABE8E02E494DCE00821D00 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		64ABE8E12E494DCE00821D00 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
@@ -192,6 +273,9 @@
 		A10000012F40000100000002 /* Frameworks/Python-visionOS.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = "Frameworks/Python-visionOS.xcframework"; sourceTree = SOURCE_ROOT; };
 		A10000012F40000100000003 /* Frameworks/Python-macOS.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = "Frameworks/Python-macOS.xcframework"; sourceTree = SOURCE_ROOT; };
 		A20000012F41000100000002 /* NoemaiOSUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NoemaiOSUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D10000012F50000000000001 /* Noema Direct.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Noema Direct.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		D10000012F50000000000002 /* NoemaMCPHost.xpc */ = {isa = PBXFileReference; explicitFileType = "wrapper.xpc-service"; includeInIndex = 0; path = NoemaMCPHost.xpc; sourceTree = BUILT_PRODUCTS_DIR; };
+		D10000012F50000000000020 /* NoemaMCPTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NoemaMCPTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -208,7 +292,6 @@
 			membershipExceptions = (
 				Info.plist,
 				Noema.xcdatamodeld,
-				Resources/leap_catalog.json,
 				"Resources/markdown-it.min.js",
 			);
 			target = 647D618D2E955AEA003DC7F3 /* NoemaMac */;
@@ -227,6 +310,22 @@
 			);
 			target = 64EA10082F42000000000008 /* NoemaEmbeddingActivity */;
 		};
+		D10000012F5000000000001B /* Exceptions for "Noema" folder in "NoemaMacDirect" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+				Noema.xcdatamodeld,
+				"Resources/markdown-it.min.js",
+			);
+			target = D10000012F50000000000005 /* NoemaMacDirect */;
+		};
+		D10000012F5000000000001C /* Exceptions for "NoemaMCPHost" folder in "NoemaMCPHost" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = D10000012F50000000000004 /* NoemaMCPHost */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -236,6 +335,7 @@
 				64AE28E52E771B0D00DEDA56 /* Exceptions for "Noema" folder in "Noema" target */,
 				646E49FC2E8EDF51004C5BD8 /* Exceptions for "Noema" folder in "NoemaVisionOS" target */,
 				647D61C12E955AEA003DC7F3 /* Exceptions for "Noema" folder in "NoemaMac" target */,
+				D10000012F5000000000001B /* Exceptions for "Noema" folder in "NoemaMacDirect" target */,
 			);
 			path = Noema;
 			sourceTree = "<group>";
@@ -263,6 +363,19 @@
 			path = NoemaiOSUITests;
 			sourceTree = "<group>";
 		};
+		D10000012F50000000000003 /* NoemaMCPHost */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				D10000012F5000000000001C /* Exceptions for "NoemaMCPHost" folder in "NoemaMCPHost" target */,
+			);
+			path = NoemaMCPHost;
+			sourceTree = "<group>";
+		};
+		D10000012F50000000000021 /* NoemaMCPTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = NoemaMCPTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -284,6 +397,7 @@
 				6A5D1F072F35A00000A10001 /* Transformers in Frameworks */,
 				64F1A0B92F00000000000001 /* RelayKit in Frameworks */,
 				640890F52F9AC8C400BCB53E /* WhisperKit in Frameworks */,
+				64D0C0DE2FA0000000000002 /* TTSKit in Frameworks */,
 				640891002F9AD40000BCB53E /* whisper in Frameworks */,
 				64E1C0012FA0000000000001 /* CoreAILM in Frameworks */,
 			);
@@ -334,6 +448,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A3C000032F50000000000003 /* MCP in Frameworks */,
 				A10000012F40000100000013 /* Frameworks/Python-macOS.xcframework in Frameworks */,
 				647D61A82E955AEA003DC7F3 /* MLXRandom in Frameworks */,
 				647D61A92E955AEA003DC7F3 /* MLXOptimizers in Frameworks */,
@@ -353,6 +468,8 @@
 				647D61B92E955AEA003DC7F3 /* SwiftMath in Frameworks */,
 				64F1A0BB2F00000000000001 /* RelayKit in Frameworks */,
 				640890F62F9AC8C400BCB53E /* WhisperKit in Frameworks */,
+				64D0C0DE2FA0000000000003 /* TTSKit in Frameworks */,
+				6A5D1F112F35A00000A10001 /* Tokenizers in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -372,6 +489,66 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D10000012F50000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F5000000000000A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				64D3EC9330067C0400A6A30E /* MLXLLM in Frameworks */,
+				64D3EC8F30067C0400A6A30E /* MLXFast in Frameworks */,
+				64D3EC9830067C0400A6A30E /* RelayKit in Frameworks */,
+				64D3EC7730067C0400A6A30E /* (null) in Frameworks */,
+				D10000012F50000000000011 /* Frameworks/Python-macOS.xcframework in Frameworks */,
+				64D3EC7830067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC7930067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC9730067C0400A6A30E /* NoemaPackages in Frameworks */,
+				64D3EC9930067C0400A6A30E /* SwiftMath in Frameworks */,
+				64D3EC9A30067C0400A6A30E /* WhisperKit in Frameworks */,
+				64D3EC7A30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC7B30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC7C30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC7D30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC7E30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC8C30067C0400A6A30E /* MCP in Frameworks */,
+				64D3EC7F30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC8030067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC8D30067C0400A6A30E /* MLX in Frameworks */,
+				64D3EC8130067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC9230067C0400A6A30E /* MLXLMCommon in Frameworks */,
+				64D3EC8230067C0400A6A30E /* Metal.framework in Frameworks */,
+				64D3EC9030067C0400A6A30E /* MLXLinalg in Frameworks */,
+				64D3EC8330067C0400A6A30E /* MetalKit.framework in Frameworks */,
+				64D3EC9530067C0400A6A30E /* MLXOptimizers in Frameworks */,
+				64D3EC8430067C0400A6A30E /* Accelerate.framework in Frameworks */,
+				64D3EC8530067C0400A6A30E /* CryptoKit.framework in Frameworks */,
+				64D3EC8630067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC8730067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC9C30067C0400A6A30E /* Tokenizers in Frameworks */,
+				64D3EC9B30067C0400A6A30E /* TTSKit in Frameworks */,
+				64D3EC9630067C0400A6A30E /* MLXRandom in Frameworks */,
+				64D3EC8E30067C0400A6A30E /* MLXFFT in Frameworks */,
+				64D3EC8830067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC8930067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC8A30067C0400A6A30E /* (null) in Frameworks */,
+				64D3EC9130067C0400A6A30E /* MLXNN in Frameworks */,
+				64D3EC9430067C0400A6A30E /* MLXVLM in Frameworks */,
+				64D3EC8B30067C0400A6A30E /* (null) in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F50000000000023 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -379,13 +556,15 @@
 			isa = PBXGroup;
 			children = (
 				642CDB372E231965009017C6 /* Noema */,
+				D10000012F50000000000003 /* NoemaMCPHost */,
+				D10000012F50000000000021 /* NoemaMCPTests */,
 				642CDB4A2E231968009017C6 /* NoemaTests */,
 				642CDB542E231968009017C6 /* NoemaUITests */,
 				A20000012F41000100000003 /* NoemaiOSUITests */,
 				644184032E4CE8AD00C5E265 /* NoemaEmbeddingActivity */,
 				64AD2F612E26FE5F00BAE465 /* Frameworks */,
-				646E49FB2E8EDF51004C5BD8 /* Noema copy-Info.plist */,
-				647D61C02E955AEA003DC7F3 /* Noema copy2-Info.plist */,
+				646E49FB2E8EDF51004C5BD8 /* NoemaVisionOS-Info.plist */,
+				647D61C02E955AEA003DC7F3 /* NoemaMac-Info.plist */,
 				642CDB362E231965009017C6 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -400,6 +579,9 @@
 				646E49FA2E8EDF51004C5BD8 /* Noema.app */,
 				647D61BF2E955AEA003DC7F3 /* Noema.app */,
 				64EA10012F42000000000001 /* NoemaEmbeddingActivity.appex */,
+				D10000012F50000000000001 /* Noema Direct.app */,
+				D10000012F50000000000002 /* NoemaMCPHost.xpc */,
+				D10000012F50000000000020 /* NoemaMCPTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -459,6 +641,7 @@
 				6A5D1F022F35A00000A10001 /* Tokenizers */,
 				6A5D1F032F35A00000A10001 /* Transformers */,
 				640890F42F9AC8C400BCB53E /* WhisperKit */,
+				64D0C0DE2FA0000000000001 /* TTSKit */,
 				640890FF2F9AD40000BCB53E /* whisper */,
 				64E1C0022FA0000000000001 /* CoreAILM */,
 			);
@@ -573,6 +756,7 @@
 			);
 			name = NoemaMac;
 			packageProductDependencies = (
+				A3C000022F50000000000002 /* MCP */,
 				647D618E2E955AEA003DC7F3 /* MLX */,
 				647D61902E955AEA003DC7F3 /* MLXFFT */,
 				647D61912E955AEA003DC7F3 /* MLXFast */,
@@ -587,6 +771,8 @@
 				64F1A0B82F00000000000000 /* RelayKit */,
 				647D619D2E955AEA003DC7F3 /* SwiftMath */,
 				640890F42F9AC8C400BCB53E /* WhisperKit */,
+				64D0C0DE2FA0000000000001 /* TTSKit */,
+				6A5D1F102F35A00000A10001 /* Tokenizers */,
 			);
 			productName = Noema;
 			productReference = 647D61BF2E955AEA003DC7F3 /* Noema.app */;
@@ -637,6 +823,95 @@
 			productReference = A20000012F41000100000002 /* NoemaiOSUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		D10000012F50000000000004 /* NoemaMCPHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D10000012F50000000000013 /* Build configuration list for PBXNativeTarget "NoemaMCPHost" */;
+			buildPhases = (
+				D10000012F50000000000006 /* Sources */,
+				D10000012F50000000000007 /* Frameworks */,
+				D10000012F50000000000008 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				D10000012F50000000000003 /* NoemaMCPHost */,
+			);
+			name = NoemaMCPHost;
+			packageProductDependencies = (
+			);
+			productName = NoemaMCPHost;
+			productReference = D10000012F50000000000002 /* NoemaMCPHost.xpc */;
+			productType = "com.apple.product-type.xpc-service";
+		};
+		D10000012F50000000000005 /* NoemaMacDirect */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D10000012F50000000000014 /* Build configuration list for PBXNativeTarget "NoemaMacDirect" */;
+			buildPhases = (
+				D10000012F50000000000009 /* Sources */,
+				D10000012F5000000000000A /* Frameworks */,
+				D10000012F5000000000000B /* Resources */,
+				D10000012F5000000000000C /* Embed Python Frameworks */,
+				D10000012F5000000000000D /* Sanitize Embedded Python Framework */,
+				D10000012F5000000000000E /* Embed XPC Services */,
+				D10000012F5000000000000F /* Prepare MCP Node Runtime */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D10000012F5000000000001A /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				642CDB372E231965009017C6 /* Noema */,
+			);
+			name = NoemaMacDirect;
+			packageProductDependencies = (
+				A3C000022F50000000000002 /* MCP */,
+				647D618E2E955AEA003DC7F3 /* MLX */,
+				647D61902E955AEA003DC7F3 /* MLXFFT */,
+				647D61912E955AEA003DC7F3 /* MLXFast */,
+				647D61922E955AEA003DC7F3 /* MLXLinalg */,
+				647D61932E955AEA003DC7F3 /* MLXNN */,
+				035AB236448800F41072CFF7 /* MLXLMCommon */,
+				B6CF4E9B49381B893090A7F0 /* MLXLLM */,
+				9671064702E2AE64A359AADF /* MLXVLM */,
+				647D61942E955AEA003DC7F3 /* MLXOptimizers */,
+				647D61952E955AEA003DC7F3 /* MLXRandom */,
+				647D61962E955AEA003DC7F3 /* NoemaPackages */,
+				64F1A0B82F00000000000000 /* RelayKit */,
+				647D619D2E955AEA003DC7F3 /* SwiftMath */,
+				640890F42F9AC8C400BCB53E /* WhisperKit */,
+				64D0C0DE2FA0000000000001 /* TTSKit */,
+				6A5D1F102F35A00000A10001 /* Tokenizers */,
+			);
+			productName = "Noema Direct";
+			productReference = D10000012F50000000000001 /* Noema Direct.app */;
+			productType = "com.apple.product-type.application";
+		};
+		D10000012F50000000000025 /* NoemaMCPTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D10000012F5000000000002A /* Build configuration list for PBXNativeTarget "NoemaMCPTests" */;
+			buildPhases = (
+				D10000012F50000000000022 /* Sources */,
+				D10000012F50000000000023 /* Frameworks */,
+				D10000012F50000000000024 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D10000012F50000000000027 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D10000012F50000000000021 /* NoemaMCPTests */,
+			);
+			name = NoemaMCPTests;
+			packageProductDependencies = (
+			);
+			productName = NoemaMCPTests;
+			productReference = D10000012F50000000000020 /* NoemaMCPTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -666,6 +941,12 @@
 						CreatedOnToolsVersion = 16.4;
 						TestTargetID = 642CDB342E231965009017C6;
 					};
+					D10000012F50000000000004 = {
+						CreatedOnToolsVersion = 26.0;
+					};
+					D10000012F50000000000005 = {
+						CreatedOnToolsVersion = 26.0;
+					};
 				};
 			};
 			buildConfigurationList = 642CDB302E231965009017C6 /* Build configuration list for PBXProject "Noema" */;
@@ -688,6 +969,7 @@
 			mainGroup = 642CDB2C2E231965009017C6;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				A3C000012F50000000000001 /* XCRemoteSwiftPackageReference "swift-sdk" */,
 				2FB3F4F8C56943ACAEC3C135 /* XCLocalSwiftPackageReference "." */,
 				64431EB92E5E2F5E00BD5E8C /* XCRemoteSwiftPackageReference "SwiftMath" */,
 				53802217708316E36FDFDC47 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
@@ -708,6 +990,9 @@
 				642CDB502E231968009017C6 /* NoemaUITests */,
 				A20000012F41000100000004 /* NoemaiOSUITests */,
 				647D618D2E955AEA003DC7F3 /* NoemaMac */,
+				D10000012F50000000000005 /* NoemaMacDirect */,
+				D10000012F50000000000004 /* NoemaMCPHost */,
+				D10000012F50000000000025 /* NoemaMCPTests */,
 			);
 		};
 /* End PBXProject section */
@@ -756,6 +1041,27 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A20000012F41000100000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F50000000000008 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F5000000000000B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F50000000000024 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -871,6 +1177,45 @@
 			shellPath = /bin/sh;
 			shellScript = "set -e\nif [ ! -d \"$CODESIGNING_FOLDER_PATH\" ]; then\n  exit 0\nfi\nfind \"$CODESIGNING_FOLDER_PATH\" -type f -perm -111 -exec sh -c '\n  for path do\n    case \"$(file -b \"$path\")\" in\n      Mach-O*) ;;\n      *)\n        echo \"Clearing executable bit on non-Mach-O bundle file: ${path#$CODESIGNING_FOLDER_PATH/}\"\n        chmod a-x \"$path\"\n        ;;\n    esac\n  done\n' sh {} +\ntouch \"$CODESIGNING_FOLDER_PATH/.noema-executable-bit-normalized\"\n";
 		};
+		D10000012F5000000000000D /* Sanitize Embedded Python Framework */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Sanitize Embedded Python Framework";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/Python.framework/.noema-sanitized",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nPYTHON_FRAMEWORK_ROOT=\"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Python.framework/Versions/Current\"\nif [ -d \"$PYTHON_FRAMEWORK_ROOT/lib\" ]; then\n  find \"$PYTHON_FRAMEWORK_ROOT/lib\" \\( -name '*.o' -o -name '*.a' \\) -type f -delete\n  find \"$PYTHON_FRAMEWORK_ROOT/lib\" -type d -path '*/config-*-darwin' -exec rm -rf {} +\nfi\nmkdir -p \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Python.framework\"\ntouch \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Python.framework/.noema-sanitized\"\n";
+		};
+		D10000012F5000000000000F /* Prepare MCP Node Runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/scripts/mcp/prepare-node-runtime.sh",
+			);
+			name = "Prepare MCP Node Runtime";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MCPRuntime/.noema-node-runtime-22.17.1",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\n/bin/sh \"$PROJECT_DIR/scripts/mcp/prepare-node-runtime.sh\"\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -923,6 +1268,27 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D10000012F50000000000006 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F50000000000009 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000012F50000000000022 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -945,6 +1311,16 @@
 			isa = PBXTargetDependency;
 			target = 642CDB342E231965009017C6 /* Noema */;
 			targetProxy = A20000012F41000100000001 /* PBXContainerItemProxy */;
+		};
+		D10000012F5000000000001A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D10000012F50000000000004 /* NoemaMCPHost */;
+			targetProxy = D10000012F50000000000019 /* PBXContainerItemProxy */;
+		};
+		D10000012F50000000000027 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 647D618D2E955AEA003DC7F3 /* NoemaMac */;
+			targetProxy = D10000012F50000000000026 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1012,6 +1388,11 @@
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=macosx27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=xros27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=xrsimulator27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -1072,6 +1453,11 @@
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=macosx27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=xros27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=xrsimulator27.*]" = "$(inherited) NOEMA_ENABLE_XCODE27_APIS";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
@@ -1091,7 +1477,7 @@
 				CODE_SIGN_ENTITLEMENTS = Noema/Noema.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_CODE_COVERAGE = NO;
 				ENABLE_DEBUG_DYLIB = NO;
@@ -1126,7 +1512,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3;
+				MARKETING_VERSION = 3.5;
 				OTHER_CFLAGS = (
 					"-O3",
 					"-DGGML_USE_ACCELERATE",
@@ -1168,7 +1554,7 @@
 				CODE_SIGN_ENTITLEMENTS = Noema/Noema.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_CODE_COVERAGE = NO;
 				ENABLE_DEBUG_DYLIB = NO;
@@ -1203,7 +1589,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3;
+				MARKETING_VERSION = 3.5;
 				OTHER_CFLAGS = (
 					"-O3",
 					"-DGGML_USE_ACCELERATE",
@@ -1320,7 +1706,7 @@
 				CODE_SIGN_ENTITLEMENTS = Noema/NoemaVisionOS.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -1338,7 +1724,7 @@
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(inherited)";
-				INFOPLIST_FILE = "Noema copy-Info.plist";
+				INFOPLIST_FILE = "NoemaVisionOS-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = NoemaVisionOS;
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates = YES;
@@ -1353,7 +1739,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3;
+				MARKETING_VERSION = 3.5;
 				OTHER_CFLAGS = (
 					"-O3",
 					"-DGGML_USE_ACCELERATE",
@@ -1393,7 +1779,7 @@
 				CODE_SIGN_ENTITLEMENTS = Noema/NoemaVisionOS.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -1411,7 +1797,7 @@
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(inherited)";
-				INFOPLIST_FILE = "Noema copy-Info.plist";
+				INFOPLIST_FILE = "NoemaVisionOS-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = NoemaVisionOS;
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates = YES;
@@ -1426,7 +1812,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3;
+				MARKETING_VERSION = 3.5;
 				OTHER_CFLAGS = (
 					"-O3",
 					"-DGGML_USE_ACCELERATE",
@@ -1465,7 +1851,7 @@
 				CODE_SIGN_ENTITLEMENTS = Noema/RelayServer.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1474,7 +1860,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
 				ENABLE_RESOURCE_ACCESS_BLUETOOTH = YES;
-				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = YES;
 				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
 				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
 				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
@@ -1497,7 +1883,7 @@
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(inherited)";
-				INFOPLIST_FILE = "Noema copy2-Info.plist";
+				INFOPLIST_FILE = "NoemaMac-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Noema;
 				INFOPLIST_KEY_CFBundleName = Noema;
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
@@ -1514,7 +1900,7 @@
 					"@loader_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 3;
+				MARKETING_VERSION = 3.5;
 				OTHER_CFLAGS = (
 					"-O3",
 					"-DGGML_USE_ACCELERATE",
@@ -1561,10 +1947,11 @@
 				CODE_SIGN_ENTITLEMENTS = Noema/RelayServer.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1580,7 +1967,7 @@
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(inherited)";
-				INFOPLIST_FILE = "Noema copy2-Info.plist";
+				INFOPLIST_FILE = "NoemaMac-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Noema;
 				INFOPLIST_KEY_CFBundleName = Noema;
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
@@ -1597,7 +1984,7 @@
 					"@loader_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 3;
+				MARKETING_VERSION = 3.5;
 				OTHER_CFLAGS = (
 					"-O3",
 					"-DGGML_USE_ACCELERATE",
@@ -1629,7 +2016,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1642,7 +2029,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 2.3;
+				MARKETING_VERSION = 3.5;
 				PRODUCT_BUNDLE_IDENTIFIER = arminproducts.Noema.NoemaEmbeddingActivity;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -1661,7 +2048,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = XX3Z6V9TU9;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1674,7 +2061,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 2.3;
+				MARKETING_VERSION = 3.5;
 				PRODUCT_BUNDLE_IDENTIFIER = arminproducts.Noema.NoemaEmbeddingActivity;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -1723,6 +2110,228 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = Noema;
+			};
+			name = Release;
+		};
+		D10000012F50000000000015 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XX3Z6V9TU9;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = NoemaMCPHost/Info.plist;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.noema.NoemaMCPHost;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "NoemaMCPHost/NoemaMCPHost-Bridging-Header.h";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		D10000012F50000000000016 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = XX3Z6V9TU9;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = NoemaMCPHost/Info.plist;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.noema.NoemaMCPHost;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "NoemaMCPHost/NoemaMCPHost-Bridging-Header.h";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		D10000012F50000000000017 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = Noema/NoemaDirect.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XX3Z6V9TU9;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Frameworks",
+				);
+				GCC_C_LANGUAGE_STANDARD = c23;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"GGML_USE_ACCELERATE=1",
+					"ACCELERATE_NEW_LAPACK=1",
+					"ACCELERATE_LAPACK_ILP64=1",
+					"GGML_VERSION=\"dev\"",
+					"GGML_COMMIT=\"local\"",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(inherited)";
+				INFOPLIST_FILE = "NoemaMac-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Noema Direct";
+				INFOPLIST_KEY_CFBundleName = "Noema Direct";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 3.3;
+				ONLY_ACTIVE_ARCH = NO;
+				OTHER_CFLAGS = (
+					"-O3",
+					"-DGGML_USE_ACCELERATE",
+					"-DGGML_METAL_NDEBUG",
+				);
+				OTHER_CPLUSPLUSFLAGS = (
+					"$(OTHER_CFLAGS)",
+					"-std=c++17",
+				);
+				OTHER_LDFLAGS = "\"-ObjC \"";
+				PRODUCT_BUNDLE_IDENTIFIER = arminproducts.Noema.direct;
+				PRODUCT_NAME = "Noema Direct";
+				RUNTIME_EXCEPTION_ALLOW_JIT = YES;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) NOEMA_MCP_DIRECT";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Noema/Noema-Bridging.h";
+				SWIFT_OBJC_INTEROP_MODE = objcxx;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		D10000012F50000000000018 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_CXX_STANDARD_LIBRARY_HARDENING = extensive;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = Noema/NoemaDirect.entitlements;
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XX3Z6V9TU9;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Frameworks",
+				);
+				GCC_C_LANGUAGE_STANDARD = c23;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"GGML_USE_ACCELERATE=1",
+					"ACCELERATE_NEW_LAPACK=1",
+					"ACCELERATE_LAPACK_ILP64=1",
+					"GGML_VERSION=\"dev\"",
+					"GGML_COMMIT=\"local\"",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(inherited)";
+				INFOPLIST_FILE = "NoemaMac-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Noema Direct";
+				INFOPLIST_KEY_CFBundleName = "Noema Direct";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 3.3;
+				ONLY_ACTIVE_ARCH = NO;
+				OTHER_CFLAGS = (
+					"-O3",
+					"-DGGML_USE_ACCELERATE",
+					"-DGGML_METAL_NDEBUG",
+				);
+				OTHER_CPLUSPLUSFLAGS = (
+					"$(OTHER_CFLAGS)",
+					"-std=c++17",
+				);
+				OTHER_LDFLAGS = "\"-ObjC \"";
+				PRODUCT_BUNDLE_IDENTIFIER = arminproducts.Noema.direct;
+				PRODUCT_NAME = "Noema Direct";
+				RUNTIME_EXCEPTION_ALLOW_JIT = YES;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) NOEMA_MCP_DIRECT";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Noema/Noema-Bridging.h";
+				SWIFT_OBJC_INTEROP_MODE = objcxx;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		D10000012F50000000000028 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.noema.MCPTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_OBJC_INTEROP_MODE = objcxx;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Noema.app/Contents/MacOS/Noema";
+			};
+			name = Debug;
+		};
+		D10000012F50000000000029 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.noema.MCPTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_OBJC_INTEROP_MODE = objcxx;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Noema.app/Contents/MacOS/Noema";
 			};
 			name = Release;
 		};
@@ -1801,6 +2410,33 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		D10000012F50000000000013 /* Build configuration list for PBXNativeTarget "NoemaMCPHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D10000012F50000000000015 /* Debug */,
+				D10000012F50000000000016 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D10000012F50000000000014 /* Build configuration list for PBXNativeTarget "NoemaMacDirect" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D10000012F50000000000017 /* Debug */,
+				D10000012F50000000000018 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D10000012F5000000000002A /* Build configuration list for PBXNativeTarget "NoemaMCPTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D10000012F50000000000028 /* Debug */,
+				D10000012F50000000000029 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
@@ -1831,16 +2467,16 @@
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm.git";
 			requirement = {
-				branch = main;
-				kind = branch;
+				kind = revision;
+				revision = 702e5a0eaf990e1f6d3db2b6e7d8872858a44055;
 			};
 		};
 		640890ED2F9AC8C400BCB53E /* XCRemoteSwiftPackageReference "WhisperKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/argmaxinc/WhisperKit";
 			requirement = {
-				branch = main;
-				kind = branch;
+				kind = revision;
+				revision = 80d96762fa727f816ffceab76a6529cd12c2726f;
 			};
 		};
 		64431EB92E5E2F5E00BD5E8C /* XCRemoteSwiftPackageReference "SwiftMath" */ = {
@@ -1889,6 +2525,14 @@
 			requirement = {
 				kind = upToNextMajorVersion;
 				minimumVersion = 1.1.0;
+			};
+		};
+		A3C000012F50000000000001 /* XCRemoteSwiftPackageReference "swift-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/modelcontextprotocol/swift-sdk.git";
+			requirement = {
+				kind = exactVersion;
+				version = 0.12.1;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -2024,6 +2668,11 @@
 			package = 647D619E2E955AEA003DC7F3 /* XCRemoteSwiftPackageReference "SwiftMath" */;
 			productName = SwiftMath;
 		};
+		64D0C0DE2FA0000000000001 /* TTSKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 640890ED2F9AC8C400BCB53E /* XCRemoteSwiftPackageReference "WhisperKit" */;
+			productName = TTSKit;
+		};
 		64E1C0022FA0000000000001 /* CoreAILM */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 64E1C0032FA0000000000001 /* XCLocalSwiftPackageReference "External/coreai-models" */;
@@ -2054,6 +2703,11 @@
 			package = 6A5D1F012F35A00000A10001 /* XCRemoteSwiftPackageReference "swift-transformers" */;
 			productName = Transformers;
 		};
+		6A5D1F102F35A00000A10001 /* Tokenizers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 6A5D1F012F35A00000A10001 /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Tokenizers;
+		};
 		89508E8A4241F3F06F767D32 /* MLXLMCommon */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 53802217708316E36FDFDC47 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
@@ -2063,6 +2717,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 53802217708316E36FDFDC47 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
 			productName = MLXVLM;
+		};
+		A3C000022F50000000000002 /* MCP */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A3C000012F50000000000001 /* XCRemoteSwiftPackageReference "swift-sdk" */;
+			productName = MCP;
 		};
 		A75FE0F413B83C5653A358FA /* MLXLMCommon */ = {
 			isa = XCSwiftPackageProductDependency;

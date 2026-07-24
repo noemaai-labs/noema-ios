@@ -1,4 +1,3 @@
-// DeviceGPUInfo.swift
 import Foundation
 
 struct DeviceGPUInfo {

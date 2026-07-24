@@ -52,7 +52,8 @@ struct ModelDoctorSummaryContent: View {
     }
 
     private var modelSignature: String {
-        modelManager.downloadedModels.map(\.url.path).joined(separator: "|")
+        let installed = modelManager.downloadedModels.map(\.url.path).joined(separator: "|")
+        return "\(installed)|loaded=\(modelManager.loadedModel?.url.path ?? "none")"
     }
 
     // Compute the report counts without blocking the scroll runloop: the GGUF
@@ -110,7 +111,6 @@ struct ModelDoctorView: View {
     @State private var selectedModelPath: String = ""
     @State private var reportExportURL: URL?
     @State private var reportExportError: String?
-    @State private var checkedAt = Date()
 
     private var availableModels: [LocalModel] {
         modelManager.downloadedModels.sorted { lhs, rhs in
@@ -135,6 +135,24 @@ struct ModelDoctorView: View {
     }
 
     var body: some View {
+        platformContent
+            .onAppear(perform: ensureSelection)
+            .onReceive(modelManager.$downloadedModels) { _ in ensureSelection() }
+    }
+
+    private var platformContent: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons). The sheet already supplies the
+        // title + close, so no navigationTitle on macOS.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Model Doctor"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             if availableModels.isEmpty {
                 Section(LocalizedStringKey("Model Doctor")) {
@@ -163,10 +181,121 @@ struct ModelDoctorView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("Model Doctor"))
-        .onAppear(perform: ensureSelection)
-        .onReceive(modelManager.$downloadedModels) { _ in ensureSelection() }
     }
+
+#if os(macOS)
+    private var macBody: some View {
+        MacSettingsPage {
+            if availableModels.isEmpty {
+                MacSettingsCard(LocalizedStringKey("Model Doctor")) {
+                    MacSettingsNoteRow(LocalizedStringKey("No local models installed"), divider: false)
+                    MacSettingsNoteRow(LocalizedStringKey("Install a local model to run file, memory, template, sidecar, tool, vision, and speculative decoding checks."))
+                }
+            } else {
+                MacSettingsCard(LocalizedStringKey("Model")) {
+                    MacSettingsControlRow(LocalizedStringKey("Check Model"), divider: false) {
+                        Picker(LocalizedStringKey("Check Model"), selection: selectedPathBinding) {
+                            ForEach(availableModels, id: \.id) { model in
+                                Text(verbatim: modelLabel(model)).tag(model.url.path)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                }
+
+                if let report = selectedReport {
+                    macOverviewCard(report)
+                    macRecommendationsCard(report)
+                    macChecksCard(report)
+                    macRuntimeCard(report)
+                    macExportCard(report)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macOverviewCard(_ report: ModelDoctorReport) -> some View {
+        MacSettingsCard(LocalizedStringKey("Compatibility Report")) {
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Overall"),
+                value: report.overallStatus.localizedTitle,
+                systemImage: report.overallStatus.systemImage,
+                tint: report.overallStatus.tint,
+                divider: false
+            )
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Runtime Path"), value: report.runtimePath)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Load State"), value: report.isLoaded ? String(localized: "Loaded now") : String(localized: "Not loaded"))
+        }
+    }
+
+    @ViewBuilder
+    private func macRecommendationsCard(_ report: ModelDoctorReport) -> some View {
+        MacSettingsCard(LocalizedStringKey("Recommendations")) {
+            if report.recommendations.isEmpty {
+                MacSettingsNoteRow(LocalizedStringKey("No immediate action needed"), divider: false)
+            } else {
+                ForEach(Array(report.recommendations.enumerated()), id: \.offset) { index, recommendation in
+                    MacDoctorRecommendationRow(text: recommendation, divider: index != 0)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macChecksCard(_ report: ModelDoctorReport) -> some View {
+        MacSettingsCard(LocalizedStringKey("Checks")) {
+            ForEach(Array(report.checks.enumerated()), id: \.element.id) { index, check in
+                MacSettingsStatusRow(
+                    title: LocalizedStringKey(check.titleKey),
+                    value: check.value,
+                    systemImage: check.status.systemImage,
+                    tint: check.status.tint,
+                    divider: index != 0
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macRuntimeCard(_ report: ModelDoctorReport) -> some View {
+        MacSettingsCard(LocalizedStringKey("Runtime Budget")) {
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Context Length"), value: report.contextValue, divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Estimated Working Set"), value: report.workingSetValue)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Memory Budget"), value: report.budgetValue)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Safe Context"), value: report.safeContextValue)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("KV Cache"), value: report.kvCacheValue)
+        }
+    }
+
+    @ViewBuilder
+    private func macExportCard(_ report: ModelDoctorReport) -> some View {
+        MacSettingsCard(LocalizedStringKey("Doctor Export")) {
+            MacSettingsActionRow(divider: false) {
+                Button {
+                    generateExport(report)
+                } label: {
+                    Label(LocalizedStringKey("Generate Doctor JSON"), systemImage: "doc.badge.gearshape")
+                }
+                .buttonStyle(.industrial(.tinted))
+
+                if let reportExportURL {
+                    ShareLink(item: reportExportURL) {
+                        Label(LocalizedStringKey("Share Doctor JSON"), systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.industrial(.quiet))
+                }
+            }
+
+            if let reportExportURL {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Export File"), value: reportExportURL.lastPathComponent)
+            }
+            if let reportExportError {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Export Error"), value: reportExportError)
+            }
+        }
+    }
+#endif
 
     private var selectedPathBinding: Binding<String> {
         Binding(
@@ -206,13 +335,6 @@ struct ModelDoctorView: View {
             )
             DoctorValueRow(title: LocalizedStringKey("Runtime Path"), value: report.runtimePath)
             DoctorValueRow(title: LocalizedStringKey("Load State"), value: report.isLoaded ? String(localized: "Loaded now") : String(localized: "Not loaded"))
-            DoctorValueRow(title: LocalizedStringKey("Last Checked"), value: checkedAt.formatted(date: .omitted, time: .standard))
-
-            Button {
-                checkedAt = Date()
-            } label: {
-                Label(LocalizedStringKey("Run Model Doctor"), systemImage: "stethoscope")
-            }
         }
     }
 
@@ -358,6 +480,27 @@ private struct DoctorStatusRow: View {
     }
 }
 
+#if os(macOS)
+/// Recommendation lines arrive pre-localized at runtime, so this mirrors
+/// `MacSettingsNoteRow`'s look while rendering the value verbatim (a
+/// `LocalizedStringKey` would re-run table lookup on an already-translated
+/// string).
+private struct MacDoctorRecommendationRow: View {
+    let text: String
+    var divider: Bool = true
+
+    var body: some View {
+        MacSettingsRowContainer(divider: divider) {
+            Text(verbatim: text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Color.primary.opacity(0.45))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+#endif
+
 private struct ModelDoctorCheck: Identifiable {
     let id = UUID()
     let titleKey: String
@@ -419,13 +562,18 @@ private struct ModelDoctorReport {
         let moeInfo = model.moeInfo ?? (model.format == .gguf ? GGUFMetadata.moeInfo(at: model.url) : nil)
         let kvEstimate = ModelRAMAdvisor.GGUFKVCacheEstimate.resolved(from: settings)
         let contextLength = max(512, Int(settings.contextLength.rounded()))
+        // A context that is running now is measured evidence. Never let a volatile
+        // post-load headroom snapshot make Model Doctor recommend less than that value.
+        let knownWorkingContextLength = isLoaded ? contextLength : nil
         let (workingSet, budget) = ModelRAMAdvisor.estimateAndBudget(
             format: model.format,
             sizeBytes: sizeBytes,
             contextLength: contextLength,
             layerCount: layerCount,
             moeInfo: moeInfo,
-            kvCacheEstimate: kvEstimate
+            kvCacheEstimate: kvEstimate,
+            runtimeConfiguration: .resolved(from: settings, modelURL: model.url),
+            knownWorkingContextLength: knownWorkingContextLength
         )
         let safeContext = ModelRAMAdvisor.maxContextUnderBudget(
             format: model.format,
@@ -433,7 +581,9 @@ private struct ModelDoctorReport {
             layerCount: layerCount,
             moeInfo: moeInfo,
             upperBound: GGUFMetadata.contextLength(at: model.url),
-            kvCacheEstimate: kvEstimate
+            kvCacheEstimate: kvEstimate,
+            runtimeConfiguration: .resolved(from: settings, modelURL: model.url),
+            knownWorkingContextLength: knownWorkingContextLength
         )
 
         modelName = model.name
@@ -448,7 +598,7 @@ private struct ModelDoctorReport {
         workingSetValue = ByteCountFormatter.string(fromByteCount: workingSet, countStyle: .memory)
         budgetValue = budget.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory) } ?? String(localized: "Unknown")
         safeContextValue = safeContext.map { String.localizedStringWithFormat(String(localized: "%d tokens"), $0) } ?? String(localized: "Unknown")
-        kvCacheValue = "\(kvEstimate.kCacheQuant.rawValue) / \(kvEstimate.vCacheQuant.rawValue)"
+        kvCacheValue = kvEstimate.displayLabel
 
         let reportContext = ReportContext(
             model: model,
@@ -526,7 +676,16 @@ private struct ModelDoctorReport {
         let mtpPath = gguf ? MtpLocator.mtpPath(alongside: model.url) : nil
         let hasEmbeddedMTP = gguf && GGUFMetadata.hasMTP(at: model.url)
         let hasMTP = mtpPath != nil || hasEmbeddedMTP
-        let template = gguf ? GGUFMetadata.chatTemplate(at: model.url) : nil
+        // Resolve the template the way the runtime does (curated → sidecar chat_template
+        // → hub.json → tokenizer_config → tokenizer.json → config.json → embedded GGUF),
+        // not just the embedded GGUF blob — otherwise models whose template ships in a
+        // sidecar are wrongly reported as "Missing".
+        let template = gguf
+            ? ModelSettings.promptTemplateResolution(
+                for: model,
+                directory: ModelSettings.settingsDirectory(for: model)
+              ).template
+            : nil
         let trainingContext = gguf ? GGUFMetadata.contextLength(at: model.url) : nil
         let tokenizerPath = ModelSettings.resolvedTokenizerPath(for: model)
 

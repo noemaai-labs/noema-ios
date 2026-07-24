@@ -86,13 +86,28 @@ struct PrivacyFlightRecorderView: View {
     @State private var exportError: String?
 
     var body: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons), so macOS gets a first-class
+        // industrial-dialect layout instead. The sheet already supplies the
+        // title + close, so no navigationTitle here.
+        macBody
+            .onAppear { checkedAt = Date() }
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Privacy Flight Recorder"))
+            .onAppear { checkedAt = Date() }
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             Section(LocalizedStringKey("Flight Summary")) {
                 PrivacyFlightStatusRow(
                     title: LocalizedStringKey("Privacy Mode"),
                     value: offGrid ? String(localized: "Off-grid") : String(localized: "Standard"),
                     systemImage: offGrid ? "wifi.slash" : "wifi",
-                    tint: offGrid ? .green : .accentColor
+                    tint: offGrid ? .green : .secondary
                 )
                 PrivacyFlightValueRow(title: LocalizedStringKey("Network Kill Switch"), value: NetworkKillSwitch.isEnabled ? String(localized: "Enabled") : String(localized: "Disabled"))
                 PrivacyFlightValueRow(title: LocalizedStringKey("Active Runtime"), value: runtimeValue)
@@ -223,9 +238,169 @@ struct PrivacyFlightRecorderView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("Privacy Flight Recorder"))
-        .onAppear { checkedAt = Date() }
     }
+
+#if os(macOS)
+    // MARK: - macOS industrial layout
+
+    private var macBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                MacPrivacyCard(LocalizedStringKey("Flight Summary")) {
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Privacy Mode"),
+                        value: offGrid ? String(localized: "Off-grid") : String(localized: "Standard"),
+                        systemImage: offGrid ? "wifi.slash" : "wifi",
+                        tint: offGrid ? .green : .secondary,
+                        divider: false
+                    )
+                    MacPrivacyKeyValueRow(title: LocalizedStringKey("Network Kill Switch"), value: NetworkKillSwitch.isEnabled ? String(localized: "Enabled") : String(localized: "Disabled"))
+                    MacPrivacyKeyValueRow(title: LocalizedStringKey("Active Runtime"), value: runtimeValue)
+                    MacPrivacyKeyValueRow(title: LocalizedStringKey("Active Model"), value: activeModelValue)
+                    MacPrivacyKeyValueRow(title: LocalizedStringKey("Active Dataset"), value: activeDatasetValue)
+                    MacPrivacyKeyValueRow(title: LocalizedStringKey("Checked"), value: checkedAt.formatted(date: .abbreviated, time: .standard))
+                }
+
+                MacPrivacyCard(LocalizedStringKey("Local Surfaces")) {
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Local Model Execution"),
+                        value: activeLocalModel == nil ? String(localized: "Idle") : String(localized: "Local"),
+                        systemImage: "cpu",
+                        tint: activeLocalModel == nil ? .secondary : .green,
+                        divider: false
+                    )
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Dataset Retrieval"),
+                        value: activeDataset == nil ? String(localized: "Inactive") : String(localized: "Local"),
+                        systemImage: "doc.text.magnifyingglass",
+                        tint: activeDataset == nil ? .secondary : .green
+                    )
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Persistent Memory"),
+                        value: settings.memoryEnabled ? String(localized: "Local") : String(localized: "Off"),
+                        systemImage: "square.stack.3d.up",
+                        tint: settings.memoryEnabled ? .green : .secondary
+                    )
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Python Sandbox"),
+                        value: settings.pythonEnabled ? String(localized: "Local") : String(localized: "Off"),
+                        systemImage: "terminal",
+                        tint: settings.pythonEnabled ? .green : .secondary
+                    )
+                }
+
+                MacPrivacyCard(LocalizedStringKey("Network-Capable Surfaces")) {
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Web Search"),
+                        value: networkSurfaceValue(enabled: settings.webSearchEnabled),
+                        systemImage: "magnifyingglass",
+                        tint: networkSurfaceTint(enabled: settings.webSearchEnabled),
+                        divider: false
+                    )
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Remote Backends"),
+                        value: remoteBackendValue,
+                        systemImage: "network",
+                        tint: remoteBackendTint
+                    )
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Downloads and Explore"),
+                        value: offGrid ? String(localized: "Blocked") : String(localized: "Allowed"),
+                        systemImage: "arrow.down.circle",
+                        tint: offGrid ? .green : .orange
+                    )
+                    MacPrivacyStatusRow(
+                        title: LocalizedStringKey("Wallet Signing"),
+                        value: offGrid ? String(localized: "Blocked") : String(localized: "Allowed"),
+                        systemImage: "wallet.pass",
+                        tint: offGrid ? .green : .orange
+                    )
+                }
+
+                MacPrivacyCard(LocalizedStringKey("Off-Grid Proof Drill")) {
+                    MacPrivacyActionRow(divider: false) {
+                        Button {
+                            runProofDrill()
+                        } label: {
+                            Label(LocalizedStringKey("Run Proof Drill"), systemImage: "checkmark.shield")
+                        }
+                        .buttonStyle(.industrial(.prominent))
+                    }
+
+                    if drillResults.isEmpty {
+                        MacPrivacyNoteRow(LocalizedStringKey("Run the drill to verify external network paths are blocked while loopback and local paths remain available."))
+                    } else {
+                        ForEach(drillResults) { result in
+                            MacPrivacyDrillRow(result: result)
+                        }
+                    }
+                }
+
+                MacPrivacyCard(LocalizedStringKey("Recent Blocked Attempts")) {
+                    let attempts = Array(NetworkKillSwitch.recentBlockedAttempts.prefix(8))
+                    if attempts.isEmpty {
+                        MacPrivacyNoteRow(LocalizedStringKey("No blocked network attempts recorded"), divider: false)
+                    } else {
+                        ForEach(Array(attempts.enumerated()), id: \.element.id) { index, attempt in
+                            MacPrivacyBlockedAttemptRow(attempt: attempt, divider: index != 0)
+                        }
+                        MacPrivacyActionRow {
+                            Button(role: .destructive) {
+                                NetworkKillSwitch.clearBlockedAttempts()
+                                checkedAt = Date()
+                            } label: {
+                                Label(LocalizedStringKey("Clear Blocked Attempts"), systemImage: "trash")
+                            }
+                            .buttonStyle(.industrial(.destructive))
+                        }
+                    }
+                }
+
+                MacPrivacyCard(LocalizedStringKey("Remote Session")) {
+                    if let remote = modelManager.activeRemoteSession {
+                        MacPrivacyKeyValueRow(title: LocalizedStringKey("Backend"), value: remote.backendName, divider: false)
+                        MacPrivacyKeyValueRow(title: LocalizedStringKey("Model"), value: remote.modelName)
+                        MacPrivacyKeyValueRow(title: LocalizedStringKey("Endpoint"), value: remote.endpointType.displayName)
+                        MacPrivacyKeyValueRow(title: LocalizedStringKey("Transport"), value: remote.transport.label)
+                    } else {
+                        MacPrivacyNoteRow(LocalizedStringKey("No remote session is active"), divider: false)
+                    }
+                }
+
+                MacPrivacyCard(LocalizedStringKey("Privacy Export")) {
+                    MacPrivacyActionRow(divider: false) {
+                        HStack(spacing: 8) {
+                            Button {
+                                generateExport()
+                            } label: {
+                                Label(LocalizedStringKey("Generate Privacy JSON"), systemImage: "doc.badge.gearshape")
+                            }
+                            .buttonStyle(.industrial(.tinted))
+
+                            if let exportURL {
+                                ShareLink(item: exportURL) {
+                                    Label(LocalizedStringKey("Share Privacy JSON"), systemImage: "square.and.arrow.up")
+                                }
+                                .buttonStyle(.industrial(.quiet))
+                            }
+                        }
+                    }
+
+                    if let exportURL {
+                        MacPrivacyKeyValueRow(title: LocalizedStringKey("Export File"), value: exportURL.lastPathComponent)
+                    }
+                    if let exportError {
+                        MacPrivacyKeyValueRow(title: LocalizedStringKey("Export Error"), value: exportError)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
+            .padding(.bottom, 28)
+        }
+        .background(AppTheme.windowBackground.ignoresSafeArea())
+    }
+#endif
 
     private var offGrid: Bool {
         UserDefaults.standard.object(forKey: "offGrid") as? Bool ?? false
@@ -484,6 +659,17 @@ private struct PrivacyFlightPill: View {
     }
 }
 
+private struct PrivacyStatusDot: View {
+    let tint: Color
+
+    var body: some View {
+        Circle()
+            .fill(tint)
+            .frame(width: 7, height: 7)
+            .accessibilityHidden(true)
+    }
+}
+
 private struct PrivacyFlightStatusRow: View {
     let title: LocalizedStringKey
     let value: String
@@ -492,13 +678,20 @@ private struct PrivacyFlightStatusRow: View {
 
     var body: some View {
         LabeledContent {
-            Text(verbatim: value)
-                .multilineTextAlignment(.trailing)
-                .foregroundStyle(tint)
-                .textSelection(.enabled)
+            HStack(spacing: 7) {
+                PrivacyStatusDot(tint: tint)
+                Text(verbatim: value)
+                    .multilineTextAlignment(.trailing)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
         } label: {
-            Label(title, systemImage: systemImage)
-                .foregroundStyle(tint)
+            Label {
+                Text(title)
+            } icon: {
+                Image(systemName: systemImage)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
@@ -523,9 +716,11 @@ private struct PrivacyProofDrillRow: View {
     var body: some View {
         LabeledContent {
             VStack(alignment: .trailing, spacing: 3) {
-                Text(verbatim: result.status)
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(result.tint)
+                HStack(spacing: 7) {
+                    PrivacyStatusDot(tint: result.tint)
+                    Text(verbatim: result.status)
+                        .font(.subheadline.weight(.medium))
+                }
                 Text(verbatim: result.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -534,8 +729,12 @@ private struct PrivacyProofDrillRow: View {
                     .multilineTextAlignment(.trailing)
             }
         } label: {
-            Label(result.title, systemImage: result.systemImage)
-                .foregroundStyle(result.tint)
+            Label {
+                Text(result.title)
+            } icon: {
+                Image(systemName: result.systemImage)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -547,13 +746,18 @@ private struct PrivacyBlockedAttemptRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
-                Label(attempt.host, systemImage: "wifi.slash")
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(.green)
+                Label {
+                    Text(verbatim: attempt.host)
+                        .font(.body.weight(.medium))
+                } icon: {
+                    Image(systemName: "wifi.slash")
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 8)
                 Text(attempt.blockedAt, style: .time)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .monospacedDigit()
             }
             Text(verbatim: attempt.urlString)
                 .font(.caption)
@@ -564,3 +768,196 @@ private struct PrivacyBlockedAttemptRow: View {
         .padding(.vertical, 3)
     }
 }
+
+#if os(macOS)
+// MARK: - macOS industrial rows
+
+/// A bordered section card in the Mac industrial dialect: an
+/// `IndustrialSectionHeader` over hairline-separated rows. Rows opt out of their
+/// leading hairline with `divider: false` so the first row sits flush under the
+/// header's own hairline.
+private struct MacPrivacyCard<Content: View>: View {
+    let title: LocalizedStringKey
+    @ViewBuilder let content: () -> Content
+
+    init(_ title: LocalizedStringKey, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            IndustrialSectionHeader(title)
+            content()
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+
+private struct MacPrivacyKeyValueRow: View {
+    let title: LocalizedStringKey
+    let value: String
+    var divider: Bool = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(title)
+                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(Color.primary.opacity(0.55))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                Spacer(minLength: 12)
+                Text(verbatim: value)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.8))
+                    .multilineTextAlignment(.trailing)
+                    .textSelection(.enabled)
+            }
+            .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct MacPrivacyStatusRow: View {
+    let title: LocalizedStringKey
+    let value: String
+    let systemImage: String
+    var tint: Color = .secondary
+    var divider: Bool = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .frame(width: 18)
+                Text(title)
+                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(Color.primary.opacity(0.6))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                Spacer(minLength: 12)
+                IndustrialBadge(verbatim: value, tint: tint, dot: true)
+            }
+            .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct MacPrivacyDrillRow: View {
+    let result: PrivacyProofDrillResult
+    var divider: Bool = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: result.systemImage)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(result.title)
+                        .textCase(.uppercase)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.3)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                    Text(verbatim: result.detail)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.4))
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 12)
+                IndustrialBadge(verbatim: result.status, tint: result.tint, dot: true)
+            }
+            .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct MacPrivacyBlockedAttemptRow: View {
+    let attempt: NetworkBlockedAttempt
+    var divider: Bool = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "wifi.slash")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.primary.opacity(0.4))
+                    Text(verbatim: attempt.host)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.7))
+                    Spacer(minLength: 8)
+                    Text(attempt.blockedAt, style: .time)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.4))
+                        .monospacedDigit()
+                }
+                Text(verbatim: attempt.urlString)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            }
+            .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct MacPrivacyNoteRow: View {
+    let text: LocalizedStringKey
+    var divider: Bool = true
+
+    init(_ text: LocalizedStringKey, divider: Bool = true) {
+        self.text = text
+        self.divider = divider
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            Text(text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Color.primary.opacity(0.45))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct MacPrivacyActionRow<Content: View>: View {
+    var divider: Bool = true
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            HStack(spacing: 8) {
+                content()
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 8)
+        }
+    }
+}
+#endif

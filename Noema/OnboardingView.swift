@@ -1,4 +1,3 @@
-// OnboardingView.swift
 #if canImport(UIKit)
 import SwiftUI
 import Combine
@@ -7,6 +6,15 @@ import UIKit
 #if canImport(AppKit)
 import AppKit
 #endif
+
+private struct FLPressableStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .opacity(configuration.isPressed ? 0.55 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
 
 struct OnboardingView: View {
     @Binding var showOnboarding: Bool
@@ -33,9 +41,18 @@ struct OnboardingView: View {
     @State private var recommendedSpeed = 0.0
     @State private var recommendedDownloading = false
 
+    // MARK: First Light flow state
+    enum Act: Int, CaseIterable { case ignition, fork, chat, dark, constellation, handoff, console, grid, open }
+    @State private var act: Act = .ignition
+    @AppStorage("isAdvancedMode") private var isAdvancedMode = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var ignited = false
+    @State private var streamedText = ""
+    @State private var reasoningDone = false
+    @State private var selectedEngine = "GGUF"
+
     let totalPages = 4
     
-    // Color Palette - Navy and White
     var navyBlue: Color {
         colorScheme == .dark ? Color(red: 173/255, green: 185/255, blue: 202/255) : Color(red: 20/255, green: 40/255, blue: 80/255)
     }
@@ -60,67 +77,77 @@ struct OnboardingView: View {
         colorScheme == .dark ? Color(red: 180/255, green: 190/255, blue: 210/255) : Color(red: 100/255, green: 110/255, blue: 130/255)
     }
     
+    private var flSpring: Animation { reduceMotion ? .easeInOut(duration: 0.28) : .spring(response: 0.34, dampingFraction: 0.84) }
+
     var body: some View {
         ZStack {
-            // Clean background
-            backgroundColor
+            backgroundColor.ignoresSafeArea()
+            // "The Dark" privacy beat dims the whole canvas to near-black.
+            Color.black
+                .opacity(act == .dark ? 0.94 : 0)
                 .ignoresSafeArea()
-            
-            VStack(spacing: 0) {
-                // Page content
-                TabView(selection: $currentPage) {
-                    ScrollView {
-                        welcomePage
-                            .padding(.vertical, 20)
+                .animation(.easeInOut(duration: 0.6), value: act)
+
+            actContent
+                .padding(.horizontal, 24)
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            // Persistent "Skip to setup" escape on the simple path.
+            if !isAdvancedMode, act != .ignition, act != .fork {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button(action: { isAdvancedMode = true; act = .console }) {
+                            Text("Skip to setup ›").font(.footnote)
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(textSecondary)
+                        .background(Capsule().fill(Color.primary.opacity(0.06)))
                     }
-                    .tag(0)
-                    
-                    ScrollView {
-                        overviewPage
-                            .padding(.vertical, 20)
-                    }
-                    .tag(1)
-                    
-                    ScrollView {
-                        modelsPage
-                            .padding(.vertical, 20)
-                    }
-                    .tag(2)
-                    
-                    ScrollView {
-                        getStartedPage
-                            .padding(.vertical, 20)
-                    }
-                    .tag(3)
+                    Spacer()
                 }
-                .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
-                .animation(.easeInOut(duration: 0.3), value: currentPage)
-                
-                // Navigation
-                navigationView
-                    .padding(.horizontal, 30)
-                    .padding(.bottom, 50)
+                .padding(.top, 8).padding(.trailing, 16)
+                .transition(.opacity)
+            }
+
+            // Bottom control bar (Back + progress) for the narrative acts.
+            if act != .handoff, act != .open {
+                VStack {
+                    Spacer()
+                    controlBar.padding(.horizontal, 28).padding(.bottom, 30)
+                }
             }
         }
+        .animation(flSpring, value: act)
         .onAppear {
-            withAnimation(.easeOut(duration: 0.8)) {
-                logoScale = 1.0
+            withAnimation(reduceMotion ? .easeInOut(duration: 0.4) : .spring(response: 0.6, dampingFraction: 0.72)) {
+                ignited = true
             }
-            withAnimation(.easeOut(duration: 1.0).delay(0.3)) {
-                textOpacity = 1.0
-                animateElements = true
-            }
-            // Ensure the embed installer reflects current disk state if the user reopens onboarding
             embedInstaller.refreshStateFromDisk()
             loadRecommendedModel()
+        }
+    }
+
+    @ViewBuilder private var actContent: some View {
+        switch act {
+        case .ignition: ignitionAct
+        case .fork: forkAct
+        case .chat: livingChatAct
+        case .dark: theDarkAct
+        case .constellation: constellationAct
+        case .handoff: handoffAct
+        case .console: consoleAct
+        case .grid: capabilitiesGridAct
+        case .open: openNoemaAct
         }
     }
     
     private var welcomePage: some View {
         VStack(spacing: 40) {
             Spacer()
-            
-            // Logo and title
+
             VStack(spacing: 24) {
                 Image("Noema")
                     .resizable()
@@ -142,8 +169,7 @@ struct OnboardingView: View {
             }
             
             Spacer()
-            
-            // Key benefits
+
             VStack(spacing: 24) {
                 benefitRow(
                     icon: "lock.shield",
@@ -263,7 +289,6 @@ struct OnboardingView: View {
             }
             .padding(.top, 40)
             
-            // Models section
             VStack(spacing: 20) {
                 Text("Model Formats")
                     .font(.headline)
@@ -283,7 +308,6 @@ struct OnboardingView: View {
             
             onboardingImageView(keywords: ["Onboarding3", "models", "model", "selection"], height: 150)
             
-            // Datasets section
             VStack(spacing: 16) {
                 Text("Enhance with Datasets")
                     .font(.headline)
@@ -406,7 +430,6 @@ struct OnboardingView: View {
             
             onboardingImageView(keywords: ["Onboarding4", "get-started", "getting-started", "setup", "start"], height: 180)
             
-            // Embedding model download section
             VStack(spacing: 20) {
                 VStack(spacing: 8) {
                     Label("Enable dataset search", systemImage: "magnifyingglass")
@@ -453,9 +476,8 @@ struct OnboardingView: View {
                         .disabled(isDownloadingEmbedModel || embedInstaller.state == .ready)
                         
                         if isDownloadingEmbedModel && embedProgress > 0 {
-                            ProgressView(value: embedProgress)
+                            DownloadCapsuleBar(value: embedProgress, tint: navyBlue)
                                 .frame(width: 240)
-                                .tint(navyBlue)
                         }
                     }
                 }
@@ -514,6 +536,359 @@ struct OnboardingView: View {
                 recommendedSpeed = 0
             }
         }
+    }
+
+    // MARK: - First Light acts
+
+    private var actSequence: [Act] {
+        isAdvancedMode ? [.ignition, .fork, .console, .grid, .open]
+                       : [.ignition, .fork, .chat, .dark, .constellation, .handoff]
+    }
+    private var actIndex: Int { actSequence.firstIndex(of: act) ?? 0 }
+
+    private func flAdvance() {
+        let s = actSequence
+        guard let i = s.firstIndex(of: act), i + 1 < s.count else { return }
+        act = s[i + 1]
+        if act == .chat { runScriptedStream() }
+    }
+    private func flBack() {
+        let s = actSequence
+        guard let i = s.firstIndex(of: act), i > 0 else { return }
+        act = s[i - 1]
+    }
+    private func flPick(advanced: Bool) {
+        isAdvancedMode = advanced
+        #if os(iOS)
+        Haptics.impact(.medium)
+        #endif
+        act = advanced ? .console : .chat
+        if act == .chat { runScriptedStream() }
+    }
+    private func flSkipExit() {
+        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+        withAnimation(.easeInOut) { showOnboarding = false }
+    }
+    private func flFinishPower() {
+        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+        let dest: MainTab = modelManager.downloadedModels.isEmpty ? .explore : .stored
+        withAnimation(.easeInOut) { showOnboarding = false }
+        tabRouter.selection = dest
+    }
+
+    private func runScriptedStream() {
+        streamedText = ""
+        reasoningDone = false
+        let full = "Your prompt and the model both stay on your device. Nothing is sent to a server — the AI runs in your phone's own memory."
+        if reduceMotion {
+            reasoningDone = true
+            streamedText = full
+            return
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard act == .chat else { return }
+            withAnimation { reasoningDone = true }
+            for word in full.split(separator: " ").map(String.init) {
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                guard act == .chat else { return }
+                streamedText += (streamedText.isEmpty ? "" : " ") + word
+            }
+        }
+    }
+
+    private var controlBar: some View {
+        HStack(spacing: 12) {
+            if actIndex > 0 {
+                Button(action: flBack) {
+                    HStack(spacing: 4) { Image(systemName: "chevron.left"); Text("Back") }
+                }
+                .buttonStyle(.plain).foregroundColor(textSecondary)
+            }
+            Spacer()
+            HStack(spacing: 6) {
+                ForEach(0..<actSequence.count, id: \.self) { i in
+                    Capsule()
+                        .fill(i == actIndex ? Color.accentColor : Color.primary.opacity(0.18))
+                        .frame(width: i == actIndex ? 18 : 7, height: 7)
+                }
+            }
+            Spacer()
+            if act != .fork {
+                Button(action: flAdvance) {
+                    Text(act == .ignition ? "Begin" : "Continue").fontWeight(.semibold)
+                }
+                .buttonStyle(.plain).foregroundColor(.accentColor)
+            } else {
+                Color.clear.frame(width: 44, height: 1)
+            }
+        }
+        .font(.subheadline)
+    }
+
+    private func featurePill(_ icon: String, _ label: String) -> some View {
+        HStack(spacing: 6) { Image(systemName: icon); Text(label) }
+            .font(.caption)
+            .padding(.horizontal, 11).padding(.vertical, 5)
+            .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+            .foregroundColor(.accentColor)
+    }
+
+    private var ignitionAct: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image("Noema")
+                .resizable().scaledToFit()
+                .frame(width: 94, height: 94)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .scaleEffect(ignited ? 1 : 0.6)
+                .opacity(ignited ? 1 : 0)
+            Text("Noema").font(.system(size: 34, weight: .semibold)).foregroundColor(textPrimary).opacity(ignited ? 1 : 0)
+            Text("It runs here. Watch.").font(.title3).foregroundColor(textSecondary).opacity(ignited ? 1 : 0)
+            featurePill("iphone", "On-device").opacity(ignited ? 1 : 0).padding(.top, 2)
+            Spacer()
+            Text("Tap to begin").font(.footnote).foregroundColor(textSecondary.opacity(0.7))
+                .padding(.bottom, 80)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { flAdvance() }
+        .transition(.opacity)
+    }
+
+    private func doorCard(icon: String, title: String, subtitle: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                Image(systemName: icon).font(.system(size: 22)).foregroundColor(.accentColor).frame(width: 30)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.headline).foregroundColor(textPrimary)
+                    Text(subtitle).font(.caption).foregroundColor(textSecondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(secondaryBackground))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.primary.opacity(0.08)))
+        }
+        .buttonStyle(FLPressableStyle())
+    }
+
+    private var forkAct: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Spacer()
+            Text("FIRST, ONE CHOICE").font(.caption).tracking(1.4).foregroundColor(textSecondary)
+            Text("How do you want to meet Noema?").font(.system(size: 26, weight: .semibold)).foregroundColor(textPrimary)
+            doorCard(icon: "sparkles", title: "Show me around", subtitle: "Learn by doing — I'll walk you through it") { flPick(advanced: false) }
+                .padding(.top, 6)
+            doorCard(icon: "slider.horizontal.3", title: "I know my way around", subtitle: "Skip to setup · engine · quant · context · backends") { flPick(advanced: true) }
+            Text("This sets the app's mode — you can flip it anytime in Settings.")
+                .font(.caption2).foregroundColor(textSecondary.opacity(0.8)).padding(.top, 4)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .transition(reduceMotion ? .opacity : .scale(scale: 0.96).combined(with: .opacity))
+    }
+
+    private var livingChatAct: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Spacer()
+            Text("IT'S ALREADY RUNNING").font(.caption).tracking(1.4).foregroundColor(textSecondary)
+            Text("A real answer, on your phone").font(.system(size: 24, weight: .semibold)).foregroundColor(textPrimary)
+            HStack(spacing: 8) { featurePill("globe", "Web"); featurePill("photo", "Vision"); featurePill("mic", "Voice") }
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Explain how on-device AI keeps my data private", systemImage: "person.fill")
+                    .font(.subheadline).foregroundColor(textSecondary)
+                HStack(spacing: 7) {
+                    Image(systemName: reasoningDone ? "checkmark" : "ellipsis").font(.caption)
+                    Text(reasoningDone ? "Reasoning complete" : "Thinking…").font(.caption)
+                }
+                .foregroundColor(textSecondary)
+                Text(streamedText.isEmpty ? " " : streamedText)
+                    .font(.body).foregroundColor(textPrimary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .animation(.easeOut(duration: 0.12), value: streamedText)
+            }
+            .padding(16)
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(secondaryBackground))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .transition(.opacity)
+        .onAppear { if streamedText.isEmpty { runScriptedStream() } }
+    }
+
+    private var theDarkAct: some View {
+        let local = ["Model", "Dataset", "Memory", "Python"]
+        let blocked = ["Web", "Cloud"]
+        return VStack(spacing: 16) {
+            Spacer()
+            Text("FLIP ONE SWITCH").font(.caption).tracking(1.4).foregroundColor(Color.green.opacity(0.8))
+            Text("Nothing left your device.").font(.system(size: 28, weight: .semibold)).foregroundColor(.white)
+            Text("Off-grid blocks every network path — and proves it.")
+                .font(.subheadline).foregroundColor(.white.opacity(0.7)).multilineTextAlignment(.center)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), spacing: 8)], spacing: 8) {
+                ForEach(local, id: \.self) { darkBadge($0, "Local", color: .green) }
+                ForEach(blocked, id: \.self) { darkBadge($0, "Blocked", color: .red) }
+            }
+            .padding(.top, 6)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .transition(.opacity)
+    }
+    private func darkBadge(_ name: String, _ state: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: color == .green ? "lock.fill" : "xmark.circle.fill").font(.caption2)
+            Text("\(name) · \(state)").font(.caption)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Capsule().fill(color.opacity(0.18)))
+        .foregroundColor(color == .green ? Color.green : Color(red: 0.95, green: 0.6, blue: 0.5))
+    }
+
+    private var constellationAct: some View {
+        let nodes: [(String, String)] = [
+            ("doc.text.magnifyingglass", "Chat your docs"), ("shippingbox", "Knowledge Packs"),
+            ("magnifyingglass", "Explore models"), ("function", "Real tools"),
+            ("waveform", "Voice notes"), ("bolt", "Siri + Shortcuts"),
+            ("square.grid.2x2", "Live Activities"), ("building.2", "Teams")
+        ]
+        return VStack(alignment: .leading, spacing: 14) {
+            Spacer()
+            Text("EVERYTHING IT CAN DO").font(.caption).tracking(1.4).foregroundColor(textSecondary)
+            Text("And so much more").font(.system(size: 24, weight: .semibold)).foregroundColor(textPrimary)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], alignment: .leading, spacing: 8) {
+                ForEach(nodes, id: \.1) { n in
+                    HStack(spacing: 7) {
+                        Image(systemName: n.0).foregroundColor(.accentColor)
+                        Text(n.1).font(.caption).foregroundColor(textPrimary)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 11).padding(.vertical, 9)
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(secondaryBackground))
+                }
+            }
+            Text("5 engines · iPhone · iPad · Mac · Vision Pro")
+                .font(.caption2).foregroundColor(textSecondary).padding(.top, 2)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .transition(.opacity)
+    }
+
+    private var embedCard: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Document memory").font(.subheadline).fontWeight(.medium).foregroundColor(textPrimary)
+                Text("For chatting your files · 640 MB").font(.caption).foregroundColor(textSecondary)
+            }
+            Spacer()
+            if embedInstaller.state == .ready {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+            } else if isDownloadingEmbedModel {
+                DownloadCapsuleBar(value: embedProgress, tint: navyBlue).frame(width: 70)
+            } else {
+                Button("Enable") { startEmbeddingDownload() }.buttonStyle(.bordered)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(secondaryBackground))
+    }
+
+    private var handoffAct: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("LET'S GET YOU SET").font(.caption).tracking(1.4).foregroundColor(textSecondary)
+                Text("One starter model, then you're in").font(.system(size: 22, weight: .semibold)).foregroundColor(textPrimary)
+                recommendedStarterModelSection
+                embedCard
+                Button(action: beginGuidedWalkthrough) {
+                    Text("Take the tour").fontWeight(.semibold).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                Button(action: flSkipExit) {
+                    Text("Skip, I'll explore myself").font(.subheadline).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.plain).foregroundColor(textSecondary)
+            }
+            .padding(.top, 40).padding(.bottom, 40)
+        }
+        .transition(.opacity)
+    }
+
+    private var consoleAct: some View {
+        let engines = ["GGUF", "MLX", "Core ML", "ExecuTorch", "Apple"]
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("POWER SETUP").font(.caption).tracking(1.4).foregroundColor(textSecondary)
+                Text("Engine · quant · context").font(.system(size: 22, weight: .semibold)).foregroundColor(textPrimary)
+                Text("Inference engine — auto-picked for your device").font(.caption).foregroundColor(textSecondary)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], alignment: .leading, spacing: 8) {
+                    ForEach(engines, id: \.self) { e in
+                        Text(e).font(.caption).fontWeight(.medium)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .frame(maxWidth: .infinity)
+                            .background(Capsule().fill(selectedEngine == e ? Color.accentColor.opacity(0.16) : secondaryBackground))
+                            .overlay(Capsule().stroke(selectedEngine == e ? Color.accentColor : Color.primary.opacity(0.08)))
+                            .foregroundColor(selectedEngine == e ? .accentColor : textPrimary)
+                            .onTapGesture { selectedEngine = e }
+                    }
+                }
+                recommendedStarterModelSection
+                Text("Adjust context length, GPU layers, KV-cache, presets, and connect remote backends or a Mac Relay anytime in Model Settings.")
+                    .font(.caption).foregroundColor(textSecondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 40).padding(.bottom, 110)
+        }
+        .transition(.opacity)
+    }
+
+    private var capabilitiesGridAct: some View {
+        let cells: [(String, String)] = [
+            ("magnifyingglass", "Explore + import"), ("doc.text", "Datasets + RAG"),
+            ("wrench.and.screwdriver", "Tool Store"), ("shield.lefthalf.filled", "Privacy recorder"),
+            ("server.rack", "Remote + Relay"), ("stethoscope", "Model Doctor")
+        ]
+        return VStack(alignment: .leading, spacing: 14) {
+            Spacer()
+            Text("JUMP ANYWHERE").font(.caption).tracking(1.4).foregroundColor(textSecondary)
+            Text("Every capability, one tap away").font(.system(size: 22, weight: .semibold)).foregroundColor(textPrimary)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9), GridItem(.flexible(), spacing: 9)], spacing: 9) {
+                ForEach(cells, id: \.1) { c in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Image(systemName: c.0).foregroundColor(.accentColor)
+                        Text(c.1).font(.caption).foregroundColor(textPrimary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(secondaryBackground))
+                }
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .transition(.opacity)
+    }
+
+    private var openNoemaAct: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 44)).foregroundColor(.green)
+            Text("You're set up").font(.system(size: 26, weight: .semibold)).foregroundColor(textPrimary)
+            Text("\(selectedEngine) · Balanced preset").font(.subheadline).foregroundColor(textSecondary)
+            Button(action: flFinishPower) {
+                Text("Open Noema").fontWeight(.semibold).frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent).padding(.top, 8).padding(.horizontal, 40)
+            Button(action: { isAdvancedMode = false; act = .handoff }) {
+                Text("Replay guided tour").font(.subheadline)
+            }
+            .buttonStyle(.plain).foregroundColor(textSecondary)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .transition(.opacity)
     }
 
     private func beginGuidedWalkthrough() {
@@ -610,7 +985,7 @@ struct OnboardingView: View {
                 isVision = MLXBridge.isVLMModel(at: url)
             case .et:
                 let slug = detail.id.isEmpty ? url.deletingPathExtension().lastPathComponent : detail.id
-                isVision = LeapCatalogService.isVisionQuantizationSlug(slug)
+                isVision = ETModelResolver.isVisionIdentifier(slug)
             case .ane:
                 isVision = false
             case .afm:
@@ -687,7 +1062,8 @@ struct OnboardingView: View {
                 contextLength: requestedContext,
                 layerCount: layerCount,
                 moeInfo: local.moeInfo,
-                kvCacheEstimate: kvCacheEstimate
+                kvCacheEstimate: kvCacheEstimate,
+                runtimeConfiguration: .resolved(from: updated, modelURL: local.url)
             )
             if !fits {
                 if let maxContext = ModelRAMAdvisor.maxContextUnderBudget(
@@ -696,7 +1072,8 @@ struct OnboardingView: View {
                     layerCount: layerCount,
                     moeInfo: local.moeInfo,
                     upperBound: modelMaxContext,
-                    kvCacheEstimate: kvCacheEstimate
+                    kvCacheEstimate: kvCacheEstimate,
+                    runtimeConfiguration: .resolved(from: updated, modelURL: local.url)
                 ) {
                     let safeContext = max(512, min(requestedContext, maxContext))
                     if Double(safeContext) < updated.contextLength {
@@ -803,16 +1180,16 @@ struct OnboardingView: View {
         return Image(systemName: "photo.on.rectangle.angled")
     }
     
-    private var downloadStatusText: String {
+    private var downloadStatusText: LocalizedStringKey {
         switch embedInstaller.state {
         case .downloading:
-            return "Downloading..."
+            return "Downloading…"
         case .verifying:
-            return "Verifying..."
+            return "Verifying…"
         case .installing:
-            return "Installing..."
+            return "Installing…"
         default:
-            return "Preparing..."
+            return "Preparing…"
         }
     }
     
@@ -840,10 +1217,9 @@ struct OnboardingView: View {
         
         Task { @MainActor in
             await embedInstaller.installIfNeeded()
-            
-            // Cancel the timer
+
             timerCancellable?.cancel()
-            
+
             // Ensure final progress
             embedProgress = embedInstaller.state == .ready ? 1.0 : embedProgress
             
@@ -878,8 +1254,7 @@ struct OnboardingView: View {
             }
             
             Spacer()
-            
-            // Page indicators
+
             HStack(spacing: 8) {
                 ForEach(0..<totalPages, id: \.self) { index in
                     Circle()
@@ -891,8 +1266,7 @@ struct OnboardingView: View {
             }
             
             Spacer()
-            
-            // Next button
+
             if currentPage < totalPages - 1 {
                 Button("Next") {
                     withAnimation {

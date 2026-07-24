@@ -1,4 +1,3 @@
-// ModelLoadingProgressTracker.swift
 import Foundation
 import SwiftUI
 import NoemaPackages

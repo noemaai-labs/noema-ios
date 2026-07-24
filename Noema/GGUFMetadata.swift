@@ -1,7 +1,54 @@
-// GGUFMetadata.swift
 import Foundation
 
 enum GGUFMetadata {
+    enum MTPCapability: Equatable {
+        case unavailable
+        case declaredButUnsupported
+        case sidecarRequired
+        case embeddedValidated
+        case sidecarValidated(URL)
+    }
+
+    fileprivate struct MTPInspection {
+        var architecture: String?
+        var nextNLayers = 0
+        var hiddenSize: Int?
+        var vocabularySize: Int?
+        var tokenizerFingerprint: UInt64?
+        var tensorCounts: [String: Int] = [:]
+
+        var hasRequiredTensors: Bool {
+            guard nextNLayers > 0 else { return false }
+            return ["nextn.eh_proj", "nextn.enorm", "nextn.hnorm"].allSatisfy {
+                tensorCounts[$0, default: 0] >= nextNLayers
+            }
+        }
+    }
+
+    struct ExpertTensorRecord: Codable, Hashable, Sendable {
+        let name: String
+        let layer: Int
+        let family: String   // "gate" | "up" | "down" | "gate_up"
+        let ggmlType: Int32  // raw GGUF tensor type id
+        let ne: [Int64]      // dims as stored (per-tensor, full 3D incl. expert dim)
+        let offset: UInt64   // data offset relative to the tensor-data section
+    }
+
+    struct ExpertTensorInventory: Codable, Hashable, Sendable {
+        let records: [ExpertTensorRecord]
+        let tensorDataOffset: UInt64  // absolute file offset where tensor data begins
+        /// Tiny per-expert `.scale` vectors remain resident and are gathered
+        /// with real expert ids; `.input_scale` and `.bias` variants remain
+        /// unsupported until their graph contracts are explicit.
+        let residentExpertScaleCount: Int
+        let unsupportedSidecarCount: Int
+        var isEmpty: Bool { records.isEmpty }
+    }
+
+    private static let executableMTPArchitectures: Set<String> = [
+        "qwen35", "qwen35moe", "cohere2moe", "hy_v3", "step35"
+    ]
+
     fileprivate static func computeArchitectureInfo(at url: URL) -> (architecture: String, name: String?)? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
@@ -19,14 +66,14 @@ enum GGUFMetadata {
 
         func readU32() -> UInt32? {
             guard ensureCapacity(4) else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
             offset += 4
             return UInt32(littleEndian: value)
         }
 
         func readU64() -> UInt64? {
             guard ensureCapacity(8) else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             offset += 8
             return UInt64(littleEndian: value)
         }
@@ -55,7 +102,7 @@ enum GGUFMetadata {
             if elementType == 8 {
                 guard count <= UInt64(Int.max) else { return false }
                 for _ in 0..<Int(count) {
-                    guard let len = readU64().map(Int.init) else { return false }
+                    guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return false }
                     guard skipBytes(len) else { return false }
                 }
                 return true
@@ -86,18 +133,18 @@ enum GGUFMetadata {
         guard let magic = readString(len: 4), magic == "GGUF" else { return nil }
         guard readU32() != nil else { return nil }
         guard readU64() != nil else { return nil }
-        guard let kvCount = readU64().map(Int.init) else { return nil }
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
 
         var architecture: String?
         var name: String?
 
         for _ in 0..<kvCount {
-            guard let keyLen = readU64().map(Int.init), let key = readString(len: keyLen) else { return nil }
+            guard let keyLen = readU64().flatMap({ Int(exactly: $0) }), let key = readString(len: keyLen) else { return nil }
             guard let type = readU32() else { return nil }
 
             switch type {
             case 8:
-                guard let len = readU64().map(Int.init) else { return nil }
+                guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
                 guard let value = readString(len: len)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
                 if key == "general.architecture", !value.isEmpty {
                     architecture = value
@@ -110,7 +157,7 @@ enum GGUFMetadata {
                     guard count <= UInt64(Int.max) else { return nil }
                     var candidate: (value: String, score: Int)?
                     for _ in 0..<Int(count) {
-                        guard let len = readU64().map(Int.init), let value = readString(len: len) else { return nil }
+                        guard let len = readU64().flatMap({ Int(exactly: $0) }), let value = readString(len: len) else { return nil }
                         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmed.isEmpty {
                             let score = architectureSpecificity(of: trimmed)
@@ -150,16 +197,26 @@ enum GGUFMetadata {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
 
+        func ensureCapacity(_ length: Int) -> Bool {
+            length >= 0 && offset <= data.count - length
+        }
+
+        func skipBytes(_ length: Int) -> Bool {
+            guard ensureCapacity(length) else { return false }
+            offset += length
+            return true
+        }
+
         func readU32() -> UInt32? {
-            guard offset + 4 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            guard ensureCapacity(4) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
             offset += 4
             return UInt32(littleEndian: value)
         }
 
         func readU64() -> UInt64? {
-            guard offset + 8 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            guard ensureCapacity(8) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             offset += 8
             return UInt64(littleEndian: value)
         }
@@ -170,63 +227,69 @@ enum GGUFMetadata {
             offset += len
             return String(data: sub, encoding: .utf8)
         }
+
+        func skipValue(ofType type: UInt32) -> Bool {
+            switch type {
+            case 0, 1, 7:
+                return skipBytes(1)
+            case 2, 3:
+                return skipBytes(2)
+            case 4, 5, 6:
+                return skipBytes(4)
+            case 10, 11, 12:
+                return skipBytes(8)
+            case 8:
+                guard let length = readU64().flatMap({ Int(exactly: $0) }) else { return false }
+                return skipBytes(length)
+            case 9:
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                if elementType == 8 {
+                    guard count <= UInt64(Int.max) else { return false }
+                    for _ in 0..<Int(count) {
+                        guard let length = readU64().flatMap({ Int(exactly: $0) }),
+                              skipBytes(length) else { return false }
+                    }
+                    return true
+                }
+                let elementSize: Int
+                switch elementType {
+                case 0, 1, 7: elementSize = 1
+                case 2, 3: elementSize = 2
+                case 4, 5, 6: elementSize = 4
+                case 10, 11, 12: elementSize = 8
+                default: return false
+                }
+                guard count <= UInt64(Int.max / elementSize),
+                      let elementCount = Int(exactly: count) else { return false }
+                return skipBytes(elementCount * elementSize)
+            default:
+                return false
+            }
+        }
+
         guard let magic = readString(len: 4), magic == "GGUF" else { return nil }
-        guard let _ = readU32() else { return nil } // version
-        guard let _ = readU64() else { return nil } // tensor count
-        guard let kvCount = readU64().map(Int.init) else { return nil }
+        guard readU32() != nil else { return nil } // version
+        guard readU64() != nil else { return nil } // tensor count
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
         for _ in 0..<kvCount {
-            guard let klen = readU64().map(Int.init) else { return nil }
+            guard let klen = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
             guard let key = readString(len: klen) else { return nil }
             guard let type = readU32() else { return nil }
             switch type {
             case 4: // uint32
-                if let val = readU32().map(Int.init),
-                   key.contains("block_count") ||
-                   key.contains("n_layer") ||
-                   key.contains("num_hidden_layers") ||
-                   key.contains("layer_count") {
+                guard let raw = readU32(), let val = Int(exactly: raw) else { return nil }
+                if key.contains("block_count") || key.contains("n_layer") ||
+                    key.contains("num_hidden_layers") || key.contains("layer_count") {
                     return val
                 }
             case 10: // uint64
-                if let val = readU64().map(Int.init),
-                   key.contains("block_count") ||
-                   key.contains("n_layer") ||
-                   key.contains("num_hidden_layers") ||
-                   key.contains("layer_count") {
+                guard let raw = readU64(), let val = Int(exactly: raw) else { return nil }
+                if key.contains("block_count") || key.contains("n_layer") ||
+                    key.contains("num_hidden_layers") || key.contains("layer_count") {
                     return val
                 }
-            case 8: // string
-                guard let len = readU64().map(Int.init) else { return nil }
-                offset += len
-            case 9: // array
-                guard let elemType = readU32(), let count = readU64() else { return nil }
-                let size: Int
-                switch elemType {
-                case 0,1,7: size = 1
-                case 2,3:   size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                case 8:
-                    guard let arrLen = readU64() else { return nil }
-                    size = 0
-                    if offset + Int(arrLen) > data.count { return nil }
-                    offset += Int(arrLen)
-                    continue
-                default: size = 4
-                }
-                if offset + Int(count) * size > data.count { return nil }
-                offset += Int(count) * size
-                default:
-                    let size: Int
-                    switch type {
-                    case 0,1,7: size = 1
-                    case 2,3:   size = 2
-                    case 4,5,6: size = 4
-                    case 10,11,12: size = 8
-                    default: size = 0
-                    }
-                    if offset + size > data.count { return nil }
-                    offset += size
+            default:
+                guard skipValue(ofType: type) else { return nil }
             }
         }
         return nil
@@ -235,76 +298,347 @@ enum GGUFMetadata {
     fileprivate static func computeContextLength(at url: URL) -> Int? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
+
+        func ensureCapacity(_ length: Int) -> Bool {
+            length >= 0 && offset <= data.count - length
+        }
+
+        func skipBytes(_ length: Int) -> Bool {
+            guard ensureCapacity(length) else { return false }
+            offset += length
+            return true
+        }
+
         func readU32() -> UInt32? {
-            guard offset + 4 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            guard ensureCapacity(4) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
             offset += 4
             return UInt32(littleEndian: value)
         }
         func readU64() -> UInt64? {
-            guard offset + 8 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            guard ensureCapacity(8) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             offset += 8
             return UInt64(littleEndian: value)
         }
         func readString(len: Int) -> String? {
-            guard offset + len <= data.count else { return nil }
+            guard ensureCapacity(len) else { return nil }
             let sub = data.subdata(in: offset..<offset+len)
             offset += len
             return String(data: sub, encoding: .utf8)
         }
+
+        func skipValue(ofType type: UInt32) -> Bool {
+            switch type {
+            case 0, 1, 7:
+                return skipBytes(1)
+            case 2, 3:
+                return skipBytes(2)
+            case 4, 5, 6:
+                return skipBytes(4)
+            case 10, 11, 12:
+                return skipBytes(8)
+            case 8:
+                guard let length = readU64().flatMap({ Int(exactly: $0) }) else { return false }
+                return skipBytes(length)
+            case 9:
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                if elementType == 8 {
+                    guard count <= UInt64(Int.max) else { return false }
+                    for _ in 0..<Int(count) {
+                        guard let length = readU64().flatMap({ Int(exactly: $0) }),
+                              skipBytes(length) else { return false }
+                    }
+                    return true
+                }
+                let elementSize: Int
+                switch elementType {
+                case 0, 1, 7: elementSize = 1
+                case 2, 3: elementSize = 2
+                case 4, 5, 6: elementSize = 4
+                case 10, 11, 12: elementSize = 8
+                default: return false
+                }
+                guard count <= UInt64(Int.max / elementSize),
+                      let elementCount = Int(exactly: count) else { return false }
+                return skipBytes(elementCount * elementSize)
+            default:
+                return false
+            }
+        }
+
         guard let magic = readString(len: 4), magic == "GGUF" else { return nil }
-        guard let _ = readU32() else { return nil }
-        guard let _ = readU64() else { return nil }
-        guard let kvCount = readU64().map(Int.init) else { return nil }
+        guard readU32() != nil else { return nil }
+        guard readU64() != nil else { return nil }
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
         for _ in 0..<kvCount {
-            guard let klen = readU64().map(Int.init) else { return nil }
+            guard let klen = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
             guard let key = readString(len: klen) else { return nil }
             guard let type = readU32() else { return nil }
             switch type {
             case 4:
-                if key.contains("n_ctx"), let val = readU32().map(Int.init) {
-                    return val
-                }
+                guard let raw = readU32(), let value = Int(exactly: raw) else { return nil }
+                if key.contains("n_ctx") || key.contains("context_length") { return value }
             case 10:
-                if key.contains("n_ctx"), let val = readU64().map(Int.init) {
-                    return val
-                }
-            case 8:
-                guard let len = readU64().map(Int.init) else { return nil }
-                offset += len
-            case 9:
-                guard let et = readU32(), let count = readU64() else { return nil }
-                let size: Int
-                switch et {
-                case 0,1,7: size = 1
-                case 2,3: size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                case 8:
-                    guard let arrLen = readU64() else { return nil }
-                    size = 0
-                    if offset + Int(arrLen) > data.count { return nil }
-                    offset += Int(arrLen)
-                    continue
-                default: size = 4
-                }
-                if offset + Int(count) * size > data.count { return nil }
-                offset += Int(count) * size
+                guard let raw = readU64(), let value = Int(exactly: raw) else { return nil }
+                if key.contains("n_ctx") || key.contains("context_length") { return value }
             default:
-                let size: Int
-                switch type {
-                case 0,1,7: size = 1
-                case 2,3: size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                default: size = 0
-                }
-                if offset + size > data.count { return nil }
-                offset += size
+                guard skipValue(ofType: type) else { return nil }
             }
         }
         return nil
+    }
+
+    /// Attention shape needed to size the KV cache exactly. Read with architecture-agnostic
+    /// substring matching, so it works for `llama.*`, `qwen3.*`, `gemma.*`, etc. — unlike the
+    /// C scanner, which only knows the `llama.` prefix.
+    struct ArchAttentionFields {
+        var architecture: String?
+        var blockCount: Int?
+        var embeddingLength: Int?
+        var feedForwardLength: Int?
+        var vocabSize: Int?
+        var headCount: Int?
+        var headCountKV: Int?
+        var keyLength: Int?
+        var valueLength: Int?
+        var fullAttentionInterval: Int?
+        var nextNPredictLayers: Int?
+        var recurrentLayerCount: Int?
+        var ssmConvKernel: Int?
+        var ssmInnerSize: Int?
+        var ssmStateSize: Int?
+        var ssmGroupCount: Int?
+    }
+
+    /// Walk the GGUF KV header once and pull the attention-shape scalars used by the
+    /// memory estimator. Returns `nil` only when the header can't be parsed at all.
+    fileprivate static func computeAttentionFields(at url: URL) -> ArchAttentionFields? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        var offset = 0
+
+        func ensureCapacity(_ length: Int) -> Bool { length >= 0 && offset <= data.count - length }
+        func skipBytes(_ length: Int) -> Bool {
+            guard ensureCapacity(length) else { return false }
+            offset += length
+            return true
+        }
+        func readU32() -> UInt32? {
+            guard ensureCapacity(4) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
+            offset += 4
+            return UInt32(littleEndian: value)
+        }
+        func readU64() -> UInt64? {
+            guard ensureCapacity(8) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
+            offset += 8
+            return UInt64(littleEndian: value)
+        }
+        func readString(len: Int) -> String? {
+            guard ensureCapacity(len) else { return nil }
+            let sub = data.subdata(in: offset..<offset+len)
+            offset += len
+            return String(data: sub, encoding: .utf8)
+        }
+        func readU8() -> UInt8? {
+            guard ensureCapacity(1) else { return nil }
+            let value = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: UInt8.self) }
+            offset += 1
+            return value
+        }
+        func readU16() -> UInt16? {
+            guard ensureCapacity(2) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt16.self) }
+            offset += 2
+            return UInt16(littleEndian: value)
+        }
+        /// Reads a scalar integer value, fully consuming the bytes. Returns nil (without
+        /// consuming) for non-integer scalar types so the caller can skip them.
+        func readScalarInt(ofType type: UInt32) -> Int? {
+            switch type {
+            case 0: return readU8().map { Int($0) }                       // uint8
+            case 1: return readU8().map { Int(Int8(bitPattern: $0)) }     // int8
+            case 7: return readU8().map { $0 == 0 ? 0 : 1 }               // bool
+            case 2: return readU16().map { Int($0) }                      // uint16
+            case 3: return readU16().map { Int(Int16(bitPattern: $0)) }   // int16
+            case 4: return readU32().flatMap { Int(exactly: $0) }         // uint32
+            case 5: return readU32().map { Int(Int32(bitPattern: $0)) }   // int32
+            case 10: return readU64().flatMap { Int(exactly: $0) }        // uint64
+            case 11: return readU64().map { Int(Int64(bitPattern: $0)) }  // int64
+            default: return nil
+            }
+        }
+        func skipValue(ofType type: UInt32) -> Bool {
+            switch type {
+            case 0, 1, 7: return skipBytes(1)
+            case 2, 3: return skipBytes(2)
+            case 4, 5, 6: return skipBytes(4)
+            case 10, 11, 12: return skipBytes(8)
+            case 8:
+                guard let length = readU64().flatMap({ Int(exactly: $0) }) else { return false }
+                return skipBytes(length)
+            case 9:
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                if elementType == 8 {
+                    guard count <= UInt64(Int.max) else { return false }
+                    for _ in 0..<Int(count) {
+                        guard let length = readU64().flatMap({ Int(exactly: $0) }), skipBytes(length) else { return false }
+                    }
+                    return true
+                }
+                let elementSize: Int
+                switch elementType {
+                case 0, 1, 7: elementSize = 1
+                case 2, 3: elementSize = 2
+                case 4, 5, 6: elementSize = 4
+                case 10, 11, 12: elementSize = 8
+                default: return false
+                }
+                guard count <= UInt64(Int.max / elementSize), let elementCount = Int(exactly: count) else { return false }
+                return skipBytes(elementCount * elementSize)
+            default:
+                return false
+            }
+        }
+        /// For `head_count_kv`, which some hybrid architectures store as a per-layer array:
+        /// take the max element (conservative — sizes the cache to the widest layer).
+        func readArrayMaxInt(elementType: UInt32, count: UInt64) -> Int? {
+            guard elementType != 8, elementType != 9, count <= UInt64(Int.max) else { return nil }
+            var maxValue: Int?
+            for _ in 0..<Int(count) {
+                guard let value = readScalarInt(ofType: elementType) else { return nil }
+                if maxValue == nil || value > maxValue! { maxValue = value }
+            }
+            return maxValue
+        }
+        func readArrayPositiveCount(elementType: UInt32, count: UInt64) -> Int? {
+            guard elementType != 8, elementType != 9, count <= UInt64(Int.max) else { return nil }
+            var positiveCount = 0
+            for _ in 0..<Int(count) {
+                guard let value = readScalarInt(ofType: elementType) else { return nil }
+                if value > 0 { positiveCount += 1 }
+            }
+            return positiveCount
+        }
+
+        guard let magic = readString(len: 4), magic == "GGUF" else { return nil }
+        guard readU32() != nil else { return nil }      // version
+        guard readU64() != nil else { return nil }      // tensor count
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
+
+        var fields = ArchAttentionFields()
+        for _ in 0..<kvCount {
+            guard let klen = readU64().flatMap({ Int(exactly: $0) }), let key = readString(len: klen), let type = readU32() else { return nil }
+            let lower = key.lowercased()
+            var consumed = false
+
+            // Skip vision/audio/projector sub-towers so their attention shape can't be mistaken
+            // for the text model's. Their keys carry these markers (e.g. "clip.vision.*").
+            let isAuxModule = lower.contains("vision") || lower.contains("clip") ||
+                lower.contains("audio") || lower.contains("mm_") || lower.contains("projector")
+
+            if isAuxModule {
+                guard skipValue(ofType: type) else { return nil }
+                continue
+            }
+
+            if lower == "general.architecture", type == 8 {
+                if let length = readU64().flatMap({ Int(exactly: $0) }),
+                   let value = readString(len: length), !value.isEmpty {
+                    fields.architecture = value.lowercased()
+                    consumed = true
+                }
+            } else if lower.contains(".attention.recurrent_layers"), type == 9 {
+                guard let elem = readU32(), let count = readU64() else { return nil }
+                guard let value = readArrayPositiveCount(elementType: elem, count: count) else { return fields }
+                fields.recurrentLayerCount = value
+                consumed = true
+            } else if lower.contains(".full_attention_interval") {
+                if let value = readScalarInt(ofType: type), value > 0 {
+                    fields.fullAttentionInterval = value
+                    consumed = true
+                }
+            } else if lower.contains(".nextn_predict_layers") {
+                if let value = readScalarInt(ofType: type), value > 0 {
+                    fields.nextNPredictLayers = value
+                    consumed = true
+                }
+            } else if lower.contains(".ssm.conv_kernel") {
+                if let value = readScalarInt(ofType: type), value > 0 { fields.ssmConvKernel = value; consumed = true }
+            } else if lower.contains(".ssm.inner_size") {
+                if let value = readScalarInt(ofType: type), value > 0 { fields.ssmInnerSize = value; consumed = true }
+            } else if lower.contains(".ssm.state_size") {
+                if let value = readScalarInt(ofType: type), value > 0 { fields.ssmStateSize = value; consumed = true }
+            } else if lower.contains(".ssm.group_count") {
+                if let value = readScalarInt(ofType: type), value > 0 { fields.ssmGroupCount = value; consumed = true }
+            } else if lower.contains(".attention.head_count_kv") {
+                // head_count_kv may be a per-layer array; take the widest.
+                if type == 9 {
+                    guard let elem = readU32(), let count = readU64() else { return nil }
+                    // The array element + count headers are now consumed. If the body can't be
+                    // read (non-integer element type), the reader is desynced — stop and return
+                    // whatever fields were gathered before this key rather than misreading on.
+                    guard let v = readArrayMaxInt(elementType: elem, count: count) else { return fields }
+                    if v > 0 { fields.headCountKV = v }
+                    consumed = true
+                } else if let v = readScalarInt(ofType: type), v > 0 {
+                    fields.headCountKV = v
+                    consumed = true
+                }
+            } else if lower.contains(".attention.head_count") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.headCount = v; consumed = true }
+            } else if lower.contains(".attention.key_length") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.keyLength = v; consumed = true }
+            } else if lower.contains(".attention.value_length") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.valueLength = v; consumed = true }
+            } else if lower.contains(".embedding_length") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.embeddingLength = v; consumed = true }
+            } else if lower.contains(".feed_forward_length") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.feedForwardLength = v; consumed = true }
+            } else if lower.contains(".vocab_size") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.vocabSize = v; consumed = true }
+            } else if lower.contains("block_count") || lower.contains("n_layer") || lower.contains("num_hidden_layers") {
+                if let v = readScalarInt(ofType: type), v > 0 { fields.blockCount = v; consumed = true }
+            }
+
+            if !consumed {
+                guard skipValue(ofType: type) else { return nil }
+            }
+        }
+        return fields
+    }
+
+    private static func applying(_ attention: ArchAttentionFields, to info: MoEInfo) -> MoEInfo {
+        var merged = info
+        if merged.totalLayerCount == nil { merged.totalLayerCount = attention.blockCount }
+        if merged.hiddenSize == nil { merged.hiddenSize = attention.embeddingLength }
+        if merged.feedForwardSize == nil { merged.feedForwardSize = attention.feedForwardLength }
+        if merged.vocabSize == nil { merged.vocabSize = attention.vocabSize }
+        merged.headCount = attention.headCount
+        merged.headCountKV = attention.headCountKV
+        merged.keyLength = attention.keyLength
+        merged.valueLength = attention.valueLength
+        merged.architecture = attention.architecture
+        merged.ssmConvKernel = attention.ssmConvKernel
+        merged.ssmInnerSize = attention.ssmInnerSize
+        merged.ssmStateSize = attention.ssmStateSize
+        merged.ssmGroupCount = attention.ssmGroupCount
+
+        let layers = merged.totalLayerCount ?? attention.blockCount
+        let recurrentLayers: Int? = {
+            if let explicit = attention.recurrentLayerCount { return explicit }
+            guard let layers, let interval = attention.fullAttentionInterval, interval > 0 else { return nil }
+            // NextN/MTP blocks are appended after the main Qwen trunk and are always
+            // dense-attention blocks. Apply the interval only to the trunk.
+            let trunkLayers = max(0, layers - (attention.nextNPredictLayers ?? 0))
+            return max(0, trunkLayers - (trunkLayers / interval))
+        }()
+        merged.recurrentLayerCount = recurrentLayers
+        if let layers, let recurrentLayers {
+            merged.attentionLayerCount = max(0, layers - recurrentLayers)
+        }
+        return merged
     }
 
     fileprivate static func computeMoeInfo(at url: URL) -> MoEInfo? {
@@ -318,6 +652,9 @@ enum GGUFMetadata {
             }
         }
 
+        // Architecture-agnostic attention shape, overlaid onto whichever MoE scan succeeds.
+        let attention = computeAttentionFields(at: target)
+
         var scan = gguf_moe_scan_result()
         let status = target.path.withCString { gguf_moe_scan($0, &scan) }
         if status == 0 && scan.status == 0 {
@@ -330,7 +667,7 @@ enum GGUFMetadata {
             let vocab = scan.vocab_size > 0 ? Int(scan.vocab_size) : nil
             let isMoE = scan.is_moe != 0 || scan.expert_count > 0 || scan.expert_used_count > 0 || scan.moe_layer_count > 0
 
-            return MoEInfo(
+            let base = MoEInfo(
                 isMoE: isMoE,
                 expertCount: expertCount,
                 defaultUsed: defaultUsed,
@@ -340,11 +677,18 @@ enum GGUFMetadata {
                 feedForwardSize: feedForward,
                 vocabSize: vocab
             )
+            return attention.map { applying($0, to: base) } ?? base
         }
 
         if let fallback = fallbackMoEInfo(at: target) {
             print("[MoEDetect] using Swift fallback scanner for \(target.lastPathComponent)")
-            return fallback
+            return attention.map { applying($0, to: fallback) } ?? fallback
+        }
+
+        // No MoE scan succeeded, but if we recovered the attention shape we can still
+        // surface a dense descriptor so the memory estimator gets exact KV-cache sizing.
+        if let attention {
+            return applying(attention, to: .denseFallback)
         }
 
         print("[MoEDetect] MoE scan failed for \(target.lastPathComponent)")
@@ -363,7 +707,7 @@ enum GGUFMetadata {
         func readInteger<T: FixedWidthInteger>(_ type: T.Type) -> T? {
             let size = MemoryLayout<T>.size
             guard ensureCapacity(size) else { return nil }
-            let value = data.subdata(in: offset..<offset+size).withUnsafeBytes { $0.load(as: T.self) }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self) }
             offset += size
             return T(littleEndian: value)
         }
@@ -490,13 +834,13 @@ enum GGUFMetadata {
             case 10, 11, 12:
                 return skipBytes(8)
             case 8:
-                guard let len = readU64().map(Int.init) else { return false }
+                guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return false }
                 return skipBytes(len)
             case 9:
                 guard let elemType = readU32(), let count = readU64() else { return false }
                 if elemType == 8 {
                     for _ in 0..<count {
-                        guard let len = readU64().map(Int.init) else { return false }
+                        guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return false }
                         guard skipBytes(len) else { return false }
                     }
                     return true
@@ -567,7 +911,7 @@ enum GGUFMetadata {
         var maxBlockIndex = -1
 
         for _ in 0..<kvCount {
-            guard let keyLen = readU64().map(Int.init), let key = readString(len: keyLen), let type = readU32() else {
+            guard let keyLen = readU64().flatMap({ Int(exactly: $0) }), let key = readString(len: keyLen), let type = readU32() else {
                 return nil
             }
             var consumed = false
@@ -635,7 +979,7 @@ enum GGUFMetadata {
 
         var moeBlockIndices = Set<Int>()
         for _ in 0..<tensorCount {
-            guard let nameLen = readU64().map(Int.init), let name = readString(len: nameLen) else { return nil }
+            guard let nameLen = readU64().flatMap({ Int(exactly: $0) }), let name = readString(len: nameLen) else { return nil }
             guard let dimCount = readU32().map(Int.init) else { return nil }
             for _ in 0..<dimCount {
                 guard readU64() != nil else { return nil }
@@ -679,71 +1023,93 @@ enum GGUFMetadata {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         var offset = 0
 
+        func ensureCapacity(_ length: Int) -> Bool {
+            length >= 0 && offset <= data.count - length
+        }
+
+        func skipBytes(_ length: Int) -> Bool {
+            guard ensureCapacity(length) else { return false }
+            offset += length
+            return true
+        }
+
         func readU32() -> UInt32? {
-            guard offset + 4 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            guard ensureCapacity(4) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
             offset += 4
             return UInt32(littleEndian: value)
         }
 
         func readU64() -> UInt64? {
-            guard offset + 8 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            guard ensureCapacity(8) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             offset += 8
             return UInt64(littleEndian: value)
         }
 
         func readString(len: Int) -> String? {
-            guard offset + len <= data.count else { return nil }
+            guard ensureCapacity(len) else { return nil }
             let sub = data.subdata(in: offset..<offset+len)
             offset += len
             return String(data: sub, encoding: .utf8)
         }
 
+        func skipValue(ofType type: UInt32) -> Bool {
+            switch type {
+            case 0, 1, 7:
+                return skipBytes(1)
+            case 2, 3:
+                return skipBytes(2)
+            case 4, 5, 6:
+                return skipBytes(4)
+            case 10, 11, 12:
+                return skipBytes(8)
+            case 8:
+                guard let length = readU64().flatMap({ Int(exactly: $0) }) else { return false }
+                return skipBytes(length)
+            case 9:
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                if elementType == 8 {
+                    guard count <= UInt64(Int.max) else { return false }
+                    for _ in 0..<Int(count) {
+                        guard let length = readU64().flatMap({ Int(exactly: $0) }),
+                              skipBytes(length) else { return false }
+                    }
+                    return true
+                }
+                let elementSize: Int
+                switch elementType {
+                case 0, 1, 7: elementSize = 1
+                case 2, 3: elementSize = 2
+                case 4, 5, 6: elementSize = 4
+                case 10, 11, 12: elementSize = 8
+                default: return false
+                }
+                guard count <= UInt64(Int.max / elementSize),
+                      let elementCount = Int(exactly: count) else { return false }
+                return skipBytes(elementCount * elementSize)
+            default:
+                return false
+            }
+        }
+
         guard let magic = readString(len: 4), magic == "GGUF" else { return nil }
-        guard let _ = readU32() else { return nil }
-        guard let _ = readU64() else { return nil }
-        guard let kvCount = readU64().map(Int.init) else { return nil }
+        guard readU32() != nil else { return nil }
+        guard readU64() != nil else { return nil }
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
         for _ in 0..<kvCount {
-            guard let klen = readU64().map(Int.init) else { return nil }
+            guard let klen = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
             guard let key = readString(len: klen) else { return nil }
             guard let type = readU32() else { return nil }
             switch type {
             case 8: // string
-                guard let len = readU64().map(Int.init) else { return nil }
-                if key.contains("chat_template"), let tmpl = readString(len: len) {
-                    return tmpl
+                guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return nil }
+                if key.contains("chat_template") {
+                    return readString(len: len)
                 }
-                offset += len
-            case 9: // array
-                guard let elemType = readU32(), let count = readU64() else { return nil }
-                let size: Int
-                switch elemType {
-                case 0,1,7: size = 1
-                case 2,3:   size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                case 8:
-                    guard let arrLen = readU64() else { return nil }
-                    size = 0
-                    if offset + Int(arrLen) > data.count { return nil }
-                    offset += Int(arrLen)
-                    continue
-                default: size = 4
-                }
-                if offset + Int(count) * size > data.count { return nil }
-                offset += Int(count) * size
+                guard skipBytes(len) else { return nil }
             default:
-                let size: Int
-                switch type {
-                case 0,1,7: size = 1
-                case 2,3:   size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                default: size = 0
-                }
-                if offset + size > data.count { return nil }
-                offset += size
+                guard skipValue(ofType: type) else { return nil }
             }
         }
         return nil
@@ -811,28 +1177,77 @@ enum GGUFMetadata {
         defer { try? handle.close() }
         guard let head = try? handle.read(upToCount: maxScanBytes), head.count > 0 else { return false }
 
-        var data = head
+        let data = head
         var offset = 0
 
+        func ensureCapacity(_ length: Int) -> Bool {
+            length >= 0 && offset <= data.count - length
+        }
+
+        func skipBytes(_ length: Int) -> Bool {
+            guard ensureCapacity(length) else { return false }
+            offset += length
+            return true
+        }
+
         func readU32() -> UInt32? {
-            guard offset + 4 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            guard ensureCapacity(4) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
             offset += 4
             return UInt32(littleEndian: value)
         }
 
         func readU64() -> UInt64? {
-            guard offset + 8 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            guard ensureCapacity(8) else { return nil }
+            let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             offset += 8
             return UInt64(littleEndian: value)
         }
 
         func readString(len: Int) -> String? {
-            guard offset + len <= data.count else { return nil }
+            guard ensureCapacity(len) else { return nil }
             let sub = data.subdata(in: offset..<offset+len)
             offset += len
             return String(data: sub, encoding: .utf8)
+        }
+
+        func skipValue(ofType type: UInt32) -> Bool {
+            switch type {
+            case 0, 1, 7:
+                return skipBytes(1)
+            case 2, 3:
+                return skipBytes(2)
+            case 4, 5, 6:
+                return skipBytes(4)
+            case 10, 11, 12:
+                return skipBytes(8)
+            case 8:
+                guard let length = readU64().flatMap({ Int(exactly: $0) }) else { return false }
+                return skipBytes(length)
+            case 9:
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                if elementType == 8 {
+                    guard count <= UInt64(Int.max) else { return false }
+                    for _ in 0..<Int(count) {
+                        guard let length = readU64().flatMap({ Int(exactly: $0) }),
+                              skipBytes(length) else { return false }
+                    }
+                    return true
+                }
+                let elementSize: Int
+                switch elementType {
+                case 0, 1, 7: elementSize = 1
+                case 2, 3: elementSize = 2
+                case 4, 5, 6: elementSize = 4
+                case 10, 11, 12: elementSize = 8
+                default: return false
+                }
+                guard count <= UInt64(Int.max / elementSize),
+                      let elementCount = Int(exactly: count) else { return false }
+                return skipBytes(elementCount * elementSize)
+            default:
+                return false
+            }
         }
 
         // Parse GGUF header minimally to iterate kvs
@@ -844,7 +1259,7 @@ enum GGUFMetadata {
         }
         guard readU32() != nil else { return false } // version
         _ = readU64() // tensor count (unused)
-        guard let kvCount = readU64().map(Int.init) else { return false }
+        guard let kvCount = readU64().flatMap({ Int(exactly: $0) }) else { return false }
 
         let projectorIndicators = [
             "llava.projector_type",
@@ -854,7 +1269,7 @@ enum GGUFMetadata {
         ]
 
         for _ in 0..<kvCount {
-            guard let klen = readU64().map(Int.init), let key = readString(len: klen), let type = readU32() else {
+            guard let klen = readU64().flatMap({ Int(exactly: $0) }), let key = readString(len: klen), let type = readU32() else {
                 break
             }
             let lowerKey = key.lowercased()
@@ -863,40 +1278,13 @@ enum GGUFMetadata {
             }
             switch type {
             case 8: // string
-                guard let len = readU64().map(Int.init) else { return false }
+                guard let len = readU64().flatMap({ Int(exactly: $0) }) else { return false }
                 // Optionally, value can also contain indicators
                 if let value = readString(len: len)?.lowercased(), projectorIndicators.contains(where: { value.contains($0) }) {
                     return true
                 }
-            case 9: // array
-                guard let elemType = readU32(), let count = readU64() else { return false }
-                let size: Int
-                switch elemType {
-                case 0,1,7: size = 1
-                case 2,3:   size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                case 8:
-                    // Array of strings: gguf packs an aggregate length; skip payload
-                    guard let arrLen = readU64() else { return false }
-                    if offset + Int(arrLen) > data.count { return false }
-                    offset += Int(arrLen)
-                    continue
-                default: size = 4
-                }
-                if offset + Int(count) * size > data.count { return false }
-                offset += Int(count) * size
             default:
-                let size: Int
-                switch type {
-                case 0,1,7: size = 1
-                case 2,3:   size = 2
-                case 4,5,6: size = 4
-                case 10,11,12: size = 8
-                default: size = 0
-                }
-                if offset + size > data.count { return false }
-                offset += size
+                guard skipValue(ofType: type) else { return false }
             }
         }
 
@@ -909,198 +1297,288 @@ enum GGUFMetadata {
         return false
     }
 
-    fileprivate static func computeHasMTP(at url: URL) -> Bool {
-        let maxScanBytes = 16 * 1024 * 1024
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+    fileprivate static func computeMTPInspection(at url: URL) -> MTPInspection? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        guard let head = try? handle.read(upToCount: maxScanBytes), head.count > 0 else { return false }
+        let fileSize = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.uint64Value ?? 0
 
-        var data = head
-        var offset = 0
-
-        func ensureCapacity(_ length: Int) -> Bool {
-            if length < 0 { return false }
-            return offset <= data.count - length
+        func readData(_ count: Int) -> Data? {
+            let current = handle.offsetInFile
+            guard count >= 0,
+                  UInt64(count) <= fileSize - min(current, fileSize),
+                  let data = try? handle.read(upToCount: count),
+                  data.count == count else { return nil }
+            return data
         }
-
-        func skipBytes(_ length: Int) -> Bool {
-            guard ensureCapacity(length) else { return false }
-            offset += length
-            return true
+        func skip(_ count: UInt64) -> Bool {
+            let current = handle.offsetInFile
+            guard count <= UInt64.max - current, current + count <= fileSize else { return false }
+            do {
+                try handle.seek(toOffset: current + count)
+                return true
+            } catch {
+                return false
+            }
         }
-
         func readU32() -> UInt32? {
-            guard ensureCapacity(4) else { return nil }
-            let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
-            offset += 4
-            return UInt32(littleEndian: value)
+            readData(4)?.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
         }
-
         func readU64() -> UInt64? {
-            guard ensureCapacity(8) else { return nil }
-            let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self) }
-            offset += 8
-            return UInt64(littleEndian: value)
+            readData(8)?.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }
         }
-
-        func readI32() -> Int32? {
-            guard let raw = readU32() else { return nil }
-            return Int32(bitPattern: raw)
+        func readString() -> String? {
+            guard let length = readU64(), let count = Int(exactly: length), let data = readData(count) else { return nil }
+            return String(data: data, encoding: .utf8)
         }
-
-        func readI64() -> Int64? {
-            guard let raw = readU64() else { return nil }
-            return Int64(bitPattern: raw)
-        }
-
-        func readString(len: Int) -> String? {
-            guard ensureCapacity(len) else { return nil }
-            let sub = data.subdata(in: offset..<offset+len)
-            offset += len
-            return String(data: sub, encoding: .utf8)
-        }
-
-        func readScalarInteger(ofType type: UInt32) -> Int64? {
+        func readInteger(type: UInt32) -> Int64? {
             switch type {
-            case 0: // uint8
-                guard ensureCapacity(1) else { return nil }
-                let value = Int64(data[offset])
-                offset += 1
-                return value
-            case 1: // int8
-                guard ensureCapacity(1) else { return nil }
-                let value = Int64(Int8(bitPattern: data[offset]))
-                offset += 1
-                return value
-            case 2: // uint16
-                guard ensureCapacity(2) else { return nil }
-                let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
-                offset += 2
-                return Int64(UInt16(littleEndian: value))
-            case 3: // int16
-                guard ensureCapacity(2) else { return nil }
-                let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
-                offset += 2
-                return Int64(Int16(bitPattern: UInt16(littleEndian: value)))
-            case 4: // uint32
-                return readU32().map(Int64.init)
-            case 5: // int32
-                return readI32().map(Int64.init)
-            case 10: // uint64
+            case 0: return readData(1).map { Int64($0[0]) }
+            case 1: return readData(1).map { Int64(Int8(bitPattern: $0[0])) }
+            case 2: return readData(2)?.withUnsafeBytes { Int64(UInt16(littleEndian: $0.loadUnaligned(as: UInt16.self))) }
+            case 3: return readData(2)?.withUnsafeBytes { Int64(Int16(bitPattern: UInt16(littleEndian: $0.loadUnaligned(as: UInt16.self)))) }
+            case 4: return readU32().map(Int64.init)
+            case 5: return readU32().map { Int64(Int32(bitPattern: $0)) }
+            case 10:
                 guard let value = readU64(), value <= UInt64(Int64.max) else { return nil }
                 return Int64(value)
-            case 11: // int64
-                return readI64()
+            case 11: return readU64().map { Int64(bitPattern: $0) }
+            default: return nil
+            }
+        }
+        func scalarSize(type: UInt32) -> UInt64? {
+            switch type {
+            case 0, 1, 7: return 1
+            case 2, 3: return 2
+            case 4, 5, 6: return 4
+            case 10, 11, 12: return 8
+            default: return nil
+            }
+        }
+        func skipArray(elementType: UInt32, count: UInt64) -> Bool {
+            if elementType == 8 {
+                for _ in 0..<count {
+                    guard let length = readU64(), skip(length) else { return false }
+                }
+                return true
+            }
+            guard let size = scalarSize(type: elementType), count <= UInt64.max / size else { return false }
+            return skip(count * size)
+        }
+        func skipValue(type: UInt32) -> Bool {
+            switch type {
+            case 8:
+                guard let length = readU64() else { return false }
+                return skip(length)
+            case 9:
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                return skipArray(elementType: elementType, count: count)
             default:
+                guard let size = scalarSize(type: type) else { return false }
+                return skip(size)
+            }
+        }
+        func tokenizerFingerprint(count: UInt64) -> UInt64? {
+            var hash: UInt64 = 14_695_981_039_346_656_037
+            for _ in 0..<count {
+                guard let length = readU64(), let byteCount = Int(exactly: length), let bytes = readData(byteCount) else { return nil }
+                for byte in bytes {
+                    hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+                }
+                hash = (hash ^ 0xff) &* 1_099_511_628_211
+            }
+            return hash
+        }
+
+        guard readData(4) == Data("GGUF".utf8), readU32() != nil,
+              let tensorCount = readU64(), let kvCount = readU64() else { return nil }
+        var result = MTPInspection()
+
+        for _ in 0..<kvCount {
+            guard let key = readString(), let type = readU32() else { return nil }
+            let lower = key.lowercased()
+            if lower == "general.architecture", type == 8 {
+                guard let architecture = readString() else { return nil }
+                result.architecture = architecture.lowercased()
+            } else if lower == "tokenizer.ggml.tokens", type == 9 {
+                guard let elementType = readU32(), elementType == 8, let count = readU64() else { return nil }
+                result.vocabularySize = Int(exactly: count)
+                guard let fingerprint = tokenizerFingerprint(count: count) else { return nil }
+                result.tokenizerFingerprint = fingerprint
+            } else if lower == "nextn_predict_layers" || lower.hasSuffix(".nextn_predict_layers") {
+                guard let value = readInteger(type: type) else { return nil }
+                result.nextNLayers = max(0, Int(clamping: value))
+            } else if lower.hasSuffix(".embedding_length") {
+                guard let value = readInteger(type: type) else { return nil }
+                result.hiddenSize = value > 0 ? Int(exactly: value) : nil
+            } else if lower.hasSuffix(".vocab_size") {
+                guard let value = readInteger(type: type) else { return nil }
+                result.vocabularySize = value > 0 ? Int(exactly: value) : result.vocabularySize
+            } else if !skipValue(type: type) {
                 return nil
             }
         }
 
-        func skipScalar(ofType type: UInt32) -> Bool {
-            let size: Int
-            switch type {
-            case 0, 1, 7: size = 1
-            case 2, 3: size = 2
-            case 4, 5, 6: size = 4
-            case 10, 11, 12: size = 8
-            default: size = 0
+        for _ in 0..<tensorCount {
+            guard let name = readString(), let dimensions = readU32(), dimensions <= 4 else { return nil }
+            let lower = name.lowercased()
+            for marker in ["nextn.eh_proj", "nextn.enorm", "nextn.hnorm"] where lower.contains(marker) {
+                result.tensorCounts[marker, default: 0] += 1
             }
-            guard size > 0 else { return false }
-            return skipBytes(size)
+            for _ in 0..<dimensions {
+                guard readU64() != nil else { return nil }
+            }
+            guard readU32() != nil, readU64() != nil else { return nil }
         }
+        return result
+    }
 
+    fileprivate static func computeExpertTensorInventory(at url: URL) -> ExpertTensorInventory? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let fileSize = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.uint64Value ?? 0
+
+        func readData(_ count: Int) -> Data? {
+            let current = handle.offsetInFile
+            guard count >= 0,
+                  UInt64(count) <= fileSize - min(current, fileSize),
+                  let data = try? handle.read(upToCount: count),
+                  data.count == count else { return nil }
+            return data
+        }
+        func skip(_ count: UInt64) -> Bool {
+            let current = handle.offsetInFile
+            guard count <= UInt64.max - current, current + count <= fileSize else { return false }
+            do {
+                try handle.seek(toOffset: current + count)
+                return true
+            } catch {
+                return false
+            }
+        }
+        func readU32() -> UInt32? {
+            readData(4)?.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+        }
+        func readU64() -> UInt64? {
+            readData(8)?.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }
+        }
+        func readString() -> String? {
+            guard let length = readU64(), let count = Int(exactly: length), let data = readData(count) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        func readInteger(type: UInt32) -> Int64? {
+            switch type {
+            case 0: return readData(1).map { Int64($0[0]) }
+            case 1: return readData(1).map { Int64(Int8(bitPattern: $0[0])) }
+            case 2: return readData(2)?.withUnsafeBytes { Int64(UInt16(littleEndian: $0.loadUnaligned(as: UInt16.self))) }
+            case 3: return readData(2)?.withUnsafeBytes { Int64(Int16(bitPattern: UInt16(littleEndian: $0.loadUnaligned(as: UInt16.self)))) }
+            case 4: return readU32().map(Int64.init)
+            case 5: return readU32().map { Int64(Int32(bitPattern: $0)) }
+            case 10:
+                guard let value = readU64(), value <= UInt64(Int64.max) else { return nil }
+                return Int64(value)
+            case 11: return readU64().map { Int64(bitPattern: $0) }
+            default: return nil
+            }
+        }
+        func scalarSize(type: UInt32) -> UInt64? {
+            switch type {
+            case 0, 1, 7: return 1
+            case 2, 3: return 2
+            case 4, 5, 6: return 4
+            case 10, 11, 12: return 8
+            default: return nil
+            }
+        }
         func skipArray(elementType: UInt32, count: UInt64) -> Bool {
             if elementType == 8 {
-                guard count <= UInt64(Int.max) else { return false }
-                for _ in 0..<Int(count) {
-                    guard let len = readU64().map(Int.init), skipBytes(len) else { return false }
+                for _ in 0..<count {
+                    guard let length = readU64(), skip(length) else { return false }
                 }
                 return true
             }
-
-            let elementSize: Int
-            switch elementType {
-            case 0, 1, 7: elementSize = 1
-            case 2, 3: elementSize = 2
-            case 4, 5, 6: elementSize = 4
-            case 10, 11, 12: elementSize = 8
-            default: elementSize = 0
-            }
-            guard elementSize > 0 else { return false }
-            let maxElements = UInt64(Int.max) / UInt64(elementSize)
-            guard count <= maxElements else { return false }
-            return skipBytes(Int(count) * elementSize)
+            guard let size = scalarSize(type: elementType), count <= UInt64.max / size else { return false }
+            return skip(count * size)
         }
-
-        func skipValue(ofType type: UInt32) -> Bool {
+        func skipValue(type: UInt32) -> Bool {
             switch type {
             case 8:
-                guard let len = readU64().map(Int.init) else { return false }
-                return skipBytes(len)
+                guard let length = readU64() else { return false }
+                return skip(length)
             case 9:
-                guard let elemType = readU32(), let count = readU64() else { return false }
-                return skipArray(elementType: elemType, count: count)
+                guard let elementType = readU32(), let count = readU64() else { return false }
+                return skipArray(elementType: elementType, count: count)
             default:
-                return skipScalar(ofType: type)
+                guard let size = scalarSize(type: type) else { return false }
+                return skip(size)
+            }
+        }
+        func expertFamily(_ stem: Substring) -> String? {
+            switch stem {
+            case "ffn_gate_up_exps": return "gate_up"
+            case "ffn_gate_exps": return "gate"
+            case "ffn_up_exps": return "up"
+            case "ffn_down_exps": return "down"
+            default: return nil
             }
         }
 
-        func isMTPMetadataKey(_ key: String) -> Bool {
-            let lower = key.lowercased()
-            return lower == "nextn_predict_layers" || lower.hasSuffix(".nextn_predict_layers")
-        }
+        guard readData(4) == Data("GGUF".utf8), readU32() != nil,
+              let tensorCount = readU64(), let kvCount = readU64() else { return nil }
 
-        func isMTPTensorName(_ name: String) -> Bool {
-            let lower = name.lowercased()
-            return lower.contains(".nextn.")
-                || lower.contains("nextn.eh_proj")
-                || lower.contains("nextn.enorm")
-                || lower.contains("nextn.hnorm")
-                || lower.contains("nextn.embed_tokens")
-                || lower.contains("nextn.shared_head")
-        }
-
-        guard let magic = readString(len: 4), magic == "GGUF" else { return false }
-        guard readU32() != nil else { return false }
-        guard let tensorCount = readU64(), let kvCount = readU64() else { return false }
-
+        var alignment: UInt64 = 32
         for _ in 0..<kvCount {
-            guard let keyLen = readU64().map(Int.init),
-                  let key = readString(len: keyLen),
-                  let type = readU32() else {
-                return false
+            guard let key = readString(), let type = readU32() else { return nil }
+            if key.lowercased() == "general.alignment" {
+                guard let value = readInteger(type: type), value > 0 else { return nil }
+                alignment = UInt64(value)
+            } else if !skipValue(type: type) {
+                return nil
             }
-
-            if isMTPMetadataKey(key) {
-                if let value = readScalarInteger(ofType: type) {
-                    if value > 0 { return true }
-                    continue
-                }
-                guard skipValue(ofType: type) else { return false }
-                continue
-            }
-
-            guard skipValue(ofType: type) else { return false }
         }
 
-        guard tensorCount <= UInt64(Int.max) else { return false }
-        for _ in 0..<Int(tensorCount) {
-            guard let nameLen = readU64().map(Int.init),
-                  let name = readString(len: nameLen),
-                  let dimensions = readU32() else {
-                return false
-            }
-            if isMTPTensorName(name) {
-                return true
-            }
-            guard dimensions <= 4 else { return false }
+        var records: [ExpertTensorRecord] = []
+        var residentExpertScaleCount = 0
+        var unsupportedSidecarCount = 0
+        for _ in 0..<tensorCount {
+            guard let name = readString(), let dimensions = readU32(), dimensions <= 4 else { return nil }
+            var ne: [Int64] = []
+            ne.reserveCapacity(Int(dimensions))
             for _ in 0..<dimensions {
-                guard readU64() != nil else { return false }
+                guard let dim = readU64() else { return nil }
+                ne.append(Int64(bitPattern: dim))
             }
-            guard readU32() != nil, readU64() != nil else { return false }
+            guard let type = readU32(), let tensorOffset = readU64() else { return nil }
+
+            // Exact-name match keeps `_shexp`/`_chexps` and other variants out.
+            let parts = name.lowercased().split(separator: ".")
+            guard parts.count == 4, parts[0] == "blk", let layer = Int(parts[1]),
+                  let family = expertFamily(parts[2]) else { continue }
+            if parts[3] == "weight" {
+                records.append(ExpertTensorRecord(
+                    name: name,
+                    layer: layer,
+                    family: family,
+                    ggmlType: Int32(bitPattern: type),
+                    ne: ne,
+                    offset: tensorOffset
+                ))
+            } else if parts[3] == "scale" {
+                residentExpertScaleCount += 1
+            } else if parts[3] == "input_scale" || parts[3] == "bias" {
+                unsupportedSidecarCount += 1
+            }
         }
 
-        return false
+        // Tensor data begins at the aligned offset right after the tensor-info table.
+        let position = handle.offsetInFile
+        let remainder = position % alignment
+        let tensorDataOffset = remainder == 0 ? position : position + (alignment - remainder)
+        return ExpertTensorInventory(
+            records: records,
+            tensorDataOffset: tensorDataOffset,
+            residentExpertScaleCount: residentExpertScaleCount,
+            unsupportedSidecarCount: unsupportedSidecarCount
+        )
     }
 }
 
@@ -1159,9 +1637,10 @@ extension GGUFMetadata {
     }
 
     static func architectureInfo(at url: URL) -> (architecture: String, name: String?)? {
-        // Not memoized: the labeled-tuple return type is not worth boxing and
-        // this is only used by detail views, not the hot summary-card path.
-        computeArchitectureInfo(at: url)
+        // Memoized: this IS on the hot path — LocalModel.loadInstalled calls it per GGUF on the
+        // main thread on every model-list rebuild (cold launch + every refresh()), and the box is
+        // cheap. Without the cache it re-mmaps + re-walks the KV header every time.
+        memoized("architectureInfo", url) { computeArchitectureInfo(at: url) }
     }
 
     static func layerCount(at url: URL) -> Int? {
@@ -1174,6 +1653,10 @@ extension GGUFMetadata {
 
     static func moeInfo(at url: URL) -> MoEInfo? {
         memoized("moeInfo", url) { computeMoeInfo(at: url) }
+    }
+
+    static func expertTensorInventory(at url: URL) -> ExpertTensorInventory? {
+        memoized("expertTensorInventory", url) { computeExpertTensorInventory(at: url) }
     }
 
     static func chatTemplate(at url: URL) -> String? {
@@ -1193,17 +1676,58 @@ extension GGUFMetadata {
     }
 
     static func hasMTP(at url: URL) -> Bool {
-        memoized("hasMTP", url) { computeHasMTP(at: url) }
+        mtpCapability(at: url) == .embeddedValidated
+    }
+
+    static func mtpCapability(at url: URL) -> MTPCapability {
+        guard let inspection = mtpInspection(at: url), inspection.nextNLayers > 0 else {
+            return .unavailable
+        }
+        guard let architecture = inspection.architecture,
+              executableMTPArchitectures.contains(architecture) else {
+            return .declaredButUnsupported
+        }
+        return inspection.hasRequiredTensors ? .embeddedValidated : .sidecarRequired
+    }
+
+    static func mtpCapability(targetURL: URL, sidecarURL: URL) -> MTPCapability {
+        guard targetURL.standardizedFileURL != sidecarURL.standardizedFileURL,
+              let target = mtpInspection(at: targetURL),
+              let sidecar = mtpInspection(at: sidecarURL),
+              target.nextNLayers > 0,
+              sidecar.nextNLayers > 0,
+              target.nextNLayers == sidecar.nextNLayers,
+              let targetArchitecture = target.architecture,
+              executableMTPArchitectures.contains(targetArchitecture),
+              sidecar.architecture == targetArchitecture,
+              sidecar.hasRequiredTensors,
+              let targetHidden = target.hiddenSize,
+              let sidecarHidden = sidecar.hiddenSize,
+              targetHidden == sidecarHidden,
+              let targetVocabulary = target.vocabularySize,
+              let sidecarVocabulary = sidecar.vocabularySize,
+              targetVocabulary == sidecarVocabulary,
+              let targetTokenizer = target.tokenizerFingerprint,
+              let sidecarTokenizer = sidecar.tokenizerFingerprint,
+              targetTokenizer == sidecarTokenizer else {
+            return .unavailable
+        }
+        return .sidecarValidated(sidecarURL)
+    }
+
+    private static func mtpInspection(at url: URL) -> MTPInspection? {
+        memoized("mtpInspection", url) { computeMTPInspection(at: url) }
     }
 
     /// Populate the metadata cache for a GGUF file. Safe to call off the main
     /// thread (e.g. from a detached task) so that subsequent main-thread reads
     /// are served from cache and never block on disk I/O.
     static func prewarm(at url: URL) {
+        _ = architectureInfo(at: url)
         _ = layerCount(at: url)
         _ = contextLength(at: url)
         _ = moeInfo(at: url)
-        _ = hasMTP(at: url)
+        _ = mtpCapability(at: url)
         _ = hasMultimodalProjector(at: url)
         _ = chatTemplate(at: url)
     }

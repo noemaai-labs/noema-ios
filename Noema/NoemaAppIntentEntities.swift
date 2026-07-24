@@ -1,9 +1,3 @@
-// NoemaAppIntentEntities.swift
-//
-// App Intents nouns: installed models, downloaded datasets, app pages and
-// other enums Siri can reason about. Entities are also indexed in Spotlight
-// (IndexedEntity) so the new Siri AI and system search can find them by name.
-
 import AppIntents
 import Foundation
 #if canImport(CoreSpotlight)

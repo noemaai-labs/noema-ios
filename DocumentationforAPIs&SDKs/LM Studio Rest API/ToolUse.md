@@ -991,7 +991,7 @@ Assistant: The link to lmstudio.ai has been opened in your default web browser.
 
 You: What's in my current directory?
 
-Assistant: Your current directory at `/Users/matt/project` contains a total of 14 files and 8 directories. Here's the breakdown:
+Assistant: Your current directory at `/path/to/project` contains a total of 14 files and 8 directories. Here's the breakdown:
 
 - Files without an extension: 3
 - `.mjs` files: 2

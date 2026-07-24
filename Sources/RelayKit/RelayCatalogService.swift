@@ -5,6 +5,30 @@ private func canonicalHostDeviceID(_ id: String) -> String {
     id.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 }
 
+private final class RelayQueryRecordCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [CKRecord] = []
+    private var firstError: Error?
+
+    func capture(_ result: Result<CKRecord, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch result {
+        case .success(let record):
+            records.append(record)
+        case .failure(let error):
+            if firstError == nil { firstError = error }
+        }
+    }
+
+    func values() throws -> [CKRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let firstError { throw firstError }
+        return records
+    }
+}
+
 public struct RelayCatalogModelDraft: Sendable {
     public var modelID: String
     public var displayName: String
@@ -18,6 +42,8 @@ public struct RelayCatalogModelDraft: Sendable {
     public var exposed: Bool
     public var health: RelayModelHealth
     public var lastChecked: Date?
+    public var overfitClassification: String?
+    public var overfitMeasuredGenerationRate: Double?
 
     public init(modelID: String,
                 displayName: String,
@@ -30,7 +56,9 @@ public struct RelayCatalogModelDraft: Sendable {
                 tags: [String],
                 exposed: Bool,
                 health: RelayModelHealth,
-                lastChecked: Date?) {
+                lastChecked: Date?,
+                overfitClassification: String? = nil,
+                overfitMeasuredGenerationRate: Double? = nil) {
         self.modelID = modelID
         self.displayName = displayName
         self.provider = provider
@@ -43,6 +71,8 @@ public struct RelayCatalogModelDraft: Sendable {
         self.exposed = exposed
         self.health = health
         self.lastChecked = lastChecked
+        self.overfitClassification = overfitClassification
+        self.overfitMeasuredGenerationRate = overfitMeasuredGenerationRate
     }
 }
 
@@ -88,9 +118,16 @@ public actor RelayCatalogPublisher {
     private var cachedEndpoints: [String: RelayEndpointRecord] = [:]
 
     private let encoder = JSONEncoder()
-    public func configure(containerIdentifier: String, hostDeviceID: String) {
-        guard !containerIdentifier.isEmpty else { return }
-        let container = CKContainer(identifier: containerIdentifier)
+    @discardableResult
+    public func configure(containerIdentifier: String, hostDeviceID: String) -> Bool {
+        let identifier = containerIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let container = RelayCloudKitAccess.containerIfAvailable(identifier) else {
+            container = nil
+            database = nil
+            self.hostDeviceID = nil
+            log("CloudKit is unavailable for container \(identifier)")
+            return false
+        }
         self.container = container
         self.database = container.privateCloudDatabase
         let normalizedHost = canonicalHostDeviceID(hostDeviceID)
@@ -99,7 +136,8 @@ public actor RelayCatalogPublisher {
         stateVersion = 0
         cachedModels.removeAll()
         cachedEndpoints.removeAll()
-        log("Configured container: \(containerIdentifier), host: \(normalizedHost)")
+        log("Configured container: \(identifier), host: \(normalizedHost)")
+        return true
     }
 
     /// Ensure a silent-push query subscription exists for relay commands targeting this host.
@@ -192,7 +230,9 @@ public actor RelayCatalogPublisher {
                 exposed: draft.exposed,
                 health: draft.health,
                 lastChecked: draft.lastChecked,
-                version: nextVersion
+                version: nextVersion,
+                overfitClassification: draft.overfitClassification,
+                overfitMeasuredGenerationRate: draft.overfitMeasuredGenerationRate
             )
             modelRecord.apply(to: ck)
             recordsToSave.append(ck)
@@ -305,6 +345,7 @@ public actor RelayCatalogPublisher {
     }
 
     public func fetchQueuedCommands(limit: Int = 20) async throws -> [RelayCommandRecord] {
+        guard limit > 0 else { return [] }
         let db = try ensureDatabase()
         let hostID = try requireHostDeviceID()
         // Suppress this very chatty polling message from the UI console; keep it out of stdout too
@@ -313,15 +354,16 @@ public actor RelayCatalogPublisher {
         let query = CKQuery(recordType: RelayCatalogRecordType.command.rawValue, predicate: predicate)
         let operation = CKQueryOperation(query: query)
         operation.resultsLimit = limit
-        var records: [RelayCommandRecord] = []
-        operation.recordFetchedBlock = { record in
-            if let command = RelayCommandRecord(record: record) {
-                records.append(command)
-                self.log("Fetched queued command \(command.recordID.recordName) verb=\(command.verb) path=\(command.path)")
-            }
+        let collector = RelayQueryRecordCollector()
+        operation.recordMatchedBlock = { _, result in
+            collector.capture(result)
         }
         do {
             _ = try await runQuery(operation, database: db)
+            let records = try collector.values().compactMap(RelayCommandRecord.init(record:))
+            for command in records {
+                log("Fetched queued command \(command.recordID.recordName) verb=\(command.verb) path=\(command.path)")
+            }
             log("Fetched \(records.count) queued commands")
             return records
         } catch {
@@ -478,11 +520,13 @@ public actor RelayCatalogPublisher {
                 let query = CKQuery(recordType: type.rawValue, predicate: predicate)
                 operation = CKQueryOperation(query: query)
             }
-            operation.recordFetchedBlock = { record in
-                results.append(record)
+            let collector = RelayQueryRecordCollector()
+            operation.recordMatchedBlock = { _, result in
+                collector.capture(result)
             }
             log("Executing query for \(type.rawValue) records")
             cursor = try await runQuery(operation, database: database)
+            results.append(contentsOf: try collector.values())
         } while cursor != nil
         log("Fetched \(results.count) \(type.rawValue) record(s)")
         return results
@@ -643,13 +687,17 @@ public actor RelayCatalogClient {
     }
 
     private func database(for containerIdentifier: String) async throws -> CKDatabase {
-        if let container = containers[containerIdentifier] {
-            log("Reusing cached container \(containerIdentifier)")
+        let identifier = containerIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let container = RelayCloudKitAccess.containerIfAvailable(identifier) else {
+            log("CloudKit is unavailable for container \(identifier)")
+            throw RelayError.notConfigured
+        }
+        if let container = containers[identifier] {
+            log("Reusing cached container \(identifier)")
             return container.privateCloudDatabase
         }
-        log("Creating container \(containerIdentifier)")
-        let container = CKContainer(identifier: containerIdentifier)
-        containers[containerIdentifier] = container
+        log("Creating container \(identifier)")
+        containers[identifier] = container
         return container.privateCloudDatabase
     }
 
@@ -663,11 +711,13 @@ public actor RelayCatalogClient {
             } else {
                 operation = CKQueryOperation(query: query)
             }
-            operation.recordFetchedBlock = { record in
-                results.append(record)
+            let collector = RelayQueryRecordCollector()
+            operation.recordMatchedBlock = { _, result in
+                collector.capture(result)
             }
             log("Executing query with \(results.count) accumulated result(s)")
             cursor = try await runQuery(operation, database: database)
+            results.append(contentsOf: try collector.values())
         } while cursor != nil
         log("Query finished with \(results.count) record(s)")
         return results

@@ -109,6 +109,18 @@ struct ModelDependencyGraphView: View {
     }
 
     var body: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons), so macOS gets the shared
+        // industrial card layout. The sheet already supplies the title + close.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Model Dependencies"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             Section(LocalizedStringKey("Dependency Graph")) {
                 HStack(spacing: 8) {
@@ -186,8 +198,83 @@ struct ModelDependencyGraphView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("Model Dependencies"))
     }
+
+#if os(macOS)
+    private var macBody: some View {
+        MacSettingsPage {
+            MacSettingsCard(LocalizedStringKey("Dependency Graph")) {
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Models"), value: "\(snapshots.count)", divider: false)
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Missing"), value: "\(missingCount)")
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Ready"), value: "\(snapshots.filter(\.isReady).count)")
+                MacSettingsControlRow(LocalizedStringKey("Search models")) {
+                    TextField(LocalizedStringKey("Search models"), text: $searchText)
+                        .labelsHidden()
+                        .platformAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .industrialField(width: 200)
+                }
+            }
+
+            MacSettingsCard(LocalizedStringKey("Repair Queue")) {
+                MacSettingsActionRow(divider: false) {
+                    Button {
+                        Task { await repairAllModels() }
+                    } label: {
+                        Label(
+                            isRepairing ? LocalizedStringKey("Repairing Models...") : LocalizedStringKey("Repair All Models"),
+                            systemImage: isRepairing ? "arrow.triangle.2.circlepath" : "wrench.and.screwdriver"
+                        )
+                    }
+                    .buttonStyle(.industrial(.prominent))
+                    .disabled(isRepairing || snapshots.isEmpty)
+                }
+
+                MacSettingsNoteRow(LocalizedStringKey("Runs path rehoming, stale partial download cleanup, and queues downloads for resolvable missing artifacts."))
+
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Candidates"), value: "\(repairCandidateCount)")
+                MacSettingsKeyValueRow(title: LocalizedStringKey("Warnings"), value: "\(warningCount)")
+
+                if let maintenanceSummary {
+                    MacSettingsRowContainer {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checklist")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Color.primary.opacity(0.4))
+                            Text(verbatim: maintenanceSummary)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(Color.primary.opacity(0.45))
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+
+                ForEach(repairResults) { result in
+                    MacSettingsRowContainer {
+                        ModelDependencyRepairResultRow(result: result)
+                    }
+                }
+            }
+
+            if snapshots.isEmpty {
+                MacSettingsCard(LocalizedStringKey("Installed Model Dependencies")) {
+                    MacSettingsNoteRow(LocalizedStringKey("No local models installed."), divider: false)
+                }
+            } else if filteredSnapshots.isEmpty {
+                MacSettingsCard(LocalizedStringKey("Installed Model Dependencies")) {
+                    MacSettingsNoteRow(LocalizedStringKey("No matching models"), divider: false)
+                }
+            } else {
+                MacSettingsCard(LocalizedStringKey("Installed Model Dependencies")) {
+                    ForEach(Array(filteredSnapshots.enumerated()), id: \.element.id) { index, snapshot in
+                        MacDependencyDisclosure(snapshot: snapshot, divider: index != 0)
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     @MainActor
     private func repairAllModels() async {
@@ -628,3 +715,45 @@ private struct ModelDependencyPill: View {
         .background(Color.secondary.opacity(0.10), in: Capsule())
     }
 }
+
+#if os(macOS)
+/// The Form's per-model `DisclosureGroup` rebuilt in the industrial dialect:
+/// the existing status label as a tappable header over the model's item rows.
+private struct MacDependencyDisclosure: View {
+    let snapshot: ModelDependencySnapshot
+    var divider: Bool = true
+
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if divider { IndustrialHairline() }
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: 10) {
+                    ModelDependencyModelLabel(snapshot: snapshot)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(0.3))
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(snapshot.items) { item in
+                        ModelDependencyRow(item: item)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+}
+#endif

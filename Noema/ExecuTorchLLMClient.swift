@@ -8,13 +8,49 @@ import CoreGraphics
 /// system prompt and BOS markers belong to the first turn after a (re)load.
 struct ETTurnFormatter: Sendable {
     let kind: PromptBuilder.TemplateKind
+    let template: String?
+
+    private var family: ModelKind {
+        switch kind {
+        case .llama3: return .llama3
+        case .inst: return .mistral
+        case .gemmaTurn: return .gemma
+        case .phi: return .phi
+        case .internlm: return .internlm
+        case .deepseek: return .deepseek
+        case .yi: return .yi
+        case .chatml, .qwen35: return .qwen
+        case .chatmlWithStartOfText: return .lfm
+        case .alpaca, .vicuna, .none: return .other
+        }
+    }
 
     init(template: String?, modelNameHint: String) {
-        self.kind = PromptBuilder.detect(template: template, family: ModelKind.detect(id: modelNameHint))
+        let family = ModelKind.detect(id: modelNameHint)
+        self.kind = PromptBuilder.detect(template: template, family: family)
+        self.template = template
     }
 
     init(kind: PromptBuilder.TemplateKind) {
         self.kind = kind
+        self.template = nil
+    }
+
+    /// Rebuilds a fresh ExecuTorch runner after a session switch or durable
+    /// compaction. Normal turns still use `renderTurn` and retain the fast KV
+    /// continuation path.
+    func renderConversation(messages: [ChatMessage], systemPrompt: String?) -> String {
+        let history = messages.compactMap { message -> ChatVM.Msg? in
+            let role = message.role.lowercased()
+            if role == "system" { return nil }
+            return ChatVM.Msg(role: role, text: message.content)
+        }
+        return PromptBuilder.build(
+            template: template,
+            family: family,
+            history: history,
+            system: systemPrompt ?? ""
+        ).0
     }
 
     func renderTurn(
@@ -231,7 +267,11 @@ final actor ExecuTorchLLMClient {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.runGeneration(payload: payload, continuation: continuation)
+                    try await self.runGeneration(
+                        payload: payload,
+                        options: input.generationOptions,
+                        continuation: continuation
+                    )
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -325,20 +365,24 @@ final actor ExecuTorchLLMClient {
         }
     }
 
-    private func generationConfig() -> Config {
+    private func generationConfig(options: LLMGenerationOptions) -> Config {
         Config { cfg in
             cfg.isEchoEnabled = false
-            cfg.maximumNewTokens = max(1, Int(settings.contextLength.rounded(.up)))
+            cfg.maximumNewTokens = max(1, options.maxOutputTokens ?? Int(settings.contextLength.rounded(.up)))
             cfg.sequenceLength = max(128, Int(settings.contextLength.rounded(.up)))
-            cfg.temperature = settings.temperature
+            cfg.temperature = options.temperature ?? settings.temperature
             cfg.isWarming = true
             cfg.bosCount = 0
             cfg.eosCount = 0
         }
     }
 
-    private func runGeneration(payload: PreparedPayload, continuation: AsyncThrowingStream<String, Error>.Continuation) async throws {
-        let cfg = generationConfig()
+    private func runGeneration(
+        payload: PreparedPayload,
+        options: LLMGenerationOptions,
+        continuation: AsyncThrowingStream<String, Error>.Continuation
+    ) async throws {
+        let cfg = generationConfig(options: options)
         let runtimeSummary = resolvedRuntimeBackends.isEmpty
             ? "unknown"
             : resolvedRuntimeBackends.joined(separator: ",")
@@ -497,6 +541,13 @@ private enum PreparedPayload {
         // tool-result message in post-tool continuations); earlier turns live
         // in the runner's persistent KV cache.
         func renderedTurn(from messages: [ChatMessage]) -> String {
+            let containsEarlierConversation = messages.contains { message in
+                let role = message.role.lowercased()
+                return role == "assistant" || role == "tool"
+            } || messages.filter { $0.role.lowercased() == "user" }.count > 1
+            if isFirstTurn, containsEarlierConversation {
+                return formatter.renderConversation(messages: messages, systemPrompt: systemPrompt)
+            }
             let userText = messages.last(where: { $0.role.lowercased() == "user" })?.content
                 ?? messages.last?.content
                 ?? ""
@@ -599,6 +650,9 @@ extension AnyLLMClient {
             },
             reset: {
                 await client.hardResetConversation()
+            },
+            syncSystemPrompt: { prompt in
+                await client.syncSystemPrompt(prompt)
             }
         )
     }

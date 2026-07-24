@@ -1,4 +1,3 @@
-// QuantExtractor.swift
 import Foundation
 
 public struct RepoFile { let path: String; let size: Int64; let sha256: String? }
@@ -7,6 +6,11 @@ public enum QuantExtractor {
     static func extract(from files: [RepoFile], repoID: String) -> [QuantInfo] {
         var quants: [QuantInfo] = []
         var seenLabels: Set<String> = []
+        // `.noema-paged` packages (manifest.json + resident.gguf + expert banks)
+        // install as one unit; member files must not surface as standalone
+        // quants below — a resident.gguf without its expert banks is unusable.
+        let pagedQuants = pagedPackageQuants(from: files, repoID: repoID)
+        let files = files.filter { pagedPackageRoot(from: $0.path) == nil }
         struct GGUFGroup {
             let key: String
             var files: [RepoFile] = []
@@ -17,13 +21,14 @@ public enum QuantExtractor {
 
         for file in files {
             let lower = file.path.lowercased()
-            // Skip companion artifacts (.mmproj/projector and MTP draft heads).
+            // Skip companion artifacts (.mmproj/projector, MTP, and DSpark draft heads).
             if lower.contains("mmproj")
                 || lower.contains("projector")
                 || lower.contains("image_proj")
                 || lower.contains("mtp-")
                 || lower.contains("-mtp")
-                || lower.contains("nextn") {
+                || lower.contains("nextn")
+                || lower.contains("dspark") {
                 continue
             }
             guard lower.hasSuffix(".gguf") else { continue }
@@ -113,20 +118,52 @@ public enum QuantExtractor {
                                    sha256: file.sha256,
                                    configURL: cfg))
         }
-        // MLX detection (prefer safetensors shards, then NPZ, then weights.json)
-        let safetensors = files.first(where: { $0.path.lowercased().hasSuffix(".safetensors") })
-        let npz = files.first(where: { $0.path.lowercased().hasSuffix(".npz") })
-        let weightsJson = files.first(where: { $0.path.lowercased().hasSuffix("weights.json") })
-        if let picked = safetensors ?? npz ?? weightsJson {
-            let url = URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(picked.path)")!
-            let cfg = URL(string: "https://huggingface.co/\(repoID)/raw/main/config.json")
-            let label = Self.mlxLabel(for: picked.path, repoID: repoID)
-            quants.append(QuantInfo(label: label,
-                                   format: .mlx,
-                                   sizeBytes: picked.size,
-                                   downloadURL: url,
-                                   sha256: picked.sha256,
-                                   configURL: cfg))
+
+        for quant in pagedQuants where seenLabels.insert(quant.label).inserted {
+            quants.append(quant)
+        }
+        // MLX detection (prefer safetensors shards, then NPZ, then weights.json).
+        // MLX repos are single-quant, so every `.safetensors` file is a shard of
+        // that one quant — enumerate them all into `downloadParts` (the total size
+        // and the fit/plan/progress accounting all derive from this). Picking only
+        // the first shard here made a 19GB model report as its 5GB first shard.
+        let safetensorShards = files
+            .filter { $0.path.lowercased().hasSuffix(".safetensors") }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        if !safetensorShards.isEmpty {
+            let parts: [QuantInfo.DownloadPart] = safetensorShards.compactMap { file in
+                guard let url = resolveDownloadURL(repoID: repoID, path: file.path) else { return nil }
+                return QuantInfo.DownloadPart(
+                    path: file.path,
+                    sizeBytes: file.size,
+                    sha256: file.sha256,
+                    downloadURL: url
+                )
+            }
+            if let primary = parts.first {
+                let totalBytes = parts.reduce(into: Int64(0)) { $0 += max($1.sizeBytes, 0) }
+                let label = Self.mlxLabel(for: primary.path, repoID: repoID)
+                quants.append(QuantInfo(label: label,
+                                       format: .mlx,
+                                       sizeBytes: totalBytes,
+                                       downloadURL: primary.downloadURL,
+                                       sha256: primary.sha256,
+                                       configURL: cfg,
+                                       downloadParts: parts.count > 1 ? parts : nil))
+            }
+        } else {
+            let npz = files.first(where: { $0.path.lowercased().hasSuffix(".npz") })
+            let weightsJson = files.first(where: { $0.path.lowercased().hasSuffix("weights.json") })
+            if let picked = npz ?? weightsJson {
+                let url = URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(picked.path)")!
+                let label = Self.mlxLabel(for: picked.path, repoID: repoID)
+                quants.append(QuantInfo(label: label,
+                                       format: .mlx,
+                                       sizeBytes: picked.size,
+                                       downloadURL: url,
+                                       sha256: picked.sha256,
+                                       configURL: cfg))
+            }
         }
 
         // ExecuTorch detection (.pte program files plus required tokenizer sidecars)
@@ -138,6 +175,12 @@ public enum QuantExtractor {
                 let lPrimary = l.hasSuffix("/model.pte") || l == "model.pte"
                 let rPrimary = r.hasSuffix("/model.pte") || r == "model.pte"
                 if lPrimary != rPrimary { return lPrimary && !rPrimary }
+                let lXNNPACK = l.contains("xnnpack")
+                let rXNNPACK = r.contains("xnnpack")
+                if lXNNPACK != rXNNPACK { return lXNNPACK && !rXNNPACK }
+                let lQuantized = l.contains("quantized") || l.contains("8da4w") || l.contains("int4")
+                let rQuantized = r.contains("quantized") || r.contains("8da4w") || r.contains("int4")
+                if lQuantized != rQuantized { return lQuantized && !rQuantized }
                 return l < r
             }
             for file in orderedPTE {
@@ -181,6 +224,94 @@ public enum QuantExtractor {
     private static func label(for path: String, repoID: String, ext: String) -> String {
         _ = ext // kept to preserve the existing signature and call sites
         return GGUFShardNaming.normalizedQuantLabel(for: path, repoID: repoID)
+    }
+
+    /// Directory-component prefix (`<stem>.noema-paged`) enclosing `path`, or
+    /// nil when the file is not a paged-package member. Listings only carry
+    /// files, so any path with a `.noema-paged` directory component is inside
+    /// a package.
+    private static func pagedPackageRoot(from path: String) -> String? {
+        let normalized = path.replacingOccurrences(of: "\\", with: "/")
+        let components = normalized.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count > 1 else { return nil }
+        for idx in components.indices.dropLast() where components[idx].lowercased().hasSuffix(".noema-paged") {
+            return components[components.startIndex...idx].map(String.init).joined(separator: "/")
+        }
+        return nil
+    }
+
+    /// Detects `.noema-paged` package directories (manifest.json alongside a
+    /// resident GGUF and expert banks) and produces one installable quant per
+    /// package covering every member file.
+    private static func pagedPackageQuants(from files: [RepoFile], repoID: String) -> [QuantInfo] {
+        let roots = Set(files.compactMap { pagedPackageRoot(from: $0.path) })
+        guard !roots.isEmpty else { return [] }
+
+        var filesByPath: [String: RepoFile] = [:]
+        for file in files where filesByPath[file.path] == nil {
+            filesByPath[file.path] = file
+        }
+        let cfg = URL(string: "https://huggingface.co/\(repoID)/raw/main/config.json")
+
+        var quants: [QuantInfo] = []
+        for root in roots.sorted() {
+            let manifestPath = root + "/manifest.json"
+            guard filesByPath[manifestPath] != nil else { continue }
+
+            // manifest.json leads so the download router recognizes a paged
+            // install from the primary part path; relative paths keep the
+            // package directory component so the multipart writer recreates
+            // the layout on disk.
+            func rank(_ path: String) -> Int {
+                if path == manifestPath { return 0 }
+                let name = String(path.dropFirst(root.count + 1)).lowercased()
+                if name.hasSuffix(".gguf") { return 1 }
+                if name.hasPrefix("experts-") && name.hasSuffix(".bin") { return 2 }
+                return 3
+            }
+            let orderedPaths = files
+                .filter { $0.path.hasPrefix(root + "/") }
+                .map(\.path)
+                .sorted { lhs, rhs in
+                    let lr = rank(lhs)
+                    let rr = rank(rhs)
+                    if lr != rr { return lr < rr }
+                    return lhs.localizedStandardCompare(rhs) == .orderedAscending
+                }
+
+            let parts: [QuantInfo.DownloadPart] = orderedPaths.compactMap { path in
+                guard let file = filesByPath[path],
+                      let url = resolveDownloadURL(repoID: repoID, path: path) else { return nil }
+                return QuantInfo.DownloadPart(
+                    path: path,
+                    sizeBytes: file.size,
+                    sha256: file.sha256,
+                    downloadURL: url
+                )
+            }
+            guard parts.count >= 2, parts.first?.path == manifestPath else { continue }
+            let totalBytes = parts.reduce(into: Int64(0)) { $0 += max($1.sizeBytes, 0) }
+
+            let dirName = root.split(separator: "/").last.map(String.init) ?? root
+            let stem = String(dirName.dropLast(".noema-paged".count))
+            let quantLabel = GGUFShardNaming.normalizedQuantLabel(for: stem + ".gguf", repoID: repoID)
+            // Unlike a conventional GGUF repo, each `.noema-paged` directory
+            // is a complete model package. Keep the package stem in the
+            // identity so two different models using the same quant remain
+            // distinct throughout downloads and the installed-model store.
+            let label = "\(quantLabel) · \(stem) · Paged"
+
+            quants.append(QuantInfo(
+                label: label,
+                format: .gguf,
+                sizeBytes: totalBytes,
+                downloadURL: parts[0].downloadURL,
+                sha256: nil,
+                configURL: cfg,
+                downloadParts: parts
+            ))
+        }
+        return quants
     }
 
     private static func lastRegexMatch(in text: String, pattern: String) -> String? {
@@ -556,7 +687,7 @@ public enum QuantExtractor {
         case .gguf:
             // Prefer full informative token over just Q-number
             let normalized = label.replacingOccurrences(of: "-", with: "_")
-            let pat = #"(?i)(ud_(?:iq\d+[a-z0-9_]*|q\d+[a-z0-9_]*|tq\d+[a-z0-9_]*|mxfp\d+(?:_moe)?)|iq\d+[a-z0-9_]*|q\d+[a-z0-9_]*|tq\d+[a-z0-9_]*|mxfp\d+(?:_moe)?)"#
+            let pat = #"(?i)(ud_(?:iq\d+[a-z0-9_]*|pq\d+[a-z0-9_]*|q\d+[a-z0-9_]*|tq\d+[a-z0-9_]*|mxfp\d+(?:_moe)?)|iq\d+[a-z0-9_]*|pq\d+[a-z0-9_]*|q\d+[a-z0-9_]*|tq\d+[a-z0-9_]*|mxfp\d+(?:_moe)?)"#
             if let regex = try? NSRegularExpression(pattern: pat),
                let r = regex.matches(in: normalized, options: [], range: NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)).last,
                let rr = Range(r.range, in: normalized) {

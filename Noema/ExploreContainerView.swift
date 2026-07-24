@@ -1,4 +1,3 @@
-// ExploreContainerView.swift
 import SwiftUI
 
 enum ExploreSection: String, CaseIterable {
@@ -108,8 +107,11 @@ final class ExploreChromeState: ObservableObject {
     @Published var isSearchVisible: Bool = false
     @Published var searchPlaceholder: LocalizedStringKey = LocalizedStringKey("Search")
     @Published var activeSection: ExploreSection?
+    @Published var isImportVisible: Bool = false
     var toggleAction: (() -> Void)?
     var searchSubmitAction: (() -> Void)?
+    var importGGUFAction: (() -> Void)?
+    var importMLXAction: (() -> Void)?
 
     func toggle() {
         toggleAction?()
@@ -121,6 +123,14 @@ final class ExploreChromeState: ObservableObject {
 
     func submitSearch() {
         searchSubmitAction?()
+    }
+
+    func importGGUF() {
+        importGGUFAction?()
+    }
+
+    func importMLX() {
+        importMLXAction?()
     }
 }
 
@@ -243,13 +253,43 @@ struct ModelTypeFilterToggle: View {
     var onChange: (ModelTypeFilter) -> Void
 
     var body: some View {
-        Picker(LocalizedStringKey("Filter"), selection: Binding(get: { selection }, set: { onChange($0) })) {
+        let shape = RoundedRectangle(cornerRadius: 4, style: .continuous)
+        Menu {
             ForEach(ModelTypeFilter.allCases, id: \.self) { filter in
-                Label(filter.label, systemImage: filter.icon)
-                    .tag(filter)
+                Button {
+                    onChange(filter)
+                } label: {
+                    if filter == selection {
+                        Label(filter.label, systemImage: "checkmark")
+                    } else {
+                        Label(filter.label, systemImage: filter.icon)
+                    }
+                }
             }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: selection.icon)
+                    .font(.system(size: 10, weight: .semibold))
+                Text(selection.label)
+                    .textCase(.uppercase)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(0.5)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .opacity(0.6)
+            }
+            .foregroundStyle(Color.primary.opacity(0.65))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(shape.fill(Color.primary.opacity(0.05)))
+            .overlay(shape.stroke(Color.primary.opacity(0.15), lineWidth: 1))
+            .contentShape(shape)
         }
-        .pickerStyle(.menu)
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel(LocalizedStringKey("Filter"))
     }
 }
 
@@ -279,13 +319,27 @@ private struct ExploreChromeBar: View {
                 }
                 if chromeState.hasToggle {
                     Button(action: { chromeState.toggle() }) {
-                        Text(chromeState.searchMode.displayName)
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(searchModeGradient)
-                            .clipShape(Capsule())
-                            .foregroundStyle(.white)
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(searchModeGradient)
+                                .frame(width: 6, height: 6)
+                            Text(chromeState.searchMode.displayName)
+                                .textCase(.uppercase)
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .tracking(0.5)
+                                .foregroundStyle(Color.primary.opacity(0.75))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(Color.primary.opacity(0.05))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .guideHighlight(.exploreModelToggle)
@@ -293,19 +347,33 @@ private struct ExploreChromeBar: View {
             }
 
             HStack(spacing: 16) {
-                Picker(LocalizedStringKey("Section"), selection: Binding(get: { selection }, set: { onSelectionChange($0) })) {
-                    Text(LocalizedStringKey("Models")).tag(ExploreSection.models)
-                    Text(LocalizedStringKey("Datasets")).tag(ExploreSection.datasets)
+                HStack(spacing: 2) {
+                    sectionChip(LocalizedStringKey("Models"), .models)
+                    sectionChip(LocalizedStringKey("Datasets"), .datasets)
                 }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 260)
+                .padding(2)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                )
                 .guideHighlight(.exploreSwitchBar)
 
                 Spacer(minLength: 12)
 
-                if showFilter {
-                    ModelTypeFilterToggle(selection: filterSelection, onChange: onFilterChange)
-                        .transition(.opacity.combined(with: .scale))
+                if showFilter || shouldShowImport {
+                    HStack(spacing: 8) {
+                        if showFilter {
+                            ModelTypeFilterToggle(selection: filterSelection, onChange: onFilterChange)
+                        }
+                        if shouldShowImport {
+                            importMenu
+                        }
+                    }
+                    .transition(.opacity.combined(with: .scale))
                 }
             }
         }
@@ -317,6 +385,65 @@ private struct ExploreChromeBar: View {
             Divider()
                 .opacity(0.5)
         }
+    }
+
+    private func sectionChip(_ title: LocalizedStringKey, _ value: ExploreSection) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 4, style: .continuous)
+        return Button {
+            onSelectionChange(value)
+        } label: {
+            Text(title)
+                .textCase(.uppercase)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .tracking(0.5)
+                .foregroundStyle(selection == value ? Color.accentColor : Color.primary.opacity(0.55))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .background(shape.fill(selection == value ? Color.accentColor.opacity(0.16) : .clear))
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selection == value ? .isSelected : [])
+    }
+
+    private var shouldShowImport: Bool {
+        selection == .models && chromeState.isImportVisible
+    }
+
+    private var importMenu: some View {
+        Menu {
+            Button(action: { chromeState.importGGUF() }) {
+                Label(LocalizedStringKey("Import GGUF"), systemImage: "tray.and.arrow.down.fill")
+            }
+            Button(action: { chromeState.importMLX() }) {
+                Label(LocalizedStringKey("Import MLX"), systemImage: "bolt.fill")
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(LocalizedStringKey("Import"))
+                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .tracking(0.5)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .opacity(0.7)
+            }
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.14))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(LocalizedStringKey("Import"))
     }
 
     private var subtitle: LocalizedStringKey {
@@ -362,11 +489,11 @@ private struct ExploreChromeBar: View {
         .padding(.vertical, 6)
         .padding(.horizontal, 12)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
         .frame(maxWidth: 320)
@@ -479,7 +606,7 @@ struct ExploreContainerView: View {
                         exploreSectionRaw = ExploreSection.datasets.rawValue
                     }
                 }
-            case .exploreSwitchToModels, .exploreModelTypes, .exploreMLX, .exploreSLM:
+            case .exploreSwitchToModels, .exploreModelTypes, .exploreMLX, .exploreET:
                 if exploreSection != .models {
                     withAnimation(.snappy) {
                         exploreSectionRaw = ExploreSection.models.rawValue

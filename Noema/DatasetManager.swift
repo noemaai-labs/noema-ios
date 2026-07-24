@@ -1,4 +1,3 @@
-// DatasetManager.swift
 import Foundation
 import SwiftUI
 
@@ -35,9 +34,61 @@ final class DatasetManager: ObservableObject {
     @Published var processingStatus: [String: DatasetProcessingStatus] = [:]
     @AppStorage("indexingDatasetIDPersisted") private var persistedIndexingDatasetID: String = ""
 
+    // MARK: - RAG-upgrade re-embed recommendation
+    private static let ragNoticeAckKey = "ragUpgradeAcknowledgedDatasetIDs"
+    /// Dataset ids whose "re-embed for the RAG improvements" notice the user has
+    /// already seen (the row badge hides once its detail has been opened).
+    @Published private(set) var ragNoticeAcknowledgedIDs: Set<String> =
+        Set(UserDefaults.standard.stringArray(forKey: DatasetManager.ragNoticeAckKey) ?? [])
+
+    /// Acknowledgement key is scoped to the current pipeline revision, so a future
+    /// revision bump re-surfaces the badge for a dataset the user opened earlier.
+    private func ragAckKey(_ id: String) -> String {
+        "\(id)#\(DatasetIndexMetadata.currentPipelineRevision)"
+    }
+
+    /// Whether to show the small "outdated index" badge on a dataset row.
+    func shouldShowRAGUpgradeNotice(for dataset: LocalDataset) -> Bool {
+        isRAGIndexOutdated(for: dataset) && !ragNoticeAcknowledgedIDs.contains(ragAckKey(dataset.datasetID))
+    }
+
+    /// True when this dataset's index predates the current RAG pipeline (drives
+    /// the in-detail re-embed recommendation, independent of acknowledgement).
+    /// Managed (Enterprise) datasets are excluded — they are not user-re-embeddable.
+    func isRAGIndexOutdated(for dataset: LocalDataset) -> Bool {
+        let live = datasets.first(where: { $0.datasetID == dataset.datasetID }) ?? dataset
+        return live.isIndexed && live.ragIndexOutdated && live.source != "Enterprise"
+    }
+
+    /// Marks the notice seen for a dataset (called when its detail is opened),
+    /// which hides the row badge. The in-detail recommendation still shows.
+    func acknowledgeRAGUpgradeNotice(for id: String) {
+        let key = ragAckKey(id)
+        guard !ragNoticeAcknowledgedIDs.contains(key) else { return }
+        ragNoticeAcknowledgedIDs.insert(key)
+        UserDefaults.standard.set(Array(ragNoticeAcknowledgedIDs), forKey: DatasetManager.ragNoticeAckKey)
+    }
+
+    /// Forces a fresh re-embed of an already-indexed dataset so it picks up the
+    /// current RAG pipeline. Clears ALL regenerable artifacts (vectors, metadata,
+    /// AND extracted/compacted text) so the pipeline genuinely re-extracts with
+    /// the improved OCR/de-hyphenation — then runs the full embed (no plug-in
+    /// pause; `startEmbeddingForID` re-reads the now-unindexed live entry).
+    func reembedForRAGUpgrade(datasetID id: String) {
+        guard datasets.contains(where: { $0.datasetID == id }) else { return }
+        if let url = datasets.first(where: { $0.datasetID == id })?.url {
+            DatasetIndexIO.clearAllIndexArtifacts(at: url)
+        }
+        Task { await DatasetRetriever.shared.purge(datasetID: id) }
+        reloadFromDisk()
+        startEmbeddingForID(id)
+    }
+
     /// Download controller used to fetch the embedding model when missing.
     weak var downloadController: DownloadController?
     private var indexingTasks: [String: Task<Void, Never>] = [:]
+    private var reloadGeneration: UInt64 = 0
+    private var pendingReloadCompletions: [@MainActor () -> Void] = []
     // Throttle and coalesce frequent status updates to avoid UI flicker
     private var lastStatusByID: [String: DatasetProcessingStatus] = [:]
     private var lastStatusUpdateAt: [String: Date] = [:]
@@ -51,12 +102,15 @@ final class DatasetManager: ObservableObject {
         let lastTime = lastStatusUpdateAt[id] ?? .distantPast
         let minInterval: TimeInterval = 0.2 // 5 fps update cadence is sufficient for progress UI
 
-        // Only publish if stage changed or progress advanced by at least 1% or enough time elapsed
+        // Only publish on a stage change or at the time-gated cadence. `processingStatus` is
+        // @Published and observed app-wide (MainView/TabView), so each publish triggers a full
+        // re-render. The previous `progressDelta >= 0.01` escape hatch bypassed the time cap when
+        // chunks embedded faster than 1%/0.2s, storming the UI during fast embedding — drop it so
+        // progress updates are strictly capped to `minInterval` (stage changes still fire immediately).
         let stageChanged = last?.stage != normalizedStatus.stage
         let transitionedToCompleted = (last?.stage != .completed) && (normalizedStatus.stage == .completed)
-        let progressDelta = Swift.abs((last?.progress ?? -1.0) - normalizedStatus.progress)
         let timeElapsed = now.timeIntervalSince(lastTime)
-        if stageChanged || progressDelta >= 0.01 || timeElapsed >= minInterval {
+        if stageChanged || timeElapsed >= minInterval {
             processingStatus[id] = normalizedStatus
             lastStatusByID[id] = normalizedStatus
             lastStatusUpdateAt[id] = now
@@ -133,7 +187,42 @@ final class DatasetManager: ObservableObject {
         self.downloadController = downloadController
     }
 
-    func reloadFromDisk() {
+    /// Reload the dataset list from disk. The scan (directory enumeration plus per-dataset
+    /// size and index-state checks) is pure file I/O that previously ran synchronously on the
+    /// MainActor, hitching the UI whenever datasets changed or indexing finished. It now runs
+    /// on a background task and applies/publishes on the MainActor. Callers that depend on the
+    /// publish having happened (e.g. to enqueue indexing afterwards) pass `completion`, which
+    /// runs after the publish.
+    func reloadFromDisk(completion: (@MainActor () -> Void)? = nil) {
+        reloadGeneration &+= 1
+        let generation = reloadGeneration
+        if let completion {
+            pendingReloadCompletions.append(completion)
+        }
+        let selectedID = selectedDatasetID
+        let enterpriseOwnerDir = EnterpriseDatasetStore.ownerDirectoryName
+        Task { @MainActor [weak self] in
+            let found = await Task.detached(priority: .userInitiated) {
+                Self.scanDatasetsOnDisk(selectedDatasetID: selectedID, enterpriseOwnerDir: enterpriseOwnerDir)
+            }.value
+            guard let self else { return }
+            guard generation == self.reloadGeneration else { return }
+            self.applyReloadedDatasets(found)
+            let completions = self.pendingReloadCompletions
+            self.pendingReloadCompletions.removeAll(keepingCapacity: true)
+            completions.forEach { $0() }
+        }
+
+        // Do not auto-index here; indexing is started explicitly after download
+        // or via a user action in dataset settings.
+    }
+
+    /// Pure file-I/O scan of the datasets directory. Declared `nonisolated static` so it can
+    /// run off the MainActor without touching any actor-isolated state.
+    nonisolated private static func scanDatasetsOnDisk(
+        selectedDatasetID: String,
+        enterpriseOwnerDir: String
+    ) -> [LocalDataset] {
         var url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         url.appendPathComponent("LocalLLMDatasets", isDirectory: true)
         let fm = FileManager.default
@@ -157,7 +246,8 @@ final class DatasetManager: ObservableObject {
                                     let ownerName = owner.lastPathComponent
                                     if ownerName == "OTL" { return "Open Textbook Library" }
                                     if ownerName == "Imported" { return "Imported" }
-                                    if ownerName == EnterpriseDatasetStore.ownerDirectoryName { return "Enterprise" }
+                                    if ownerName == "PACK" { return "Knowledge Pack" }
+                                    if ownerName == enterpriseOwnerDir { return "Enterprise" }
                                     return "Hugging Face"
                                 }()
                                 let displayName: String = {
@@ -179,7 +269,8 @@ final class DatasetManager: ObservableObject {
                                         lastUsedDate: nil,
                                         isSelected: selectedDatasetID == id,
                                         isIndexed: hasValidIndex,
-                                        requiresReindex: hasIndexArtifacts && !hasValidIndex
+                                        requiresReindex: hasIndexArtifacts && !hasValidIndex,
+                                        ragIndexOutdated: hasValidIndex && DatasetIndexIO.isPipelineOutdated(at: dir)
                                     )
                                 )
                             }
@@ -188,6 +279,22 @@ final class DatasetManager: ObservableObject {
                 }
             }
         }
+        return found
+    }
+
+    /// Background-safe enumeration of indexed, policy-allowed datasets for tool use
+    /// (e.g. `noema.rag.search`). Does not require a live MainActor `DatasetManager`
+    /// instance: it scans disk and applies the same Enterprise policy filter that
+    /// `applyReloadedDatasets` does, so governed Teams datasets are never exposed.
+    nonisolated static func indexedDatasetsForTooling() -> [LocalDataset] {
+        scanDatasetsOnDisk(selectedDatasetID: "", enterpriseOwnerDir: EnterpriseDatasetStore.ownerDirectoryName)
+            .filter { $0.isIndexed && !$0.requiresReindex && EnterprisePolicyGate.allowsDataset(datasetID: $0.datasetID) }
+    }
+
+    /// Apply a freshly scanned dataset list on the MainActor: enforce enterprise policy,
+    /// compute processing status, and publish.
+    private func applyReloadedDatasets(_ scanned: [LocalDataset]) {
+        var found = scanned
         // Noema Teams policy: enterprise datasets are only listed for permitted roles;
         // personal datasets are never affected.
         found.removeAll { !EnterprisePolicyGate.allowsDataset(datasetID: $0.datasetID) }
@@ -197,8 +304,6 @@ final class DatasetManager: ObservableObject {
             selectedDatasetID = ""
             UserDefaults.standard.set("", forKey: "selectedDatasetID")
         }
-        // Compute new status and publish all changes on the next runloop tick
-        // to avoid nested SwiftUI view updates warnings.
         let embedded = Set(embeddedDatasetIDsRaw.split(separator: ",").map(String.init))
         var computedStatus: [String: DatasetProcessingStatus] = [:]
         for ds in found {
@@ -214,24 +319,18 @@ final class DatasetManager: ObservableObject {
                 )
             }
         }
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.datasets = found
-            self.processingStatus = computedStatus
-            self.lastStatusByID = computedStatus
-            self.scheduleSpotlightDatasetNameIndex()
+        self.datasets = found
+        self.processingStatus = computedStatus
+        self.lastStatusByID = computedStatus
+        self.scheduleSpotlightDatasetNameIndex()
 
-            if let current = self.indexingDatasetID {
-                let stillIndexing = self.datasets.contains { $0.datasetID == current && !$0.isIndexed }
-                if !stillIndexing {
-                    self.indexingDatasetID = nil
-                    self.persistedIndexingDatasetID = ""
-                }
+        if let current = self.indexingDatasetID {
+            let stillIndexing = self.datasets.contains { $0.datasetID == current && !$0.isIndexed }
+            if !stillIndexing {
+                self.indexingDatasetID = nil
+                self.persistedIndexingDatasetID = ""
             }
         }
-
-        // Do not auto-index here; indexing is started explicitly after download
-        // or via a user action in dataset settings.
     }
 
     private func scheduleSpotlightDatasetNameIndex() {
@@ -248,7 +347,7 @@ final class DatasetManager: ObservableObject {
         NoemaSpotlightIndexingService.shared.scheduleDatasetNameIndex(records: records)
     }
 
-    private func directorySize(at url: URL) throws -> Int64 {
+    nonisolated private static func directorySize(at url: URL) throws -> Int64 {
         let fm = FileManager.default
         let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])
         var total: Int64 = 0
@@ -325,10 +424,9 @@ final class DatasetManager: ObservableObject {
     /// kick off the pre-embedding indexing pipeline.
     func handleDatasetDownloadCompleted(datasetID: String) {
         Task { await logger.log("[DatasetManager] Dataset download completed: \(datasetID)") }
-        reloadFromDisk()
-        // `reloadFromDisk()` publishes on the next runloop tick; enqueue indexing after that publish so
-        // the dataset is visible in Stored before the indexing banner appears.
-        DispatchQueue.main.async { [weak self] in
+        // Enqueue indexing only after `reloadFromDisk` has published, so the dataset is visible
+        // in Stored before the indexing banner appears.
+        reloadFromDisk { [weak self] in
             // Give one more turn of the runloop so AppModelManager's `downloadedDatasets` mirror updates too.
             DispatchQueue.main.async { [weak self] in
                 self?.ensureIndexedForID(datasetID)
@@ -393,9 +491,7 @@ final class DatasetManager: ObservableObject {
             
             Task { await logger.log("[DatasetManager] Starting DatasetRetriever.prepare for: \(ds.datasetID)") }
             await DatasetRetriever.shared.prepare(dataset: ds, pauseBeforeEmbedding: true) { status in
-                Task { @MainActor in
-                    self.updateProcessingStatus(status, for: ds.datasetID)
-                }
+                self.updateProcessingStatus(status, for: ds.datasetID)
                 // Stream logs to file on each update for transparency
                 let pct = Int(status.progress * 100)
                 let stage = self.stageName(status.stage)
@@ -511,9 +607,7 @@ final class DatasetManager: ObservableObject {
             }
 
             await DatasetRetriever.shared.prepare(dataset: ds, pauseBeforeEmbedding: false) { status in
-                Task { @MainActor in
-                    self.updateProcessingStatus(status, for: ds.datasetID)
-                }
+                self.updateProcessingStatus(status, for: ds.datasetID)
                 let pct = Int(status.progress * 100)
                 let stage = self.stageName(status.stage)
                 let etaStr: String = {
@@ -566,7 +660,10 @@ final class DatasetManager: ObservableObject {
     }
 
     // Public API: background start indexing after a download completes
-    public func startIndexing(dataset: LocalDataset) {
+    /// - Parameter autoEmbed: when true, run straight through embedding to `.completed`
+    ///   instead of pausing at the embedding gate awaiting user confirmation. Used by the
+    ///   macOS composer attach so an attached PDF is immediately ready for RAG.
+    public func startIndexing(dataset: LocalDataset, autoEmbed: Bool = false) {
         if indexingTasks[dataset.datasetID] != nil { return }
         let t = Task(priority: .background) { [weak self] in
             guard let self else { return }
@@ -592,8 +689,8 @@ final class DatasetManager: ObservableObject {
                 }
                 _ = await installTask.value
             }
-            await DatasetRetriever.shared.prepare(dataset: dataset, pauseBeforeEmbedding: true) { status in
-                Task { @MainActor in self.updateProcessingStatus(status, for: dataset.datasetID) }
+            await DatasetRetriever.shared.prepare(dataset: dataset, pauseBeforeEmbedding: !autoEmbed) { status in
+                self.updateProcessingStatus(status, for: dataset.datasetID)
             }
             await MainActor.run {
                 let status = self.processingStatus[dataset.datasetID]
@@ -699,7 +796,12 @@ final class DatasetManager: ObservableObject {
             return didCopy || !mediaPicked.isEmpty
         }.value
 
-        guard copiedAny else { return nil }
+        guard copiedAny else {
+            await Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: destDir)
+            }.value
+            return nil
+        }
 
         var didTranscribeMedia = false
         var mediaTranscriptionFailures: [String] = []
@@ -753,6 +855,9 @@ final class DatasetManager: ObservableObject {
         }
 
         guard !documentPicked.isEmpty || didTranscribeMedia else {
+            await Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: destDir)
+            }.value
             if !mediaTranscriptionFailures.isEmpty {
                 embedAlert = AlertItem(message: String.localizedStringWithFormat(
                     String(localized: "Media could not be transcribed: %@"),
@@ -773,7 +878,7 @@ final class DatasetManager: ObservableObject {
         if let ds = datasets.first(where: { $0.datasetID == datasetID }) {
             return ds
         }
-        let size = (try? directorySize(at: destDir)) ?? 0
+        let size = (try? Self.directorySize(at: destDir)) ?? 0
         let sizeMB = Double(size) / 1_048_576.0
         let attrs = try? FileManager.default.attributesOfItem(atPath: destDir.path)
         let created = attrs?[.creationDate] as? Date ?? Date()
@@ -868,10 +973,18 @@ struct DatasetRow: View {
                 .foregroundStyle(AppTheme.secondaryText)
             
             VStack(alignment: .leading, spacing: 4) {
-                Text(dataset.name)
-                    .font(FontTheme.body)
-                    .fontWeight(.medium)
-                    .foregroundStyle(AppTheme.text)
+                HStack(spacing: 6) {
+                    Text(dataset.name)
+                        .font(FontTheme.body)
+                        .fontWeight(.medium)
+                        .foregroundStyle(AppTheme.text)
+                    if datasetManager.shouldShowRAGUpgradeNotice(for: dataset) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel(Text(LocalizedStringKey("Re-embedding recommended")))
+                    }
+                }
 
                 HStack(spacing: 6) {
                     if dataset.source == "Enterprise" {

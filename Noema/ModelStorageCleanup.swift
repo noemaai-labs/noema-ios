@@ -30,9 +30,15 @@ enum ModelStorageCleanup {
         guard model.format != .afm else { return Result() }
 
         let root = installRoot(for: model)
-        let canonicalURL = InstalledModelsStore.canonicalURL(for: model.url, format: model.format)
+        var canonicalURL = InstalledModelsStore.canonicalURL(for: model.url, format: model.format)
             .resolvingSymlinksInPath()
             .standardizedFileURL
+        // A paged install's canonical URL is resident.gguf inside the package;
+        // deletion must take the whole `.noema-paged` directory with it.
+        if model.format == .gguf,
+           let packageDir = PagedPackageLocator.enclosingPackage(for: canonicalURL) {
+            canonicalURL = packageDir.resolvingSymlinksInPath().standardizedFileURL
+        }
         let remainingInstalled = installedModels.filter {
             !($0.modelID == model.modelID && $0.quantLabel == model.quant)
         }
@@ -79,6 +85,7 @@ enum ModelStorageCleanup {
         var protectedRoots = Set(installedModels.map { installRoot(for: $0).path })
         protectedRoots.insert(EmbeddingModelCatalog.baseDirectory.standardizedFileURL.path)
         protectedRoots.insert(WhisperModelCatalog.baseDirectory.standardizedFileURL.path)
+        protectedRoots.insert(VoiceModelCatalog.baseDirectory.standardizedFileURL.path)
 
         var result = Result()
         pruneDownloadFiles(under: root, activeDownloadURLs: activeDownloadURLs, result: &result, fileManager: fm)
@@ -91,9 +98,11 @@ enum ModelStorageCleanup {
         var result = Result()
         removeDirectoryIfPresent(EmbeddingModelCatalog.baseDirectory, result: &result, fileManager: fm)
         removeDirectoryIfPresent(WhisperModelCatalog.baseDirectory, result: &result, fileManager: fm)
+        removeDirectoryIfPresent(VoiceModelCatalog.baseDirectory, result: &result, fileManager: fm)
         UserDefaults.standard.removeObject(forKey: EmbeddingModelCatalog.activeModelIDKey)
         UserDefaults.standard.removeObject(forKey: TranscriptionSettings.whisperKitActiveModelKey)
         UserDefaults.standard.removeObject(forKey: TranscriptionSettings.whisperCppActiveModelKey)
+        UserDefaults.standard.removeObject(forKey: VoiceModelCatalog.installedRelativePathKey)
         return result
     }
 
@@ -241,7 +250,7 @@ enum ModelStorageCleanup {
         for owner in children {
             guard isDirectory(owner, fileManager: fm) else { continue }
             if protectedRoots.contains(owner.standardizedFileURL.path) { continue }
-            if owner.lastPathComponent == "Embeddings" || owner.lastPathComponent == "Whisper" { continue }
+            if owner.lastPathComponent == "Embeddings" || owner.lastPathComponent == "Whisper" || owner.lastPathComponent == "TTS" { continue }
 
             let repoChildren = (try? fm.contentsOfDirectory(at: owner, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
             if repoChildren.isEmpty {

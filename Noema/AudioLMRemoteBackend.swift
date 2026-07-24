@@ -148,6 +148,10 @@ struct AudioLMRemoteBackend: TranscriptionBackend {
         request.httpBody = body
         request.timeoutInterval = 600
 
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)

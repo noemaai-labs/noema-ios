@@ -30,6 +30,9 @@ struct VisionStoredPanel: View {
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
     @State private var datasetPendingDeletion: LocalDataset?
+    @State private var autopilotConfig = AutopilotConfigStore.load()
+    @State private var showAutopilotSetup = false
+    @State private var showAutopilotSettings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -37,6 +40,7 @@ struct VisionStoredPanel: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
+                    autopilotCard
                     modelsSection
                     if !modelManager.remoteBackends.isEmpty {
                         remoteSection
@@ -54,10 +58,8 @@ struct VisionStoredPanel: View {
                 .fill(.ultraThinMaterial)
         )
         .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
-        .onAppear {
-            modelManager.refresh()
-            modelManager.refreshRemoteBackends(offGrid: offGrid)
-        }
+        .onAppear { modelManager.refreshRemoteBackends(offGrid: offGrid) }
+        .task { await modelManager.refreshAsync() }
         .onChangeCompat(of: offGrid) { _, newValue in
             if !newValue {
                 modelManager.refreshRemoteBackends(offGrid: false)
@@ -95,6 +97,18 @@ struct VisionStoredPanel: View {
             RemoteBackendFormView { draft in
                 try await modelManager.addRemoteBackend(from: draft)
             }
+        }
+        .sheet(isPresented: $showAutopilotSetup, onDismiss: {
+            autopilotConfig = AutopilotConfigStore.load()
+        }) {
+            AutopilotSetupView()
+                .environmentObject(modelManager)
+        }
+        .sheet(isPresented: $showAutopilotSettings, onDismiss: {
+            autopilotConfig = AutopilotConfigStore.load()
+        }) {
+            AutopilotSettingsSheet()
+                .environmentObject(modelManager)
         }
         .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: allowedUTTypes(),
@@ -256,6 +270,109 @@ struct VisionStoredPanel: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(.ultraThinMaterial)
         )
+    }
+
+    private var autopilotConfigured: Bool {
+        autopilotConfig.isReadyToArm
+    }
+
+    private var autopilotSubtitle: String {
+        guard EnterprisePolicyGate.remoteInferenceAllowed || !autopilotConfig.requiresCloudConsent else {
+            return String(localized: "Your organization's policy keeps answers on-device.")
+        }
+        guard autopilotConfigured, let escalation = autopilotConfig.escalationDisplayName else {
+            return String(localized: "Set up Autopilot")
+        }
+        guard vm.modelLoaded, let loaded = modelManager.loadedModel else {
+            return String(localized: "Engages when a model loads")
+        }
+        return "\(loaded.displayName) → \(escalation)"
+    }
+
+    private var autopilotToggleBinding: Binding<Bool> {
+        Binding(
+            get: { modelManager.autoRoutingArmed },
+            set: { newValue in
+                // Re-read the store at decision time: this panel lives in its own
+                // window, so setup can complete elsewhere (Settings, the main
+                // window's Stored tab) while the cached snapshot is stale.
+                let config = AutopilotConfigStore.load()
+                autopilotConfig = config
+                if newValue && !config.isReadyToArm {
+                    // Arming requires configuration + consent; route through the wizard,
+                    // which flips autoRoutingArmed itself once consent is granted.
+                    showAutopilotSetup = true
+                    return
+                }
+                modelManager.autoRoutingArmed = newValue
+            }
+        )
+    }
+
+    private var autopilotCard: some View {
+        let enterpriseBlocked = !EnterprisePolicyGate.remoteInferenceAllowed
+            && autopilotConfig.requiresCloudConsent
+        return HStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(Color.cyan.opacity(modelManager.autoRoutingArmed ? 0.22 : 0.12))
+                    .frame(width: 44, height: 44)
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(modelManager.autoRoutingArmed ? Color.cyan : Color.secondary)
+            }
+            .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Autopilot")
+                    .font(.headline)
+                Text(verbatim: autopilotSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            .accessibilityElement(children: .combine)
+            Spacer(minLength: 16)
+            if enterpriseBlocked {
+                Image(systemName: "lock.fill")
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+            } else {
+                Toggle(LocalizedStringKey("Autopilot"), isOn: autopilotToggleBinding)
+                    .labelsHidden()
+                    .tint(.cyan)
+                    .accessibilityHint(Text(!autopilotConfigured
+                        ? LocalizedStringKey("Set up Autopilot")
+                        : (modelManager.autoRoutingArmed
+                            ? LocalizedStringKey("Turn off Autopilot")
+                            : LocalizedStringKey("Turn on Autopilot"))))
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(modelManager.autoRoutingArmed ? Color.cyan.opacity(0.4) : cardBorderColor, lineWidth: 1)
+        )
+        .visionHoverHighlight(cornerRadius: 24)
+        .onTapGesture {
+            // Tap reveals the same Autopilot settings as the Settings tab;
+            // the wizard is reached from there (or by flipping the toggle on
+            // while unconfigured).
+            if !enterpriseBlocked {
+                showAutopilotSettings = true
+            }
+        }
+        .opacity(enterpriseBlocked ? 0.6 : 1)
+        .animation(.easeInOut(duration: 0.2), value: modelManager.autoRoutingArmed)
+        .onAppear { autopilotConfig = AutopilotConfigStore.load() }
+        .onChangeCompat(of: modelManager.autoRoutingArmed) { _, _ in
+            autopilotConfig = AutopilotConfigStore.load()
+        }
     }
 
     private var modelsSection: some View {
@@ -645,15 +762,6 @@ struct VisionStoredPanel: View {
                 )
             )
         }
-        if let source = model.slmSourceFormatLabel {
-            chips.append(
-                ModelChip(
-                    text: source,
-                    background: .fill(Color.secondary.opacity(0.15)),
-                    foreground: .secondary
-                )
-            )
-        }
         chips.append(
             ModelChip(
                 text: model.format.displayName,
@@ -881,7 +989,8 @@ struct VisionStoredPanel: View {
                     contextLength: ctx,
                     layerCount: layerHint,
                     moeInfo: model.moeInfo,
-                    kvCacheEstimate: kvCacheEstimate
+                    kvCacheEstimate: kvCacheEstimate,
+                    runtimeConfiguration: .resolved(from: settings, modelURL: model.url)
                 ) {
                     AppSoundPlayer.play(.error)
                     Haptics.error()

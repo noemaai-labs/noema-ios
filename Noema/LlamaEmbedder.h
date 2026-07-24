@@ -1,4 +1,3 @@
-// LlamaEmbedder.h
 #import <Foundation/Foundation.h>
 
 NS_ASSUME_NONNULL_BEGIN
@@ -13,9 +12,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)isReady;
 - (int)dimension;
 - (int)countTokens:(NSString *)text;
-- (BOOL)embedText:(NSString *)text intoBuffer:(float *)buffer length:(int)length; // returns YES on success
+// Writes one pooled row per input in order. rowStride is measured in floats.
+- (BOOL)embedTexts:(NSArray<NSString *> *)texts
+         intoBuffer:(float *)buffer
+          rowStride:(int)rowStride;
 - (void)unload;
 @end
 
 NS_ASSUME_NONNULL_END
-

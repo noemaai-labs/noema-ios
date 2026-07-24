@@ -53,4 +53,18 @@ final class QuantExtractorETTests: XCTestCase {
         XCTAssertFalse(quant.isMultipart)
         XCTAssertEqual(quant.allRelativeDownloadPaths, ["model.pte"])
     }
+
+    func testETQuantPrefersXNNPACKAndQuantizedPrograms() throws {
+        let files = [
+            RepoFile(path: "e2b/mlx/gemma_fp16.pte", size: 4_000, sha256: nil),
+            RepoFile(path: "e2b/vulkan/gemma_8da4w.pte", size: 2_000, sha256: nil),
+            RepoFile(path: "e2b/xnnpack/gemma_8da4w.pte", size: 2_100, sha256: nil)
+        ]
+
+        let quants = QuantExtractor.extract(from: files, repoID: "owner/gemma")
+        let preferred = try XCTUnwrap(quants.first(where: { $0.format == .et }))
+
+        XCTAssertEqual(preferred.label, "ET-XNNPACK")
+        XCTAssertTrue(preferred.downloadURL.path.contains("/xnnpack/"))
+    }
 }
