@@ -1,4 +1,3 @@
-// OpenTextbookPager.swift
 import Foundation
 import SwiftUI
 

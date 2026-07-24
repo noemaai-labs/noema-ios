@@ -181,6 +181,14 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
 }
 
+bool ggml_backend_metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_metal(buffer)) {
+        return false;
+    }
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
+    return ctx != nullptr && ggml_metal_buffer_is_shared(ctx);
+}
+
 //
 // buffer types
 //

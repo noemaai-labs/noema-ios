@@ -3,6 +3,14 @@ set -eu
 
 echo "Preparing Noema dependencies for Xcode Cloud"
 
+# Xcode Cloud builds non-interactively, so it can't show the one-time trust prompt
+# for build-tool plugins and Swift macros. Pre-approve them. The plugin key fixes
+# mlx-swift's CudaBuild build-tool plugin (a no-op on Apple platforms but still
+# gated); the macro key covers macro-based packages such as MLXHuggingFace.
+# "Validatation" is Apple's actual (misspelled) default key, not a typo here.
+defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"

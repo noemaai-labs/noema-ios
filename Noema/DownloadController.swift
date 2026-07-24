@@ -1,4 +1,3 @@
-// DownloadController.swift
 #if canImport(UIKit) || os(macOS)
 import Foundation
 import SwiftUI
@@ -8,19 +7,50 @@ import Network
 import UIKit
 #endif
 
+/// High-frequency download presentation invalidations are deliberately separate
+/// from DownloadController. The controller is injected above the whole tab tree;
+/// broadcasting progress through it makes unrelated screens such as Settings
+/// recompute while the user scrolls.
+@MainActor
+final class DownloadPresentationUpdates: ObservableObject {
+    static let shared = DownloadPresentationUpdates()
+
+    private init() {}
+
+    fileprivate func publish() {
+        objectWillChange.send()
+    }
+}
+
 @MainActor
 final class DownloadController: ObservableObject {
-	// Smoothing constant for download speed (EMA). Lower = steadier.
-    private let speedEMAAlpha: Double = 0.30
+	private static func saturatingByteSum(_ values: Int64...) -> Int64 {
+        values.reduce(into: Int64(0)) { total, value in
+            let (sum, overflow) = total.addingReportingOverflow(max(0, value))
+            total = overflow ? .max : sum
+        }
+    }
+
+    enum ProjectorDownloadDecision: Sendable {
+        case automatic
+        case selected(VisionProjectorArtifact)
+        case skip
+    }
+
+	// Download speeds smooth through a time-based EMA: the blend factor derives from
+	// elapsed time (1 - e^(-dt/τ)), not event count, so 10 Hz delegate ticks and
+	// 0.25–0.5 s samplers converge identically instead of the fast tick rate
+	// collapsing the EMA into the raw half-second window sample.
+    private let speedSmoothingTimeConstant: TimeInterval = 2.5
+    private var speedEMAs: [String: (value: Double, updatedAt: Date)] = [:]
 	// Consider speeds stale if no update arrives within this window
-	private let speedStaleAfter: TimeInterval = 1.25
+	private let speedStaleAfter: TimeInterval = 5.0
 	// Clamp unrealistically large instantaneous spikes (in B/s)
     // Upper bound for instantaneous samples to avoid UI spikes; set high enough to not mask real speeds
     private let maxInstantaneousSpeed: Double = 512 * 1024 * 1024 // ~512 MB/s
 
     // Track last time we updated a speed sample per item category
     private var lastModelSpeedSampleAt: [String: Date] = [:]
-    private var lastLeapSpeedSampleAt: [String: Date] = [:]
     private var lastDatasetSpeedSampleAt: [String: Date] = [:]
     private var speedCoastTask: Task<Void, Never>? = nil
     // Per-main-model speed sampling state (computed from fraction * expected)
@@ -37,12 +67,11 @@ final class DownloadController: ObservableObject {
     private var loggedMMProjExpected: [String: Int64] = [:]
     private var loggedIMatrixExpected: [String: Int64] = [:]
     private var loggedDatasetExpected: [String: Int64] = [:]
-    private var loggedLeapExpected: [String: Int64] = [:]
     private var loggedEmbedExpected: [String: Int64] = [:]
-    // Throttle expensive disk probing in refreshCombinedProgress to avoid main-thread I/O jank
-    private var lastDiskProbeAt: [String: Date] = [:]
-    private let diskProbeInterval: TimeInterval = 2.0
-
+    // Last whole-percent surfaced per embedding download id. The delegate already caps
+    // callbacks at 10 Hz; this suppresses redundant progress mutations that would otherwise
+    // re-arm the 5 Hz coalesced publish (and its UI / VoiceOver re-render) on every tick.
+    private var lastEmbedReportedPct: [String: Int] = [:]
     private static let byteFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.countStyle = .file
@@ -109,24 +138,6 @@ final class DownloadController: ObservableObject {
 			case .permanentError(let message): return message
 			}
 		}
-	}
-
-	struct LeapItem: Identifiable, Equatable {
-        var jobID: String? = nil
-		let entry: LeapCatalogEntry
-        var status: DownloadJobState = .queued
-        var canPause: Bool = true
-        var canResume: Bool = false
-		var progress: Double = 0
-		var speed: Double = 0
-		/// Expected total bytes for this ET bundle. Filled when download starts or on first progress event.
-		var expectedBytes: Int64 = 0
-		var completed = false
-		var verifying = false
-		/// Number of consecutive retries for backoff
-		var retryCount: Int = 0
-
-		var id: String { entry.slug }
 	}
 
         struct DatasetItem: Identifiable, Equatable {
@@ -220,30 +231,30 @@ final class DownloadController: ObservableObject {
 
 	/// Active downloads keyed by "<modelID>-<quantLabel>"
 	///
-	/// These arrays are mutated on every progress tick (up to 10 Hz per artifact).
+	/// These arrays are mutated on coalesced progress ticks.
 	/// They are intentionally NOT @Published: each @Published mutation fires
 	/// objectWillChange immediately, which re-evaluates every view observing this
-	/// controller (MainView, ExploreView, StoredView, overlay, popup) and makes the
-	/// whole UI lag during downloads. Instead, didSet funnels into a coalesced
-	/// publish that emits at most once per `publishInterval`.
+	/// controller (including the root tab hierarchy and Settings). Instead, didSet
+	/// funnels into a scoped presentation update observed only by download UI.
 	private(set) var items: [Item] = [] { didSet { scheduleCoalescedPublish() } }
-	private(set) var leapItems: [LeapItem] = [] { didSet { scheduleCoalescedPublish() } }
 	private(set) var datasetItems: [DatasetItem] = [] { didSet { scheduleCoalescedPublish() } }
 	private(set) var embeddingItems: [EmbeddingItem] = [] { didSet { scheduleCoalescedPublish() } }
     private(set) var whisperItems: [WhisperItem] = [] { didSet { scheduleCoalescedPublish() } }
 
-    // Replacements for the synthesized $items / $leapItems publishers; they emit the
-    // current value on subscribe and then at the coalesced cadence.
+    // Replacement for the synthesized $items publisher; it emits the current value
+    // on subscribe and then at the coalesced cadence.
     private let itemsSubject = CurrentValueSubject<[Item], Never>([])
-    private let leapItemsSubject = CurrentValueSubject<[LeapItem], Never>([])
     var itemsPublisher: AnyPublisher<[Item], Never> { itemsSubject.eraseToAnyPublisher() }
-    var leapItemsPublisher: AnyPublisher<[LeapItem], Never> { leapItemsSubject.eraseToAnyPublisher() }
 
     private var publishScheduled = false
+    private var forceNextUIPublish = false
     private var lastPublishAt: Date = .distantPast
-    private let publishInterval: TimeInterval = 0.2
+    // Two SwiftUI invalidations per second keeps progress legible without making
+    // every view observing this controller re-render continuously.
+    private let publishInterval: TimeInterval = 0.5
 
-    private func scheduleCoalescedPublish() {
+    private func scheduleCoalescedPublish(forceUI: Bool = false) {
+        if forceUI { forceNextUIPublish = true }
         guard !publishScheduled else { return }
         publishScheduled = true
         let delay = max(0, publishInterval - Date().timeIntervalSince(lastPublishAt))
@@ -252,9 +263,23 @@ final class DownloadController: ObservableObject {
             guard let self else { return }
             self.publishScheduled = false
             self.lastPublishAt = Date()
-            self.objectWillChange.send()
-            self.itemsSubject.send(self.items)
-            self.leapItemsSubject.send(self.leapItems)
+            let shouldPublishUI: Bool = {
+#if canImport(UIKit)
+                self.forceNextUIPublish || UIApplication.shared.applicationState == .active
+#else
+                true
+#endif
+            }()
+            self.forceNextUIPublish = false
+            if shouldPublishUI {
+                DownloadPresentationUpdates.shared.publish()
+                self.itemsSubject.send(self.items)
+            }
+#if os(iOS)
+            if #available(iOS 26.0, *) {
+                ContinuedDownloadCoordinator.shared.updateProgress(self.overallProgress, title: nil)
+            }
+#endif
         }
     }
 	@Published var showOverlay = false
@@ -281,6 +306,9 @@ final class DownloadController: ObservableObject {
 	// pause/cancel event from the dying transfer consumes this and restarts the download
 	// instead of settling the row back to paused/failed.
 	private var resumePendingIDs: Set<String> = []
+	// Consecutive GGUF-magic validation failures per item. Caps the background
+	// redownload loop when a server persistently serves garbage with HTTP 200.
+	private var ggufValidationFailures: [String: Int] = [:]
 	// Explicit module qualification avoids ambiguity with similarly named types
 #if os(macOS) && !canImport(UIKit)
 	private weak var modelManager: AnyObject?
@@ -292,53 +320,93 @@ final class DownloadController: ObservableObject {
     private let scheduleNetworkQueue = DispatchQueue(label: "download.schedule.network")
     private var schedulePathMonitor: NWPathMonitor?
     private var scheduleNetworkPath: NWPath?
+    private var scheduleRecheckTask: Task<Void, Never>? = nil
     private var hasBootstrappedDownloads = false
     private var lastAutomaticMaintenanceAt: Date? = nil
     private let automaticMaintenanceInterval: TimeInterval = 30
+    private var lastAutoFinalizeSweepAt: Date = .distantPast
+    private let autoFinalizeSweepInterval: TimeInterval = 5
+    // IDs that participated in the current continued-processing batch. Retaining
+    // this set through completion lets us report only this batch's failures rather
+    // than letting an unrelated old failed row poison the system task result.
+    private var continuedProcessingBatchIDs: Set<String> = []
 
-	init() {
-		// Periodically zero speeds that have gone stale (e.g., pause, network stall)
+    /// Folds an instantaneous sample into the per-transfer EMA using a time-based
+    /// blend factor. Alpha is capped at 0.5 so the first sample after a long gap
+    /// (network stall) can pull the average at most halfway: that sample's dt
+    /// window spans the whole stall, so its byte rate is stall-diluted and would
+    /// otherwise re-seed the EMA with a misleadingly tiny value.
+    private func smoothedSpeed(key: String, instantaneous: Double, now: Date = Date()) -> Double {
+        let inst = max(0, min(instantaneous, maxInstantaneousSpeed))
+        guard let previous = speedEMAs[key] else {
+            speedEMAs[key] = (inst, now)
+            return inst
+        }
+        let dt = max(0, now.timeIntervalSince(previous.updatedAt))
+        let alpha = min(0.5, 1 - exp(-dt / speedSmoothingTimeConstant))
+        let value = previous.value + alpha * (inst - previous.value)
+        speedEMAs[key] = (value, now)
+        return value
+    }
+
+    private func clearSpeedSmoothing(for id: String) {
+        speedEMAs[id] = nil
+        speedEMAs["\(id)|main"] = nil
+        speedEMAs["\(id)|mmproj"] = nil
+        speedEMAs["\(id)|imatrix"] = nil
+    }
+
+    init() {
         speedCoastTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     let now = Date()
-            		// Models – batch mutations to avoid separate @Published emissions per property
-            		for i in items.indices {
-            			let id = items[i].id
-            			if let t = lastModelSpeedSampleAt[id], now.timeIntervalSince(t) > speedStaleAfter || paused.contains(id) {
-                            var item = items[i]
-                            item.speed = 0
-                            item.mainSpeed = 0
-                            item.mmprojSpeed = 0
-                            item.imatrixSpeed = 0
-                            items[i] = item
-            			}
-            		}
-					// Leaps
-					for i in leapItems.indices {
-						let id = leapItems[i].id
-						if let t = lastLeapSpeedSampleAt[id], now.timeIntervalSince(t) > speedStaleAfter {
-							leapItems[i].speed = 0
-						}
-					}
-					// Datasets
-            		for i in datasetItems.indices {
-            			let id = datasetItems[i].id
-            			if let t = lastDatasetSpeedSampleAt[id], now.timeIntervalSince(t) > speedStaleAfter {
-            				datasetItems[i].speed = 0
-            			}
-            		}
+                    // A stale display keeps its EMA; an explicit pause resets it.
+                    for i in items.indices {
+                        let id = items[i].id
+                        if let t = lastModelSpeedSampleAt[id], now.timeIntervalSince(t) > speedStaleAfter || paused.contains(id) {
+                            if items[i].speed != 0 || items[i].mainSpeed != 0 ||
+                                items[i].mmprojSpeed != 0 || items[i].imatrixSpeed != 0 {
+                                var item = items[i]
+                                item.speed = 0
+                                item.mainSpeed = 0
+                                item.mmprojSpeed = 0
+                                item.imatrixSpeed = 0
+                                items[i] = item
+                            }
+                            if paused.contains(id) {
+                                clearSpeedSmoothing(for: id)
+                            }
+                        }
+                    }
+                    for i in datasetItems.indices {
+                        let id = datasetItems[i].id
+                        if let t = lastDatasetSpeedSampleAt[id], now.timeIntervalSince(t) > speedStaleAfter {
+                            if datasetItems[i].speed != 0 { datasetItems[i].speed = 0 }
+                            if paused.contains(id) {
+                                clearSpeedSmoothing(for: id)
+                            }
+                        }
+                    }
                     for i in whisperItems.indices {
                         let id = whisperItems[i].id
                         if let t = lastDatasetSpeedSampleAt[id], now.timeIntervalSince(t) > speedStaleAfter {
-                            whisperItems[i].speed = 0
+                            if whisperItems[i].speed != 0 { whisperItems[i].speed = 0 }
+                            if paused.contains(id) {
+                                clearSpeedSmoothing(for: id)
+                            }
                         }
                     }
                     // If a download reached 100% but never fired .finished (e.g., delegate lost),
-                    // finalize it when the on-disk files are present.
-                    autoFinalizeCompletedOnDisk()
+                    // perform the on-disk fallback occasionally, not on every one-second
+                    // speed tick. Its file probes are synchronous and only useful near 100%.
+                    if now.timeIntervalSince(lastAutoFinalizeSweepAt) >= autoFinalizeSweepInterval,
+                       items.contains(where: { !$0.completed && $0.progress >= 0.995 }) {
+                        lastAutoFinalizeSweepAt = now
+                        autoFinalizeCompletedOnDisk()
+                    }
                 }
             }
         }
@@ -403,17 +471,30 @@ final class DownloadController: ObservableObject {
 #if canImport(UIKit) && !os(visionOS)
         engineObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.scheduleCoalescedPublish(forceUI: true)
                 _ = await self?.runDownloadMaintenance(manual: false)
                 await self?.reconcileLiveBackgroundSnapshots()
                 await self?.resumeScheduledJobsFromEngine()
                 self?.updateWakeLock()
             }
         })
+#endif
+#if canImport(UIKit)
         engineObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { _ in
             ForegroundDownloadWakeLock.shared.release()
+            Task { await DownloadEngine.shared.checkpointProgress() }
         })
 #endif
         startScheduleConditionMonitoring()
+        // NWPathMonitor only fires on network changes, and macOS/visionOS have no
+        // BGProcessingTask or didBecomeActive maintenance hook, so entering the
+        // overnight window would never be noticed there without a periodic recheck.
+        scheduleRecheckTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(300))
+                await self?.resumeScheduledJobsFromEngine()
+            }
+        }
     }
 
     private func hasGGUFMagic(at url: URL) -> Bool {
@@ -432,7 +513,10 @@ final class DownloadController: ObservableObject {
         }
         mutate(&obj)
         if let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
-            try? out.write(to: artifactsURL)
+            do {
+                try out.write(to: artifactsURL)
+                MtpLocator.invalidateCache()
+            } catch {}
         }
     }
 
@@ -526,9 +610,12 @@ final class DownloadController: ObservableObject {
         req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         req.setValue("Noema/1.0 (+https://noema.app)", forHTTPHeaderField: "User-Agent")
 
+        // Download to the staging path the engine artifact declares (destinationURL ==
+        // stagingURL); pause/cancel fanout and live-task lookups all key off that path.
+        let stagedDest = Self.stagingURL(for: dest)
         if let idx = items.firstIndex(where: { $0.id == itemID }) {
             items[idx].imatrixProgress = 0
-            items[idx].imatrixDestination = dest
+            items[idx].imatrixDestination = stagedDest
         }
 
         var lastProgressTickAt: Date = .distantPast
@@ -544,7 +631,7 @@ final class DownloadController: ObservableObject {
         do {
             try await BackgroundDownloadManager.shared.download(
                 request: req,
-                to: dest,
+                to: stagedDest,
                 jobID: jobID,
                 artifactID: DurableArtifactID.importanceMatrix,
                 expectedSize: (imatrix.sizeBytes > 0 ? imatrix.sizeBytes : nil),
@@ -559,7 +646,7 @@ final class DownloadController: ObservableObject {
                         guard let idx = self.items.firstIndex(where: { $0.id == itemID }) else { return }
                         var item = self.items[idx]
                         item.imatrixProgress = clamped
-                        item.imatrixDestination = dest
+                        item.imatrixDestination = stagedDest
                         let totalExpected = max(Int64(1), item.mainExpectedBytes + item.mmprojSize + item.imatrixSize)
                         let doneBytes = item.mainBytesWritten + item.mmprojBytesWritten + item.imatrixBytesWritten
                         item.progress = Double(doneBytes) / Double(totalExpected)
@@ -590,7 +677,7 @@ final class DownloadController: ObservableObject {
                         }
                         let effectiveExpected = max(item.imatrixSize, expected, written, 1)
                         item.imatrixProgress = min(0.999, Double(written) / Double(effectiveExpected))
-                        item.imatrixDestination = dest
+                        item.imatrixDestination = stagedDest
                         let now = Date()
                         let totalExpected = max(Int64(1), item.mainExpectedBytes + item.mmprojSize + item.imatrixSize)
                         let doneBytes = item.mainBytesWritten + item.mmprojBytesWritten + item.imatrixBytesWritten
@@ -609,15 +696,11 @@ final class DownloadController: ObservableObject {
                         if dt >= 0.25 {
                             let bytesDelta = written - lastBytesVal!
                             let rawSpeed = dt > 0 ? Double(bytesDelta) / dt : 0.0
-                            let instSpeed = max(0, min(rawSpeed, self.maxInstantaneousSpeed))
 
                             self.lastIMatrixSpeedSampleAt[itemID] = now
                             self.lastIMatrixBytesSample[itemID] = written
 
-                            let alpha = self.speedEMAAlpha
-                            let prev = item.imatrixSpeed
-                            let newSpeed = (prev > 0) ? (1 - alpha) * prev + alpha * instSpeed : instSpeed
-                            item.imatrixSpeed = newSpeed
+                            item.imatrixSpeed = self.smoothedSpeed(key: "\(itemID)|imatrix", instantaneous: rawSpeed, now: now)
                             item.speed = min(self.maxInstantaneousSpeed, item.mainSpeed + item.mmprojSpeed + item.imatrixSpeed)
                             self.lastModelSpeedSampleAt[itemID] = now
                         }
@@ -639,6 +722,7 @@ final class DownloadController: ObservableObject {
             throw error
         }
 
+        try finalizeStagedDownload(from: stagedDest, to: dest)
         guard hasGGUFMagic(at: dest) else {
             try? FileManager.default.removeItem(at: dest)
             throw URLError(.cannotParseResponse)
@@ -667,6 +751,31 @@ final class DownloadController: ObservableObject {
         )
     }
 
+    /// Marks the artifact that landed at `destinationURL` completed and reports whether every
+    /// artifact of the job is now complete. A single finished file must not finalize a
+    /// multi-artifact job: incomplete jobs are parked in `.retrying` (autoResumeEligible) and
+    /// a resume pass is scheduled here — not every caller (e.g. maintenance repairs) follows
+    /// up with one, and nothing else would restart the remainder.
+    private func settleArtifactCompletion(externalID: String, destinationURL: URL) async -> Bool {
+        guard let job = await DownloadEngine.shared.job(forExternalID: externalID) else { return true }
+        if let artifact = job.artifacts.first(where: {
+            $0.stagingURL.path == destinationURL.path || $0.finalURL.path == destinationURL.path
+        }), artifact.state != .completed {
+            await DownloadEngine.shared.markArtifactCompleted(
+                externalID: externalID,
+                artifactID: artifact.id,
+                finalBytes: fileSize(at: destinationURL) ?? 0
+            )
+        }
+        guard let refreshed = await DownloadEngine.shared.job(forExternalID: externalID) else { return true }
+        let allCompleted = !refreshed.artifacts.isEmpty && refreshed.artifacts.allSatisfy { $0.state == .completed }
+        if !allCompleted, tasks[externalID] == nil, !refreshed.manualPause, refreshed.state != .scheduled {
+            await DownloadEngine.shared.updateJobState(externalID: externalID, state: .retrying, manualPause: false)
+            Task { await self.resumeRecoverableJobsFromEngine() }
+        }
+        return allCompleted
+    }
+
     @MainActor
     private func handleBackgroundDownloadCompletion(destinationURL: URL?, errorMessage: String?) async {
         if let msg = errorMessage { print("[DownloadController] Background download failed: \(msg)"); return }
@@ -688,6 +797,18 @@ final class DownloadController: ObservableObject {
             let finalURL = baseDir.appendingPathComponent(rel)
             return resolvedDestinationURL.path == tmpURL.path || resolvedDestinationURL.path == finalURL.path
         }) {
+            let recoveredItem = items[index]
+            if let recoveredJob = await DownloadEngine.shared.job(forExternalID: recoveredItem.id),
+               Self.requiresCanonicalModelFinalization(
+                   state: recoveredJob.state,
+                   allArtifactsCompleted: recoveredJob.artifacts.allSatisfy { $0.state == .completed }
+               ) {
+                if tasks[recoveredItem.id] == nil {
+                    await logger.log("[Download][Recovery] resuming canonical model finalization externalID=\(recoveredItem.id)")
+                    start(detail: recoveredItem.detail, quant: recoveredItem.quant, userInitiated: false)
+                }
+                return
+            }
             if items[index].quant.isMultipart {
                 refreshCombinedProgress(at: index)
                 return
@@ -768,15 +889,21 @@ final class DownloadController: ObservableObject {
         }) {
             guard !datasetItems[index].completed else { return }
             let removedID = datasetItems[index].id
-            datasetItems[index].completed = true
-            datasetItems[index].status = .completed
-            datasetItems[index].canPause = false
-            datasetItems[index].canResume = false
-            datasetItems[index].progress = 1.0
-            datasetItems[index].speed = 0
-            Task {
-                await DownloadEngine.shared.updateJobState(externalID: removedID, state: .completed, manualPause: false)
-            }
+            // A multi-file dataset must not finalize (or start indexing) off a single
+            // finished file; park it for auto-resume until every artifact completed.
+            guard await settleArtifactCompletion(externalID: removedID, destinationURL: resolvedDestinationURL) else { return }
+            // Re-check after the suspension: two straggler completion notifications can
+            // both pass the guard above and both see allCompleted; only one may finalize.
+            guard let idx = datasetItems.firstIndex(where: { $0.id == removedID }),
+                  !datasetItems[idx].completed else { return }
+            datasetItems[idx].completed = true
+            datasetItems[idx].status = .completed
+            datasetItems[idx].canPause = false
+            datasetItems[idx].canResume = false
+            datasetItems[idx].progress = 1.0
+            datasetItems[idx].speed = 0
+            await DownloadEngine.shared.updateJobState(externalID: removedID, state: .completed, manualPause: false)
+            datasetManager?.handleDatasetDownloadCompleted(datasetID: removedID)
             Haptics.success()
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(3))
@@ -787,9 +914,10 @@ final class DownloadController: ObservableObject {
             return
         }
 
-        Task { @MainActor [weak self] in
-            guard let self, let job = await DownloadEngine.shared.job(matching: resolvedDestinationURL) else { return }
-            switch job.owner {
+        // Awaited (not spawned) so job-state changes land before the caller's
+        // resumeRecoverableJobsFromEngine pass evaluates this job.
+        guard let job = await DownloadEngine.shared.job(matching: resolvedDestinationURL) else { return }
+        switch job.owner {
             case .embedding(let owner):
                 if let record = EmbeddingModelCatalog.record(matchingDownloadIdentifier: owner.externalID) ?? EmbeddingModelCatalog.record(matchingDownloadIdentifier: owner.repoID) {
                     UserDefaults.standard.set(true, forKey: "hasInstalledEmbedModel:\(record.installedURL.path)")
@@ -809,52 +937,10 @@ final class DownloadController: ObservableObject {
                 await DownloadEngine.shared.updateJobState(externalID: owner.externalID, state: .completed, manualPause: false)
                 self.scheduleJobRemoval(externalID: owner.externalID, delay: 1.2)
             case .dataset(let owner):
+                guard await settleArtifactCompletion(externalID: owner.detail.id, destinationURL: resolvedDestinationURL) else { return }
                 self.datasetManager?.handleDatasetDownloadCompleted(datasetID: owner.detail.id)
                 await DownloadEngine.shared.updateJobState(externalID: owner.detail.id, state: .completed, manualPause: false)
                 self.scheduleJobRemoval(externalID: owner.detail.id, delay: 3)
-            case .leap(let owner):
-                let modelURL: URL
-                switch owner.entry.artifactKind {
-                case .bundle:
-                    modelURL = resolvedDestinationURL
-                case .manifest:
-                    let installDir = InstalledModelsStore.baseDir(for: .et, modelID: owner.entry.modelID)
-                        .appendingPathComponent(owner.entry.slug, isDirectory: true)
-                    if resolvedDestinationURL.pathExtension.lowercased() == "gguf" {
-                        modelURL = resolvedDestinationURL
-                    } else if let candidate = (try? FileManager.default.contentsOfDirectory(at: installDir, includingPropertiesForKeys: nil))?.first(where: {
-                        let lower = $0.lastPathComponent.lowercased()
-                        return lower.hasSuffix(".gguf") && !lower.contains("mmproj") && !lower.contains("projector")
-                    }) {
-                        modelURL = candidate
-                    } else {
-                        modelURL = resolvedDestinationURL
-                    }
-                }
-                let installed = InstalledModel(
-                    modelID: owner.entry.modelID,
-                    quantLabel: owner.entry.quantization,
-                    url: modelURL,
-                    format: .et,
-                    sizeBytes: (try? FileManager.default.attributesOfItem(atPath: modelURL.path)[.size] as? Int64) ?? owner.entry.sizeBytes,
-                    lastUsed: nil,
-                    installDate: Date(),
-                    checksum: owner.entry.sha256,
-                    isFavourite: false,
-                    totalLayers: 0,
-                    isMultimodal: owner.entry.isVision,
-                    isToolCapable: true,
-                    moeInfo: nil
-                )
-#if os(macOS) && !canImport(UIKit)
-                if let manager = self.modelManager as? AppModelManager {
-                    manager.install(installed)
-                }
-#else
-                self.modelManager?.install(installed)
-#endif
-                await DownloadEngine.shared.updateJobState(externalID: owner.entry.slug, state: .completed, manualPause: false)
-                self.scheduleJobRemoval(externalID: owner.entry.slug, delay: 3)
             case .whisper(let owner):
                 if let idx = self.whisperItems.firstIndex(where: { $0.id == owner.externalID }) {
                     self.whisperItems[idx].status = .completed
@@ -869,9 +955,8 @@ final class DownloadController: ObservableObject {
                 self.scheduleJobRemoval(externalID: owner.externalID, delay: 1.2)
             case .model:
                 break
-            }
-            await self.refreshFromEngineSnapshot()
         }
+        await refreshFromEngineSnapshot()
     }
 
     private func finalizeModelAfterBackgroundCompletion(itemIndex: Int, tmpOrFinalURL: URL) {
@@ -889,6 +974,76 @@ final class DownloadController: ObservableObject {
                 print("[DownloadController] Failed to move completed file: \(error)")
             }
         }
+        // Mirror the primary download path's validation: never install an HTML error page
+        // or LFS pointer as model weights. Discard the file and let auto-resume redownload
+        // once; a second bad payload means the server is persistently serving garbage, so
+        // fail permanently instead of looping full-file redownloads.
+        if item.quant.format == .gguf, !hasGGUFMagic(at: finalURL) {
+            let externalID = item.id
+            // Only an existing-but-invalid payload counts toward the cap; a duplicate
+            // completion event for an already-discarded file must not burn retry budget.
+            if fm.fileExists(atPath: finalURL.path) {
+                try? fm.removeItem(at: finalURL)
+                ggufValidationFailures[externalID, default: 0] += 1
+            }
+            if ggufValidationFailures[externalID, default: 0] >= 2 {
+                ggufValidationFailures[externalID] = nil
+                let downloadError = categorizeError(URLError(.cannotParseResponse))
+                items[itemIndex].status = .failed
+                items[itemIndex].error = downloadError
+                items[itemIndex].canPause = false
+                items[itemIndex].canResume = false
+                items[itemIndex].speed = 0
+                Task { @MainActor in
+                    await logger.log("[DownloadController] GGUF magic check failed repeatedly for \(finalURL.lastPathComponent); marking failed")
+                    if let job = await DownloadEngine.shared.job(forExternalID: externalID),
+                       let artifact = job.artifacts.first(where: { $0.finalURL.path == finalURL.path }) {
+                        await DownloadEngine.shared.updateArtifactState(
+                            externalID: externalID,
+                            artifactID: artifact.id,
+                            state: .failed,
+                            errorMessage: downloadError.localizedDescription,
+                            manualPause: false
+                        )
+                    }
+                    await DownloadEngine.shared.updateJobState(
+                        externalID: externalID,
+                        state: .failed,
+                        manualPause: false,
+                        errorMessage: downloadError.localizedDescription
+                    )
+                    try? await Task.sleep(for: .seconds(5))
+                    self.items.removeAll { $0.id == externalID }
+                    self.lastMainSpeedSampleAt[externalID] = nil
+                    self.lastMainBytesSample[externalID] = nil
+                    if self.allItems.isEmpty { self.showOverlay = false }
+                }
+                return
+            }
+            items[itemIndex].status = .retrying
+            items[itemIndex].canPause = false
+            items[itemIndex].canResume = true
+            items[itemIndex].mainProgress = 0
+            items[itemIndex].mainBytesWritten = 0
+            refreshCombinedProgress(at: itemIndex)
+            Task { @MainActor in
+                await logger.log("[DownloadController] GGUF magic check failed for \(finalURL.lastPathComponent); discarding and retrying")
+                if let job = await DownloadEngine.shared.job(forExternalID: externalID),
+                   let artifact = job.artifacts.first(where: { $0.finalURL.path == finalURL.path }) {
+                    await DownloadEngine.shared.updateArtifactState(
+                        externalID: externalID,
+                        artifactID: artifact.id,
+                        state: .retrying,
+                        downloadedBytes: 0,
+                        manualPause: false
+                    )
+                }
+                await DownloadEngine.shared.updateJobState(externalID: externalID, state: .retrying, manualPause: false)
+                await self.resumeRecoverableJobsFromEngine()
+            }
+            return
+        }
+        ggufValidationFailures[item.id] = nil
         // Update artifacts.json to point at the weights for later recovery
         do {
             let artifactsURL = dir.appendingPathComponent("artifacts.json")
@@ -911,7 +1066,8 @@ final class DownloadController: ObservableObject {
                 obj["mtp"] = NSNull()
             }
             let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
-            try? out.write(to: artifactsURL)
+            try out.write(to: artifactsURL)
+            MtpLocator.invalidateCache()
         } catch {}
 
         // Mark UI state
@@ -1135,6 +1291,13 @@ final class DownloadController: ObservableObject {
         let fm = FileManager.default
         for idx in items.indices {
             if items[idx].completed { continue }
+            // This fallback is for orphaned rows only. An active wrapper owns validation,
+            // metadata/sidecar work, and registration and must be allowed to finish them.
+            if tasks[items[idx].id] != nil { continue }
+            // A persisted verifying/finalizing job has canonical owner-specific work left
+            // (metadata, sidecars, registration). Relaunch recovery will restart that owner;
+            // the generic on-disk fallback must not short-circuit it into a minimal install.
+            if items[idx].status == .verifying || items[idx].status == .finalizing { continue }
             // Require near-complete progress to avoid hijacking active downloads.
             if items[idx].progress < 0.995 { continue }
             let baseDir = InstalledModelsStore.baseDir(for: items[idx].quant.format, modelID: items[idx].detail.id)
@@ -1168,7 +1331,12 @@ final class DownloadController: ObservableObject {
 		"\(detail.id)-\(quant.label)"
 	}
 
-	func start(detail: ModelDetails, quant: QuantInfo) {
+	func start(
+        detail: ModelDetails,
+        quant: QuantInfo,
+        userInitiated: Bool = true,
+        projectorDecision: ProjectorDownloadDecision = .automatic
+    ) {
 		let id = key(for: detail, quant: quant)
 		if tasks[id] != nil { return }
 		cancelledExternalIDs.remove(id)
@@ -1181,6 +1349,7 @@ final class DownloadController: ObservableObject {
 			items.append(item)
 		}
 		showOverlay = true
+		updateWakeLock(userInitiated: userInitiated)
 
 			let t = Task { [weak self] in
 				guard let self else { return }
@@ -1241,29 +1410,40 @@ final class DownloadController: ObservableObject {
                         await self.preflightFail(error, itemID: id)
                         return
                     }
-					// Discover mmproj via HF API file list; search the quant's repo first, then fall back to the base repo
-					var selected: (name: String, url: URL, size: Int64)? = nil
-					var repoCandidates: [String] = []
-                    if let quantRepo = self.huggingFaceRepoID(from: quant.downloadURL) {
-					repoCandidates.append(quantRepo)
-				}
-					if !repoCandidates.contains(detail.id) {
-						repoCandidates.append(detail.id)
-					}
+					// Resolve the projector using the global precision preference. Explore
+                    // preflights exact preferences and passes the user's explicit fallback choice.
+                    let repoCandidates = VisionModelDetector.repositoryCandidates(
+                        modelID: detail.id,
+                        downloadURL: quant.downloadURL
+                    )
 					let token = UserDefaults.standard.string(forKey: "huggingFaceToken")?.trimmingCharacters(in: .whitespacesAndNewlines)
-					for repo in repoCandidates {
-						if let proj = await VisionModelDetector.projectorMetadata(repoId: repo, token: token) {
-							let escapedRepo = repo.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repo
-							let url = URL(string: "https://huggingface.co/\(escapedRepo)/resolve/main/\(proj.filename)?download=1")!
-							var size = proj.size
-							if size <= 0 {
-								let headSize = await self.fetchRemoteSize(url)
-								if headSize > 0 { size = headSize }
-							}
-							selected = (proj.filename, url, size)
-							break
-						}
-					}
+                    let selectedArtifact: VisionProjectorArtifact?
+                    switch projectorDecision {
+                    case .selected(let artifact):
+                        selectedArtifact = artifact
+                    case .skip:
+                        selectedArtifact = nil
+                    case .automatic:
+                        let plan = await VisionModelDetector.projectorDownloadPlan(
+                            repoIDs: repoCandidates,
+                            token: token,
+                            preference: .current
+                        )
+                        selectedArtifact = plan.selected ?? plan.alternatives.first
+                    }
+                    var selected: (name: String, url: URL, size: Int64)? = nil
+                    if let artifact = selectedArtifact {
+                        let escapedRepo = artifact.repositoryID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? artifact.repositoryID
+                        let escapedFilename = artifact.filename.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? artifact.filename
+                        if let url = URL(string: "https://huggingface.co/\(escapedRepo)/resolve/main/\(escapedFilename)?download=1") {
+                            var size = artifact.size
+                            if size <= 0 {
+                                let headSize = await self.fetchRemoteSize(url)
+                                if headSize > 0 { size = headSize }
+                            }
+                            selected = (artifact.filename, url, size)
+                        }
+                    }
                 await MainActor.run {
                     if let idx = self.items.firstIndex(where: { $0.id == id }) {
                         self.items[idx].mmprojSize = selected?.size ?? 0
@@ -1407,15 +1587,11 @@ final class DownloadController: ObservableObject {
                                     if dt >= 0.25 { // ~4 Hz
                                         let bytesDelta = written - lastBytesVal!
                                         let rawSpeed = dt > 0 ? Double(bytesDelta) / dt : 0.0
-                                        let instSpeed = max(0, min(rawSpeed, self.maxInstantaneousSpeed))
 
                                         self.lastMMProjSpeedSampleAt[id] = now
                                         self.lastMMProjBytesSample[id] = written
 
-                                        let alpha = self.speedEMAAlpha
-                                        let prevSpeed = item.mmprojSpeed
-                                        let newSpeed = (prevSpeed > 0) ? (1 - alpha) * prevSpeed + alpha * instSpeed : instSpeed
-                                        item.mmprojSpeed = newSpeed
+                                        item.mmprojSpeed = self.smoothedSpeed(key: "\(id)|mmproj", instantaneous: rawSpeed, now: now)
                                         item.speed = min(self.maxInstantaneousSpeed, item.mainSpeed + item.mmprojSpeed + item.imatrixSpeed)
                                         self.lastModelSpeedSampleAt[id] = now
                                     }
@@ -1597,11 +1773,7 @@ final class DownloadController: ObservableObject {
                             }
                             let now = Date()
                             item.mainBytesWritten = max(bytesSoFar, item.mainBytesWritten)
-                            // Use manager-reported instantaneous speed; EMA smooth and aggregate
-                            let prev = item.mainSpeed
-                            let alpha = self.speedEMAAlpha
-                            let inst = max(0, min(managerSpeed, self.maxInstantaneousSpeed))
-                            item.mainSpeed = prev > 0 ? (1 - alpha) * prev + alpha * inst : inst
+                            item.mainSpeed = self.smoothedSpeed(key: "\(id)|main", instantaneous: managerSpeed, now: now)
                             item.speed = min(self.maxInstantaneousSpeed, item.mainSpeed + item.mmprojSpeed + item.imatrixSpeed)
                             self.lastModelSpeedSampleAt[item.id] = now
                             self.lastMainSpeedSampleAt[id] = now
@@ -1637,6 +1809,7 @@ final class DownloadController: ObservableObject {
 						// Clear per-item main speed samplers
 						self.lastMainSpeedSampleAt[id] = nil
 						self.lastMainBytesSample[id] = nil
+						self.clearSpeedSmoothing(for: id)
                         self.scheduleJobRemoval(externalID: id, delay: 3)
 						Task { @MainActor in
 							try? await Task.sleep(for: .seconds(3))
@@ -1655,6 +1828,7 @@ final class DownloadController: ObservableObject {
 						// Clear main speed samplers for this id
 						self.lastMainSpeedSampleAt[id] = nil
 						self.lastMainBytesSample[id] = nil
+						self.clearSpeedSmoothing(for: id)
 						if self.allItems.isEmpty { self.showOverlay = false }
                                         case .paused(let p):
                                                 // Resume was tapped while this pause was still settling;
@@ -1757,7 +1931,7 @@ final class DownloadController: ObservableObject {
                                                         await self.waitForNetworkConnectivity()
                                                         if let item = self.items.first(where: { $0.id == id }),
                                                            !self.pauseRequestedIDs.contains(id) {
-                                                                self.start(detail: item.detail, quant: item.quant)
+                                                                self.start(detail: item.detail, quant: item.quant, userInitiated: false)
                                                         }
                                                 }
 					default:
@@ -1770,68 +1944,81 @@ final class DownloadController: ObservableObject {
 		tasks[id] = t
 	}
 
-func pause(itemID: String) {
-		pauseRequestedIDs.insert(itemID)
-		resumePendingIDs.remove(itemID)
-		paused.insert(itemID)
-		if let item = items.first(where: { $0.id == itemID }) {
-            if let idx = items.firstIndex(where: { $0.id == itemID }) {
-                items[idx].status = .paused
-                items[idx].canPause = false
-                items[idx].canResume = true
-            }
-			Task {
-                await manager.pause(modelID: item.detail.id, quantLabel: item.quant.label)
-                if let dest = item.mmprojDestination {
-                    await BackgroundDownloadManager.shared.pause(destination: dest)
-                }
-                if let dest = item.imatrixDestination {
-                    await BackgroundDownloadManager.shared.pause(destination: dest)
-                }
-                // Also fan out over engine-tracked artifacts to catch transfers whose
-                // in-memory destinations haven't been recorded on the item yet.
-                if let job = await DownloadEngine.shared.job(forExternalID: itemID) {
-                    for artifact in job.artifacts where artifact.state != .completed && artifact.state != .cancelled {
-                        await BackgroundDownloadManager.shared.pause(destination: artifact.destinationURL)
-                    }
-                }
-                await self.setAllArtifacts(externalID: itemID, state: .paused, manualPause: true)
-                await DownloadEngine.shared.updateJobState(externalID: itemID, state: .paused, manualPause: true)
-            }
-            return
-		}
-        if let idx = leapItems.firstIndex(where: { $0.id == itemID }) {
-            leapItems[idx].status = .paused
-            leapItems[idx].canPause = false
-            leapItems[idx].canResume = true
-            LeapBundleDownloader.shared.pause(slug: itemID)
-            tasks[itemID] = nil
-            return
+    func pause(itemID: String) {
+        prepareVisiblePause(itemID: itemID)
+        Task { await pauseTransfersAndPersist(itemID: itemID) }
+    }
+
+    /// Called when iOS expires or the person cancels the user-visible continued
+    /// processing task. Stop the underlying work cooperatively and retain resume
+    /// state; silently moving it to another session would defeat system Cancel.
+    func pauseActiveDownloadsForContinuedProcessingExpiration() async {
+        let modelIDs = items.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let datasetIDs = datasetItems.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let embeddingIDs = embeddingItems.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let whisperIDs = whisperItems.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let activeIDs = Set(modelIDs + datasetIDs + embeddingIDs + whisperIDs)
+        for itemID in activeIDs {
+            prepareVisiblePause(itemID: itemID)
+        }
+        for itemID in activeIDs {
+            await pauseTransfersAndPersist(itemID: itemID)
+        }
+        await refreshFromEngineSnapshot()
+    }
+
+    private func prepareVisiblePause(itemID: String) {
+        pauseRequestedIDs.insert(itemID)
+        resumePendingIDs.remove(itemID)
+        paused.insert(itemID)
+
+        if let idx = items.firstIndex(where: { $0.id == itemID }) {
+            items[idx].status = .paused
+            items[idx].canPause = false
+            items[idx].canResume = true
+            items[idx].speed = 0
+            items[idx].mainSpeed = 0
+            items[idx].mmprojSpeed = 0
+            items[idx].imatrixSpeed = 0
         }
         if let idx = datasetItems.firstIndex(where: { $0.id == itemID }) {
             datasetItems[idx].status = .paused
             datasetItems[idx].canPause = false
             datasetItems[idx].canResume = true
+            datasetItems[idx].speed = 0
         }
         if let idx = embeddingItems.firstIndex(where: { $0.id == itemID }) {
             embeddingItems[idx].status = .paused
             embeddingItems[idx].canPause = false
             embeddingItems[idx].canResume = true
+            embeddingItems[idx].speed = 0
         }
         if let idx = whisperItems.firstIndex(where: { $0.id == itemID }) {
             whisperItems[idx].status = .paused
             whisperItems[idx].canPause = false
             whisperItems[idx].canResume = true
+            whisperItems[idx].speed = 0
         }
-        Task {
-            guard let job = await DownloadEngine.shared.job(forExternalID: itemID) else { return }
+    }
+
+    private func pauseTransfersAndPersist(itemID: String) async {
+        if let item = items.first(where: { $0.id == itemID }) {
+            await manager.pause(modelID: item.detail.id, quantLabel: item.quant.label)
+            if let destination = item.mmprojDestination {
+                await BackgroundDownloadManager.shared.pause(destination: destination)
+            }
+            if let destination = item.imatrixDestination {
+                await BackgroundDownloadManager.shared.pause(destination: destination)
+            }
+        }
+        if let job = await DownloadEngine.shared.job(forExternalID: itemID) {
             for artifact in job.artifacts where artifact.state != .completed && artifact.state != .cancelled {
                 await BackgroundDownloadManager.shared.pause(destination: artifact.destinationURL)
             }
-            await self.setAllArtifacts(externalID: itemID, state: .paused, manualPause: true)
-            await DownloadEngine.shared.updateJobState(externalID: itemID, state: .paused, manualPause: true)
         }
-}
+        await setAllArtifacts(externalID: itemID, state: .paused, manualPause: true)
+        await DownloadEngine.shared.updateJobState(externalID: itemID, state: .paused, manualPause: true)
+    }
 
     func schedule(itemID: String) {
         pauseRequestedIDs.insert(itemID)
@@ -1869,14 +2056,6 @@ func pause(itemID: String) {
 			start(detail: item.detail, quant: item.quant)
             return
 		}
-        if let idx = leapItems.firstIndex(where: { $0.id == itemID }) {
-            leapItems[idx].status = .queued
-            leapItems[idx].canPause = true
-            leapItems[idx].canResume = false
-            let item = leapItems[idx]
-            startLeap(entry: item.entry)
-            return
-        }
         if let idx = datasetItems.firstIndex(where: { $0.id == itemID }) {
             datasetItems[idx].error = nil
             datasetItems[idx].status = .queued
@@ -1913,13 +2092,6 @@ func pause(itemID: String) {
             items[idx].mainSpeed = 0
             items[idx].mmprojSpeed = 0
             items[idx].imatrixSpeed = 0
-        }
-        if let idx = leapItems.firstIndex(where: { $0.id == itemID }) {
-            leapItems[idx].status = .scheduled
-            leapItems[idx].canPause = false
-            leapItems[idx].canResume = true
-            leapItems[idx].speed = 0
-            LeapBundleDownloader.shared.pause(slug: itemID)
         }
         if let idx = datasetItems.firstIndex(where: { $0.id == itemID }) {
             datasetItems[idx].status = .scheduled
@@ -2099,167 +2271,14 @@ func pause(itemID: String) {
                 }
         }
 
-    func startLeap(entry: LeapCatalogEntry) {
-        let id = entry.slug
-        if tasks[id] != nil { return }
-        cancelledExternalIDs.remove(id)
-        pauseRequestedIDs.remove(id)
-        resumePendingIDs.remove(id)
-        // Ensure single UI entry per slug
-        if !leapItems.contains(where: { $0.id == id }) {
-            var item = LeapItem(entry: entry)
-            item.status = .preparing
-            leapItems.append(item)
-        }
-        showOverlay = true
-
-		let t = Task { [weak self] in
-			guard let self else { return }
-            let job = await self.ensureLeapJob(entry: entry)
-            if Task.isCancelled {
-                if self.tasks[id] == nil {
-                    await DownloadEngine.shared.removeJob(externalID: id)
-                }
-                return
-            }
-            await MainActor.run {
-                if let idx = self.leapItems.firstIndex(where: { $0.id == id }) {
-                    self.leapItems[idx].jobID = job.id
-                    self.leapItems[idx].status = .preparing
-                    self.leapItems[idx].canPause = true
-                    self.leapItems[idx].canResume = false
-                }
-            }
-			for await event in LeapBundleDownloader.shared.download(entry, jobID: job.id) {
-				await MainActor.run {
-					guard let idx = self.leapItems.firstIndex(where: { $0.id == id }) else { return }
-                switch event {
-                case .started(let total):
-                    self.leapItems[idx].status = .downloading
-                    self.leapItems[idx].canPause = true
-                    self.leapItems[idx].canResume = false
-                    Task {
-                        await DownloadEngine.shared.updateJobState(externalID: id, state: .downloading, manualPause: false)
-                    }
-                    if let t = total, t > 0 {
-                        self.leapItems[idx].expectedBytes = t
-                        if self.loggedLeapExpected[id] != t {
-                            self.loggedLeapExpected[id] = t
-                            self.logDetectedSize(kind: "ET", id: id, bytes: t, source: "metadata")
-                        }
-                    }
-                case .progress(let p, _, let expected, let speed):
-                    self.leapItems[idx].status = .downloading
-                    let pClamped = min(p, 0.999)
-                    self.leapItems[idx].progress = pClamped
-                    let previous = self.leapItems[idx].speed
-                    let alpha = self.speedEMAAlpha
-                    let clipped = min(speed, self.maxInstantaneousSpeed)
-                    self.leapItems[idx].speed = previous * (1 - alpha) + clipped * alpha
-                    self.lastLeapSpeedSampleAt[self.leapItems[idx].id] = Date()
-                    self.leapItems[idx].verifying = false
-                    if expected > 0 {
-                        let prev = self.leapItems[idx].expectedBytes
-                        self.leapItems[idx].expectedBytes = expected
-                        if self.loggedLeapExpected[id] != expected || prev != expected {
-                            self.loggedLeapExpected[id] = expected
-                            self.logDetectedSize(kind: "ET", id: id, bytes: expected, source: "Content-Length")
-                        }
-                    }
-                case .finished(let installed):
-                    self.leapItems[idx].progress = 1
-                    self.leapItems[idx].speed = 0
-                    self.leapItems[idx].status = .completed
-                    self.leapItems[idx].canPause = false
-                    self.leapItems[idx].canResume = false
-                    self.leapItems[idx].completed = true
-                    self.leapItems[idx].verifying = false
-                    Task {
-                        await DownloadEngine.shared.updateJobState(externalID: id, state: .completed, manualPause: false)
-                    }
-                    Haptics.success()
-                    if self.leapItems[idx].expectedBytes <= 0 { self.leapItems[idx].expectedBytes = Int64(installed.sizeBytes) }
-#if os(macOS) && !canImport(UIKit)
-                    if let manager = self.modelManager as? AppModelManager {
-                        manager.install(installed)
-                    }
-#else
-                    self.modelManager?.install(installed)
-#endif
-                    self.tasks[id] = nil
-                    self.scheduleJobRemoval(externalID: id, delay: 3)
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(3))
-                        self.leapItems.removeAll { $0.id == id }
-                        if self.allItems.isEmpty { self.showOverlay = false }
-                    }
-                case .cancelled:
-                    self.leapItems.removeAll { $0.id == id }
-                    self.tasks[id] = nil
-                    Task {
-                        await DownloadEngine.shared.removeJob(externalID: id)
-                    }
-                    if self.allItems.isEmpty { self.showOverlay = false }
-                case .paused(let progress):
-                    self.leapItems[idx].progress = progress
-                    self.leapItems[idx].speed = 0
-                    self.leapItems[idx].status = .paused
-                    self.leapItems[idx].canPause = false
-                    self.leapItems[idx].canResume = true
-                    self.leapItems[idx].verifying = false
-                    self.tasks[id] = nil
-                    self.paused.insert(id)
-                    Task {
-                        await DownloadEngine.shared.updateJobState(externalID: id, state: .paused, manualPause: true)
-                    }
-                case .networkError(_, let progress):
-                    // Keep the item and schedule a retry with backoff
-                    self.leapItems[idx].progress = progress
-                    self.leapItems[idx].speed = 0
-                    self.leapItems[idx].status = .retrying
-                    self.leapItems[idx].canPause = false
-                    self.leapItems[idx].canResume = true
-                    self.leapItems[idx].verifying = false
-                    self.tasks[id] = nil
-                    self.leapItems[idx].retryCount += 1
-                    Task {
-                        await DownloadEngine.shared.updateJobState(externalID: id, state: .retrying, manualPause: false)
-                    }
-                    let delay = min(pow(2.0, Double(self.leapItems[idx].retryCount)), 60)
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(delay))
-                        await self.waitForNetworkConnectivity()
-                        if self.tasks[id] == nil && self.leapItems.contains(where: { $0.id == id }) {
-                            self.startLeap(entry: entry)
-                        }
-                    }
-                case .failed(_):
-                    self.leapItems[idx].completed = false
-                    self.leapItems[idx].status = .failed
-                    self.leapItems[idx].canPause = false
-                    self.leapItems[idx].canResume = true
-                    self.leapItems[idx].verifying = false
-                    self.tasks[id] = nil
-                    Task {
-                        await DownloadEngine.shared.updateJobState(externalID: id, state: .failed, manualPause: false)
-                    }
-                    if self.allItems.isEmpty { self.showOverlay = false }
-                default:
-                    break
-                }
-				}
-			}
-		}
-
-		tasks[id] = t
-	}
-
-        func startDataset(detail: DatasetDetails) {
+        func startDataset(detail: DatasetDetails, userInitiated: Bool = true) {
                 let id = detail.id
                 if tasks[id] != nil { return }
                 cancelledExternalIDs.remove(id)
                 pauseRequestedIDs.remove(id)
                 resumePendingIDs.remove(id)
+                clearSpeedSmoothing(for: id)
+                lastDatasetSpeedSampleAt[id] = nil
                 // Determine upfront file list and expected size using any known lengths from `detail`
                 var filesToDownload: [DatasetFile] = detail.files.filter { DatasetFileSupport.isSupported($0) }
                 // For OTL datasets, prefer the PDF file to match the size shown in search results
@@ -2287,6 +2306,7 @@ func pause(itemID: String) {
                         datasetItems.append(item)
                 }
                 showOverlay = true
+                updateWakeLock(userInitiated: userInitiated)
 
                 let t = Task { [weak self] in
                         guard let self else { return }
@@ -2311,21 +2331,42 @@ func pause(itemID: String) {
 								if http.expectedContentLength > 0 { return (original, http.expectedContentLength) }
 							}
 						} catch {}
-						// 2) naive fetch
+						// 2) ranged sniff: only the leading bytes are needed to detect
+						// PDF/EPUB signatures — never pull the whole file into RAM.
 						var get = URLRequest(url: original)
 						get.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+						get.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
 						if NetworkKillSwitch.isEnabled { return nil }
 						NetworkKillSwitch.track(session: URLSession.shared)
-						if let (data, resp) = try? await URLSession.shared.data(for: HFEndpoint.rewrite(get)), let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
-							// crude content-sniffing
-							let mime = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-							let isPDF = mime.contains("pdf") || data.prefix(4) == Data([0x25, 0x50, 0x44, 0x46])
-							let isEPUB = mime.contains("epub") || data.starts(with: Data([0x50, 0x4b])) // zip signature
-							if isPDF || isEPUB {
-								return (original, Int64(data.count))
+						do {
+							let (bytes, resp) = try await URLSession.shared.bytes(for: HFEndpoint.rewrite(get))
+							guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+							var prefix = Data()
+							prefix.reserveCapacity(1024)
+							for try await byte in bytes {
+								prefix.append(byte)
+								if prefix.count >= 1024 { break }
 							}
+							// Stop the transfer even when the server ignored the Range header.
+							bytes.task.cancel()
+							let mime = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+							let isPDF = mime.contains("pdf") || prefix.prefix(4) == Data([0x25, 0x50, 0x44, 0x46])
+							let isEPUB = mime.contains("epub") || prefix.starts(with: Data([0x50, 0x4b])) // zip signature
+							guard isPDF || isEPUB else { return nil }
+							let total: Int64 = {
+								if let range = http.value(forHTTPHeaderField: "Content-Range"),
+								   let tail = range.split(separator: "/").last, let len = Int64(tail) {
+									return len
+								}
+								if http.statusCode == 200, http.expectedContentLength > 0 {
+									return http.expectedContentLength
+								}
+								return Int64(prefix.count)
+							}()
+							return (original, total)
+						} catch {
+							return nil
 						}
-						return nil
 					}
 					// Use the first available file URL as a candidate landing URL
 					if let candidate = detail.files.first,
@@ -2381,17 +2422,33 @@ func pause(itemID: String) {
                                 let fileCount = max(filesToDownload.count, 1)
                                 var completedFiles: Int = 0
 
-                                // Download each file sequentially for now (can parallelize later)
                                 for file in filesToDownload {
                                         let fileURL = file.downloadURL
                     let relativePath = Self.datasetRelativePath(for: file)
                     let artifactID = Self.datasetArtifactID(relativePath: relativePath)
+                                        let finalDest = Self.datasetDestinationURL(for: id, relativePath: relativePath)
+                                        // A file already at its final path completed in a previous run
+                                        // (finals only appear via finalizeStagedDownload); resuming a
+                                        // multi-file dataset must not re-download it from scratch.
+                                        if let onDisk = fileSize(at: finalDest), onDisk > 0,
+                                           file.sizeBytes <= 0 || onDisk == file.sizeBytes {
+                                                await DownloadEngine.shared.markArtifactCompleted(
+                                                    externalID: id,
+                                                    artifactID: artifactID,
+                                                    finalBytes: onDisk
+                                                )
+                                                completedBytes += file.sizeBytes > 0 ? file.sizeBytes : onDisk
+                                                if let idx = self.datasetItems.firstIndex(where: { $0.id == id }) {
+                                                        self.datasetItems[idx].downloadedBytes = completedBytes
+                                                }
+                                                if totalSize == 0 { completedFiles += 1 }
+                                                continue
+                                        }
                                         var req = URLRequest(url: fileURL)
                     req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
                     req.setValue("Noema/1.0 (+https://noema.app)", forHTTPHeaderField: "User-Agent")
                                         var knownExpected: Int64 = file.sizeBytes
                                         if knownExpected <= 0 { knownExpected = await self.fetchRemoteSize(fileURL) }
-                                        let finalDest = Self.datasetDestinationURL(for: id, relativePath: relativePath)
                                         let stagedDest = Self.stagingURL(for: finalDest)
                                         try? FileManager.default.createDirectory(at: finalDest.deletingLastPathComponent(), withIntermediateDirectories: true)
                                         var speedLastTime: Date? = nil
@@ -2494,10 +2551,7 @@ func pause(itemID: String) {
                                                 lastBytes = written
                                                 Task { @MainActor in
                                                     if let idx = self.datasetItems.firstIndex(where: { $0.id == id }) {
-                                                        let previous = self.datasetItems[idx].speed
-                                                        let alpha = self.speedEMAAlpha
-                                                        let clipped = min(instSpeed, self.maxInstantaneousSpeed)
-                                                        self.datasetItems[idx].speed = previous * (1 - alpha) + clipped * alpha
+                                                        self.datasetItems[idx].speed = self.smoothedSpeed(key: id, instantaneous: instSpeed)
                                                         self.lastDatasetSpeedSampleAt[self.datasetItems[idx].id] = Date()
                                                     }
                                                 }
@@ -2641,12 +2695,12 @@ func pause(itemID: String) {
 		tasks[id] = t
 	}
 
-	func startEmbedding(repoID: String) {
+	func startEmbedding(repoID: String, userInitiated: Bool = true) {
         let record = EmbeddingModelCatalog.record(matchingDownloadIdentifier: repoID) ?? EmbeddingModelCatalog.activeRecord()
-        startEmbedding(recordID: record.id)
+        startEmbedding(recordID: record.id, userInitiated: userInitiated)
     }
 
-    func startEmbedding(recordID: String) {
+    func startEmbedding(recordID: String, userInitiated: Bool = true) {
         guard let record = EmbeddingModelCatalog.record(for: recordID),
               record.isInstallable,
               let artifact = record.primaryArtifact,
@@ -2654,21 +2708,25 @@ func pause(itemID: String) {
             Task { await logger.log("[DownloadController] Embedding model is not installable: \(recordID)") }
             return
         }
-		let id = record.id
-		if tasks[id] != nil { return }
+        let id = record.id
+        if tasks[id] != nil { return }
         cancelledExternalIDs.remove(id)
         pauseRequestedIDs.remove(id)
         resumePendingIDs.remove(id)
+        clearSpeedSmoothing(for: id)
         let finalDest = artifact.localURL(recordID: record.id)
-		if FileManager.default.fileExists(atPath: finalDest.path) {
-			Task { await logger.log("[DownloadController] Embedding model already installed; skipping download request for \(record.id)") }
-			NotificationCenter.default.post(
+        if FileManager.default.fileExists(atPath: finalDest.path) {
+            Task { @MainActor [weak self] in
+                await logger.log("[DownloadController] Embedding model already installed; reconciling download state for \(record.id)")
+                await self?.handleBackgroundDownloadCompletion(destinationURL: finalDest, errorMessage: nil)
+            }
+            NotificationCenter.default.post(
                 name: .embeddingModelAvailabilityChanged,
                 object: nil,
                 userInfo: ["available": record.id == EmbeddingModelCatalog.activeRecord().id, "recordID": record.id]
             )
-			return
-		}
+            return
+        }
 
 		var item = EmbeddingItem(record: record)
         item.status = .preparing
@@ -2676,8 +2734,9 @@ func pause(itemID: String) {
             embeddingItems[idx] = item
         } else {
 		    embeddingItems.append(item)
-        }
+		}
 		showOverlay = true
+		updateWakeLock(userInitiated: userInitiated)
 
 		let t = Task { [weak self] in
 			guard let self else { return }
@@ -2717,6 +2776,8 @@ func pause(itemID: String) {
                 var req = URLRequest(url: remote)
                 req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
                 req.setValue("Noema/1.0 (+https://noema.app)", forHTTPHeaderField: "User-Agent")
+                var attempt = 0
+                retryLoop: while true {
                 if Task.isCancelled {
                     if self.tasks[id] == nil {
                         await DownloadEngine.shared.removeJob(externalID: id)
@@ -2727,6 +2788,7 @@ func pause(itemID: String) {
                     await self.holdAuxTaskForPause(itemID: id)
                     return
                 }
+                do {
                 await DownloadEngine.shared.updateArtifactState(
                     externalID: id,
                     artifactID: DurableArtifactID.embedding,
@@ -2742,7 +2804,16 @@ func pause(itemID: String) {
                     expectedSize: knownExpected,
                     progress: { [weak self] prog in
                         guard let self else { return }
+                        // The delegate already caps callbacks at 10 Hz; only mutate published
+                        // state when the displayed percent actually changes so we don't re-arm
+                        // the 5 Hz coalesced publish (and its UI/VoiceOver re-render) per tick.
+                        let pct = Int(min(prog, 0.999) * 100)
                         Task { @MainActor in
+                            // Trailing ticks from a transfer that is being paused must not
+                            // flip the row back to "downloading".
+                            if self.pauseRequestedIDs.contains(id) { return }
+                            if self.lastEmbedReportedPct[id] == pct { return }
+                            self.lastEmbedReportedPct[id] = pct
                             if let idx = self.embeddingItems.firstIndex(where: { $0.id == id }) {
                                 self.embeddingItems[idx].status = .downloading
                                 let expected = max(knownExpected, artifact.sizeBytes)
@@ -2762,9 +2833,47 @@ func pause(itemID: String) {
                                 expected: knownExpected > 0 ? knownExpected : artifact.sizeBytes
                             )
                         }
-                        // Keep speed optional for embed download UI; we don't show it, but we can later
                         _ = written
                     })
+                break retryLoop
+                } catch {
+                    let nsError = error as NSError
+                    if nsError.domain == NSURLErrorDomain,
+                       nsError.code == NSURLErrorCancelled,
+                       self.resumePendingIDs.remove(id) != nil {
+                        // Resume was tapped while the pause was still settling;
+                        // retry now instead of failing permanently.
+                        continue retryLoop
+                    }
+                    let pausedByUser = nsError.domain == NSURLErrorDomain
+                        && nsError.code == NSURLErrorCancelled
+                        && (self.paused.contains(id) || self.pauseRequestedIDs.contains(id))
+                    let errType = self.categorizeError(error)
+                    // Pauses, cancellations and permanent failures keep the existing
+                    // handling in the outer catch; only transient errors retry here.
+                    guard !pausedByUser, !Task.isCancelled, errType.isRetryable else { throw error }
+                    attempt += 1
+                    let delay = min(pow(2.0, Double(attempt)), 60)
+                    await DownloadEngine.shared.updateArtifactState(
+                        externalID: id,
+                        artifactID: DurableArtifactID.embedding,
+                        state: .retrying,
+                        retryCount: attempt,
+                        nextRetryAt: Date().addingTimeInterval(delay),
+                        errorMessage: errType.localizedDescription,
+                        manualPause: false
+                    )
+                    await DownloadEngine.shared.updateJobState(
+                        externalID: id,
+                        state: .retrying,
+                        manualPause: false,
+                        errorMessage: errType.localizedDescription
+                    )
+                    try? await Task.sleep(for: .seconds(delay))
+                    await self.waitForNetworkConnectivity()
+                    continue retryLoop
+                }
+                }
                 try self.finalizeStagedDownload(from: stagedDest, to: finalDest)
                 await DownloadEngine.shared.markArtifactCompleted(
                     externalID: id,
@@ -2847,7 +2956,7 @@ func pause(itemID: String) {
         "whisper:\(runtime.rawValue):\(recordID)"
     }
 
-    func startWhisper(recordID: String, runtime: WhisperRuntimeFormat) {
+    func startWhisper(recordID: String, runtime: WhisperRuntimeFormat, userInitiated: Bool = true) {
         guard let record = WhisperModelCatalog.record(for: recordID),
               let artifact = record.artifact(for: runtime),
               let remote = artifact.downloadURL else {
@@ -2860,10 +2969,15 @@ func pause(itemID: String) {
         cancelledExternalIDs.remove(id)
         pauseRequestedIDs.remove(id)
         resumePendingIDs.remove(id)
+        clearSpeedSmoothing(for: id)
+        lastDatasetSpeedSampleAt[id] = nil
         let finalDest = record.directoryURL(runtime: runtime)
             .appendingPathComponent(URL(fileURLWithPath: artifact.resourcePath).lastPathComponent)
         if FileManager.default.fileExists(atPath: finalDest.path) {
-            Task { await logger.log("[DownloadController] Whisper model already installed; skipping download request for \(record.id)") }
+            Task { @MainActor [weak self] in
+                await logger.log("[DownloadController] Whisper model already installed; reconciling download state for \(record.id)")
+                await self?.handleBackgroundDownloadCompletion(destinationURL: finalDest, errorMessage: nil)
+            }
             return
         }
 
@@ -2875,6 +2989,7 @@ func pause(itemID: String) {
             whisperItems.append(item)
         }
         showOverlay = true
+        updateWakeLock(userInitiated: userInitiated)
 
         let t = Task { [weak self] in
             guard let self else { return }
@@ -2909,6 +3024,10 @@ func pause(itemID: String) {
                 req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
                 req.setValue("Noema/1.0 (+https://noema.app)", forHTTPHeaderField: "User-Agent")
 
+                var speedLastTime: Date?
+                var lastBytes: Int64 = 0
+                var attempt = 0
+                retryLoop: while true {
                 if Task.isCancelled {
                     if self.tasks[id] == nil {
                         await DownloadEngine.shared.removeJob(externalID: id)
@@ -2919,6 +3038,7 @@ func pause(itemID: String) {
                     await self.holdAuxTaskForPause(itemID: id)
                     return
                 }
+                do {
                 await DownloadEngine.shared.updateArtifactState(
                     externalID: id,
                     artifactID: DurableArtifactID.whisper,
@@ -2926,9 +3046,6 @@ func pause(itemID: String) {
                     manualPause: false
                 )
                 await DownloadEngine.shared.updateJobState(externalID: id, state: .downloading, manualPause: false)
-
-                var speedLastTime: Date?
-                var lastBytes: Int64 = 0
                 try await BackgroundDownloadManager.shared.download(
                     request: req,
                     to: stagedDest,
@@ -2938,6 +3055,9 @@ func pause(itemID: String) {
                     progress: { [weak self] prog in
                         guard let self else { return }
                         Task { @MainActor in
+                            // Trailing ticks from a transfer that is being paused must not
+                            // flip the row back to "downloading".
+                            if self.pauseRequestedIDs.contains(id) { return }
                             guard let idx = self.whisperItems.firstIndex(where: { $0.id == id }) else { return }
                             self.whisperItems[idx].status = .downloading
                             let expected = max(knownExpected, artifact.sizeBytes)
@@ -2972,11 +3092,50 @@ func pause(itemID: String) {
                         Task { @MainActor in
                             guard let idx = self.whisperItems.firstIndex(where: { $0.id == id }) else { return }
                             self.whisperItems[idx].downloadedBytes = written
-                            self.whisperItems[idx].speed = max(0, min(raw, self.maxInstantaneousSpeed))
+                            self.whisperItems[idx].speed = self.smoothedSpeed(key: id, instantaneous: raw)
                             self.lastDatasetSpeedSampleAt[id] = Date()
                         }
                     }
                 )
+                break retryLoop
+                } catch {
+                    let nsError = error as NSError
+                    if nsError.domain == NSURLErrorDomain,
+                       nsError.code == NSURLErrorCancelled,
+                       self.resumePendingIDs.remove(id) != nil {
+                        // Resume was tapped while the pause was still settling;
+                        // retry now instead of failing permanently.
+                        continue retryLoop
+                    }
+                    let pausedByUser = nsError.domain == NSURLErrorDomain
+                        && nsError.code == NSURLErrorCancelled
+                        && (self.paused.contains(id) || self.pauseRequestedIDs.contains(id))
+                    let errType = self.categorizeError(error)
+                    // Pauses, cancellations and permanent failures keep the existing
+                    // handling in the outer catch; only transient errors retry here.
+                    guard !pausedByUser, !Task.isCancelled, errType.isRetryable else { throw error }
+                    attempt += 1
+                    let delay = min(pow(2.0, Double(attempt)), 60)
+                    await DownloadEngine.shared.updateArtifactState(
+                        externalID: id,
+                        artifactID: DurableArtifactID.whisper,
+                        state: .retrying,
+                        retryCount: attempt,
+                        nextRetryAt: Date().addingTimeInterval(delay),
+                        errorMessage: errType.localizedDescription,
+                        manualPause: false
+                    )
+                    await DownloadEngine.shared.updateJobState(
+                        externalID: id,
+                        state: .retrying,
+                        manualPause: false,
+                        errorMessage: errType.localizedDescription
+                    )
+                    try? await Task.sleep(for: .seconds(delay))
+                    await self.waitForNetworkConnectivity()
+                    continue retryLoop
+                }
+                }
 
                 try self.finalizeStagedDownload(from: stagedDest, to: finalDest)
                 let finalBytes = fileSize(at: finalDest) ?? max(knownExpected, artifact.sizeBytes)
@@ -3130,6 +3289,12 @@ func pause(itemID: String) {
 		resumePendingIDs.remove(itemID)
 		tasks[itemID]?.cancel()
 		tasks[itemID] = nil
+		clearSpeedSmoothing(for: itemID)
+		lastModelSpeedSampleAt[itemID] = nil
+		lastMainSpeedSampleAt[itemID] = nil
+		lastMainBytesSample[itemID] = nil
+		lastDatasetSpeedSampleAt[itemID] = nil
+		ggufValidationFailures[itemID] = nil
         Task {
             // Snapshot the artifacts before flipping states: markCancelled sets every
             // artifact to .cancelled, which would hide the live transfers from the loop below.
@@ -3194,10 +3359,6 @@ func pause(itemID: String) {
                 _ = ModelStorageCleanup.deleteURLs(cleanupURLs)
             }
 		}
-		if let idx = leapItems.firstIndex(where: { $0.id == itemID }) {
-			leapItems.remove(at: idx)
-			LeapBundleDownloader.shared.cancel(slug: itemID)
-		}
 		if let idx = datasetItems.firstIndex(where: { $0.id == itemID }) {
 			datasetItems.remove(at: idx)
 		}
@@ -3225,12 +3386,6 @@ func pause(itemID: String) {
 			let expected = max(Int64(1), $1.mainExpectedBytes + $1.mmprojSize + $1.imatrixSize)
 			return $0 + Double(expected)
 		}
-                let bytesSLM  = leapItems.reduce(0.0) { acc, li in
-                        let expected = li.expectedBytes > 0
-                                ? li.expectedBytes
-                                : (li.entry.sizeBytes > 0 ? li.entry.sizeBytes : 1)
-                        return acc + Double(expected)
-                }
                 let bytesDS   = datasetItems.reduce(0.0) { res, item in
                         let expected = item.expectedBytes > 0 ? Double(item.expectedBytes) :
                                 Double(DatasetFileSupport.totalSupportedSize(files: item.detail.files))
@@ -3245,18 +3400,12 @@ func pause(itemID: String) {
                 let expected = item.expectedBytes > 0 ? Double(item.expectedBytes) : 1.0
                 return res + expected
             }
-			let total = bytesGGUF + bytesSLM + bytesDS + bytesEMB + bytesWhisper
+			let total = bytesGGUF + bytesDS + bytesEMB + bytesWhisper
 		guard total > 0 else { return 0 }
 		let completedGGUF = items.reduce(0.0) {
 			let written = $1.mainBytesWritten + $1.mmprojBytesWritten + $1.imatrixBytesWritten
 			return $0 + Double(written)
 		}
-                let completedSLM  = leapItems.reduce(0.0) { acc, li in
-                        let expected = li.expectedBytes > 0
-                                ? li.expectedBytes
-                                : (li.entry.sizeBytes > 0 ? li.entry.sizeBytes : 1)
-                        return acc + Double(expected) * li.progress
-                }
                 let completedDS   = datasetItems.reduce(0.0) { res, item in
                         let expected = item.expectedBytes > 0 ? Double(item.expectedBytes) :
                                 Double(DatasetFileSupport.totalSupportedSize(files: item.detail.files))
@@ -3271,15 +3420,15 @@ func pause(itemID: String) {
                 let expected = item.expectedBytes > 0 ? Double(item.expectedBytes) : 1.0
                 return res + expected * item.progress
             }
-			return (completedGGUF + completedSLM + completedDS + completedEMB + completedWhisper) / total
+			return (completedGGUF + completedDS + completedEMB + completedWhisper) / total
 		}
 
 		var allItems: [Any] {
-			return items as [Any] + leapItems as [Any] + datasetItems as [Any] + embeddingItems as [Any] + whisperItems as [Any]
+			return items as [Any] + datasetItems as [Any] + embeddingItems as [Any] + whisperItems as [Any]
 		}
 
 		var allCompleted: Bool {
-			!allItems.isEmpty && items.allSatisfy({ $0.completed }) && leapItems.allSatisfy({ $0.completed }) && datasetItems.allSatisfy({ $0.completed }) && embeddingItems.allSatisfy({ $0.completed }) && whisperItems.allSatisfy({ $0.completed })
+			!allItems.isEmpty && items.allSatisfy({ $0.completed }) && datasetItems.allSatisfy({ $0.completed }) && embeddingItems.allSatisfy({ $0.completed }) && whisperItems.allSatisfy({ $0.completed })
 		}
 
 	// Aggregation for embedding progress (bytes)
@@ -3321,6 +3470,29 @@ extension DownloadController {
         hasInMemoryTask || hasLiveTask
     }
 
+    /// Returns the byte count that crash recovery can prove is still durable, or nil when
+    /// the persisted count should remain untouched. URLSession progress is intentionally
+    /// monotonic during a live transfer; relaunch is the one point where lowering a stale
+    /// count is required so a restarted transfer does not appear frozen at (for example) 97%.
+    nonisolated static func recoveredArtifactByteCount(state: DownloadArtifactState,
+                                                        persistedBytes: Int64,
+                                                        stagingBytes: Int64?,
+                                                        hasFinalFile: Bool,
+                                                        hasLiveTask: Bool,
+                                                        hasResumeData: Bool) -> Int64? {
+        guard state != .completed, state != .cancelled,
+              !hasFinalFile, !hasLiveTask, !hasResumeData else {
+            return nil
+        }
+        let durableBytes = max(0, stagingBytes ?? 0)
+        return durableBytes == persistedBytes ? nil : durableBytes
+    }
+
+    nonisolated static func requiresCanonicalModelFinalization(state: DownloadJobState,
+                                                               allArtifactsCompleted: Bool) -> Bool {
+        state == .verifying || state == .finalizing || (allArtifactsCompleted && state.autoResumeEligible)
+    }
+
     nonisolated static func aggregateModelProgress(mainWritten: Int64,
                                                    mainExpected: Int64,
                                                    projectorWritten: Int64,
@@ -3347,13 +3519,22 @@ extension DownloadController {
         }
     }
 
+    /// Presentation mapping for engine snapshots with no live-transfer evidence. Unlike
+    /// `stateAfterLiveSnapshot` (which reconciles jobs that verifiably have a running
+    /// URLSession task), this must not promote failed/queued states to "downloading" —
+    /// a failed job with no task would otherwise read as active forever.
+    nonisolated static func displayState(for state: DownloadJobState, manualPause: Bool) -> DownloadJobState {
+        if state == .scheduled { return .scheduled }
+        if manualPause && state != .completed { return .paused }
+        return state
+    }
+
 	    private enum DurableArtifactID {
 	        static let main = "main"
 	        static let projector = "projector"
 	        static let importanceMatrix = "imatrix"
             static let mtp = "mtp"
-	        static let leapBundle = "bundle"
-	        static let embedding = "embedding"
+		        static let embedding = "embedding"
             static let whisper = "whisper"
 
         static func shard(_ relativePath: String) -> String {
@@ -3364,14 +3545,12 @@ extension DownloadController {
             DatasetPathing.durableArtifactID(forDatasetRelativePath: relativePath)
         }
 
-        static func leapAsset(_ name: String) -> String {
-            "leap:\(name)"
-        }
     }
 
     func bootstrapIfNeeded() {
         if hasBootstrappedDownloads {
             Task { @MainActor [weak self] in
+                await BackgroundDownloadManager.shared.prepareForActiveProcess()
                 await self?.reattachActiveBackgroundObservers()
                 await self?.reconcileLiveBackgroundSnapshots()
                 await self?.resumeRecoverableJobsFromEngine()
@@ -3380,7 +3559,11 @@ extension DownloadController {
         }
         hasBootstrappedDownloads = true
         Task { @MainActor [weak self] in
+            await BackgroundDownloadManager.shared.prepareForActiveProcess()
             await DownloadEngine.shared.bootstrap()
+            // Materialize persisted rows before maintenance dispatches any repaired
+            // completion. Model finalization matches the completion URL to these rows.
+            await self?.refreshFromEngineSnapshot()
             _ = await self?.runDownloadMaintenance(manual: false, force: true)
             await self?.reattachActiveBackgroundObservers()
             await self?.reconcileLiveBackgroundSnapshots()
@@ -3444,14 +3627,12 @@ extension DownloadController {
         let jobs = await DownloadEngine.shared.snapshots().filter {
             $0.state != .cancelled && !cancelledExternalIDs.contains($0.externalID)
         }
-        let existingModels = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
-        let existingLeap = Dictionary(uniqueKeysWithValues: leapItems.map { ($0.id, $0) })
-        let existingDatasets = Dictionary(uniqueKeysWithValues: datasetItems.map { ($0.id, $0) })
-        let existingEmbeddings = Dictionary(uniqueKeysWithValues: embeddingItems.map { ($0.id, $0) })
-        let existingWhisper = Dictionary(uniqueKeysWithValues: whisperItems.map { ($0.id, $0) })
+        let existingModels = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        let existingDatasets = Dictionary(datasetItems.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        let existingEmbeddings = Dictionary(embeddingItems.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        let existingWhisper = Dictionary(whisperItems.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
 
         var newItems: [Item] = []
-        var newLeapItems: [LeapItem] = []
         var newDatasetItems: [DatasetItem] = []
         var newEmbeddingItems: [EmbeddingItem] = []
         var newWhisperItems: [WhisperItem] = []
@@ -3469,31 +3650,17 @@ extension DownloadController {
             case .model(let owner):
                 var item = existingModels[job.externalID] ?? Item(detail: owner.detail, quant: owner.quant)
                 item.jobID = job.id
-                item.status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+                item.status = Self.displayState(for: job.state, manualPause: job.manualPause)
                 item.canPause = job.canPause
                 item.canResume = job.canResume
                 item.completed = job.state == .completed
                 item.error = job.state == .failed ? .permanentError(job.lastErrorDescription ?? "Download failed") : nil
                 applyModelArtifacts(job.artifacts, to: &item)
                 newItems.append(item)
-            case .leap(let owner):
-                var item = existingLeap[job.externalID] ?? LeapItem(entry: owner.entry)
-                item.jobID = job.id
-                item.status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
-                item.canPause = job.canPause
-                item.canResume = job.canResume
-                item.completed = job.state == .completed
-                let total = max(job.totalExpectedBytes, Int64(owner.entry.sizeBytes))
-                if total > 0 {
-                    item.expectedBytes = total
-                    item.progress = min(1, max(0, Double(job.totalDownloadedBytes) / Double(total)))
-                }
-                if job.state == .completed { item.progress = 1 }
-                newLeapItems.append(item)
             case .dataset(let owner):
                 var item = existingDatasets[job.externalID] ?? DatasetItem(detail: owner.detail)
                 item.jobID = job.id
-                item.status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+                item.status = Self.displayState(for: job.state, manualPause: job.manualPause)
                 item.canPause = job.canPause
                 item.canResume = job.canResume
                 item.completed = job.state == .completed
@@ -3508,7 +3675,7 @@ extension DownloadController {
             case .embedding(let owner):
                 var item = existingEmbeddings[job.externalID] ?? EmbeddingItem(repoID: owner.externalID)
                 item.jobID = job.id
-                item.status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+                item.status = Self.displayState(for: job.state, manualPause: job.manualPause)
                 item.canPause = job.canPause
                 item.canResume = job.canResume
                 item.completed = job.state == .completed
@@ -3535,7 +3702,7 @@ extension DownloadController {
                     runtime: owner.runtime
                 )
                 item.jobID = job.id
-                item.status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+                item.status = Self.displayState(for: job.state, manualPause: job.manualPause)
                 item.canPause = job.canPause
                 item.canResume = job.canResume
                 item.completed = job.state == .completed
@@ -3553,8 +3720,26 @@ extension DownloadController {
             }
         }
 
+        // A start call creates its visible `.preparing` row immediately, then the
+        // wrapper asynchronously creates the durable engine job. An unrelated
+        // engine notification can arrive inside that gap. Preserve rows that still
+        // have a live wrapper so the refresh cannot momentarily erase the operation,
+        // complete its continued-processing task, and lose user-initiation provenance.
+        newItems.append(contentsOf: items.filter { item in
+            tasks[item.id] != nil && !newItems.contains(where: { $0.id == item.id })
+        })
+        newDatasetItems.append(contentsOf: datasetItems.filter { item in
+            tasks[item.id] != nil && !newDatasetItems.contains(where: { $0.id == item.id })
+        })
+        newEmbeddingItems.append(contentsOf: embeddingItems.filter { item in
+            tasks[item.id] != nil && !newEmbeddingItems.contains(where: { $0.id == item.id })
+        })
+        newWhisperItems.append(contentsOf: whisperItems.filter { item in
+            tasks[item.id] != nil && !newWhisperItems.contains(where: { $0.id == item.id })
+        })
+        newPaused.formUnion(paused.filter { tasks[$0] != nil })
+
         items = newItems
-        leapItems = newLeapItems
         datasetItems = newDatasetItems
         embeddingItems = newEmbeddingItems
         whisperItems = newWhisperItems
@@ -3631,7 +3816,7 @@ extension DownloadController {
         case .model:
             guard let idx = items.firstIndex(where: { $0.id == externalID }) else { return }
             var item = items[idx]
-            item.status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+            item.status = Self.displayState(for: job.state, manualPause: job.manualPause)
             item.canPause = job.canPause
             item.canResume = job.canResume
             if item.status != .failed {
@@ -3639,17 +3824,9 @@ extension DownloadController {
             }
             applyModelArtifacts(job.artifacts, to: &item)
             items[idx] = item
-        case .leap:
-            guard let idx = leapItems.firstIndex(where: { $0.id == externalID }) else { return }
-            leapItems[idx].status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
-            leapItems[idx].canPause = job.canPause
-            leapItems[idx].canResume = job.canResume
-            let total = max(job.totalExpectedBytes, Int64(leapItems[idx].entry.sizeBytes), 1)
-            leapItems[idx].expectedBytes = total
-            leapItems[idx].progress = min(1, max(0, Double(job.totalDownloadedBytes) / Double(total)))
         case .dataset:
             guard let idx = datasetItems.firstIndex(where: { $0.id == externalID }) else { return }
-            datasetItems[idx].status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+            datasetItems[idx].status = Self.displayState(for: job.state, manualPause: job.manualPause)
             datasetItems[idx].canPause = job.canPause
             datasetItems[idx].canResume = job.canResume
             datasetItems[idx].expectedBytes = job.totalExpectedBytes
@@ -3659,7 +3836,7 @@ extension DownloadController {
             }
         case .embedding:
             guard let idx = embeddingItems.firstIndex(where: { $0.id == externalID }) else { return }
-            embeddingItems[idx].status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+            embeddingItems[idx].status = Self.displayState(for: job.state, manualPause: job.manualPause)
             embeddingItems[idx].canPause = job.canPause
             embeddingItems[idx].canResume = job.canResume
             embeddingItems[idx].expectedBytes = max(job.totalExpectedBytes, embeddingItems[idx].expectedBytes)
@@ -3667,7 +3844,7 @@ extension DownloadController {
             embeddingItems[idx].progress = min(1, max(0, Double(job.totalDownloadedBytes) / Double(total)))
         case .whisper:
             guard let idx = whisperItems.firstIndex(where: { $0.id == externalID }) else { return }
-            whisperItems[idx].status = Self.stateAfterLiveSnapshot(current: job.state, manualPause: job.manualPause)
+            whisperItems[idx].status = Self.displayState(for: job.state, manualPause: job.manualPause)
             whisperItems[idx].canPause = job.canPause
             whisperItems[idx].canResume = job.canResume
             whisperItems[idx].expectedBytes = max(job.totalExpectedBytes, whisperItems[idx].expectedBytes)
@@ -3762,6 +3939,7 @@ extension DownloadController {
     }
 
     private func resumeRecoverableJobsFromEngine() async {
+        await reconcileRecoveredArtifactProgress()
         let jobs = await DownloadEngine.shared.autoResumableJobs()
         for job in jobs {
             if cancelledExternalIDs.contains(job.externalID) { continue }
@@ -3775,17 +3953,61 @@ extension DownloadController {
             }
             switch job.owner {
             case .model(let owner):
-                start(detail: owner.detail, quant: owner.quant)
-            case .leap(let owner):
-                startLeap(entry: owner.entry)
+                start(detail: owner.detail, quant: owner.quant, userInitiated: false)
             case .dataset(let owner):
-                startDataset(detail: owner.detail)
+                startDataset(detail: owner.detail, userInitiated: false)
             case .embedding(let owner):
                 let recordID = EmbeddingModelCatalog.record(matchingDownloadIdentifier: owner.externalID)?.id ?? owner.externalID
-                startEmbedding(recordID: recordID)
+                startEmbedding(recordID: recordID, userInitiated: false)
             case .whisper(let owner):
-                startWhisper(recordID: owner.recordID, runtime: owner.runtime)
+                startWhisper(recordID: owner.recordID, runtime: owner.runtime, userInitiated: false)
             }
+        }
+    }
+
+    /// Reconcile persisted progress with evidence that survived the prior process. If there
+    /// is no live task, resume blob, final file, or staged byte range, the next start is a
+    /// fresh transfer and its visible progress must start at zero as well.
+    private func reconcileRecoveredArtifactProgress() async {
+        let jobs = await DownloadEngine.shared.autoResumableJobs()
+        let fm = FileManager.default
+        var changed = false
+
+        for job in jobs {
+            // Engine notifications can request a resume pass while an existing wrapper is
+            // briefly between URLSession tasks (retry/backoff/finalization). That is not a
+            // relaunch and must never lower its live in-memory progress.
+            if tasks[job.externalID] != nil { continue }
+            for artifact in job.artifacts where artifact.state != .completed && artifact.state != .cancelled {
+                let hasLiveTask = await BackgroundDownloadManager.shared.hasLiveTask(for: artifact.destinationURL)
+                let hasFinalFile = fm.fileExists(atPath: artifact.finalURL.path)
+                let stagingBytes = fileSize(at: artifact.stagingURL)
+                let resumeURL = DownloadPersistencePaths.resumeDataURL(jobID: job.id, artifactID: artifact.id)
+                let hasResumeData = fm.fileExists(atPath: resumeURL.path)
+
+                guard let durableBytes = Self.recoveredArtifactByteCount(
+                    state: artifact.state,
+                    persistedBytes: artifact.downloadedBytes,
+                    stagingBytes: stagingBytes,
+                    hasFinalFile: hasFinalFile,
+                    hasLiveTask: hasLiveTask,
+                    hasResumeData: hasResumeData
+                ) else { continue }
+
+                await DownloadEngine.shared.resetArtifactProgress(
+                    jobID: job.id,
+                    artifactID: artifact.id,
+                    downloadedBytes: durableBytes
+                )
+                await logger.log(
+                    "[Download][Recovery] reset stale progress externalID=\(job.externalID) artifactID=\(artifact.id) persisted=\(artifact.downloadedBytes) durable=\(durableBytes)"
+                )
+                changed = true
+            }
+        }
+
+        if changed {
+            await refreshFromEngineSnapshot()
         }
     }
 
@@ -3811,16 +4033,14 @@ extension DownloadController {
             await DownloadEngine.shared.updateJobState(externalID: job.externalID, state: .queued, manualPause: false)
             switch job.owner {
             case .model(let owner):
-                start(detail: owner.detail, quant: owner.quant)
-            case .leap(let owner):
-                startLeap(entry: owner.entry)
+                start(detail: owner.detail, quant: owner.quant, userInitiated: false)
             case .dataset(let owner):
-                startDataset(detail: owner.detail)
+                startDataset(detail: owner.detail, userInitiated: false)
             case .embedding(let owner):
                 let recordID = EmbeddingModelCatalog.record(matchingDownloadIdentifier: owner.externalID)?.id ?? owner.externalID
-                startEmbedding(recordID: recordID)
+                startEmbedding(recordID: recordID, userInitiated: false)
             case .whisper(let owner):
-                startWhisper(recordID: owner.recordID, runtime: owner.runtime)
+                startWhisper(recordID: owner.recordID, runtime: owner.runtime, userInitiated: false)
             }
         }
     }
@@ -3853,7 +4073,9 @@ extension DownloadController {
 
     private static func isWiFiPath(_ path: NWPath?) -> Bool {
         guard let path, path.status == .satisfied else { return false }
-        return path.usesInterfaceType(.wifi)
+        // Wired Ethernet counts as "Wi-Fi" for scheduling: the policy really means
+        // "unmetered", and desktop Macs on Ethernet would otherwise never qualify.
+        return path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet)
     }
 
     private static func isDeviceChargingForScheduledDownloads() -> Bool {
@@ -3912,8 +4134,11 @@ extension DownloadController {
             }
         }
 
-            for job in jobs {
-            var shouldRemoveJob = job.state != .completed
+        for job in jobs {
+            // Active, paused, scheduled, and finalizing jobs are durable work. Only terminal
+            // records are maintenance candidates; an all-complete `.finalizing` job must stay
+            // available so owner-specific registration can resume after a process exit.
+            var shouldRemoveJob = job.state == .completed || job.state == .failed || job.state == .cancelled
             var repairedJob = false
 
             for artifact in job.artifacts {
@@ -3951,15 +4176,24 @@ extension DownloadController {
                 }
             }
 
-            if job.state == .completed || job.artifacts.allSatisfy({ $0.state == .completed }) {
+            if job.state == .completed {
                 shouldRemoveJob = true
             }
 
-            if repairedJob,
-               let completionURL = job.artifacts
-                .map(\.finalURL)
-                .first(where: { fm.fileExists(atPath: $0.path) }) {
-                repairedCompletionURLs.append(completionURL)
+            if repairedJob {
+                switch job.owner {
+                case .model:
+                    // ModelDownloadManager performs validation, metadata/sidecar backfill,
+                    // and registration. Keep the repaired job in `.finalizing`; the normal
+                    // auto-resume pass will re-enter that complete pipeline.
+                    break
+                default:
+                    if let completionURL = job.artifacts
+                        .map(\.finalURL)
+                        .first(where: { fm.fileExists(atPath: $0.path) }) {
+                        repairedCompletionURLs.append(completionURL)
+                    }
+                }
             }
 
             if shouldRemoveJob {
@@ -4020,18 +4254,56 @@ extension DownloadController {
         ]
     }
 
-    private func updateWakeLock() {
-#if canImport(UIKit) && !os(visionOS)
-        let hasActive = items.contains(where: { isWakeLockStatus($0.status) }) ||
-            leapItems.contains(where: { isWakeLockStatus($0.status) }) ||
-            datasetItems.contains(where: { isWakeLockStatus($0.status) }) ||
-            embeddingItems.contains(where: { isWakeLockStatus($0.status) })
+    private func updateWakeLock(userInitiated: Bool = false) {
+        let modelActiveIDs = items.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let datasetActiveIDs = datasetItems.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let embeddingActiveIDs = embeddingItems.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let whisperActiveIDs = whisperItems.filter { isWakeLockStatus($0.status) }.map(\.id)
+        let activeIDs = Set(modelActiveIDs + datasetActiveIDs + embeddingActiveIDs + whisperActiveIDs)
+        let hasActive = !activeIDs.isEmpty
+#if canImport(UIKit)
         let isSceneActive = UIApplication.shared.applicationState == .active
-        ForegroundDownloadWakeLock.shared.update(hasActiveForegroundDownloads: hasActive, isSceneActive: isSceneActive)
 #else
-        ForegroundDownloadWakeLock.shared.update(hasActiveForegroundDownloads: false, isSceneActive: false)
+        // macOS: the App Nap assertion should hold whenever downloads run, frontmost or not.
+        let isSceneActive = true
+#endif
+        ForegroundDownloadWakeLock.shared.update(hasActiveForegroundDownloads: hasActive, isSceneActive: isSceneActive)
+#if os(iOS)
+        if #available(iOS 26.0, *) {
+            if hasActive {
+                continuedProcessingBatchIDs.formUnion(activeIDs)
+                ContinuedDownloadCoordinator.shared.downloadsBecameActive(
+                    title: continuedDownloadTitle(),
+                    userInitiated: userInitiated,
+                    controller: self
+                )
+            } else {
+                let failedModelIDs = items.filter { $0.status == .failed }.map(\.id)
+                let failedDatasetIDs = datasetItems.filter { $0.status == .failed }.map(\.id)
+                let failedEmbeddingIDs = embeddingItems.filter { $0.status == .failed }.map(\.id)
+                let failedWhisperIDs = whisperItems.filter { $0.status == .failed }.map(\.id)
+                let failedIDs = Set(failedModelIDs + failedDatasetIDs + failedEmbeddingIDs + failedWhisperIDs)
+                let batchSucceeded = continuedProcessingBatchIDs.isDisjoint(with: failedIDs)
+                ContinuedDownloadCoordinator.shared.downloadsFinished(success: batchSucceeded)
+                continuedProcessingBatchIDs.removeAll()
+            }
+        }
 #endif
     }
+
+#if os(iOS)
+    private func continuedDownloadTitle() -> String {
+        var names: [String] = []
+        for item in items where isWakeLockStatus(item.status) {
+            names.append(item.detail.id.split(separator: "/").last.map(String.init) ?? item.detail.id)
+        }
+        for item in datasetItems where isWakeLockStatus(item.status) { names.append(item.detail.displayName ?? item.detail.id) }
+        for item in embeddingItems where isWakeLockStatus(item.status) { names.append(item.displayName) }
+        for item in whisperItems where isWakeLockStatus(item.status) { names.append(item.displayName) }
+        if names.count == 1, let only = names.first, !only.isEmpty { return only }
+        return String(localized: "Downloading models")
+    }
+#endif
 
     private func isWakeLockStatus(_ status: DownloadJobState) -> Bool {
         switch status {
@@ -4275,56 +4547,6 @@ extension DownloadController {
         )
     }
 
-    private func ensureLeapJob(entry: LeapCatalogEntry) async -> DownloadJob {
-        let baseDir = InstalledModelsStore.baseDir(for: .et, modelID: entry.modelID)
-        let artifacts: [DownloadArtifact]
-        switch entry.artifactKind {
-        case .bundle:
-            let finalURL = baseDir.appendingPathComponent(entry.slug + ".bundle")
-            artifacts = [
-                DownloadArtifact(
-                    id: DurableArtifactID.leapBundle,
-                    role: .leapBundle,
-                    remoteURL: nil,
-                    stagingURL: Self.stagingURL(for: finalURL),
-                    finalURL: finalURL,
-                    expectedBytes: entry.sizeBytes > 0 ? entry.sizeBytes : nil,
-                    downloadedBytes: 0,
-                    checksum: entry.sha256,
-                    state: .queued,
-                    retryCount: 0,
-                    nextRetryAt: nil,
-                    lastErrorDescription: nil,
-                    manualPause: false
-                )
-            ]
-        case .manifest:
-            let installDir = baseDir.appendingPathComponent(entry.slug, isDirectory: true)
-            let finalURL = installDir.appendingPathComponent(entry.quantization + ".json")
-            artifacts = [
-                DownloadArtifact(
-                    id: "manifest",
-                    role: .leapManifest,
-                    remoteURL: nil,
-                    stagingURL: Self.stagingURL(for: finalURL),
-                    finalURL: finalURL,
-                    expectedBytes: nil,
-                    downloadedBytes: 0,
-                    checksum: nil,
-                    state: .queued,
-                    retryCount: 0,
-                    nextRetryAt: nil,
-                    lastErrorDescription: nil,
-                    manualPause: false
-                )
-            ]
-        }
-        return await DownloadEngine.shared.upsertJob(
-            owner: .leap(LeapDownloadOwner(entry: entry)),
-            artifacts: artifacts,
-            state: .queued
-        )
-    }
     }
 
 #endif

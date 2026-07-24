@@ -1,4 +1,3 @@
-// EmbedModelInstaller.swift
 import Foundation
 import SwiftUI
 
@@ -15,6 +14,12 @@ final class EmbedModelInstaller: ObservableObject {
 
     @Published var progress: Double = 0
     @Published var state: State = .idle
+
+    // Concurrent installIfNeeded calls (onboarding + DatasetManager auto-install)
+    // share one install per destination: a second download racing the first over
+    // the same staging path can fail and clean up the winner's freshly installed
+    // file. Keyed by destination path; entries clear themselves on completion.
+    private static var installsInFlight: [String: Task<Void, Error>] = [:]
 
     private let recordID: String?
 
@@ -50,28 +55,54 @@ final class EmbedModelInstaller: ObservableObject {
             return
         }
         state = .downloading
-        do {
-            // Ensure destination directory exists first
-            try FileManager.default.createDirectory(at: artifact.directoryURL(recordID: record.id), withIntermediateDirectories: true)
-            let dest = destinationURL
-            try await BackgroundDownloadManager.shared.download(from: remoteURL, to: dest, expectedSize: nil) { [weak self] p in
-                // Progress callback may be non-async; hop to main safely.
-                Task { @MainActor in self?.progress = p }
+        let install: Task<Void, Error>
+        if let inFlight = Self.installsInFlight[destinationURL.path] {
+            install = inFlight
+        } else {
+            install = Task {
+                defer { Self.installsInFlight[destinationURL.path] = nil }
+                try await self.performInstall(record: record, artifact: artifact, remoteURL: remoteURL, destinationURL: destinationURL)
             }
-            state = .verifying
-            try verifyGGUF(at: dest)
-            state = .installing
-            // File is already at destination, nothing to move
-            // Log the successful download + install so we can trace this in the console / log file.
-            Task.detached { await logger.log("[EmbedInstaller] ✅ Embedding model downloaded and installed at: \(dest.path)") }
-            UserDefaults.standard.set(true, forKey: "hasInstalledEmbedModel:\(dest.path)")
+            Self.installsInFlight[destinationURL.path] = install
+        }
+        do {
+            try await install.value
             state = .ready
             progress = 1
-            Haptics.success()
             notifyAvailabilityChanged(record.id == EmbeddingModelCatalog.activeRecord().id)
         } catch {
             state = .failed(error.localizedDescription)
             notifyAvailabilityChanged(false)
+        }
+    }
+
+    private func performInstall(record: EmbeddingModelRecord,
+                                artifact: EmbeddingModelArtifact,
+                                remoteURL: URL,
+                                destinationURL: URL) async throws {
+        // Stage next to the destination and only move a verified file into place:
+        // refreshStateFromDisk treats any file at destinationURL as .ready, so a
+        // corrupt download left there would block every future repair attempt.
+        let stagingURL = destinationURL.appendingPathExtension("download")
+        do {
+            try FileManager.default.createDirectory(at: artifact.directoryURL(recordID: record.id), withIntermediateDirectories: true)
+            try await BackgroundDownloadManager.shared.download(from: remoteURL, to: stagingURL, expectedSize: nil) { [weak self] p in
+                // Progress callback may be non-async; hop to main safely.
+                Task { @MainActor in self?.progress = p }
+            }
+            state = .verifying
+            try verifyGGUF(at: stagingURL)
+            state = .installing
+            try atomicMove(from: stagingURL, to: destinationURL)
+            let dest = destinationURL
+            Task.detached { await logger.log("[EmbedInstaller] ✅ Embedding model downloaded and installed at: \(dest.path)") }
+            UserDefaults.standard.set(true, forKey: "hasInstalledEmbedModel:\(dest.path)")
+            Haptics.success()
+        } catch {
+            // Never touch destinationURL here: only verified files land there, and a
+            // concurrent install may have just put one in place.
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw error
         }
     }
 

@@ -1,4 +1,3 @@
-// DatasetLiveActivityController.swift
 import Foundation
 
 #if os(iOS) && canImport(ActivityKit)

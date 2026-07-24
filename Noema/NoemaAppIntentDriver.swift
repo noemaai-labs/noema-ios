@@ -1,10 +1,3 @@
-// NoemaAppIntentDriver.swift
-//
-// Bridges App Intents (Siri / Shortcuts / Spotlight) to the live app object
-// graph. Each platform's App entry binds its root objects here at launch;
-// intents resolve through the driver and fail with a friendly error when the
-// app has not finished launching yet.
-
 import Foundation
 import SwiftUI
 
@@ -165,7 +158,7 @@ final class AppIntentDriver {
     func startNewChat() throws {
         guard let chatVM else { throw NoemaIntentError.appNotReady }
         tabRouter?.selection = .chat
-        chatVM.startNewSession()
+        chatVM.startNewSession(carryingActiveDataset: false)
     }
 
     /// Starts a new chat and sends `prompt`. Generation streams in the app UI;
@@ -174,7 +167,7 @@ final class AppIntentDriver {
         guard let chatVM else { throw NoemaIntentError.appNotReady }
         tabRouter?.selection = .chat
         if inNewChat {
-            chatVM.startNewSession()
+            chatVM.startNewSession(carryingActiveDataset: false)
         }
         Task { await chatVM.sendMessage(prompt) }
     }

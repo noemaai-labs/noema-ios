@@ -1,4 +1,3 @@
-// ModelScanner.swift
 import Foundation
 
 enum ModelScanner {

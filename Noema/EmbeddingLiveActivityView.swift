@@ -1,5 +1,5 @@
-// EmbeddingLiveActivityView.swift
 import SwiftUI
+import Combine
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -11,6 +11,7 @@ import UIKit
 struct EmbeddingLiveActivityView: View {
     @ObservedObject var datasetManager: DatasetManager
 
+    @EnvironmentObject private var tabRouter: TabRouter
     @Environment(\.locale) private var locale
     @Environment(\.colorScheme) private var colorScheme
 
@@ -20,6 +21,9 @@ struct EmbeddingLiveActivityView: View {
     @State private var removalTasks: [String: Task<Void, Never>] = [:]
     @State private var batteryConfirmDatasetID: String?
     @State private var stopConfirmDatasetID: String?
+    #if os(iOS)
+    @State private var keyboardVisible = false
+    #endif
 
     private static let activeBlue = Color(red: 0.07, green: 0.56, blue: 1.0)
 
@@ -64,6 +68,36 @@ struct EmbeddingLiveActivityView: View {
             for task in removalTasks.values { task.cancel() }
             removalTasks = [:]
         }
+        #if os(iOS)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                keyboardVisible = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                keyboardVisible = false
+            }
+        }
+        #endif
+    }
+
+    /// The collapsed pill is pinned top-trailing — the same corner that hosts the
+    /// keyboard's dismiss affordance and, on the Explore tab, the model-type
+    /// toggle. While either is on screen the pill would cover that control, so
+    /// nudge it down to keep the control tappable. Only applies while collapsed —
+    /// the expanded card sits lower.
+    private var collapsedTopTrailingDrop: CGFloat {
+        guard isCollapsed else { return 0 }
+        #if os(iOS) || os(visionOS)
+        var covered = tabRouter.selection == .explore
+        #if os(iOS)
+        covered = covered || keyboardVisible
+        #endif
+        return covered ? 48 : 0
+        #else
+        return 0
+        #endif
     }
 
     // MARK: - Layout
@@ -93,7 +127,9 @@ struct EmbeddingLiveActivityView: View {
         }
         .frame(maxWidth: cardWidth == 0 ? .infinity : cardWidth, alignment: isCollapsed ? .trailing : .center)
         .padding(.horizontal, outerHorizontalPadding)
+        .padding(.top, collapsedTopTrailingDrop)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isCollapsed)
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: tabRouter.selection)
         .contextMenu {
             Button(role: .destructive) {
                 dismissTransientEntries()
@@ -169,10 +205,12 @@ struct EmbeddingLiveActivityView: View {
         .padding(.vertical, 14)
         .frame(maxWidth: cardWidth == 0 ? .infinity : cardWidth)
         .glassPill(cornerRadius: 22)
+#if !os(macOS)
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .stroke(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.24), lineWidth: 0.8)
         )
+#endif
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: entries.map(\.id))
     }
 
@@ -191,7 +229,7 @@ struct EmbeddingLiveActivityView: View {
                 Spacer(minLength: 8)
 
                 Text(aggregatePercentText)
-                    .font(.caption2)
+                    .activityStatFont()
                     .monospacedDigit()
                     .foregroundStyle(secondaryTextColor)
 
@@ -224,13 +262,13 @@ struct EmbeddingLiveActivityView: View {
 
                 ZStack(alignment: .trailing) {
                     Text("100% · ~88m 88s")
-                        .font(.caption2)
+                        .activityStatFont()
                         .monospacedDigit()
                         .compactStatusText(minimumScaleFactor: 0.72)
                         .hidden()
 
                     Text(presentation.progressText)
-                        .font(.caption2)
+                        .activityStatFont()
                         .monospacedDigit()
                         .foregroundStyle(trailingTextColor(for: presentation))
                         .compactStatusText(minimumScaleFactor: 0.72)
@@ -254,7 +292,11 @@ struct EmbeddingLiveActivityView: View {
             } else {
                 Capsule()
                     .fill(terminalTrackColor(for: presentation))
+#if os(macOS)
+                    .frame(height: 2)
+#else
                     .frame(height: 5)
+#endif
             }
 
             if presentation.message != presentation.title && !presentation.message.isEmpty {
@@ -271,6 +313,21 @@ struct EmbeddingLiveActivityView: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 8) {
+#if os(macOS)
+                    Button {
+                        requestStart(entry.datasetID)
+                    } label: {
+                        Label(String(localized: "Confirm and Start Embedding", locale: locale), systemImage: "play.fill")
+                    }
+                    .buttonStyle(.industrial(.tinted))
+
+                    Button(role: .destructive) {
+                        stopConfirmDatasetID = entry.datasetID
+                    } label: {
+                        Label(String(localized: "Stop", locale: locale), systemImage: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.industrial(.destructive))
+#else
                     Button {
                         requestStart(entry.datasetID)
                     } label: {
@@ -296,6 +353,7 @@ struct EmbeddingLiveActivityView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+#endif
 
                     Spacer(minLength: 0)
                 }
@@ -329,7 +387,7 @@ struct EmbeddingLiveActivityView: View {
                 Spacer(minLength: 6)
 
                 Text(aggregatePercentText)
-                    .font(.caption2)
+                    .activityStatFont()
                     .monospacedDigit()
                     .foregroundStyle(secondaryTextColor)
                     .compactStatusText(minimumScaleFactor: 0.76)
@@ -341,14 +399,20 @@ struct EmbeddingLiveActivityView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .frame(width: collapsedPillWidth)
+#if os(macOS)
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+#else
             .contentShape(Capsule())
+#endif
         }
         .buttonStyle(.plain)
         .glassPill(cornerRadius: 18)
+#if !os(macOS)
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.24), lineWidth: 0.8)
         )
+#endif
     }
 
     // MARK: - Derived state
@@ -600,7 +664,11 @@ struct EmbeddingLiveActivityView: View {
     }
 
     private var ringTrackColor: Color {
+        #if os(macOS)
+        Color.primary.opacity(0.12)
+        #else
         colorScheme == .dark ? Color.white.opacity(0.16) : Color.black.opacity(0.12)
+        #endif
     }
 
     private var primaryTextColor: Color {
@@ -617,6 +685,17 @@ struct EmbeddingLiveActivityView: View {
         #else
         Color.secondary
         #endif
+    }
+}
+
+// Stat lines follow the Mac industrial 11pt mono; touch keeps caption2.
+private extension View {
+    func activityStatFont() -> some View {
+#if os(macOS)
+        font(.system(size: 11, weight: .medium, design: .monospaced))
+#else
+        font(.caption2)
+#endif
     }
 }
 
@@ -646,7 +725,9 @@ private struct LiveActivityDot: View {
         Circle()
             .fill(color)
             .frame(width: 7, height: 7)
+#if !os(macOS)
             .shadow(color: color.opacity(0.55), radius: 3)
+#endif
             .opacity(isPulsing && dimmed ? 0.35 : 1.0)
             .onAppear {
                 guard isPulsing else { return }

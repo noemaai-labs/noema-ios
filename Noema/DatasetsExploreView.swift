@@ -1,5 +1,4 @@
 #if os(iOS) || os(visionOS)
-// DatasetsExploreView.swift
 import SwiftUI
 import Foundation
 import UniformTypeIdentifiers
@@ -18,7 +17,6 @@ struct DatasetsExploreView: View {
     @State private var hintTask: Task<Void, Never>? = nil
     @AppStorage("huggingFaceToken") private var huggingFaceToken = ""
 
-    // Import flow state
     @State private var showImporter = false
     @State private var importNotice: String?
     @State private var pendingPickedURLs: [URL] = []
@@ -96,7 +94,7 @@ struct DatasetsExploreView: View {
                 .guideHighlight(.exploreImportButton)
             }
         }
-        .task { await vm.loadCurated() }
+        .task { await vm.loadCurated(); await vm.loadKnowledgePacks() }
         // Search requested from outside the view hierarchy (Siri / App Intents)
         .onAppear { consumePendingExploreSearchIfNeeded() }
         .onReceive(tabRouter.$pendingExploreSearch) { _ in
@@ -150,14 +148,12 @@ struct DatasetsExploreView: View {
                                 .font(FontTheme.heading(size: 24))
                                 .padding(.horizontal, 4)
 
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 24)], spacing: 24) {
-                                ForEach(datasetManager.datasets) { dataset in
-                                    localDatasetCard(dataset)
-                                }
-                            }
+                            localDatasetList(datasetManager.datasets)
                         }
                         .frame(maxWidth: 1000)
                     }
+
+                    if isSearchEmpty { knowledgePacksGrid }
 
                     if isSearchEmpty {
                         VStack(alignment: .leading, spacing: 24) {
@@ -167,9 +163,7 @@ struct DatasetsExploreView: View {
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 4)
                             } else {
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 24)], spacing: 24) {
-                                    ForEach(vm.recommended, content: recordCard)
-                                }
+                                recordList(vm.recommended)
                             }
                         }
                         .frame(maxWidth: 1000)
@@ -185,9 +179,7 @@ struct DatasetsExploreView: View {
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 4)
                             } else {
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 24)], spacing: 24) {
-                                    ForEach(vm.searchResults, content: recordCard)
-                                }
+                                recordList(vm.searchResults)
 
                                 if vm.canLoadMore {
                                     ProgressView()
@@ -214,11 +206,21 @@ struct DatasetsExploreView: View {
     private var phoneContent: some View {
         List {
             if isSearchEmpty {
-                Text(searchHint)
-                    .foregroundStyle(.secondary)
+                if !vm.knowledgePacks.isEmpty {
+                    Section {
+                        ForEach(vm.knowledgePacks, content: recordRow)
+                            .listRowBackground(Color.clear)
+                    } header: {
+                        Text(LocalizedStringKey("Knowledge Packs"))
+                    }
+                } else {
+                    Text(searchHint)
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 Section(LocalizedStringKey("Results")) {
                     ForEach(vm.searchResults, content: recordRow)
+                        .listRowBackground(Color.clear)
                     if vm.canLoadMore {
                         ProgressView().onAppear { vm.loadNextPage() }
                     }
@@ -227,6 +229,13 @@ struct DatasetsExploreView: View {
         }
         .searchable(text: $vm.searchText, prompt: Text(LocalizedStringKey("Search datasets")))
         .onSubmit(of: .search) { vm.triggerSearch() }
+        // Match the (smooth) Explore Models list configuration. The default inset-grouped List
+        // style recomposites its grouped background + row insets during the `.searchable`
+        // pull-down reveal, which janks on device; `.plain` + a hidden scroll background is cheap.
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(AppTheme.windowBackground)
+        .contentMargins(.bottom, 40, for: .scrollContent)
         .onChange(of: vm.searchText) { _ in vm.triggerSearch() }
         .onChange(of: huggingFaceToken, perform: updateRegistry)
         .guideHighlight(.exploreDatasetList)
@@ -234,130 +243,56 @@ struct DatasetsExploreView: View {
 
     @ViewBuilder
     private func recordRow(_ record: DatasetRecord) -> some View {
-        Button { startOpen(record) } label: {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(record.displayName)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                if !record.publisher.isEmpty {
-                    Text(record.publisher)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if let summary = record.summary, !summary.isEmpty {
-                    Text(summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .padding(.top, 2)
+        DatasetRecordRow(record: record) { startOpen(record) }
+    }
+
+    /// Flat list of dataset rows, hairline `Divider`s between them and no card
+    /// background — the exact industrial layout of the Stored model list.
+    @ViewBuilder
+    private func recordList(_ records: [DatasetRecord]) -> some View {
+        LazyVStack(spacing: 0) {
+            ForEach(Array(records.enumerated()), id: \.element.id) { index, record in
+                DatasetRecordRow(record: record) { startOpen(record) }
+                    .padding(.horizontal, 8)
+                if index < records.count - 1 {
+                    Divider().padding(.leading, 8)
                 }
             }
-            .padding(.vertical, 4)
+        }
+    }
+
+    /// Flat list of the user's imported datasets, same industrial styling as
+    /// `recordList` so both sections read as one coherent list.
+    @ViewBuilder
+    private func localDatasetList(_ datasets: [LocalDataset]) -> some View {
+        LazyVStack(spacing: 0) {
+            ForEach(Array(datasets.enumerated()), id: \.element.id) { index, dataset in
+                LocalDatasetRow(
+                    dataset: dataset,
+                    showsReindexNotice: datasetManager.shouldShowRAGUpgradeNotice(for: dataset)
+                ) { importedDataset = dataset }
+                    .padding(.horizontal, 8)
+                if index < datasets.count - 1 {
+                    Divider().padding(.leading, 8)
+                }
+            }
         }
     }
 
     @ViewBuilder
-    private func localDatasetCard(_ dataset: LocalDataset) -> some View {
-        Button {
-            importedDataset = dataset
-        } label: {
+    private var knowledgePacksGrid: some View {
+        if !vm.knowledgePacks.isEmpty {
             VStack(alignment: .leading, spacing: 16) {
-                HStack(alignment: .top) {
-                    Text(dataset.name)
-                        .font(FontTheme.heading(size: 18))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    if dataset.isIndexed {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green.gradient)
-                    }
+                HStack(spacing: 8) {
+                    Image(systemName: "shippingbox.fill")
+                    Text(LocalizedStringKey("Knowledge Packs"))
                 }
-
-                Spacer()
-
-                HStack {
-                    if !dataset.source.isEmpty {
-                        Text(dataset.source)
-                            .font(FontTheme.caption(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Image(systemName: "folder.fill")
-                        .font(.body)
-                        .foregroundStyle(.secondary.opacity(0.5))
-                }
+                .font(FontTheme.heading(size: 24))
+                .padding(.horizontal, 4)
+                recordList(vm.knowledgePacks)
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
-            .background(AppTheme.cardBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.04), radius: 12, x: 0, y: 4)
+            .frame(maxWidth: 1000)
         }
-        .visionHoverHighlight(cornerRadius: 12)
-        .buttonStyle(.plain)
-    }
-    
-    @ViewBuilder
-    private func recordCard(_ record: DatasetRecord) -> some View {
-        Button { startOpen(record) } label: {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .top) {
-                    Text(record.displayName)
-                        .font(FontTheme.heading(size: 18))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    if record.installed {
-                        Image(systemName: "checkmark.seal.fill")
-                            .foregroundStyle(.green.gradient)
-                    }
-                }
-
-                if let summary = record.summary, !summary.isEmpty {
-                    Text(summary)
-                        .font(FontTheme.body(size: 14))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 8)
-
-                HStack {
-                    if !record.publisher.isEmpty {
-                        Text(record.publisher.uppercased())
-                            .font(FontTheme.caption(size: 11))
-                            .tracking(1)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary.opacity(0.5))
-                }
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
-            .background(AppTheme.cardBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.04), radius: 12, x: 0, y: 4)
-        }
-        .visionHoverHighlight(cornerRadius: 12)
-        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -470,7 +405,6 @@ struct DatasetsExploreView: View {
             datasetToIndex = ds
             askStartIndexing = true
         }
-        // Reset state
         pendingPickedURLs.removeAll()
         showNameSheet = false
     }
@@ -507,7 +441,6 @@ struct DatasetsExploreView: View {
     @State private var hintTask: Task<Void, Never>? = nil
     @AppStorage("huggingFaceToken") private var huggingFaceToken = ""
 
-    // Import flow state
     @State private var pendingPickedURLs: [URL] = []
     @State private var showNameSheet = false
     @State private var datasetName: String = ""
@@ -528,66 +461,54 @@ struct DatasetsExploreView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Centered Header
-            VStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(LocalizedStringKey("Explore Datasets"))
-                    .font(FontTheme.heading(size: 32)) // Serif heading
-                    .foregroundStyle(Color.primary)
+                    .font(.system(size: 20, weight: .semibold))
                 Text(LocalizedStringKey("Browse curated datasets for retrieval"))
-                    .font(FontTheme.body(size: 16))
-                    .foregroundStyle(.secondary)
+                    .industrialStat()
             }
-            .frame(maxWidth: .infinity)
-            .padding(.top, 48)
-            .padding(.bottom, 48)
-            
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 32)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+
             ScrollView {
-                VStack(alignment: .center, spacing: 48) { // Generous spacing
+                VStack(alignment: .center, spacing: 28) {
                     if !datasetManager.datasets.isEmpty {
-                        VStack(alignment: .leading, spacing: 24) {
-                            Text(LocalizedStringKey("Datasets"))
-                                .font(FontTheme.heading(size: 24))
-                                .padding(.horizontal, 4)
-                            
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 24)], spacing: 24) {
-                                ForEach(datasetManager.datasets) { dataset in
-                                    localDatasetCard(dataset)
-                                }
-                            }
+                        VStack(alignment: .leading, spacing: 12) {
+                            IndustrialSectionHeader("Datasets", detail: "\(datasetManager.datasets.count)")
+
+                            localDatasetList(datasetManager.datasets)
                         }
-                        .frame(maxWidth: 1000) // Limit width for "focused island" feel
+                        .frame(maxWidth: 1000)
                     }
 
+                    if vm.searchText.trimmingCharacters(in: .whitespaces).isEmpty { knowledgePacksGrid }
+
                     if vm.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
-                        VStack(alignment: .leading, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 12) {
                             if vm.recommended.isEmpty {
                                 Text(LocalizedStringKey("Search for any subject you're interested in."))
-                                    .font(FontTheme.body(size: 16))
+                                    .font(.system(size: 13))
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 4)
                             } else {
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 24)], spacing: 24) {
-                                    ForEach(vm.recommended, content: recordCard)
-                                }
+                                recordList(vm.recommended)
                             }
                         }
                         .frame(maxWidth: 1000)
                     } else {
-                        VStack(alignment: .leading, spacing: 24) {
-                            Text(LocalizedStringKey("Results"))
-                                .font(FontTheme.heading(size: 24))
-                                .padding(.horizontal, 4)
-                            
+                        VStack(alignment: .leading, spacing: 12) {
+                            IndustrialSectionHeader("Results", detail: vm.searchResults.isEmpty ? nil : "\(vm.searchResults.count)")
+
                             if vm.searchResults.isEmpty && !vm.isLoadingSearch {
                                 Text(LocalizedStringKey("No datasets found. Try different keywords."))
-                                    .font(FontTheme.body(size: 16))
+                                    .font(.system(size: 13))
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 4)
                             } else {
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 24)], spacing: 24) {
-                                    ForEach(vm.searchResults, content: recordCard)
-                                }
-                                
+                                recordList(vm.searchResults)
+
                                 if vm.canLoadMore {
                                     ProgressView()
                                         .frame(maxWidth: .infinity)
@@ -600,7 +521,8 @@ struct DatasetsExploreView: View {
                     }
                 }
                 .padding(.horizontal, 32)
-                .padding(.bottom, 64)
+                .padding(.top, 8)
+                .padding(.bottom, 32)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -617,13 +539,10 @@ struct DatasetsExploreView: View {
         } message: {
             Text(LocalizedStringKey("We'll extract text and prepare embeddings. You can also start later from the dataset details."))
         }
-        .alert(item: $datasetManager.embedAlert) { info in
-            Alert(title: Text(info.message))
-        }
         .overlay(alignment: .center) { loadingOverlay }
         .overlay(alignment: .center) { if vm.isLoadingSearch { ProgressView() } }
         .onChange(of: huggingFaceToken, perform: updateRegistry)
-        .task { await vm.loadCurated() }
+        .task { await vm.loadCurated(); await vm.loadKnowledgePacks() }
         .onAppear {
             chromeState.activeSection = .datasets
             chromeState.toggleAction = nil
@@ -684,8 +603,9 @@ struct DatasetsExploreView: View {
             } label: {
                 Label(LocalizedStringKey("Import"), systemImage: "square.and.arrow.down")
             }
-            .buttonStyle(GlassButtonStyle.glass(isActive: false))
-            .padding(24)
+            .buttonStyle(.industrial(.quiet))
+            .padding(.horizontal, 32)
+            .padding(.vertical, 20)
         }
     }
 
@@ -698,112 +618,47 @@ struct DatasetsExploreView: View {
         }
     }
 
+    /// Flat list of the user's imported datasets — industrial Stored-model layout,
+    /// hairline `Divider`s, no card background.
     @ViewBuilder
-    private func localDatasetCard(_ dataset: LocalDataset) -> some View {
-        Button {
-            importedDataset = dataset
-        } label: {
-            VStack(alignment: .leading, spacing: 16) {
-                // Header Row
-                HStack(alignment: .top) {
-                    Text(dataset.name)
-                        .font(FontTheme.heading(size: 18))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    if dataset.isIndexed {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green.gradient)
-                    }
-                }
-                
-                Spacer()
-                
-                // Metadata Row
-                HStack {
-                    if !dataset.source.isEmpty {
-                        Text(dataset.source)
-                            .font(FontTheme.caption(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Image(systemName: "folder.fill")
-                        .font(.body)
-                        .foregroundStyle(.secondary.opacity(0.5))
+    private func localDatasetList(_ datasets: [LocalDataset]) -> some View {
+        LazyVStack(spacing: 0) {
+            ForEach(Array(datasets.enumerated()), id: \.element.id) { index, dataset in
+                LocalDatasetRow(
+                    dataset: dataset,
+                    showsReindexNotice: datasetManager.shouldShowRAGUpgradeNotice(for: dataset)
+                ) { importedDataset = dataset }
+                    .padding(.horizontal, 8)
+                if index < datasets.count - 1 {
+                    Divider().padding(.leading, 8)
                 }
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
-            .background(AppTheme.cardBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.04), radius: 12, x: 0, y: 4)
         }
-        .visionHoverHighlight(cornerRadius: 12)
-        .buttonStyle(.plain)
+    }
+
+    /// Flat list of dataset rows, hairline separators, no card background.
+    @ViewBuilder
+    private func recordList(_ records: [DatasetRecord]) -> some View {
+        LazyVStack(spacing: 0) {
+            ForEach(Array(records.enumerated()), id: \.element.id) { index, record in
+                DatasetRecordRow(record: record) { startOpen(record) }
+                    .padding(.horizontal, 8)
+                if index < records.count - 1 {
+                    Divider().padding(.leading, 8)
+                }
+            }
+        }
     }
 
     @ViewBuilder
-    private func recordCard(_ record: DatasetRecord) -> some View {
-        Button { startOpen(record) } label: {
+    private var knowledgePacksGrid: some View {
+        if !vm.knowledgePacks.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
-                // Header
-                HStack(alignment: .top) {
-                    Text(record.displayName)
-                        .font(FontTheme.heading(size: 18))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    if record.installed {
-                        Image(systemName: "checkmark.seal.fill")
-                            .foregroundStyle(.green.gradient)
-                    }
-                }
-                
-                if let summary = record.summary, !summary.isEmpty {
-                    Text(summary)
-                        .font(FontTheme.body(size: 14))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                
-                Spacer(minLength: 8)
-                
-                // Metadata Row
-                HStack {
-                    if !record.publisher.isEmpty {
-                        Text(record.publisher.uppercased())
-                            .font(FontTheme.caption(size: 11))
-                            .tracking(1)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary.opacity(0.5))
-                }
+                IndustrialSectionHeader("Knowledge Packs", detail: "\(vm.knowledgePacks.count)")
+                recordList(vm.knowledgePacks)
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
-            .background(AppTheme.cardBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.04), radius: 12, x: 0, y: 4)
+            .frame(maxWidth: 1000)
         }
-        .visionHoverHighlight(cornerRadius: 12)
-        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -864,7 +719,7 @@ struct DatasetsExploreView: View {
                                 .foregroundStyle(.primary)
                                 .multilineTextAlignment(.leading)
                             Button("Cancel") { cancelLoading() }
-                                .buttonStyle(.bordered)
+                                .buttonStyle(.industrial(.quiet))
                         }
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
@@ -872,7 +727,7 @@ struct DatasetsExploreView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
                 .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(.ultraThinMaterial)
                 )
                 .shadow(radius: 8)
@@ -994,15 +849,18 @@ struct DatasetsExploreView: View {
     private var nameSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(LocalizedStringKey("Name your dataset"))
-                .font(.headline)
+                .font(.system(size: 13, weight: .semibold))
             TextField(LocalizedStringKey("Dataset name"), text: $datasetName)
-                .textFieldStyle(.roundedBorder)
+                .industrialField()
+                .font(.system(size: 12, design: .monospaced))
             Spacer()
             HStack {
                 Button(LocalizedStringKey("Cancel")) { showNameSheet = false }
+                    .buttonStyle(.industrial(.quiet))
                 Spacer()
                 Button(LocalizedStringKey("Import")) { Task { await performImport() } }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.industrial(.prominent))
+                    .keyboardShortcut(.defaultAction)
                     .disabled(datasetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }

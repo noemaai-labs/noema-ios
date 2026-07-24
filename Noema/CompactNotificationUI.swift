@@ -11,6 +11,10 @@ struct NotificationProgressBar: View {
     }
 
     var body: some View {
+#if os(macOS)
+        IndustrialProgressBar(value: clampedValue, tint: .accentColor)
+            .animation(.easeOut(duration: 0.14), value: clampedValue)
+#else
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule()
@@ -31,6 +35,7 @@ struct NotificationProgressBar: View {
             }
         }
         .frame(height: height)
+#endif
     }
 
     private var vibrantBlue: Color {

@@ -61,7 +61,10 @@ public final class RelayLogStore: ObservableObject {
     public func setPaused(_ paused: Bool) {
         guard paused != isPaused else { return }
         isPaused = paused
-        if !paused {
+        if paused {
+            flushTask?.cancel()
+            flushTask = nil
+        } else {
             scheduleFlush(immediate: true)
         }
     }
@@ -109,6 +112,8 @@ public final class RelayLogStore: ObservableObject {
     }
 
     public func clear() {
+        flushTask?.cancel()
+        flushTask = nil
         pending.removeAll(keepingCapacity: true)
         entries.removeAll()
     }
@@ -119,8 +124,13 @@ public final class RelayLogStore: ObservableObject {
         flushTask = Task { [weak self] in
             guard let self else { return }
             if delay > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } catch {
+                    return
+                }
             }
+            guard !Task.isCancelled else { return }
             await self.flushPending()
         }
     }
@@ -211,12 +221,21 @@ public enum RelayLog {
     }
 }
 
-private final class RelayLogDateFormatter {
-    static let shared: DateFormatter = {
+private final class RelayLogDateFormatter: @unchecked Sendable {
+    static let shared = RelayLogDateFormatter()
+
+    private let lock = NSLock()
+    private let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .none
         formatter.timeStyle = .medium
         formatter.locale = Locale.autoupdatingCurrent
         return formatter
     }()
+
+    func string(from date: Date) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return formatter.string(from: date)
+    }
 }

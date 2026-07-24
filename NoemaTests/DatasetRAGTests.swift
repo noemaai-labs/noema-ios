@@ -111,6 +111,16 @@ final class DatasetRAGTests: XCTestCase {
         XCTAssertNil(DatasetRetriever.titleForEmbedding(source: nil, datasetTitle: "   "))
     }
 
+    func testLongTextSplitterMakesProgressWhenTextStartsWithDelimiter() {
+        let input = "." + String(repeating: "a", count: 24)
+
+        let parts = DatasetRetriever.splitLongTextForEmbedding(input, maxChars: 8)
+
+        XCTAssertFalse(parts.isEmpty)
+        XCTAssertTrue(parts.allSatisfy { $0.count <= 8 })
+        XCTAssertEqual(parts.joined(), input)
+    }
+
     func testDatasetIndexIORequiresMetadataAndPositiveChunkCount() throws {
         let dir = try makeTempDirectory(prefix: "dataset-index-")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -293,6 +303,203 @@ final class DatasetRAGTests: XCTestCase {
         XCTAssertEqual(decoded.ragInjectionInfo?.method, .fullContent)
         XCTAssertEqual(decoded.citations ?? [], [])
         XCTAssertEqual(decoded.retrievedContext, "Full document text")
+    }
+
+    func testFullDocumentAccessReceiptOnlyShowsOnceForSameDocumentAndModel() {
+        let firstUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Explain eigenvalues.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var firstReply = ChatVM.Msg(role: "🤖", text: "Answer", localModelName: "Local 4B")
+        firstReply.documentAccessDecision = automaticContextDecision(datasetName: "Linear Algebra")
+        firstReply.ragInjectionInfo = injectionInfo(datasetName: "Linear Algebra", method: .fullContent)
+
+        let followUp = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "How are determinants related?",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var secondReply = ChatVM.Msg(role: "🤖", text: "", streaming: true, localModelName: "Local 4B")
+        secondReply.documentAccessDecision = automaticContextDecision(datasetName: "Linear Algebra")
+
+        let history = [firstUser, firstReply, followUp, secondReply]
+
+        XCTAssertTrue(ChatVM.shouldShowDocumentAccessReceipt(for: firstReply, in: history))
+        XCTAssertFalse(ChatVM.shouldShowDocumentAccessReceipt(for: secondReply, in: history))
+    }
+
+    func testFullDocumentAccessReceiptReturnsForDifferentModelOrDataset() {
+        let firstUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Explain eigenvalues.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var firstReply = ChatVM.Msg(role: "🤖", text: "Answer", localModelName: "Local 4B")
+        firstReply.documentAccessDecision = automaticContextDecision(datasetName: "Linear Algebra")
+        firstReply.ragInjectionInfo = injectionInfo(datasetName: "Linear Algebra", method: .fullContent)
+
+        let sameDocumentUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Follow up.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var differentModelReply = ChatVM.Msg(role: "🤖", text: "Answer", localModelName: "Local 8B")
+        differentModelReply.documentAccessDecision = automaticContextDecision(datasetName: "Linear Algebra")
+        differentModelReply.ragInjectionInfo = injectionInfo(datasetName: "Linear Algebra", method: .fullContent)
+
+        let differentDocumentUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Explain this one.",
+            datasetID: "calculus",
+            datasetName: "Calculus"
+        )
+        var differentDocumentReply = ChatVM.Msg(role: "🤖", text: "Answer", localModelName: "Local 4B")
+        differentDocumentReply.documentAccessDecision = automaticContextDecision(datasetName: "Calculus")
+        differentDocumentReply.ragInjectionInfo = injectionInfo(datasetName: "Calculus", method: .fullContent)
+
+        let history = [
+            firstUser, firstReply,
+            sameDocumentUser, differentModelReply,
+            differentDocumentUser, differentDocumentReply,
+        ]
+
+        XCTAssertTrue(ChatVM.shouldShowDocumentAccessReceipt(for: differentModelReply, in: history))
+        XCTAssertTrue(ChatVM.shouldShowDocumentAccessReceipt(for: differentDocumentReply, in: history))
+    }
+
+    func testSmartRetrievalReceiptStillShowsAfterFullDocumentUse() {
+        let firstUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Explain eigenvalues.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var firstReply = ChatVM.Msg(role: "🤖", text: "Answer", localModelName: "Local 4B")
+        firstReply.documentAccessDecision = automaticContextDecision(datasetName: "Linear Algebra")
+        firstReply.ragInjectionInfo = injectionInfo(datasetName: "Linear Algebra", method: .fullContent)
+
+        let followUp = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Find the relevant section.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var retrievalReply = ChatVM.Msg(role: "🤖", text: "Answer", localModelName: "Local 4B")
+        retrievalReply.documentAccessDecision = automaticContextDecision(datasetName: "Linear Algebra")
+        retrievalReply.ragInjectionInfo = injectionInfo(datasetName: "Linear Algebra", method: .rag)
+
+        let history = [firstUser, firstReply, followUp, retrievalReply]
+
+        XCTAssertTrue(ChatVM.shouldShowDocumentAccessReceipt(for: retrievalReply, in: history))
+    }
+
+    func testFullDocumentToSmartRetrievalCreatesOneContextTransitionReceipt() {
+        let firstUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Explain eigenvalues.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var fullDocumentReply = ChatVM.Msg(role: "🤖", text: "Answer")
+        fullDocumentReply.ragInjectionInfo = injectionInfo(
+            datasetName: "Linear Algebra",
+            method: .fullContent
+        )
+
+        let followUp = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Find the relevant section.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var firstRetrievalReply = ChatVM.Msg(role: "🤖", text: "Answer")
+        firstRetrievalReply.ragInjectionInfo = injectionInfo(
+            datasetName: "Linear Algebra",
+            method: .rag
+        )
+
+        let firstHistory = [firstUser, fullDocumentReply, followUp, firstRetrievalReply]
+        let receipt = ChatVM.documentContextTransitionReceipt(
+            for: firstRetrievalReply,
+            in: firstHistory
+        )
+
+        XCTAssertEqual(receipt?.datasetName, "Linear Algebra")
+        XCTAssertEqual(receipt?.fullDocumentTokens, 1_200)
+        XCTAssertEqual(receipt?.configuredContextTokens, 4_096)
+        XCTAssertEqual(receipt?.reservedResponseTokens, 512)
+        XCTAssertEqual(receipt?.retrievedContextTokens, 420)
+
+        let nextUser = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Continue.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var repeatedRetrievalReply = ChatVM.Msg(role: "🤖", text: "Answer")
+        repeatedRetrievalReply.ragInjectionInfo = injectionInfo(
+            datasetName: "Linear Algebra",
+            method: .rag
+        )
+        let repeatedHistory = firstHistory + [nextUser, repeatedRetrievalReply]
+
+        XCTAssertNil(
+            ChatVM.documentContextTransitionReceipt(
+                for: repeatedRetrievalReply,
+                in: repeatedHistory
+            )
+        )
+    }
+
+    func testInitialSmartRetrievalDoesNotClaimFullDocumentWasReleased() {
+        let user = ChatVM.Msg(
+            role: "🧑‍💻",
+            text: "Find the relevant section.",
+            datasetID: "linear-algebra",
+            datasetName: "Linear Algebra"
+        )
+        var reply = ChatVM.Msg(role: "🤖", text: "Answer")
+        reply.ragInjectionInfo = injectionInfo(datasetName: "Linear Algebra", method: .rag)
+
+        XCTAssertNil(
+            ChatVM.documentContextTransitionReceipt(for: reply, in: [user, reply])
+        )
+    }
+
+    private func automaticContextDecision(datasetName: String) -> DocumentAccessDecisionRecord {
+        DocumentAccessDecisionRecord(
+            datasetName: datasetName,
+            requestedStrategy: .context,
+            effectiveStrategy: .context,
+            decidedBy: .appleFoundationModel
+        )
+    }
+
+    private func injectionInfo(
+        datasetName: String,
+        method: ChatVM.Msg.RAGInjectionInfo.Method
+    ) -> ChatVM.Msg.RAGInjectionInfo {
+        ChatVM.Msg.RAGInjectionInfo(
+            datasetName: datasetName,
+            stage: .injected,
+            method: method,
+            requestedMaxChunks: 5,
+            retrievedChunkCount: method == .rag ? 2 : 0,
+            injectedChunkCount: method == .rag ? 2 : 0,
+            trimmedChunkCount: 0,
+            partialChunkInjected: false,
+            fullContentEstimateTokens: 1_200,
+            configuredContextTokens: 4_096,
+            reservedResponseTokens: 512,
+            contextBudgetTokens: 3_584,
+            injectedContextTokens: method == .rag ? 420 : 1_200,
+            decisionReason: method == .rag ? "Using smart retrieval." : "Using the full document."
+        )
     }
 
     func testRAGPackingUsesFullPromptBudgetInsteadOfFixedEightyPercentWindow() async {

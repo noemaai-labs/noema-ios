@@ -1,6 +1,3 @@
-// NoemaLlamaClient.swift
-// NoemaLlamaClient.swift - Swift wrapper for our llama.cpp implementation
-
 import Foundation
 import Dispatch
 import os
@@ -107,14 +104,20 @@ actor GenerationCoordinator {
 
 private actor GenerationReleaseToken {
     private var coordinator: GenerationCoordinator?
+    private var onRelease: (@Sendable () -> Void)?
 
-    init(coordinator: GenerationCoordinator) {
+    init(coordinator: GenerationCoordinator,
+         onRelease: @escaping @Sendable () -> Void = {}) {
         self.coordinator = coordinator
+        self.onRelease = onRelease
     }
 
     func release() async {
         guard let coordinator else { return }
         self.coordinator = nil
+        let onRelease = self.onRelease
+        self.onRelease = nil
+        onRelease?()
         await coordinator.releaseGeneration()
     }
 }
@@ -148,6 +151,70 @@ private actor LoopbackSessionState {
         let session = activeSession
         activeSession = nil
         session?.invalidateAndCancel()
+    }
+}
+
+enum LoopbackOutputCapturePolicy: Equatable, Sendable {
+    case none
+    case characterCount
+    case fullText
+}
+
+struct LoopbackGenerationResult: Equatable, Sendable {
+    let text: String?
+    let characterCount: Int
+}
+
+struct LoopbackOutputCapture: Sendable {
+    let policy: LoopbackOutputCapturePolicy
+    private(set) var text: String?
+    private(set) var characterCount = 0
+
+    init(policy: LoopbackOutputCapturePolicy) {
+        self.policy = policy
+        self.text = policy == .fullText ? "" : nil
+    }
+
+    mutating func append(_ chunk: String) {
+        guard !chunk.isEmpty else { return }
+        switch policy {
+        case .none:
+            break
+        case .characterCount:
+            characterCount += chunk.count
+        case .fullText:
+            characterCount += chunk.count
+            text?.append(chunk)
+        }
+    }
+
+    var result: LoopbackGenerationResult {
+        LoopbackGenerationResult(text: text, characterCount: characterCount)
+    }
+}
+
+enum BoundedLoopbackStreamEmitter {
+    static let capacity = 16
+
+    static func yield(
+        _ chunk: String,
+        to continuation: AsyncThrowingStream<String, Error>.Continuation
+    ) async throws {
+        while true {
+            try Task.checkCancellation()
+            switch continuation.yield(chunk) {
+            case .enqueued:
+                return
+            case .dropped:
+                // `.bufferingOldest` rejects this newest element when full. Wait
+                // for the consumer and retry the same chunk to preserve ordering.
+                try await Task.sleep(nanoseconds: 1_000_000)
+            case .terminated:
+                throw CancellationError()
+            @unknown default:
+                throw CancellationError()
+            }
+        }
     }
 }
 
@@ -191,22 +258,74 @@ public enum LLMResponseFormat: Sendable {
     }
 }
 
+/// Distinguishes user-visible chat generations from internal maintenance work.
+/// Auxiliary requests must never become the durable prompt/cache checkpoint for
+/// a conversation, especially for single-slot paged runtimes.
+public enum LLMRequestPurpose: Sendable, Equatable {
+    case chat
+    case auxiliary
+}
+
 public struct LLMGenerationOptions: Sendable {
     public var reasoningEnabled: Bool?
     public var maxOutputTokens: Int?
     public var thinkingBudgetTokens: Int?
     public var responseFormat: LLMResponseFormat?
+    /// Request-scoped sampling overrides. These avoid mutating the process-wide
+    /// llama environment when Relay serves concurrent callers.
+    public var seed: Int?
+    public var temperature: Double?
+    public var topK: Int?
+    public var topP: Double?
+    public var minP: Double?
+    public var repeatPenalty: Double?
+    public var repeatLastN: Int?
+    public var presencePenalty: Double?
+    public var frequencyPenalty: Double?
+    public var logitBias: [Int: Double]?
+    public var promptCache: Bool?
+    public var requestPurpose: LLMRequestPurpose
+    /// OpenAI-style tool schemas to send as the request `tools` array so the model's
+    /// own chat template renders them natively (llama.cpp requires --jinja). When set,
+    /// the loopback stops relying on hand-written prompt tool guidance.
+    public var tools: [ToolSpec]?
 
     public init(
         reasoningEnabled: Bool? = nil,
         maxOutputTokens: Int? = nil,
         thinkingBudgetTokens: Int? = nil,
-        responseFormat: LLMResponseFormat? = nil
+        responseFormat: LLMResponseFormat? = nil,
+        seed: Int? = nil,
+        temperature: Double? = nil,
+        topK: Int? = nil,
+        topP: Double? = nil,
+        minP: Double? = nil,
+        repeatPenalty: Double? = nil,
+        repeatLastN: Int? = nil,
+        presencePenalty: Double? = nil,
+        frequencyPenalty: Double? = nil,
+        logitBias: [Int: Double]? = nil,
+        promptCache: Bool? = nil,
+        requestPurpose: LLMRequestPurpose = .chat,
+        tools: [ToolSpec]? = nil
     ) {
         self.reasoningEnabled = reasoningEnabled
         self.maxOutputTokens = maxOutputTokens
         self.thinkingBudgetTokens = thinkingBudgetTokens
         self.responseFormat = responseFormat
+        self.seed = seed
+        self.temperature = temperature
+        self.topK = topK
+        self.topP = topP
+        self.minP = minP
+        self.repeatPenalty = repeatPenalty
+        self.repeatLastN = repeatLastN
+        self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.logitBias = logitBias
+        self.promptCache = promptCache
+        self.requestPurpose = requestPurpose
+        self.tools = tools
     }
 }
 
@@ -264,6 +383,10 @@ public extension LLMInput {
 }
 
 struct LoopbackSpeculativeTimings: Codable, Equatable, Sendable {
+    let speculativeType: String?
+    let speculativeState: String?
+    let draftAttempts: Int?
+    let draftEmptyAttempts: Int?
     let cacheN: Int?
     let promptN: Int?
     let promptMS: Double?
@@ -273,6 +396,56 @@ struct LoopbackSpeculativeTimings: Codable, Equatable, Sendable {
     let predictedPerSecond: Double?
     let draftN: Int?
     let draftNAccepted: Int?
+    let draftNBudget: Int?
+    let draftMS: Double?
+    let draftVerificationMS: Double?
+    let draftRollbackMS: Double?
+    let draftAcceptedPerPosition: [Int]?
+    /// Current dynamic draft length when the auto-tuner is on; 0 = speculation
+    /// temporarily paused, nil = static drafting.
+    let draftNDyn: Int?
+
+    init(
+        cacheN: Int?,
+        promptN: Int?,
+        promptMS: Double?,
+        promptPerSecond: Double?,
+        predictedN: Int?,
+        predictedMS: Double?,
+        predictedPerSecond: Double?,
+        draftN: Int?,
+        draftNAccepted: Int?,
+        draftNDyn: Int?,
+        speculativeType: String? = nil,
+        speculativeState: String? = nil,
+        draftAttempts: Int? = nil,
+        draftEmptyAttempts: Int? = nil,
+        draftNBudget: Int? = nil,
+        draftMS: Double? = nil,
+        draftVerificationMS: Double? = nil,
+        draftRollbackMS: Double? = nil,
+        draftAcceptedPerPosition: [Int]? = nil
+    ) {
+        self.speculativeType = speculativeType
+        self.speculativeState = speculativeState
+        self.draftAttempts = draftAttempts
+        self.draftEmptyAttempts = draftEmptyAttempts
+        self.cacheN = cacheN
+        self.promptN = promptN
+        self.promptMS = promptMS
+        self.promptPerSecond = promptPerSecond
+        self.predictedN = predictedN
+        self.predictedMS = predictedMS
+        self.predictedPerSecond = predictedPerSecond
+        self.draftN = draftN
+        self.draftNAccepted = draftNAccepted
+        self.draftNBudget = draftNBudget
+        self.draftMS = draftMS
+        self.draftVerificationMS = draftVerificationMS
+        self.draftRollbackMS = draftRollbackMS
+        self.draftAcceptedPerPosition = draftAcceptedPerPosition
+        self.draftNDyn = draftNDyn
+    }
 
     var acceptanceRate: Double? {
         guard let draftN, draftN > 0, let draftNAccepted else { return nil }
@@ -280,6 +453,10 @@ struct LoopbackSpeculativeTimings: Codable, Equatable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case speculativeType = "speculative_type"
+        case speculativeState = "speculative_state"
+        case draftAttempts = "draft_attempts"
+        case draftEmptyAttempts = "draft_empty_attempts"
         case cacheN = "cache_n"
         case promptN = "prompt_n"
         case promptMS = "prompt_ms"
@@ -289,6 +466,39 @@ struct LoopbackSpeculativeTimings: Codable, Equatable, Sendable {
         case predictedPerSecond = "predicted_per_second"
         case draftN = "draft_n"
         case draftNAccepted = "draft_n_accepted"
+        case draftNBudget = "draft_n_budget"
+        case draftMS = "draft_ms"
+        case draftVerificationMS = "draft_verification_ms"
+        case draftRollbackMS = "draft_rollback_ms"
+        case draftAcceptedPerPosition = "draft_accepted_per_position"
+        case draftNDyn = "draft_n_dyn"
+    }
+}
+
+/// Synchronous mirror of the most recent response timings. Written on the
+/// stream-parsing task before the request finishes, so a reader that runs
+/// after stream completion (e.g. ChatVM perf finalization) always sees the
+/// values for the response that just ended.
+enum LoopbackLatestTimings {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var value: LoopbackSpeculativeTimings?
+
+    static func record(_ timings: LoopbackSpeculativeTimings) {
+        lock.lock()
+        value = timings
+        lock.unlock()
+    }
+
+    static func reset() {
+        lock.lock()
+        value = nil
+        lock.unlock()
+    }
+
+    static func snapshot() -> LoopbackSpeculativeTimings? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
@@ -297,6 +507,8 @@ struct LoopbackResponseDiagnostics: Equatable, Sendable {
     let endpoint: String
     let requestMode: String
     let streaming: Bool
+    let modelIdentifier: String
+    let speculativeType: String?
     let timings: LoopbackSpeculativeTimings?
     let finishReason: String?
     let outputCharacters: Int
@@ -422,9 +634,14 @@ func logLastLoopbackStartOptions(prefix: String = "[Loopback][StartOptions]") {
     guard let options = LlamaServerBridge.lastStartOptions() else { return }
     let spec = options.speculativeType.isEmpty ? "none" : options.speculativeType
     let draft = options.mtpPath.isEmpty ? "embedded-or-none" : URL(fileURLWithPath: options.mtpPath).lastPathComponent
+    let paged = options.pagedMode.map {
+        " mode=\($0) io=\(options.pagedIOThreads ?? 0)x\(options.pagedIODepth ?? 0)"
+            + " waves=\(options.pagedWaves ?? false)"
+            + " expertMajor=\(options.pagedExpertMajor ?? false)"
+    } ?? ""
     let argv = options.argv.joined(separator: " ")
     Task {
-        await logger.log("\(prefix) port=\(options.port) spec=\(spec) mtp=\(draft) specDraftNMax=\(options.specDraftNMax.map(String.init) ?? "nil") specDraftNMin=\(options.specDraftNMin.map(String.init) ?? "nil") specDraftPMin=\(options.specDraftPMin.map { "\($0)" } ?? "nil") argv=\(argv)")
+        await logger.log("\(prefix) port=\(options.port) spec=\(spec) mtp=\(draft) specDraftNMax=\(options.specDraftNMax.map(String.init) ?? "nil") specDraftNMin=\(options.specDraftNMin.map(String.init) ?? "nil") specDraftPMin=\(options.specDraftPMin.map { "\($0)" } ?? "nil") specDynamic=\(options.specDynamic.map(String.init) ?? "nil")\(paged) argv=\(argv)")
     }
 }
 
@@ -471,12 +688,239 @@ private extension Dictionary where Key == String, Value == AnyCodable {
 // MARK: - NoemaLlamaClient
 
 public final class NoemaLlamaClient: @unchecked Sendable {
+    private struct LoopbackLease: Sendable {
+        let ownerID: UUID
+        let port: Int32
+        let ggufPath: String
+    }
+
+    /// Ownership token for a raw loopback consumer that does not wrap its
+    /// server in `NoemaLlamaClient` (currently LocalVLM).
+    struct StandaloneLoopbackLease: Sendable {
+        fileprivate let ownerID: UUID
+        let port: Int32
+        fileprivate let ggufPath: String
+    }
+
+    /// Identifies the newest `NoemaLlamaClient` to claim the process-global
+    /// loopback. Port and path alone are not sufficient: the bridge can reuse
+    /// both for a later server instance, and a stale client's deinit must not
+    /// stop that replacement.
+    private static let activeLoopbackOwner = OSAllocatedUnfairLock<UUID?>(initialState: nil)
+
+    /// Serializes use of the process-global bridge across distinct client
+    /// instances. Per-client GenerationCoordinator is not sufficient when a
+    /// utility such as Pass Scanner creates its own temporary GGUF client.
+    private enum BridgeUseState: Sendable {
+        case idle
+        case generation
+        case mutation
+    }
+    private static let bridgeUseState = OSAllocatedUnfairLock<BridgeUseState>(initialState: .idle)
+
+    private static func beginBridgeGeneration() -> Bool {
+        bridgeUseState.withLock { state in
+            guard case .idle = state else { return false }
+            state = .generation
+            return true
+        }
+    }
+
+    private static func endBridgeGeneration() {
+        bridgeUseState.withLock { state in
+            if case .generation = state { state = .idle }
+        }
+    }
+
+    private static func beginBridgeMutation() -> Bool {
+        bridgeUseState.withLock { state in
+            guard case .idle = state else { return false }
+            state = .mutation
+            return true
+        }
+    }
+
+    private static func endBridgeMutation() {
+        bridgeUseState.withLock { state in
+            if case .mutation = state { state = .idle }
+        }
+    }
+
+    private static func waitForBridgeMutation() async -> Bool {
+        while true {
+            guard !Task.isCancelled else { return false }
+            if beginBridgeMutation() {
+                if Task.isCancelled {
+                    endBridgeMutation()
+                    return false
+                }
+                return true
+            }
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            } catch {
+                return false
+            }
+        }
+    }
+
+    final class BridgeMutationReservation: @unchecked Sendable {
+        private let active: OSAllocatedUnfairLock<Bool>
+
+        fileprivate init(isActive: Bool) {
+            active = OSAllocatedUnfairLock(initialState: isActive)
+        }
+
+        var isActive: Bool {
+            active.withLock { $0 }
+        }
+
+        func release() {
+            let shouldRelease = active.withLock { active in
+                guard active else { return false }
+                active = false
+                return true
+            }
+            if shouldRelease {
+                NoemaLlamaClient.endBridgeMutation()
+            }
+        }
+
+        deinit { release() }
+    }
+
+    final class BridgeGenerationReservation: @unchecked Sendable {
+        private let active = OSAllocatedUnfairLock<Bool>(initialState: true)
+
+        func release() {
+            let shouldRelease = active.withLock { active in
+                guard active else { return false }
+                active = false
+                return true
+            }
+            if shouldRelease {
+                NoemaLlamaClient.endBridgeGeneration()
+            }
+        }
+
+        deinit { release() }
+    }
+
+    static func reserveLoopbackBridge() async -> BridgeMutationReservation {
+        BridgeMutationReservation(isActive: await waitForBridgeMutation())
+    }
+
+    /// Entry point for app subsystems that intentionally replace the embedded
+    /// server without creating a NoemaLlamaClient first (resident loader,
+    /// Relay vision, LocalVLM). It waits for any active GGUF response, clears
+    /// stale client ownership, then performs one serialized replacement.
+    static func replaceLoopbackServer(
+        with configuration: LlamaServerBridge.StartConfiguration
+    ) async -> Int32 {
+        let reservation = await reserveLoopbackBridge()
+        defer { reservation.release() }
+        return replaceLoopbackServer(with: configuration, reservation: reservation)
+    }
+
+    static func replaceLoopbackServer(
+        with configuration: LlamaServerBridge.StartConfiguration,
+        reservation: BridgeMutationReservation
+    ) -> Int32 {
+        guard reservation.isActive else { return -1 }
+        LlamaServerBridge.stop()
+        LoopbackVisionState.setEnabled(false)
+        activeLoopbackOwner.withLock { $0 = nil }
+        return LlamaServerBridge.start(configuration)
+    }
+
+    static func stopLoopbackServerExclusively() async {
+        let reservation = await reserveLoopbackBridge()
+        defer { reservation.release() }
+        guard reservation.isActive else { return }
+        LlamaServerBridge.stop()
+        LoopbackVisionState.setEnabled(false)
+        activeLoopbackOwner.withLock { $0 = nil }
+    }
+
+    /// Starts a loopback server for a raw HTTP consumer and publishes an exact
+    /// UUID lease. A later GGUF replacement invalidates the lease, so that
+    /// consumer can neither send to nor stop the replacement model by mistake.
+    static func startStandaloneLoopbackServer(
+        with configuration: LlamaServerBridge.StartConfiguration,
+        visionEnabled: Bool = false
+    ) async -> StandaloneLoopbackLease? {
+        let reservation = await reserveLoopbackBridge()
+        defer { reservation.release() }
+        guard reservation.isActive else { return nil }
+
+        LlamaServerBridge.stop()
+        LoopbackVisionState.setEnabled(false)
+        activeLoopbackOwner.withLock { $0 = nil }
+        let port = LlamaServerBridge.start(configuration)
+        guard port > 0 else { return nil }
+
+        let lease = StandaloneLoopbackLease(
+            ownerID: UUID(),
+            port: port,
+            ggufPath: canonicalLoopbackPath(configuration.ggufPath)
+        )
+        activeLoopbackOwner.withLock { $0 = lease.ownerID }
+        LoopbackVisionState.setEnabled(visionEnabled)
+        return lease
+    }
+
+    static func reserveStandaloneLoopbackGeneration(
+        for lease: StandaloneLoopbackLease
+    ) -> BridgeGenerationReservation? {
+        guard beginBridgeGeneration() else { return nil }
+        let reservation = BridgeGenerationReservation()
+        guard standaloneLoopbackIsCurrent(lease) else {
+            reservation.release()
+            return nil
+        }
+        return reservation
+    }
+
+    static func stopStandaloneLoopbackServer(ifOwned lease: StandaloneLoopbackLease) async {
+        let reservation = await reserveLoopbackBridge()
+        defer { reservation.release() }
+        guard reservation.isActive else { return }
+        activeLoopbackOwner.withLock { activeOwner in
+            guard activeOwner == lease.ownerID,
+                  standaloneLoopbackIsCurrent(lease, activeOwner: activeOwner) else { return }
+            LlamaServerBridge.stop()
+            LoopbackVisionState.setEnabled(false)
+            activeOwner = nil
+        }
+    }
+
     private let modelURL: URL
     private let contextLength: Int32
     private let mmprojPath: String?
+    private let allowProjectorAutoDiscovery: Bool
     private let explicitThreadCount: Int32?
     private let preferParameterContextOverEnvironment: Bool
     private let forceFreshLoopback: Bool
+    private let serverConfiguration: LlamaServerBridge.StartConfiguration?
+    private struct PagedTelemetrySnapshot {
+        var waves: Int64
+        var prefillBytes: Int64
+        var hits: Int64
+        var misses: Int64
+        var decodeHits: Int64
+        var decodeMisses: Int64
+        var decodeBytes: Int64
+        var decodeStallNs: Int64
+        var historyPredictions: Int64
+        var historyPredictionMatches: Int64
+        var checksumVerifications: Int64
+        var checksumCacheHits: Int64
+    }
+    /// Previous completion's boot-cumulative paged counters, so the telemetry
+    /// line can report per-completion deltas. Lives here because extensions
+    /// cannot hold stored properties.
+    private let pagedTelemetrySnapshot =
+        OSAllocatedUnfairLock<PagedTelemetrySnapshot?>(initialState: nil)
     // Keep loopback requests effectively unbounded for long local generations.
     private static let loopbackRequestTimeout: TimeInterval = 60 * 60 * 24 * 365 * 10
     private static let loopbackResourceTimeout: TimeInterval = 60 * 60 * 24 * 365 * 10
@@ -489,6 +933,199 @@ public final class NoemaLlamaClient: @unchecked Sendable {
     private var effectiveMMProj: String? = nil
     private let generationCoordinator = GenerationCoordinator()
     private let loopbackSessionState = LoopbackSessionState()
+    /// Synchronous completion metadata for the most recently finished request.
+    /// ChatVM uses `length` to resume generation when the native runtime cannot
+    /// shift its KV context (for example, multimodal and some hybrid memories).
+    private let latestFinishReason = OSAllocatedUnfairLock<String?>(initialState: nil)
+    /// `NoemaLlamaClient` talks to a process-global embedded server. Remember
+    /// which concrete server instance this client loaded/reused so a stale
+    /// client can never stop a newer model that has since taken over the bridge.
+    private let loopbackLease = OSAllocatedUnfairLock<LoopbackLease?>(initialState: nil)
+    /// Explicit unload is idempotent. The deinit fallback snapshots and clears
+    /// the lease separately so it cannot race a later model load.
+    private let unloadRequested = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    private static func canonicalLoopbackPath(_ path: String) -> String {
+        URL(fileURLWithPath: path)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+    }
+
+    private static func standaloneLoopbackIsCurrent(
+        _ lease: StandaloneLoopbackLease,
+        activeOwner suppliedOwner: UUID? = nil
+    ) -> Bool {
+        let activeOwner = suppliedOwner ?? activeLoopbackOwner.withLock { $0 }
+        let options = LlamaServerBridge.lastStartOptions()
+        return activeOwner == lease.ownerID
+            && lease.port > 0
+            && lease.port == LlamaServerBridge.port()
+            && options?.port == Int(lease.port)
+            && lease.ggufPath == options.map { canonicalLoopbackPath($0.ggufPath) }
+    }
+
+    /// True only while this client still owns the exact process-global server
+    /// generation it loaded. Relay uses this to reject stale cache entries
+    /// after another GGUF utility has replaced the bridge.
+    func isCurrentLoopbackOwner() -> Bool {
+        guard !unloadRequested.withLock({ $0 }),
+              let lease = loopbackLease.withLock({ $0 }) else { return false }
+        return Self.activeLoopbackOwner.withLock { activeOwner in
+            let options = LlamaServerBridge.lastStartOptions()
+            return activeOwner == lease.ownerID
+                && lease.port > 0
+                && lease.port == LlamaServerBridge.port()
+                && options?.port == Int(lease.port)
+                && lease.ggufPath == options.map { Self.canonicalLoopbackPath($0.ggufPath) }
+        }
+    }
+
+    private func checkedLoopbackPath(port: Int) throws -> String {
+        let requestedPath = Self.canonicalLoopbackPath(modelURL.path)
+        let options = LlamaServerBridge.lastStartOptions()
+        guard port > 0,
+              LlamaServerBridge.port() == Int32(port),
+              options?.port == port,
+              options.map({ Self.canonicalLoopbackPath($0.ggufPath) }) == requestedPath else {
+            throw NSError(
+                domain: "Noema",
+                code: 2002,
+                userInfo: [
+                    NSLocalizedDescriptionKey: String(
+                        localized: "The GGUF server is already running a different model.",
+                        locale: LocalizationManager.preferredLocale()
+                    )
+                ]
+            )
+        }
+        return requestedPath
+    }
+
+    /// Claims a newly loaded/restarted bridge generation for this client.
+    private func claimLoopbackLease(
+        port: Int,
+        allowReplacingExistingOwner: Bool = false
+    ) throws {
+        // Serialize check + generation publication against other clients. The
+        // instance lease is written immediately afterward without nesting two
+        // unfair-lock closures (which Swift 6 rejects for captured inout state).
+        let priorOwner = loopbackLease.withLock { $0?.ownerID }
+        let claimed = try Self.activeLoopbackOwner.withLock { activeOwner in
+            guard activeOwner == nil
+                    || activeOwner == priorOwner
+                    || allowReplacingExistingOwner else {
+                throw loopbackOwnershipError()
+            }
+            let requestedPath = try checkedLoopbackPath(port: port)
+            let lease = LoopbackLease(
+                ownerID: UUID(),
+                port: Int32(port),
+                ggufPath: requestedPath
+            )
+            activeOwner = lease.ownerID
+            return lease
+        }
+        loopbackLease.withLock { lease in
+            lease = claimed
+        }
+    }
+
+    private func loopbackOwnershipError() -> NSError {
+        NSError(
+            domain: "Noema",
+            code: 2002,
+            userInfo: [
+                NSLocalizedDescriptionKey: String(
+                    localized: "The GGUF runtime is already in use.",
+                    locale: LocalizationManager.preferredLocale()
+                )
+            ]
+        )
+    }
+
+    /// Stops the bridge only when the supplied lease is still the published
+    /// owner of the exact server generation. Caller must hold bridge mutation.
+    private static func stopLoopbackIfOwned(_ lease: LoopbackLease?) -> Bool {
+        activeLoopbackOwner.withLock { activeOwner in
+            let options = LlamaServerBridge.lastStartOptions()
+            guard let lease,
+                  activeOwner == lease.ownerID,
+                  lease.port > 0,
+                  lease.port == LlamaServerBridge.port(),
+                  options?.port == Int(lease.port),
+                  lease.ggufPath == options.map({ canonicalLoopbackPath($0.ggufPath) }) else {
+                return false
+            }
+            LlamaServerBridge.stop()
+            LoopbackVisionState.setEnabled(false)
+            activeOwner = nil
+            return true
+        }
+    }
+
+    /// Atomically stops and restarts only the generation this client still
+    /// owns. A stale request may not kill a replacement client's bridge while
+    /// recovering from a connection reset.
+    private func restartOwnedLoopback(mmprojPath: String?) throws -> Int {
+        guard let existing = loopbackLease.withLock({ $0 }) else {
+            throw loopbackOwnershipError()
+        }
+        let result: (port: Int, lease: LoopbackLease)? = try Self.activeLoopbackOwner.withLock { activeOwner in
+            let requestedPath = try checkedLoopbackPath(port: Int(existing.port))
+            guard activeOwner == existing.ownerID,
+                  existing.ggufPath == requestedPath else {
+                throw loopbackOwnershipError()
+            }
+
+            LlamaServerBridge.stop()
+            LoopbackVisionState.setEnabled(false)
+            let restarted = Int(LlamaServerBridge.start(
+                loopbackStartConfiguration(mmprojPath: mmprojPath)
+            ))
+            guard restarted > 0 else {
+                activeOwner = nil
+                return nil
+            }
+            let restartedPath = try checkedLoopbackPath(port: restarted)
+            let lease = LoopbackLease(
+                ownerID: UUID(),
+                port: Int32(restarted),
+                ggufPath: restartedPath
+            )
+            activeOwner = lease.ownerID
+            return (restarted, lease)
+        }
+        guard let result else { return 0 }
+        loopbackLease.withLock { $0 = result.lease }
+        LoopbackVisionState.setEnabled(true)
+        return result.port
+    }
+
+    /// Validates an already-running bridge without stealing ownership from a
+    /// newer client that happens to use the same model path and port.
+    private func validateLoopbackLease(port: Int) throws {
+        let lease = loopbackLease.withLock { $0 }
+        let ownsGeneration = try Self.activeLoopbackOwner.withLock { activeOwner in
+            let requestedPath = try checkedLoopbackPath(port: port)
+            guard let lease else { return false }
+            return activeOwner == lease.ownerID
+                && lease.port == Int32(port)
+                && lease.ggufPath == requestedPath
+        }
+        guard ownsGeneration else {
+            throw NSError(
+                domain: "Noema",
+                code: 2002,
+                userInfo: [
+                    NSLocalizedDescriptionKey: String(
+                        localized: "The GGUF runtime is already in use.",
+                        locale: LocalizationManager.preferredLocale()
+                    )
+                ]
+            )
+        }
+    }
 
     private var templateProfile: TemplateDrivenModelSupport.Profile {
         TemplateDrivenModelSupport.resolvedProfile(modelURL: modelURL)
@@ -507,53 +1144,72 @@ public final class NoemaLlamaClient: @unchecked Sendable {
     }
 
     private func performCoordinatedUnload(completionMessage: String) async -> Bool {
+        // Enter the coordinator before consulting idempotence. A second caller
+        // must wait for an unload already in progress rather than returning
+        // while the bridge is still being torn down.
         let acquired = await generationCoordinator.beginUnloadAcquiring()
         guard acquired else { return false }
 
-        LlamaServerBridge.stop()
-        LoopbackVisionState.setEnabled(false)
+        let shouldUnload = unloadRequested.withLock { alreadyRequested in
+            guard !alreadyRequested else { return false }
+            alreadyRequested = true
+            return true
+        }
+        guard shouldUnload else {
+            await generationCoordinator.endUnload()
+            return false
+        }
+
+        // Another client may be finishing a request or changing bridge
+        // ownership. Wait for the process-global bridge itself, not only this
+        // client's coordinator, before checking and stopping its generation.
+        let bridgeReservation = await Self.reserveLoopbackBridge()
+        defer { bridgeReservation.release() }
+
+        let lease = loopbackLease.withLock { current -> LoopbackLease? in
+            defer { current = nil }
+            return current
+        }
+        let stillOwnsLoopback = Self.stopLoopbackIfOwned(lease)
+
+        if !stillOwnsLoopback, lease != nil {
+            fputs("[NoemaLlamaClient] Unload skipped: loopback ownership moved to another model.\n", stderr)
+        }
         await generationCoordinator.endUnload()
         fputs(completionMessage, stderr)
-        return true
+        return stillOwnsLoopback
+    }
+
+    /// Whether requests from this client hit a paged (Overfit) loopback
+    /// server. The explicit StartConfiguration wins when it says paged;
+    /// otherwise fall back to the live bridge snapshot for THIS model, then
+    /// to the install shape itself. Clients constructed without a
+    /// StartConfiguration (or with a stale non-paged copy) must still detect
+    /// a paged session: any positive signal is enough, because pinning
+    /// cache_prompt=true on a resident server matches the server default
+    /// (harmless), while a false negative re-prefills the whole transcript
+    /// every paged turn — minutes of TTFT on an overfit model.
+    var isPagedLoopbackSession: Bool {
+        if let pagedMode = serverConfiguration?.pagedMode, pagedMode != .off { return true }
+        if let options = LlamaServerBridge.lastStartOptions(),
+           options.ggufPath == modelURL.path,
+           let rawMode = options.pagedMode, rawMode != 0 {
+            return true
+        }
+        return PagedPackageLocator.isPagedInstall(modelURL)
     }
 
     private func loopbackStartConfiguration(mmprojPath: String?) -> LlamaServerBridge.StartConfiguration {
-        let mtpEnabled = getenv("NOEMA_MTP_ENABLED").map { String(cString: $0) == "1" } ?? false
-        let mtpPath = mtpEnabled ? MtpLocator.mtpPath(alongside: modelURL) : nil
-        let hasMTP = mtpPath != nil || GGUFMetadata.hasMTP(at: modelURL)
-        let draftNMax: Int32? = {
-            guard mtpEnabled else { return nil }
-            guard let raw = getenv("NOEMA_MTP_DRAFT_N_MAX"),
-                  let value = Int32(String(cString: raw)) else {
-                return 2
-            }
-            return max(1, min(6, value))
-        }()
-        let draftNMin: Int32? = {
-            guard mtpEnabled else { return nil }
-            guard let raw = getenv("NOEMA_MTP_DRAFT_N_MIN"),
-                  let value = Int32(String(cString: raw)) else {
-                return 0
-            }
-            return max(0, min(draftNMax ?? 6, value))
-        }()
-        let draftPMin: Double? = {
-            guard mtpEnabled else { return nil }
-            guard let raw = getenv("NOEMA_MTP_DRAFT_P_MIN"),
-                  let value = Double(String(cString: raw)) else {
-                return 0.1
-            }
-            return min(1.0, max(0.0, value))
-        }()
+        if let serverConfiguration { return serverConfiguration }
+        let threads = explicitThreadCount
+            ?? max(1, Int32(ProcessInfo.processInfo.activeProcessorCount - 2))
         return TemplateDrivenModelSupport.loopbackStartConfiguration(
             modelURL: modelURL,
             ggufPath: modelURL.path,
             mmprojPath: mmprojPath,
-            mtpPath: mtpPath,
-            speculativeType: mtpEnabled && hasMTP ? "draft-mtp" : nil,
-            specDraftNMax: mtpEnabled && hasMTP ? draftNMax : nil,
-            specDraftNMin: mtpEnabled && hasMTP ? draftNMin : nil,
-            specDraftPMin: mtpEnabled && hasMTP ? draftPMin : nil
+            contextSize: contextLength,
+            threads: threads,
+            threadsBatch: threads
         )
     }
     
@@ -561,15 +1217,19 @@ public final class NoemaLlamaClient: @unchecked Sendable {
         url: URL,
         contextLength: Int32 = 2048,
         mmprojPath: String? = nil,
+        allowProjectorAutoDiscovery: Bool = true,
         threadCount: Int32? = nil,
         preferParameterContextOverEnvironment: Bool = false,
-        forceFreshLoopback: Bool = false
+        forceFreshLoopback: Bool = false,
+        serverConfiguration: LlamaServerBridge.StartConfiguration? = nil
     ) {
         self.modelURL = url
         self.contextLength = contextLength
         self.mmprojPath = mmprojPath
+        self.allowProjectorAutoDiscovery = allowProjectorAutoDiscovery
         self.preferParameterContextOverEnvironment = preferParameterContextOverEnvironment
         self.forceFreshLoopback = forceFreshLoopback
+        self.serverConfiguration = serverConfiguration
         if let threadCount, threadCount > 0 {
             self.explicitThreadCount = threadCount
         } else {
@@ -578,47 +1238,99 @@ public final class NoemaLlamaClient: @unchecked Sendable {
     }
     
     deinit {
-        unload()
+        // `unload()` captures self weakly and cannot be relied on once deinit
+        // has begun. Snapshot the value state and perform an ownership-checked
+        // fallback without retaining or dereferencing this instance.
+        let lease = loopbackLease.withLock { current -> LoopbackLease? in
+            defer { current = nil }
+            return current
+        }
+        guard lease != nil else { return }
+        Task.detached(priority: .utility) {
+            let bridgeReservation = await Self.reserveLoopbackBridge()
+            defer { bridgeReservation.release() }
+            _ = Self.stopLoopbackIfOwned(lease)
+        }
     }
     
     // MARK: - Loading/Unloading
     
     public func load() async throws {
+        let reservation = await Self.reserveLoopbackBridge()
+        try await load(using: reservation)
+    }
+
+    private func load(using reservation: BridgeMutationReservation) async throws {
         try await Task.detached { [weak self] in
+            defer { reservation.release() }
             guard let self else { return }
+            guard reservation.isActive else {
+                throw self.loopbackOwnershipError()
+            }
             guard FileManager.default.fileExists(atPath: self.modelURL.path) else {
                 throw NoemaLlamaError.invalidParameters
             }
-            // Respect environment-provided tuning from the app (ChatVM.applyEnvironmentVariables)
-            func intEnv(_ key: String) -> Int32? {
-                guard let c = getenv(key) else { return nil }
-                return Int32(String(cString: c))
-            }
-
-            let threadsEnv = intEnv("LLAMA_THREADS")
-            let ctxEnv = intEnv("LLAMA_CONTEXT_SIZE")
-
-            let requestedCtx = self.preferParameterContextOverEnvironment ? self.contextLength : (ctxEnv ?? self.contextLength)
+            let requestedCtx = self.serverConfiguration?.contextSize ?? self.contextLength
             let nCtx = max(Int32(1), requestedCtx)
             self.effectiveContext = nCtx
-            setenv("LLAMA_CONTEXT_SIZE", String(nCtx), 1)
 
             // Resolve projector (if any) so a lazy-start fallback can enable vision.
-            self.effectiveMMProj = (self.mmprojPath?.isEmpty == false ? self.mmprojPath : nil)
-                ?? ProjectorLocator.projectorPath(alongside: self.modelURL)
+            self.effectiveMMProj = self.allowProjectorAutoDiscovery
+                ? ((self.mmprojPath?.isEmpty == false ? self.mmprojPath : nil)
+                    ?? ProjectorLocator.projectorPath(alongside: self.modelURL))
+                : nil
 
             // Ensure the loopback server is running. ChatVM normally starts it during model load,
             // but we keep a defensive fallback here.
             if self.forceFreshLoopback, Int(LlamaServerBridge.port()) > 0 {
                 LlamaServerBridge.stop()
                 LoopbackVisionState.setEnabled(false)
+                Self.activeLoopbackOwner.withLock { $0 = nil }
             }
             var port = Int(LlamaServerBridge.port())
             if port <= 0 {
-                port = Int(LlamaServerBridge.start(
-                    self.loopbackStartConfiguration(mmprojPath: self.effectiveMMProj)
-                ))
+                let startConfiguration = self.loopbackStartConfiguration(mmprojPath: self.effectiveMMProj)
+                let fitAssessment = await ModelRAMAdvisor.definitiveGGUFLaunchFitAssessment(
+                    contextLength: Int(nCtx),
+                    kvCacheEstimate: .resolved(from: startConfiguration),
+                    runtimeConfiguration: .resolved(from: startConfiguration),
+                    serverConfiguration: startConfiguration
+                )
+                if fitAssessment.status == .doesNotFit,
+                   !UserDefaults.standard.bool(forKey: "bypassRAMCheck") {
+                    throw NSError(
+                        domain: "Noema",
+                        code: 2003,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: String(
+                                localized: "Model likely exceeds memory budget. Lower context or choose a smaller quant.",
+                                locale: LocalizationManager.preferredLocale()
+                            )
+                        ]
+                    )
+                }
+                // No concrete server exists, so any published owner is stale.
+                Self.activeLoopbackOwner.withLock { $0 = nil }
+                let baselineFootprint = ModelRAMAdvisor.processFootprintBytes()
+                let peakSampler = Task.detached(priority: .utility) {
+                    var peak = baselineFootprint
+                    while !Task.isCancelled {
+                        peak = max(peak, ModelRAMAdvisor.processFootprintBytes())
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                    return max(peak, ModelRAMAdvisor.processFootprintBytes())
+                }
+                port = Int(LlamaServerBridge.start(startConfiguration))
+                peakSampler.cancel()
+                let peakFootprint = await peakSampler.value
                 if port > 0 {
+                    if let exactBytes = fitAssessment.estimatedIncrementalBytes {
+                        ModelRAMAdvisor.recordSuccessfulGGUFLaunch(
+                            estimatedIncrementalBytes: exactBytes,
+                            baselineFootprintBytes: baselineFootprint,
+                            peakFootprintBytes: peakFootprint
+                        )
+                    }
                     LoopbackVisionState.setEnabled(true)
                 }
             }
@@ -633,8 +1345,13 @@ public final class NoemaLlamaClient: @unchecked Sendable {
                 )
             }
 
+            try self.claimLoopbackLease(
+                port: port,
+                allowReplacingExistingOwner: self.forceFreshLoopback
+            )
+
             if getenv("NOEMA_LLAMA_VERBOSE") != nil {
-                let threads = (self.explicitThreadCount ?? threadsEnv ?? 0)
+                let threads = self.serverConfiguration?.threads ?? self.explicitThreadCount ?? 0
                 let mm = self.effectiveMMProj.map { URL(fileURLWithPath: $0).lastPathComponent }
                     ?? (GGUFMetadata.hasMultimodalProjector(at: self.modelURL) ? "merged" : "none")
                 fputs("[NoemaLlamaClient] Loopback ready port=\(port) gguf=\(self.modelURL.lastPathComponent) ctx=\(nCtx) threads=\(threads) mmproj=\(mm)\n", stderr)
@@ -668,6 +1385,14 @@ public final class NoemaLlamaClient: @unchecked Sendable {
     // MARK: - Cancellation
     public func cancel() {
         Task { await loopbackSessionState.cancelActive() }
+        // Killing the HTTP stream is not enough for Overfit paged (mode 2)
+        // runs: the server only notices the disconnect when writing a chunk,
+        // so a cancelled prefill would keep paging expert reads for minutes.
+        // Fail the active generation at the runtime too (safe no-op when
+        // nothing is generating).
+        if isPagedLoopbackSession {
+            LlamaServerBridge.pagedCancel()
+        }
     }
     
     // MARK: - Text Generation
@@ -683,7 +1408,7 @@ public final class NoemaLlamaClient: @unchecked Sendable {
             if Task.isCancelled { await generationCoordinator.releaseGeneration(); throw CancellationError() }
             let releaseToken = GenerationReleaseToken(coordinator: generationCoordinator)
             let streamState = StreamState()
-            return AsyncThrowingStream<String, Error>(bufferingPolicy: .unbounded) { @Sendable continuation in
+            return AsyncThrowingStream<String, Error>(bufferingPolicy: .bufferingOldest(16)) { @Sendable continuation in
                 Task { [weak self, input, releaseToken, streamState] in
                     do {
                         guard let self = self else {
@@ -723,7 +1448,7 @@ public final class NoemaLlamaClient: @unchecked Sendable {
         let releaseToken = GenerationReleaseToken(coordinator: generationCoordinator)
         let streamState = StreamState()
 
-        return AsyncThrowingStream<String, Error>(bufferingPolicy: .unbounded) { @Sendable continuation in
+        return AsyncThrowingStream<String, Error>(bufferingPolicy: .bufferingOldest(16)) { @Sendable continuation in
             // Bridge llama.cpp callbacks into an async throwing stream. Tie stream lifetime
             // to underlying generation by cancelling the runner when the stream terminates.
             Task { [weak self, input, releaseToken, streamState] in
@@ -912,12 +1637,23 @@ public final class NoemaLlamaClient: @unchecked Sendable {
     ) async throws -> AsyncThrowingStream<String, Error> {
         await generationCoordinator.acquireGeneration()
         if Task.isCancelled { await generationCoordinator.releaseGeneration(); throw CancellationError() }
-        let releaseToken = GenerationReleaseToken(coordinator: generationCoordinator)
+        guard Self.beginBridgeGeneration() else {
+            await generationCoordinator.releaseGeneration()
+            throw loopbackOwnershipError()
+        }
+        let bridgeGenerationReservation = BridgeGenerationReservation()
+        let releaseToken = GenerationReleaseToken(
+            coordinator: generationCoordinator,
+            onRelease: { bridgeGenerationReservation.release() }
+        )
         let streamState = StreamState()
 
-        return AsyncThrowingStream<String, Error>(bufferingPolicy: .unbounded) { @Sendable continuation in
+        return AsyncThrowingStream<String, Error>(
+            bufferingPolicy: .bufferingOldest(BoundedLoopbackStreamEmitter.capacity)
+        ) { @Sendable continuation in
             let generationTask = Task { [weak self, input, releaseToken, streamState] in
                 do {
+                    try Task.checkCancellation()
                     guard let self else {
                         await releaseToken.release()
                         continuation.finish(throwing: NoemaLlamaError.invalidParameters)
@@ -940,13 +1676,16 @@ public final class NoemaLlamaClient: @unchecked Sendable {
                         continuation.finish(throwing: NoemaLlamaError.invalidParameters)
                         return
                     }
+                    try Task.checkCancellation()
                     await streamState.markStarted()
+                    try Task.checkCancellation()
                     _ = try await self.generateViaLoopbackServer(
                         input: input,
                         onToken: { chunk in
-                            continuation.yield(chunk)
+                            try await BoundedLoopbackStreamEmitter.yield(chunk, to: continuation)
                         },
-                        onPromptProgress: onPromptProgress
+                        onPromptProgress: onPromptProgress,
+                        capturePolicy: .characterCount
                     )
                     continuation.finish()
                     await releaseToken.release()
@@ -961,22 +1700,42 @@ public final class NoemaLlamaClient: @unchecked Sendable {
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { [weak self, releaseToken, streamState] termination in
+            continuation.onTermination = { [weak self] termination in
                 if case .cancelled = termination {
                     generationTask.cancel()
                     self?.cancel()
                 }
-                Task { if await !streamState.hasStarted() { await releaseToken.release() } }
             }
         }
     }
     
     public func text(from input: LLMInput) async throws -> String {
-        var result = ""
-        for try await token in try await textStream(from: input) {
-            result += token
+        await generationCoordinator.acquireGeneration()
+        if Task.isCancelled {
+            await generationCoordinator.releaseGeneration()
+            throw CancellationError()
         }
-        return result
+        guard Self.beginBridgeGeneration() else {
+            await generationCoordinator.releaseGeneration()
+            throw loopbackOwnershipError()
+        }
+        let reservation = BridgeGenerationReservation()
+        let release = GenerationReleaseToken(
+            coordinator: generationCoordinator,
+            onRelease: { reservation.release() }
+        )
+        do {
+            let result = try await generateViaLoopbackServer(
+                input: input,
+                forceNonStreaming: true,
+                capturePolicy: .fullText
+            )
+            await release.release()
+            return result.text ?? ""
+        } catch {
+            await release.release()
+            throw UserFacingErrorFormatter.normalizedTransportError(error, context: .localModel)
+        }
     }
 }
 
@@ -1003,11 +1762,38 @@ extension NoemaLlamaClient {
             url: url,
             contextLength: context32,
             mmprojPath: parameter.mmproj,
+            allowProjectorAutoDiscovery: parameter.loadVisionProjector,
             threadCount: threadOverride,
             preferParameterContextOverEnvironment: parameter.preferContextOverEnvironment,
-            forceFreshLoopback: parameter.forceFreshLoopback
+            forceFreshLoopback: parameter.forceFreshLoopback,
+            serverConfiguration: parameter.serverConfiguration
         )
         try await client.load()
+        return client
+    }
+
+    static func llama(
+        url: URL,
+        parameter: LlamaParameter,
+        bridgeReservation: BridgeMutationReservation
+    ) async throws -> NoemaLlamaClient {
+        let context = parameter.contextLength ?? 2048
+        let context32 = Int32(clamping: max(1, context))
+        let threadOverride = parameter.threadCount.flatMap { value -> Int32? in
+            guard value > 0 else { return nil }
+            return Int32(clamping: value)
+        }
+        let client = NoemaLlamaClient(
+            url: url,
+            contextLength: context32,
+            mmprojPath: parameter.mmproj,
+            allowProjectorAutoDiscovery: parameter.loadVisionProjector,
+            threadCount: threadOverride,
+            preferParameterContextOverEnvironment: parameter.preferContextOverEnvironment,
+            forceFreshLoopback: parameter.forceFreshLoopback,
+            serverConfiguration: parameter.serverConfiguration
+        )
+        try await client.load(using: bridgeReservation)
         return client
     }
 }
@@ -1019,23 +1805,29 @@ public struct LlamaParameter {
     public let options: LlamaOptions?
     public let threadCount: Int?
     public let mmproj: String?
+    public let loadVisionProjector: Bool
     public let preferContextOverEnvironment: Bool
     public let forceFreshLoopback: Bool
+    public let serverConfiguration: LlamaServerBridge.StartConfiguration?
     
     public init(
         options: LlamaOptions? = nil,
         contextLength: Int? = nil,
         threadCount: Int? = nil,
         mmproj: String? = nil,
+        loadVisionProjector: Bool = true,
         preferContextOverEnvironment: Bool = false,
-        forceFreshLoopback: Bool = false
+        forceFreshLoopback: Bool = false,
+        serverConfiguration: LlamaServerBridge.StartConfiguration? = nil
     ) {
         self.options = options
         self.contextLength = contextLength
         self.threadCount = threadCount
         self.mmproj = mmproj
+        self.loadVisionProjector = loadVisionProjector
         self.preferContextOverEnvironment = preferContextOverEnvironment
         self.forceFreshLoopback = forceFreshLoopback
+        self.serverConfiguration = serverConfiguration
     }
 }
 
@@ -1062,6 +1854,8 @@ public struct AnyLLMClient: Sendable {
     private let unloadAsyncClosure: (@Sendable () async -> Void)?
     private let resetClosure: (@Sendable () async -> Void)?
     private let syncSystemPromptClosure: (@Sendable (String?) async -> Void)?
+    private let runtimeIsCurrentClosure: (@Sendable () -> Bool)?
+    private let finishReasonClosure: (@Sendable () -> String?)?
     
     public init(_ client: NoemaLlamaClient) {
         let streamWithProgressClosure: @Sendable (LLMInput, (@Sendable (Double) -> Void)?) async throws -> AsyncThrowingStream<String, Error> = { input, onPromptProgress in
@@ -1085,6 +1879,12 @@ public struct AnyLLMClient: Sendable {
         self.unloadAsyncClosure = { [weak client] in await client?.unloadAndWait() }
         self.resetClosure = nil
         self.syncSystemPromptClosure = nil
+        self.runtimeIsCurrentClosure = { [weak client] in
+            client?.isCurrentLoopbackOwner() ?? false
+        }
+        self.finishReasonClosure = { [weak client] in
+            client?.mostRecentFinishReason()
+        }
     }
     
     // Removed LocalLLMClient bridging initializer to avoid undefined symbols
@@ -1111,8 +1911,10 @@ public struct AnyLLMClient: Sendable {
         self.cancelClosure = { client.cancel() }
         self.unloadClosure = { [weak client] in client?.unload() }
         self.unloadAsyncClosure = nil
-        self.resetClosure = nil
+        self.resetClosure = { [weak client] in client?.resetPromptCache() }
         self.syncSystemPromptClosure = nil
+        self.runtimeIsCurrentClosure = nil
+        self.finishReasonClosure = nil
     }
 
     @available(macOS 13.0, iOS 16.0, *)
@@ -1137,6 +1939,8 @@ public struct AnyLLMClient: Sendable {
         self.unloadAsyncClosure = nil
         self.resetClosure = nil
         self.syncSystemPromptClosure = nil
+        self.runtimeIsCurrentClosure = nil
+        self.finishReasonClosure = nil
     }
 
     // Convenience initializer to build a failing client for unimplemented adapters.
@@ -1152,6 +1956,7 @@ public struct AnyLLMClient: Sendable {
     static func makeDeterministicFake(
         chunks: [String],
         delayNanoseconds: UInt64 = 0,
+        finishReason: String? = nil,
         probe: DeterministicLLMClientProbe = DeterministicLLMClientProbe()
     ) -> AnyLLMClient {
         let stream: @Sendable (LLMInput) async throws -> AsyncThrowingStream<String, Error> = { input in
@@ -1202,6 +2007,9 @@ public struct AnyLLMClient: Sendable {
             reset: {
                 probe.reset()
             },
+            finishReason: {
+                finishReason
+            },
             tokenCount: { text in
                 max(1, text.split { $0.isWhitespace || $0.isNewline }.count)
             }
@@ -1227,6 +2035,8 @@ public struct AnyLLMClient: Sendable {
         self.unloadAsyncClosure = nil
         self.resetClosure = nil
         self.syncSystemPromptClosure = nil
+        self.runtimeIsCurrentClosure = nil
+        self.finishReasonClosure = nil
     }
 
     public init(
@@ -1238,6 +2048,8 @@ public struct AnyLLMClient: Sendable {
         unloadAsync: (@Sendable () async -> Void)? = nil,
         reset: (@Sendable () async -> Void)? = nil,
         syncSystemPrompt: (@Sendable (String?) async -> Void)? = nil,
+        runtimeIsCurrent: (@Sendable () -> Bool)? = nil,
+        finishReason: (@Sendable () -> String?)? = nil,
         tokenCount: (@Sendable (String) async throws -> Int)? = nil
     ) {
         self.textStreamClosure = textStream
@@ -1261,6 +2073,8 @@ public struct AnyLLMClient: Sendable {
         self.unloadAsyncClosure = unloadAsync
         self.resetClosure = reset
         self.syncSystemPromptClosure = syncSystemPrompt
+        self.runtimeIsCurrentClosure = runtimeIsCurrent
+        self.finishReasonClosure = finishReason
     }
     
     public func textStream(from input: LLMInput) async throws -> AsyncThrowingStream<String, Error> {
@@ -1305,6 +2119,18 @@ public struct AnyLLMClient: Sendable {
 
     public func syncSystemPrompt(_ prompt: String?) async {
         await syncSystemPromptClosure?(prompt)
+    }
+
+    /// `nil` for instance-scoped backends; GGUF returns whether its exact UUID
+    /// lease still owns the process-global loopback generation.
+    func isCurrentRuntime() -> Bool? {
+        runtimeIsCurrentClosure?()
+    }
+
+    /// OpenAI-style reason reported by the last completed generation when the
+    /// backend exposes it (`stop`, `length`, or `tool_calls`).
+    func mostRecentFinishReason() -> String? {
+        finishReasonClosure?()
     }
 
     // Reset behavior is backend dependent.
@@ -1397,24 +2223,41 @@ extension NoemaLlamaClient {
             }
         }
 
+        // One streamed/complete tool call fragment from the server (OpenAI shape).
+        // In streaming mode `function.arguments` arrives as string fragments to be
+        // concatenated per `index`; `function.name` typically arrives once.
+        struct ToolCallFragment: Decodable {
+            struct Function: Decodable {
+                let name: String?
+                let arguments: String?
+            }
+            let index: Int?
+            let id: String?
+            let function: Function?
+        }
+
         struct Choice: Decodable {
             struct Delta: Decodable {
                 let content: String?
                 let reasoningContent: String?
+                let toolCalls: [ToolCallFragment]?
 
                 enum CodingKeys: String, CodingKey {
                     case content
                     case reasoningContent = "reasoning_content"
+                    case toolCalls = "tool_calls"
                 }
             }
 
             struct Message: Decodable {
                 let content: String?
                 let reasoningContent: String?
+                let toolCalls: [ToolCallFragment]?
 
                 enum CodingKeys: String, CodingKey {
                     case content
                     case reasoningContent = "reasoning_content"
+                    case toolCalls = "tool_calls"
                 }
             }
 
@@ -1448,7 +2291,17 @@ extension NoemaLlamaClient {
     private struct LoopbackCompletionChunk: Decodable {
         let content: String?
         let stop: Bool?
+        let stopType: String?
+        let truncated: Bool?
         let timings: LoopbackSpeculativeTimings?
+
+        enum CodingKeys: String, CodingKey {
+            case content
+            case stop
+            case stopType = "stop_type"
+            case truncated
+            case timings
+        }
     }
 
     private struct LoopbackErrorEnvelope: Decodable {
@@ -1545,6 +2398,132 @@ extension NoemaLlamaClient {
         if let responseFormat = options.responseFormat {
             body["response_format"] = responseFormat.requestPayload
         }
+        if let seed = options.seed { body["seed"] = seed }
+        if let temperature = options.temperature { body["temperature"] = temperature }
+        if let topK = options.topK { body["top_k"] = topK }
+        if let topP = options.topP { body["top_p"] = topP }
+        if let minP = options.minP { body["min_p"] = minP }
+        if let repeatPenalty = options.repeatPenalty { body["repeat_penalty"] = repeatPenalty }
+        if let repeatLastN = options.repeatLastN { body["repeat_last_n"] = repeatLastN }
+        if let presencePenalty = options.presencePenalty { body["presence_penalty"] = presencePenalty }
+        if let frequencyPenalty = options.frequencyPenalty { body["frequency_penalty"] = frequencyPenalty }
+        if let logitBias = options.logitBias, !logitBias.isEmpty {
+            body["logit_bias"] = Dictionary(
+                uniqueKeysWithValues: logitBias.map { (String($0.key), $0.value) }
+            )
+        }
+        if options.requestPurpose == .auxiliary {
+            // Never restore or publish the conversation slot for an internal
+            // summarization/classification request. The next user-visible turn
+            // will establish the durable prompt state again.
+            body["cache_prompt"] = false
+        } else if isPagedLoopbackSession {
+            // Paged launches run with cache-ram 0 but ctx-checkpoints ON
+            // (hybrid architectures cannot roll a sequence back partially, so
+            // a restored checkpoint is the only route to prefix reuse). Both
+            // slot prefix reuse and checkpoint restore are gated per-request
+            // by `cache_prompt`. The options seed derives from
+            // settings.promptCacheEnabled (off in several presets), and
+            // sending false here makes every paged turn re-prefill the entire
+            // transcript — minutes of TTFT per follow-up on an overfit model.
+            // Reuse costs nothing, so always ask for it — and detect "paged"
+            // robustly (isPagedLoopbackSession), not only via this instance's
+            // StartConfiguration copy.
+            body["cache_prompt"] = true
+        } else if let promptCache = options.promptCache {
+            body["cache_prompt"] = promptCache
+        }
+    }
+
+    /// One self-explaining line per paged completion: whether the slot prefix
+    /// was reused (prompt_n/cache_n and the first progress report), whether
+    /// wave-split prefill engaged (waveCount, and if not, WHY via the
+    /// runtime's wavesRejectedReason), and the expert-I/O cost of the prefill
+    /// (prefillBytesRead, hits/misses). This is the line a user log needs to
+    /// diagnose paged TTFT without a debugger.
+    private func logPagedCompletionTelemetry(
+        timings: LoopbackSpeculativeTimings?,
+        promptCached: Int?,
+        promptTotal: Int?
+    ) {
+        var waveCount: Int64 = -1
+        var prefillBytesRead: Int64 = -1
+        var hits: Int64 = -1
+        var misses: Int64 = -1
+        var decodeHits: Int64 = -1
+        var decodeMisses: Int64 = -1
+        var decodeBytes: Int64 = -1
+        var decodeStallNs: Int64 = -1
+        var historyPredictions: Int64 = -1
+        var historyPredictionMatches: Int64 = -1
+        var checksumVerifications: Int64 = -1
+        var checksumCacheHits: Int64 = -1
+        var wavesReason = "unavailable"
+        if let raw = LlamaServerBridge.pagedStatsJSON(),
+           let data = raw.data(using: .utf8),
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let stream = json["stream"] as? [String: Any] {
+            wavesReason = (stream["wavesRejectedReason"] as? String) ?? "unavailable"
+            let phases = json["phases"] as? [String: Any]
+            let decode = phases?["ordinaryDecode"] as? [String: Any]
+            // The runtime's counters are boot-cumulative (reset only at server
+            // teardown), so a turn-2 line would otherwise repeat turn-1's
+            // multi-GB prefill — the exact signature of the re-prefill bug
+            // this line exists to rule out. Diff against the previous
+            // completion; a counter that shrank means the server restarted,
+            // in which case the raw value is itself the per-completion figure.
+            let current = PagedTelemetrySnapshot(
+                waves: (stream["waveCount"] as? NSNumber)?.int64Value ?? -1,
+                prefillBytes: (stream["prefillBytesRead"] as? NSNumber)?.int64Value ?? -1,
+                hits: (stream["hits"] as? NSNumber)?.int64Value ?? -1,
+                misses: (stream["misses"] as? NSNumber)?.int64Value ?? -1,
+                decodeHits: (decode?["hits"] as? NSNumber)?.int64Value ?? -1,
+                decodeMisses: (decode?["misses"] as? NSNumber)?.int64Value ?? -1,
+                decodeBytes: (decode?["bytesRead"] as? NSNumber)?.int64Value ?? -1,
+                decodeStallNs: (decode?["stallNs"] as? NSNumber)?.int64Value ?? -1,
+                historyPredictions: (stream["historyPredictions"] as? NSNumber)?.int64Value ?? -1,
+                historyPredictionMatches: (stream["historyPredictionMatches"] as? NSNumber)?.int64Value ?? -1,
+                checksumVerifications: (stream["checksumVerifications"] as? NSNumber)?.int64Value ?? -1,
+                checksumCacheHits: (stream["checksumCacheHits"] as? NSNumber)?.int64Value ?? -1
+            )
+            let previous = pagedTelemetrySnapshot.withLock { snapshot -> PagedTelemetrySnapshot? in
+                let held = snapshot
+                snapshot = current
+                return held
+            }
+            func perCompletion(_ cur: Int64, _ prev: Int64?) -> Int64 {
+                guard cur >= 0 else { return cur }
+                guard let prev, prev >= 0, cur >= prev else { return cur }
+                return cur - prev
+            }
+            waveCount = perCompletion(current.waves, previous?.waves)
+            prefillBytesRead = perCompletion(current.prefillBytes, previous?.prefillBytes)
+            hits = perCompletion(current.hits, previous?.hits)
+            misses = perCompletion(current.misses, previous?.misses)
+            decodeHits = perCompletion(current.decodeHits, previous?.decodeHits)
+            decodeMisses = perCompletion(current.decodeMisses, previous?.decodeMisses)
+            decodeBytes = perCompletion(current.decodeBytes, previous?.decodeBytes)
+            decodeStallNs = perCompletion(current.decodeStallNs, previous?.decodeStallNs)
+            historyPredictions = perCompletion(
+                current.historyPredictions, previous?.historyPredictions)
+            historyPredictionMatches = perCompletion(
+                current.historyPredictionMatches, previous?.historyPredictionMatches)
+            checksumVerifications = perCompletion(
+                current.checksumVerifications, previous?.checksumVerifications)
+            checksumCacheHits = perCompletion(
+                current.checksumCacheHits, previous?.checksumCacheHits)
+        }
+        let promptN = timings?.promptN.map(String.init) ?? "-"
+        let cacheN = timings?.cacheN.map(String.init) ?? "-"
+        let progress = "\(promptCached.map(String.init) ?? "-")/\(promptTotal.map(String.init) ?? "-")"
+        let line = "[Loopback][PagedTelemetry] prompt_n=\(promptN) cache_n=\(cacheN)"
+            + " progress_cached=\(progress) waves=\(waveCount) waves_reason=\(wavesReason)"
+            + " prefill_bytes=\(prefillBytesRead) stream_hits=\(hits) stream_misses=\(misses)"
+            + " decode_hits=\(decodeHits) decode_misses=\(decodeMisses)"
+            + " decode_bytes=\(decodeBytes) decode_stall_ms=\(decodeStallNs >= 0 ? decodeStallNs / 1_000_000 : -1)"
+            + " history_predictions=\(historyPredictions) history_matches=\(historyPredictionMatches)"
+            + " checksum_verified=\(checksumVerifications) checksum_cached=\(checksumCacheHits)"
+        Task { await logger.log(line) }
     }
 
     private func buildLoopbackChatBody(
@@ -1562,15 +2541,45 @@ extension NoemaLlamaClient {
         if !forceNonStreaming {
             body["stream_options"] = ["include_usage": true]
         }
-        if isQwen35Model {
-            let reasoningEnabled = options.reasoningEnabled ?? true
-            if reasoningEnabled {
-                body["reasoning_format"] = "deepseek"
-            }
-            body["chat_template_kwargs"] = ["enable_thinking": reasoningEnabled]
+        var templateKwargs: [String: Bool] = [:]
+        let reasoningEnabled = options.reasoningEnabled ?? true
+        if isQwen35Model, reasoningEnabled {
+            // Ask the server to split <think> reasoning into reasoning_content for the
+            // profiles whose parsing we trust; other reasoning models stream <think>
+            // inline and the app's own parser separates it.
+            body["reasoning_format"] = "deepseek"
+        }
+        // enable_thinking is a harmless no-op for templates that don't branch on it, so
+        // send it for every GGUF: any thinking-capable model then honors the user's
+        // reasoning toggle (ReasoningCapabilityDetector only surfaces the control when the
+        // template actually reads this kwarg).
+        templateKwargs["enable_thinking"] = reasoningEnabled
+        // llama.cpp chat-template kwarg: when true, prior assistant turns' reasoning
+        // (<think>/reasoning_content) is kept in the serialized prompt instead of being
+        // dropped, so the model can build on its own earlier thinking across turns
+        // (measurably better multi-turn reasoning recall, at a small prompt-token cost).
+        // Global user setting; default ON. Harmless for templates that don't read it.
+        let preserveThinking = (UserDefaults.standard.object(forKey: "preserveThinking") as? Bool) ?? true
+        templateKwargs["preserve_thinking"] = preserveThinking
+        if !templateKwargs.isEmpty {
+            body["chat_template_kwargs"] = templateKwargs
         }
         if usesTemplateDrivenMessages {
             body["add_generation_prompt"] = true
+        }
+        // Native tool calling: pass the OpenAI-style tools array so the server's Jinja
+        // template renders tool schemas and the model emits its native tool-call format
+        // (returned as structured tool_calls, consumed in emitChoice). Requires --jinja.
+        // Sort by tool name: the server parses request JSON as ordered_json, so the
+        // tools' array order flows byte-for-byte into the rendered prompt. Registry
+        // enumeration order is not stable across catalog rebuilds, and an unstable
+        // tools section breaks the slot KV common prefix at the very start of the
+        // prompt — every turn then re-prefills the full transcript.
+        if let tools = options.tools, !tools.isEmpty,
+           let data = try? JSONEncoder().encode(tools.sorted(by: { $0.function.name < $1.function.name })),
+           let toolsArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            body["tools"] = toolsArray
+            body["tool_choice"] = "auto"
         }
         applyGenerationOptions(options, to: &body)
         return body
@@ -1629,11 +2638,12 @@ extension NoemaLlamaClient {
         case .multimodal(let prompt, let paths):
             var content: [[String: Any]] = [["type": "text", "text": prompt]]
             content.append(contentsOf: paths.map(makeLoopbackImageObject(from:)))
-            let body = buildLoopbackChatBody(
+            var body = buildLoopbackChatBody(
                 messages: [["role": "user", "content": content]],
                 forceNonStreaming: forceNonStreaming,
                 options: input.generationOptions
             )
+            body["speculative"] = false
             return LoopbackRequestPlan(
                 endpoint: "/v1/chat/completions",
                 body: body,
@@ -1641,11 +2651,12 @@ extension NoemaLlamaClient {
                 requestMode: "chat_completions"
             )
         case .multimodalMessages(let messages, let paths):
-            let body = buildLoopbackChatBody(
+            var body = buildLoopbackChatBody(
                 messages: buildLoopbackMultimodalMessages(from: messages, imagePaths: paths),
                 forceNonStreaming: forceNonStreaming,
                 options: input.generationOptions
             )
+            body["speculative"] = false
             return LoopbackRequestPlan(
                 endpoint: "/v1/chat/completions",
                 body: body,
@@ -1714,7 +2725,12 @@ extension NoemaLlamaClient {
         NSError(
             domain: "Noema",
             code: 2004,
-            userInfo: [NSLocalizedDescriptionKey: "Local model server is still loading. Please try again in a moment."]
+            userInfo: [
+                NSLocalizedDescriptionKey: String(
+                    localized: "The on-device model is still loading. Please try again in a moment.",
+                    locale: LocalizationManager.preferredLocale()
+                )
+            ]
         )
     }
 
@@ -1739,6 +2755,7 @@ extension NoemaLlamaClient {
         configuration.urlCache = nil
         configuration.connectionProxyDictionary = [AnyHashable: Any]()
         let session = URLSession(configuration: configuration)
+        NetworkKillSwitch.track(session: session)
         defer { session.finishTasksAndInvalidate() }
 
         for path in ["health", "v1/health"] {
@@ -1774,44 +2791,72 @@ extension NoemaLlamaClient {
 
     fileprivate func generateViaLoopbackServer(
         input: LLMInput,
-        onToken: ((String) -> Void)? = nil,
+        onToken: (@Sendable (String) async throws -> Void)? = nil,
         onPromptProgress: (@Sendable (Double) -> Void)? = nil,
         forceNonStreaming: Bool = false,
-        allowRetry: Bool = true
-    ) async throws -> String {
+        allowRetry: Bool = true,
+        capturePolicy: LoopbackOutputCapturePolicy = .fullText
+    ) async throws -> LoopbackGenerationResult {
+        latestFinishReason.withLock { $0 = nil }
         let bypassRAMCheck = UserDefaults.standard.bool(forKey: "bypassRAMCheck")
         let ctxForRAM = Int(self.effectiveContext > 0 ? self.effectiveContext : self.contextLength)
-        // Re-assert context length for the embedded server so it matches the current model settings.
-        setenv("LLAMA_CONTEXT_SIZE", String(ctxForRAM), 1)
-
         var port = Int(LlamaServerBridge.port())
+        let mm = self.allowProjectorAutoDiscovery
+            ? (self.effectiveMMProj ?? ProjectorLocator.projectorPath(alongside: self.modelURL))
+            : nil
+        var fitAssessment: ModelRAMAdvisor.GGUFLaunchFitAssessment?
         // Only enforce the RAM safety guard when we are about to start the embedded server.
         // Once the server is already running, available memory will naturally be lower (because
         // the model/KV/vision buffers are already allocated), so a "can we load?" check here
         // becomes a false-positive gate.
-        if port <= 0, !bypassRAMCheck,
-           let size = (try? FileManager.default.attributesOfItem(atPath: self.modelURL.path)[.size]) as? Int64,
-           ModelRAMAdvisor.fitsInRAM(
-               format: .gguf,
-               sizeBytes: size,
-               contextLength: ctxForRAM,
-               layerCount: nil,
-               moeInfo: nil,
-               kvCacheEstimate: .resolvedFromEnvironment()
-           ) == false {
-            Task { await logger.log("[Loopback][RAMGuard] blocked model=\(self.modelURL.lastPathComponent) ctx=\(ctxForRAM)") }
-            throw NSError(
-                domain: "Noema",
-                code: 2003,
-                userInfo: [NSLocalizedDescriptionKey: "Loopback server blocked by RAM safety guard for this model/context. Lower context length or bypass the safety check."]
+        if port <= 0 {
+            let startConfiguration = self.loopbackStartConfiguration(mmprojPath: mm)
+            let assessment = await ModelRAMAdvisor.definitiveGGUFLaunchFitAssessment(
+                contextLength: ctxForRAM,
+                kvCacheEstimate: .resolved(from: startConfiguration),
+                runtimeConfiguration: .resolved(from: startConfiguration),
+                serverConfiguration: startConfiguration
             )
+            fitAssessment = assessment
+            if !bypassRAMCheck, assessment.status == .doesNotFit {
+                Task { await logger.log("[Loopback][RAMGuard] blocked exact=true model=\(self.modelURL.lastPathComponent) ctx=\(ctxForRAM)") }
+                throw NSError(
+                    domain: "Noema",
+                    code: 2003,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: String(
+                            localized: "The on-device model runtime was blocked by the RAM safety guard for this model and context. Lower the context length or bypass the safety check.",
+                            locale: LocalizationManager.preferredLocale()
+                        )
+                    ]
+                )
+            }
         }
+        var startedLoopback = false
         if port <= 0 {
             // Best-effort lazy start: ChatVM normally starts loopback during model load, but
             // keep a defensive fallback here for race conditions.
-            let mm = self.effectiveMMProj ?? ProjectorLocator.projectorPath(alongside: self.modelURL)
+            Self.activeLoopbackOwner.withLock { $0 = nil }
+            let baselineFootprint = ModelRAMAdvisor.processFootprintBytes()
+            let peakSampler = Task.detached(priority: .utility) {
+                var peak = baselineFootprint
+                while !Task.isCancelled {
+                    peak = max(peak, ModelRAMAdvisor.processFootprintBytes())
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                return max(peak, ModelRAMAdvisor.processFootprintBytes())
+            }
             let p = Int(LlamaServerBridge.start(self.loopbackStartConfiguration(mmprojPath: mm)))
+            peakSampler.cancel()
+            let peakFootprint = await peakSampler.value
             if p > 0 {
+                if let exactBytes = fitAssessment?.estimatedIncrementalBytes {
+                    ModelRAMAdvisor.recordSuccessfulGGUFLaunch(
+                        estimatedIncrementalBytes: exactBytes,
+                        baselineFootprintBytes: baselineFootprint,
+                        peakFootprintBytes: peakFootprint
+                    )
+                }
                 LoopbackVisionState.setEnabled(true)
                 let projName = mm.map { URL(fileURLWithPath: $0).lastPathComponent }
                     ?? (GGUFMetadata.hasMultimodalProjector(at: self.modelURL) ? "merged" : "none")
@@ -1819,6 +2864,7 @@ extension NoemaLlamaClient {
                 Task { await logger.log("[Loopback] lazyStart ok port=\(p) gguf=\(self.modelURL.lastPathComponent) mmproj=\(projName) template=\(templateLabel)") }
                 logLastLoopbackStartOptions(prefix: "[Loopback][StartOptions][LazyStart]")
                 port = p
+                startedLoopback = true
             } else {
                 let diagnostics = LlamaServerBridge.lastStartDiagnostics()
                 let reason = diagnostics?.message.isEmpty == false
@@ -1837,6 +2883,11 @@ extension NoemaLlamaClient {
                 ]
             )
         }
+        if startedLoopback {
+            try claimLoopbackLease(port: port)
+        } else {
+            try validateLoopbackLease(port: port)
+        }
         let preflightProbe = await waitForLoopbackReady(baseURL: baseURL, timeout: Self.loopbackReadyProbeTimeout)
         let preflightStatus = preflightProbe.statusCode.map(String.init) ?? "-1"
         Task {
@@ -1852,30 +2903,25 @@ extension NoemaLlamaClient {
         if preflightProbe.usedBridgeFallback {
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        // Pull current sampling knobs from environment variables, which ChatVM sets from ModelSettings
-        func env(_ k: String) -> String? { guard let v = getenv(k) else { return nil }; return String(cString: v) }
-
         let requestPlan = buildLoopbackRequestPlan(for: input, forceNonStreaming: forceNonStreaming)
         let endpoint = requestPlan.endpoint
-        var body = requestPlan.body
+        let body = requestPlan.body
         let imagePaths = requestPlan.imagePaths
         let requestMode = requestPlan.requestMode
+        let requestModelIdentifier = modelURL.path
+        let requestSpeculativeType = LlamaServerBridge.lastStartOptions()?.speculativeType
 
-        if let s = env("LLAMA_SEED"), let n = Int(s) { body["seed"] = n }
-        if let t = env("NOEMA_TEMPERATURE"), let f = Double(t) { body["temperature"] = f }
-        if let k = env("NOEMA_TOP_K"), let n = Int(k) { body["top_k"] = n }
-        if let p = env("NOEMA_TOP_P"), let f = Double(p) { body["top_p"] = f }
-        if let mp = env("NOEMA_MIN_P"), let f = Double(mp) { body["min_p"] = f }
-        if let rp = env("NOEMA_REPEAT_PENALTY"), let f = Double(rp) { body["repeat_penalty"] = f }
-        if let rl = env("NOEMA_REPEAT_LAST_N"), let n = Int(rl) { body["repeat_last_n"] = n }
-        if let pr = env("NOEMA_PRESENCE_PENALTY"), let f = Double(pr) { body["presence_penalty"] = f }
-        if let fr = env("NOEMA_FREQUENCY_PENALTY"), let f = Double(fr) { body["frequency_penalty"] = f }
         var req = URLRequest(url: baseURL.appendingPathComponent(endpoint))
         req.httpMethod = "POST"
         req.setValue(forceNonStreaming ? "application/json" : "text/event-stream", forHTTPHeaderField: "Accept")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("close", forHTTPHeaderField: "Connection")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        // .sortedKeys is load-bearing, not cosmetic: the server parses the body as
+        // nlohmann::ordered_json, so OBJECT KEY ORDER inside tool schemas flows into
+        // the Jinja-rendered prompt. NSDictionary serialization order is not stable
+        // across rebuilt dictionaries, and any byte drift at the tools section
+        // invalidates the slot KV prefix (full re-prefill per turn on paged models).
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         req.timeoutInterval = Self.loopbackRequestTimeout
         if NetworkKillSwitch.shouldBlock(request: req) {
             Task { await logger.log("[Loopback] blocked by off-grid/kill-switch url=\(req.url?.absoluteString ?? "nil")") }
@@ -1884,7 +2930,8 @@ extension NoemaLlamaClient {
         let approxBytes: Int = imagePaths.reduce(0) { acc, path in
             let fileURL = URL(fileURLWithPath: path)
             let bytes = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            return acc + max(0, bytes)
+            let (total, overflow) = acc.addingReportingOverflow(max(0, bytes))
+            return overflow ? .max : total
         }
         let modeLabel = forceNonStreaming ? "json" : "sse"
         let templateLabel = templateProfile.templateLabel
@@ -1905,6 +2952,7 @@ extension NoemaLlamaClient {
         configuration.urlCache = nil
         configuration.connectionProxyDictionary = [AnyHashable: Any]()
         let session = URLSession(configuration: configuration)
+        NetworkKillSwitch.track(session: session)
         await loopbackSessionState.set(session)
         defer {
             Task { await self.loopbackSessionState.clearIfMatching(session) }
@@ -1912,7 +2960,8 @@ extension NoemaLlamaClient {
         }
 
         let decoder = JSONDecoder()
-        var out = ""
+        var outputCapture = LoopbackOutputCapture(policy: capturePolicy)
+        var deliveredCharacterCount = 0
         var bufferedNonSSEPayload = ""
         var sawSSEPayload = false
         var thinkOpen = false
@@ -1921,17 +2970,78 @@ extension NoemaLlamaClient {
         var sawContent = false
         var reasoningArrivedBeforeContent = false
         var latestTimings: LoopbackSpeculativeTimings?
+        var didReportPromptCache = false
+        var reportedPromptCached: Int?
+        var reportedPromptTotal: Int?
+        LoopbackLatestTimings.reset()
 
-        func emit(_ token: String) {
+        func emit(_ token: String) async throws {
             guard !token.isEmpty else { return }
-            out += token
-            onToken?(token)
+            deliveredCharacterCount += token.count
+            outputCapture.append(token)
+            try await onToken?(token)
         }
 
-        func emitChoice(_ choice: LoopbackChatChunk.Choice) {
+        // Native tool calls arrive as structured `tool_calls` (streamed as fragments per
+        // `index`). Accumulate them, then bridge each completed call into the existing
+        // dispatch path by emitting a `TOOL_CALL: {json}` sentinel (the downstream loop
+        // already handles that reliably — no regex scan of model prose needed).
+        var toolCallAcc: [Int: (id: String?, name: String, args: String)] = [:]
+        var toolCallOrder: [Int] = []
+        var flushedToolCalls = false
+
+        func accumulateToolCalls(_ fragments: [LoopbackChatChunk.ToolCallFragment]?) {
+            guard let fragments else { return }
+            for frag in fragments {
+                let idx = frag.index ?? 0
+                if toolCallAcc[idx] == nil { toolCallOrder.append(idx) }
+                var entry = toolCallAcc[idx] ?? (id: nil, name: "", args: "")
+                if let id = frag.id, !id.isEmpty { entry.id = id }
+                if let name = frag.function?.name, !name.isEmpty { entry.name = name }
+                if let args = frag.function?.arguments { entry.args += args }
+                toolCallAcc[idx] = entry
+            }
+        }
+
+        func flushToolCalls() async throws {
+            guard !flushedToolCalls, !toolCallOrder.isEmpty else { return }
+            flushedToolCalls = true
+            // Close any open reasoning block FIRST. Native tool calls often arrive with
+            // only reasoning_content (no visible content), so </think> hasn't been emitted
+            // yet. The downstream loop ignores TOOL_CALL sentinels seen inside an open
+            // <think> block, so emitting the sentinel here without closing think would make
+            // the call silently dropped (model appears to stop right after thinking).
+            if thinkOpen {
+                try await emit("</think>")
+                thinkOpen = false
+            }
+            for idx in toolCallOrder {
+                guard let entry = toolCallAcc[idx], !entry.name.isEmpty else { continue }
+                let argsValue: Any
+                if entry.args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    argsValue = [String: Any]()
+                } else if let d = entry.args.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: d) {
+                    argsValue = obj
+                } else {
+                    argsValue = entry.args
+                }
+                let payload: [String: Any] = ["name": entry.name, "arguments": argsValue]
+                // sortedKeys: this sentinel is stored in the transcript and re-serialized
+                // into later prompts, so its byte shape must be launch-stable.
+                if let d = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+                   let json = String(data: d, encoding: .utf8) {
+                    try await emit("TOOL_CALL: " + json)
+                }
+            }
+        }
+
+        func emitChoice(_ choice: LoopbackChatChunk.Choice) async throws {
             if let reason = choice.finishReason, !reason.isEmpty {
                 finishReason = reason
             }
+
+            accumulateToolCalls(choice.delta?.toolCalls ?? choice.message?.toolCalls)
 
             if let reasoning = choice.delta?.reasoningContent ?? choice.message?.reasoningContent,
                !reasoning.isEmpty {
@@ -1940,21 +3050,25 @@ extension NoemaLlamaClient {
                 }
                 sawReasoning = true
                 if !thinkOpen {
-                    emit("<think>")
+                    try await emit("<think>")
                     thinkOpen = true
                 }
-                emit(reasoning)
+                try await emit(reasoning)
             }
 
             if let contentChunk = choice.delta?.content ?? choice.message?.content ?? choice.text ?? choice.completion,
                !contentChunk.isEmpty {
                 sawContent = true
                 if thinkOpen {
-                    emit("</think>")
+                    try await emit("</think>")
                     thinkOpen = false
                 }
-                emit(contentChunk)
+                try await emit(contentChunk)
             }
+
+            // Flush native tool calls LAST, after this chunk's reasoning/content, so the
+            // TOOL_CALL sentinel is always emitted outside <think> and after any prose.
+            if finishReason == "tool_calls" { try await flushToolCalls() }
         }
 
         func reportPromptProgress(_ progress: LoopbackChatChunk.PromptProgress?) {
@@ -1967,11 +3081,27 @@ extension NoemaLlamaClient {
 
             let fraction = min(1.0, max(0.0, Double(processed) / Double(total)))
             onPromptProgress?(fraction)
+
+            if !didReportPromptCache {
+                didReportPromptCache = true
+                let cached = min(total, max(0, progress.cache ?? 0))
+                reportedPromptCached = cached
+                reportedPromptTotal = total
+                let remaining = max(0, total - cached)
+                let reusePercent = Int((Double(cached) / Double(total) * 100).rounded())
+                let timeMs = progress.timeMs ?? 0
+                Task {
+                    await logger.log(
+                        "[Loopback][PromptCache] cached=\(cached) total=\(total) remaining=\(remaining) reuse=\(reusePercent)% first_progress_ms=\(timeMs)"
+                    )
+                }
+            }
         }
 
         func recordTimings(_ timings: LoopbackSpeculativeTimings?) {
             guard let timings else { return }
             latestTimings = timings
+            LoopbackLatestTimings.record(timings)
         }
 
         func decodeServerErrorMessage(from data: Data) -> String? {
@@ -1993,11 +3123,16 @@ extension NoemaLlamaClient {
             return nil
         }
 
-        func finalizeResponseLog() {
+        func finalizeResponseLog() async throws {
             if thinkOpen {
-                emit("</think>")
+                try await emit("</think>")
             }
-            let outCount = out.count
+            // Safety net: emit any accumulated native tool calls that weren't flushed by a
+            // finish_reason=="tool_calls" chunk (some templates/servers close with "stop").
+            try await flushToolCalls()
+            let resolvedFinishReason = finishReason
+            latestFinishReason.withLock { $0 = resolvedFinishReason }
+            let outCount = deliveredCharacterCount
             let reasonSuffix = finishReason.map { " finish_reason=\($0)" } ?? ""
             let draftSuffix: String = {
                 guard let latestTimings else { return "" }
@@ -2020,6 +3155,8 @@ extension NoemaLlamaClient {
                 endpoint: endpoint,
                 requestMode: requestMode,
                 streaming: !forceNonStreaming,
+                modelIdentifier: requestModelIdentifier,
+                speculativeType: requestSpeculativeType?.isEmpty == false ? requestSpeculativeType : nil,
                 timings: latestTimings,
                 finishReason: finishReason,
                 outputCharacters: outCount
@@ -2027,15 +3164,30 @@ extension NoemaLlamaClient {
             Task {
                 await LoopbackRuntimeDiagnostics.shared.recordResponse(diagnostics)
             }
+            // Paged sessions persist the newest prompt KV and SWA/hybrid
+            // checkpoints after each successful completion. The cache
+            // coalesces overlapping saves and the server waits for slot idle.
+            if isPagedLoopbackSession,
+               input.generationOptions.requestPurpose == .chat {
+                OverfitPromptStateCache.shared.noteSuccessfulPagedCompletion(
+                    port: Int32(port),
+                    promptCacheTokens: latestTimings?.cacheN
+                )
+                logPagedCompletionTelemetry(
+                    timings: latestTimings,
+                    promptCached: reportedPromptCached,
+                    promptTotal: reportedPromptTotal
+                )
+            }
         }
 
-        func parseJSONBody(_ data: Data) throws {
+        func parseJSONBody(_ data: Data) async throws {
             // Try OAI chat/completion format first (has "choices" array)
             if let chunk = try? decoder.decode(LoopbackChatChunk.self, from: data) {
                 recordTimings(chunk.timings)
                 reportPromptProgress(chunk.promptProgress)
                 for choice in chunk.choices {
-                    emitChoice(choice)
+                    try await emitChoice(choice)
                 }
                 return
             }
@@ -2043,19 +3195,30 @@ extension NoemaLlamaClient {
             if let raw = try? decoder.decode(LoopbackCompletionChunk.self, from: data) {
                 recordTimings(raw.timings)
                 if let content = raw.content, !content.isEmpty {
-                    emit(content)
+                    try await emit(content)
                 }
                 if raw.stop == true {
-                    finishReason = "stop"
+                    finishReason = raw.stopType == "limit" || raw.truncated == true
+                        ? "length"
+                        : "stop"
                 }
                 return
             }
             if let message = decodeServerErrorMessage(from: data) {
-                throw NSError(domain: "Noema", code: 2002, userInfo: [NSLocalizedDescriptionKey: "Server error: \(message)"])
+                throw NSError(
+                    domain: "Noema",
+                    code: 2002,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: String.localizedStringWithFormat(
+                            String(localized: "Model runtime error: %@", locale: LocalizationManager.preferredLocale()),
+                            message
+                        )
+                    ]
+                )
             }
             let plain = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             if !plain.isEmpty {
-                emit(plain)
+                try await emit(plain)
             }
         }
 
@@ -2066,11 +3229,20 @@ extension NoemaLlamaClient {
             }
             guard (200...299).contains(http.statusCode) else {
                 let message = decodeServerErrorMessage(from: data) ?? String(decoding: data.prefix(4096), as: UTF8.self)
-                throw NSError(domain: "Noema", code: 2002, userInfo: [NSLocalizedDescriptionKey: "Server error: \(message)"])
+                throw NSError(
+                    domain: "Noema",
+                    code: 2002,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: String.localizedStringWithFormat(
+                            String(localized: "Model runtime error: %@", locale: LocalizationManager.preferredLocale()),
+                            message
+                        )
+                    ]
+                )
             }
-            try parseJSONBody(data)
-            finalizeResponseLog()
-            return out
+            try await parseJSONBody(data)
+            try await finalizeResponseLog()
+            return outputCapture.result
         }
 
         do {
@@ -2086,7 +3258,16 @@ extension NoemaLlamaClient {
                     if buffer.count >= 4096 { break }
                 }
                 let message = decodeServerErrorMessage(from: buffer) ?? String(decoding: buffer, as: UTF8.self)
-                throw NSError(domain: "Noema", code: 2002, userInfo: [NSLocalizedDescriptionKey: "Server error: \(message)"])
+                throw NSError(
+                    domain: "Noema",
+                    code: 2002,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: String.localizedStringWithFormat(
+                            String(localized: "Model runtime error: %@", locale: LocalizationManager.preferredLocale()),
+                            message
+                        )
+                    ]
+                )
             }
 
             for try await rawLine in bytes.lines {
@@ -2107,7 +3288,7 @@ extension NoemaLlamaClient {
                     recordTimings(chunk.timings)
                     reportPromptProgress(chunk.promptProgress)
                     for choice in chunk.choices {
-                        emitChoice(choice)
+                        try await emitChoice(choice)
                     }
                     continue
                 }
@@ -2115,33 +3296,44 @@ extension NoemaLlamaClient {
                 if let raw = try? decoder.decode(LoopbackCompletionChunk.self, from: payloadData) {
                     recordTimings(raw.timings)
                     if raw.stop == true {
-                        finishReason = "stop"
+                        finishReason = raw.stopType == "limit" || raw.truncated == true
+                            ? "length"
+                            : "stop"
                         break
                     }
                     if let content = raw.content, !content.isEmpty {
-                        emit(content)
+                        try await emit(content)
                     }
                     continue
                 }
                 if let message = decodeServerErrorMessage(from: payloadData) {
-                    throw NSError(domain: "Noema", code: 2002, userInfo: [NSLocalizedDescriptionKey: "Server error: \(message)"])
+                    throw NSError(
+                        domain: "Noema",
+                        code: 2002,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: String.localizedStringWithFormat(
+                                String(localized: "Model runtime error: %@", locale: LocalizationManager.preferredLocale()),
+                                message
+                            )
+                        ]
+                    )
                 }
             }
 
             if !sawSSEPayload, !bufferedNonSSEPayload.isEmpty,
                let data = bufferedNonSSEPayload.data(using: .utf8) {
-                try parseJSONBody(data)
+                try await parseJSONBody(data)
             }
 
-            finalizeResponseLog()
-            return out
+            try await finalizeResponseLog()
+            return outputCapture.result
         } catch {
             // Diagnostic logging for connection failures
             let errNS = error as NSError
             let errCode = errNS.code
             let errDomain = errNS.domain
             let errDesc = errNS.localizedDescription
-            let charsReceived = out.count
+            let charsReceived = deliveredCharacterCount
             let mode = forceNonStreaming ? "json" : "sse"
             let ep = endpoint
             Task {
@@ -2159,7 +3351,7 @@ extension NoemaLlamaClient {
                 return URLError.Code(rawValue: nsError.code)
             }()
 
-            if allowRetry, let retryCode {
+            if allowRetry, deliveredCharacterCount == 0, let retryCode {
                 let isRetryableConnectionError =
                     retryCode == .networkConnectionLost ||
                     retryCode == .cannotConnectToHost ||
@@ -2189,15 +3381,16 @@ extension NoemaLlamaClient {
                             onToken: onToken,
                             onPromptProgress: onPromptProgress,
                             forceNonStreaming: true,
-                            allowRetry: false
+                            allowRetry: false,
+                            capturePolicy: capturePolicy
                         )
                     }
 
-                    let mm = self.effectiveMMProj ?? ProjectorLocator.projectorPath(alongside: self.modelURL)
-                    LlamaServerBridge.stop()
-                    let restarted = Int(LlamaServerBridge.start(self.loopbackStartConfiguration(mmprojPath: mm)))
+                    let mm = self.allowProjectorAutoDiscovery
+                        ? (self.effectiveMMProj ?? ProjectorLocator.projectorPath(alongside: self.modelURL))
+                        : nil
+                    let restarted = try self.restartOwnedLoopback(mmprojPath: mm)
                     if restarted > 0 {
-                        LoopbackVisionState.setEnabled(true)
                         let restartedURL = URL(string: "http://127.0.0.1:\(restarted)")
                         let postRestartProbe: LoopbackReadyProbeResult
                         if let restartedURL {
@@ -2232,7 +3425,12 @@ extension NoemaLlamaClient {
                         throw NSError(
                             domain: "Noema",
                             code: 2005,
-                            userInfo: [NSLocalizedDescriptionKey: "Loopback server restart failed while recovering from a connection reset."]
+                            userInfo: [
+                                NSLocalizedDescriptionKey: String(
+                                    localized: "The on-device model runtime could not recover. Reload the model and try again.",
+                                    locale: LocalizationManager.preferredLocale()
+                                )
+                            ]
                         )
                     }
                     return try await self.generateViaLoopbackServer(
@@ -2240,11 +3438,16 @@ extension NoemaLlamaClient {
                         onToken: onToken,
                         onPromptProgress: onPromptProgress,
                         forceNonStreaming: true,
-                        allowRetry: false
+                        allowRetry: false,
+                        capturePolicy: capturePolicy
                     )
                 }
             }
-            throw error
+            throw UserFacingErrorFormatter.normalizedTransportError(error, context: .localModel)
         }
+    }
+
+    fileprivate func mostRecentFinishReason() -> String? {
+        latestFinishReason.withLock { $0 }
     }
 }

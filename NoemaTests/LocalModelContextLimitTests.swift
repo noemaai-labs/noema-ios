@@ -14,6 +14,29 @@ final class LocalModelContextLimitTests: XCTestCase {
         XCTAssertEqual(ModelSettings.supportedMaxContextLength(for: model), 131_072)
     }
 
+    func testPagedGGUFContextLimitUsesPlatformLaunchCap() throws {
+        let temporaryRoot = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let packageURL = temporaryRoot.appendingPathComponent("model.noema-paged", isDirectory: true)
+        try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
+
+        let ggufURL = packageURL.appendingPathComponent("resident.gguf")
+        try writeMinimalGGUF(to: ggufURL, contextLength: 131_072)
+        try Data("{}".utf8).write(to: packageURL.appendingPathComponent("manifest.json"))
+
+        let model = makeLocalModel(format: .gguf, url: ggufURL)
+        XCTAssertEqual(
+            ModelSettings.supportedMaxContextLength(for: model),
+            OverfitPlanResolver.pagedContextCapTokens
+        )
+
+        let settings = ModelSettings(contextLength: 131_072)
+        XCTAssertEqual(
+            settings.normalizedForLocalModel(model).contextLength,
+            Double(OverfitPlanResolver.pagedContextCapTokens)
+        )
+    }
+
     func testSupportedMaxContextLengthReadsNestedMLXConfig() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -109,6 +132,28 @@ final class LocalModelContextLimitTests: XCTestCase {
 
         XCTAssertGreaterThan(f16Estimate, q8Estimate)
         XCTAssertGreaterThan(q8Estimate, q4Estimate)
+    }
+
+    func testMLXEstimateDropsAcrossEverySupportedKVCacheBitWidth() {
+        let quantizations: [MLXKVCacheQuantization] = [
+            .fullPrecision, .eightBit, .sixBit, .fiveBit, .fourBit, .threeBit, .twoBit
+        ]
+        let estimates = quantizations.map { quantization in
+            var settings = ModelSettings.default(for: .mlx)
+            settings.mlxKVCacheQuantization = quantization
+            return ModelRAMAdvisor.estimateAndBudget(
+                format: .mlx,
+                sizeBytes: gib(2),
+                contextLength: 32_768,
+                layerCount: 32,
+                moeInfo: nil,
+                kvCacheEstimate: .resolved(from: settings)
+            ).estimate
+        }
+
+        for pair in zip(estimates, estimates.dropFirst()) {
+            XCTAssertGreaterThan(pair.0, pair.1)
+        }
     }
 
     func testGGUFVCacheQuantOnlyChangesEstimateWhenFlashAttentionIsEnabled() {

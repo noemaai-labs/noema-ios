@@ -86,7 +86,7 @@ struct MemoryToolResponse: Codable, Sendable {
 
 public struct MemoryTool: Tool {
     public let name = "noema.memory"
-    public let description = "Manage persistent cross-conversation memory entries stored on device."
+    public let description = "Read or update the user's persistent on-device memory — facts worth keeping across conversations (preferences, recurring details, things they ask you to remember). Pick the action with \"operation\": list/view to recall, create/replace/insert to save (a save may be queued for the user's review first), rename/delete to manage. Returns the affected entry or the list of stored entries. Use to recall a saved fact or to remember something the user explicitly asks you to keep."
     public let schema = #"""
     {
       "type":"object",
@@ -136,11 +136,33 @@ public struct MemoryTool: Tool {
     }
     """#
 
+    /// Upper bounds on model-supplied memory text. A buggy or runaway model could
+    /// otherwise write an arbitrarily large entry, exhausting storage or tripping
+    /// MemoryStore limits.
+    private static let maxMemoryTitleLength = 200
+    private static let maxMemoryContentLength = 8_000
+
+    private enum MemoryToolValidationError: LocalizedError {
+        case valueTooLong(field: String, limit: Int)
+        var errorDescription: String? {
+            switch self {
+            case let .valueTooLong(field, limit):
+                return "The \(field) is too long (max \(limit) characters)."
+            }
+        }
+    }
+
     public func call(args: Data) async throws -> Data {
         let input = try JSONDecoder().decode(MemoryToolArguments.self, from: args)
         let operation = input.operation.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
         do {
+            if let title = input.title, title.count > Self.maxMemoryTitleLength {
+                throw MemoryToolValidationError.valueTooLong(field: "title", limit: Self.maxMemoryTitleLength)
+            }
+            if let content = input.content, content.count > Self.maxMemoryContentLength {
+                throw MemoryToolValidationError.valueTooLong(field: "content", limit: Self.maxMemoryContentLength)
+            }
             let response: MemoryToolResponse
             switch operation {
             case "list":

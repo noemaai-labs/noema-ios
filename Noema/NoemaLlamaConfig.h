@@ -1,4 +1,3 @@
-// NoemaLlamaConfig.h
 #ifndef NOEMA_LLAMA_CONFIG_H
 #define NOEMA_LLAMA_CONFIG_H
 

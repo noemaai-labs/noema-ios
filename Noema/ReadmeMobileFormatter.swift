@@ -1,76 +1,16 @@
-// ReadmeMobileFormatter.swift
 import Foundation
 
-/// Mobile-friendly README formatter that converts README content for better mobile readability.
-/// 
-/// This class implements the same transformations as readme_mobile_transform.py:
-/// 1. Preserves YAML frontmatter at the top (block enclosed in --- ... ---)
-/// 2. In HTML <div> with inline style containing 'display: flex;', adds 'flex-wrap: wrap;'
-///    and removes width attributes from <img> tags, replacing with responsive styles
-/// 3. Converts Markdown tables to list-based format for better mobile viewing
-/// 4. Preserves standard Markdown elements and code blocks
 final class ReadmeMobileFormatter {
     
     private static let codeBlockPlaceholder = "__CODE_BLOCK_"
-    
-    #if DEBUG
-    /// Run tests to validate the formatter works correctly
-    static func runTests() {
-        ReadmeMobileFormatterTests.runTests()
-    }
-    
-    /// Debug function to test formatting on sample content
-    static func debugFormat(_ content: String) -> String {
-        print("🔍 Debug: Original content length: \(content.count)")
-        let result = transform(content)
-        print("🔍 Debug: Transformed content length: \(result.count)")
-        print("🔍 Debug: Contains tables: \(content.contains("|"))")
-        print("🔍 Debug: Contains flex divs: \(content.contains("display: flex"))")
-        print("🔍 Debug: Contains frontmatter: \(content.hasPrefix("---"))")
-        return result
-    }
-    #endif
-    
-    /// Transform README content for mobile-friendly display according to the specified rules
-    static func transform(_ content: String) -> String {
-        #if DEBUG
-        print("🔄 ReadmeMobileFormatter: Starting transformation")
-        print("🔄 ReadmeMobileFormatter: Input length: \(content.count)")
-        #endif
-        
-        // Rule 1: Handle YAML frontmatter (preserve or remove)
+
+    static func transform(_ content: String, keepTables: Bool = false) -> String {
         let (frontmatter, body) = splitFrontmatter(content)
-        
-        #if DEBUG
-        print("🔄 ReadmeMobileFormatter: Frontmatter length: \(frontmatter.count)")
-        print("🔄 ReadmeMobileFormatter: Body length: \(body.count)")
-        #endif
-        
-        // Extract code blocks to preserve them verbatim (Rule 4)
         let (bodyNoCode, codeBlocks) = extractFencedCodeBlocks(body)
-        
-        #if DEBUG
-        print("🔄 ReadmeMobileFormatter: Code blocks extracted: \(codeBlocks.count)")
-        #endif
-        
-        // Rule 2: Apply HTML responsiveness
         let bodyWithResponsiveHTML = transformResponsiveHTML(bodyNoCode)
-        
-        // Rule 3: Transform tables to lists
-        let bodyWithTables = transformMarkdownTables(bodyWithResponsiveHTML)
-        
-        // Restore code blocks (Rule 4)
+        let bodyWithTables = keepTables ? bodyWithResponsiveHTML : transformMarkdownTables(bodyWithResponsiveHTML)
         let transformedBody = restoreCodeBlocks(bodyWithTables, codeBlocks: codeBlocks)
-        
-        // For now, we'll preserve frontmatter (can be changed to remove it if needed)
-        let result = frontmatter + transformedBody
-        
-        #if DEBUG
-        print("🔄 ReadmeMobileFormatter: Output length: \(result.count)")
-        print("🔄 ReadmeMobileFormatter: Transformation complete")
-        #endif
-        
-        return result
+        return frontmatter + transformedBody
     }
     
     // MARK: - Frontmatter Handling
@@ -91,7 +31,6 @@ final class ReadmeMobileFormatter {
             }
         }
         
-        // No closing '---' found; treat as normal content
         return ("", text)
     }
     
@@ -116,8 +55,10 @@ final class ReadmeMobileFormatter {
             }
             
             let fenceRange = match.range(at: 2)
-            let fence = String(line[Range(fenceRange, in: line)!])
-            return (true, String(fence.first!), fence.count)
+            guard let range = Range(fenceRange, in: line) else { return (false, "", 0) }
+            let fence = String(line[range])
+            guard let first = fence.first else { return (false, "", 0) }
+            return (true, String(first), fence.count)
         }
         
         for line in lines {
@@ -133,11 +74,9 @@ final class ReadmeMobileFormatter {
                 }
             } else {
                 currentBlock.append(line)
-                // Check for closing fence: same char, length >= opening length
                 let pattern = #"^\s*"# + NSRegularExpression.escapedPattern(for: fenceChar) + #"{"# + String(fenceLen) + #",}\s*.*$"#
                 if let regex = try? NSRegularExpression(pattern: pattern),
                    regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
-                    // Close block
                     let blockText = currentBlock.joined(separator: "\n")
                     let placeholder = "\(codeBlockPlaceholder)\(codeBlocks.count)__"
                     codeBlocks.append(blockText)
@@ -150,7 +89,6 @@ final class ReadmeMobileFormatter {
             }
         }
         
-        // If an unclosed code block remains, keep it as normal text
         if !currentBlock.isEmpty {
             outputParts.append(contentsOf: currentBlock)
         }
@@ -498,7 +436,7 @@ final class ReadmeMobileFormatter {
     private static func isDividerLine(_ line: String) -> Bool {
         guard let cells = splitTableLine(line) else { return false }
         
-        let pattern = #"^\s*:?-{3,}:?\s*$"#
+        let pattern = #"^\s*:?-+:?\s*$"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
         
         for cell in cells {

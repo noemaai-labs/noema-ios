@@ -1,4 +1,3 @@
-// Noema-Bridging.h
 #import <Foundation/Foundation.h>
 #import <stdint.h>
 
@@ -43,4 +42,7 @@ int gguf_moe_scan(const char *path, struct gguf_moe_scan_result *out_result);
 #endif
 #if __has_include("WhisperCpp.h")
 #import "WhisperCpp.h"
+#endif
+#if __has_include("ToolbarObserverCrashGuard.h")
+#import "ToolbarObserverCrashGuard.h"
 #endif

@@ -1,4 +1,3 @@
-// LocalDatasetDetailView.swift
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -45,6 +44,9 @@ struct LocalDatasetDetailView: View {
         let displayedDataset = liveDataset
         NavigationStack {
             ScrollView {
+#if os(macOS)
+                macContent(for: displayedDataset)
+#else
                 VStack(alignment: .leading, spacing: 24) {
                     VStack(spacing: 12) {
                         RoundedRectangle(cornerRadius: 3, style: .continuous)
@@ -87,8 +89,7 @@ struct LocalDatasetDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .padding(.top, 10)
-                    
-                    // Info Card
+
                     VStack(spacing: 16) {
                         let datasetBytes = Int64(displayedDataset.sizeMB * 1_048_576.0)
                         let sizeString = localizedFileSizeString(bytes: datasetBytes, locale: locale)
@@ -121,19 +122,22 @@ struct LocalDatasetDetailView: View {
                         }
                     }
                     .padding(16)
-                    .background(cardBackgroundColor) // Use system background color
+                    .background(cardBackgroundColor)
                     .cornerRadius(12)
                     .overlay(
                         RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                     )
 
-                    // Embedding Card
+                    // RAG-upgrade re-embed recommendation (optional, non-blocking).
+                    if datasetManager.isRAGIndexOutdated(for: displayedDataset) {
+                        ragUpgradeCard(displayedDataset)
+                    }
+
                     if let metadata = indexMetadata, let fingerprint = metadata.embeddingFingerprint {
                         embeddingCard(metadata: metadata, fingerprint: fingerprint)
                     }
 
-                    // Preparation Card
                     VStack(alignment: .leading, spacing: 16) {
                         Text(LocalizedStringKey("Preparation"))
                             .font(.headline)
@@ -154,7 +158,6 @@ struct LocalDatasetDetailView: View {
                             .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                     )
                     
-                    // Files Card
                     if !files.isEmpty {
                         VStack(alignment: .leading, spacing: 16) {
                             Text(LocalizedStringKey("Files"))
@@ -197,7 +200,6 @@ struct LocalDatasetDetailView: View {
                         )
                     }
                     
-                    // Actions
                     VStack(spacing: 12) {
                         let isReady = isDatasetReady
                         
@@ -247,8 +249,9 @@ struct LocalDatasetDetailView: View {
                     .padding(.bottom, 30)
                 }
                 .padding(.horizontal, 20)
+#endif
             }
-            .background(windowBackgroundColor) // Use window background
+            .background(windowBackgroundColor)
             .navigationTitle("")
             #if !os(macOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -282,6 +285,11 @@ struct LocalDatasetDetailView: View {
                 Text(LocalizedStringKey("This will remove the dataset and its embeddings from this device."))
             }
             .task {
+                // Opening the detail counts as "seen" → hides the row badge. Only
+                // record it for datasets that actually carry the notice.
+                if datasetManager.isRAGIndexOutdated(for: dataset) {
+                    datasetManager.acknowledgeRAGUpgradeNotice(for: dataset.datasetID)
+                }
                 loadFiles()
                 loadIndexReport()
                 loadIndexMetadata()
@@ -300,12 +308,179 @@ struct LocalDatasetDetailView: View {
     }
 
     // MARK: - Subviews
-    
+
+#if os(macOS)
+    private func macContent(for displayedDataset: LocalDataset) -> some View {
+        VStack(alignment: .leading, spacing: 20) {
+            macHeader(for: displayedDataset)
+
+            if datasetManager.isRAGIndexOutdated(for: displayedDataset) {
+                ragUpgradeCard(displayedDataset)
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                IndustrialSectionHeader(
+                    "Preparation",
+                    dotColor: isDatasetReady ? .green : .orange
+                )
+                let status = datasetManager.processingStatus[dataset.datasetID]
+                if let s = status, s.stage != .completed {
+                    processingView(status: s)
+                } else {
+                    readyView()
+                }
+            }
+
+            if let metadata = indexMetadata, let fingerprint = metadata.embeddingFingerprint {
+                VStack(alignment: .leading, spacing: 12) {
+                    IndustrialSectionHeader("Embedding")
+                    embeddingRows(metadata: metadata, fingerprint: fingerprint)
+                }
+            }
+
+            if !files.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    IndustrialSectionHeader("Files", detail: "\(files.count)")
+                    ForEach(files, id: \.name) { file in
+                        MacFileRow(
+                            name: file.name,
+                            size: file.size,
+                            url: DatasetPathing.destinationURL(for: file.name, in: displayedDataset.url)
+                        )
+                    }
+                }
+            }
+
+            macActionBar(for: displayedDataset)
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 4)
+        .padding(.bottom, 20)
+    }
+
+    private func macHeader(for displayedDataset: LocalDataset) -> some View {
+        let datasetBytes = Int64(displayedDataset.sizeMB * 1_048_576.0)
+        let sizeString = localizedFileSizeString(bytes: datasetBytes, locale: locale)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                if isDatasetReady {
+                    IndustrialBadge("Indexed", tint: .green)
+                }
+                IndustrialBadge(verbatim: sizeString)
+            }
+            HStack(spacing: 14) {
+                IndustrialStatPair(label: "Downloaded", value: formatDate(displayedDataset.downloadDate))
+                if !compressedMB.isEmpty {
+                    IndustrialStatPair(label: "Compressed Text", value: compressedMB)
+                }
+                if !tokenEstimate.isEmpty {
+                    IndustrialStatPair(label: "Approx. Tokens", value: tokenEstimate)
+                }
+            }
+            Text(verbatim: displayedDataset.datasetID)
+                .industrialStat()
+        }
+    }
+
+    private func macActionBar(for displayedDataset: LocalDataset) -> some View {
+        HStack(spacing: 8) {
+            Button(role: .destructive) {
+                datasetPendingDeletion = displayedDataset
+            } label: {
+                Text(LocalizedStringKey("Delete Dataset"))
+            }
+            .buttonStyle(.industrial(.destructive))
+
+            Spacer()
+
+            if modelManager.activeDataset?.datasetID == displayedDataset.datasetID {
+                Button {
+                    chatVM.setDatasetForActiveSession(nil)
+                    close()
+                } label: {
+                    Text(LocalizedStringKey("Stop Using Dataset"))
+                }
+                .buttonStyle(.industrial(.quiet))
+            } else {
+                Button {
+                    if isDatasetReady {
+                        Task { await logger.log("[UI] User tapped Use Dataset for \(displayedDataset.datasetID)") }
+                        chatVM.setDatasetForActiveSession(displayedDataset)
+                        warmingUpEmbed = true
+                        embedProgress = 0.0
+                        Task { await prepareEmbeddingsAndIndex() }
+                    } else {
+                        disabledUseReason = disabledUseDatasetReason
+                        showDisabledUseReason = true
+                    }
+                } label: {
+                    Text(LocalizedStringKey("Use Dataset"))
+                }
+                .buttonStyle(.industrial(.prominent))
+                .keyboardShortcut(.defaultAction)
+                .disabled(!isDatasetReady)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private struct MacFileRow: View {
+        let name: String
+        let size: String
+        let url: URL
+
+        @State private var hovering = false
+
+        var body: some View {
+            NavigationLink(destination: DatasetFileViewer(url: url)) {
+                HStack(spacing: 9) {
+                    Text(name)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Text(verbatim: size)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.4))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(0.3))
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(hovering ? Color.primary.opacity(0.045) : .clear)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+        }
+    }
+#endif
+
     private struct InfoRow: View {
         let label: String
         let value: String
-        
+
         var body: some View {
+#if os(macOS)
+            HStack(spacing: 8) {
+                Text(label)
+                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .lineLimit(1)
+                Spacer()
+                Text(value)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.7))
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(2)
+            }
+#else
             HStack {
                 Text(label)
                     .font(.body)
@@ -318,22 +493,73 @@ struct LocalDatasetDetailView: View {
                     .lineLimit(2)
                     .minimumScaleFactor(0.82)
             }
+#endif
         }
     }
     
     @ViewBuilder
-    private func embeddingCard(metadata: DatasetIndexMetadata, fingerprint: EmbeddingIndexFingerprint) -> some View {
-        let record = EmbeddingModelCatalog.record(for: fingerprint.modelID)
-        let modelDisplay = record?.displayName ?? fingerprint.modelID
-        let quantization = record?.artifacts.first(where: { $0.id == fingerprint.artifactID })?.quantization
-            ?? record?.primaryArtifact?.quantization
+    private func ragUpgradeCard(_ dataset: LocalDataset) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(.orange)
+                Text(LocalizedStringKey("Retrieval improvements available"))
+                    .font(.headline)
+            }
+            Text(LocalizedStringKey("This dataset was indexed before Noema's latest retrieval improvements — better text extraction from PDFs, smarter chunking, and more accurate search. It still works as-is, so re-embedding is optional; it just refreshes the index with the improvements."))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            // Tapping starts a full re-embed; this card then disappears (the index
+            // is cleared) and the Preparation card below shows live progress.
+            Button {
+                datasetManager.reembedForRAGUpgrade(datasetID: dataset.datasetID)
+            } label: {
+                Label(LocalizedStringKey("Re-embed now"), systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.industrial(.prominent, tint: .orange))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.orange.opacity(0.08))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+    }
 
+    @ViewBuilder
+    private func embeddingCard(metadata: DatasetIndexMetadata, fingerprint: EmbeddingIndexFingerprint) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(LocalizedStringKey("Embedding"))
                 .font(.headline)
                 .padding(.bottom, 4)
 
-            VStack(spacing: 16) {
+            embeddingRows(metadata: metadata, fingerprint: fingerprint)
+        }
+        .padding(16)
+        .background(cardBackgroundColor)
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func embeddingRows(metadata: DatasetIndexMetadata, fingerprint: EmbeddingIndexFingerprint) -> some View {
+        let record = EmbeddingModelCatalog.record(for: fingerprint.modelID)
+        let modelDisplay = record?.displayName ?? fingerprint.modelID
+        let quantization = record?.artifacts.first(where: { $0.id == fingerprint.artifactID })?.quantization
+            ?? record?.primaryArtifact?.quantization
+#if os(macOS)
+        let rowSpacing: CGFloat = 8
+#else
+        let rowSpacing: CGFloat = 16
+#endif
+
+        VStack(spacing: rowSpacing) {
                 InfoRow(label: String(localized: "Model"), value: modelDisplay)
                 if let publisher = record?.publisher {
                     Divider()
@@ -361,15 +587,7 @@ struct LocalDatasetDetailView: View {
                 InfoRow(label: String(localized: "Chunks"), value: "\(metadata.chunkCount)")
                 Divider()
                 InfoRow(label: String(localized: "Indexed"), value: formatDate(metadata.createdAt))
-            }
         }
-        .padding(16)
-        .background(cardBackgroundColor)
-        .cornerRadius(12)
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
-        )
     }
 
     private func poolingDisplay(_ raw: String) -> String {
@@ -404,7 +622,7 @@ struct LocalDatasetDetailView: View {
                     Button(LocalizedStringKey("Stop"), role: .destructive) {
                         datasetManager.cancelProcessingForID(dataset.datasetID)
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.industrial(.destructive))
 
                     if s.stage == .embedding {
                         Text(LocalizedStringKey("Keep Noema open while embedding — locking the screen pauses progress."))
@@ -432,7 +650,7 @@ struct LocalDatasetDetailView: View {
                         Text(LocalizedStringKey("Confirm and Start Embedding"))
                             .compactStatusText(minimumScaleFactor: 0.75)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.industrial(.prominent))
                     .confirmationDialog(Text(LocalizedStringKey("Proceed on battery power?")), isPresented: $showConfirmOnBatteryConfirm, titleVisibility: .visible) {
                         Button(LocalizedStringKey("Proceed")) {
                             Task {
@@ -536,11 +754,11 @@ struct LocalDatasetDetailView: View {
             }
 
             if state.showsProgressBar, let progress = state.progress {
-                NotificationProgressBar(value: progress, height: 7)
+                NotificationProgressBar(value: progress, height: preparationBarHeight)
             } else {
                 Capsule()
                     .fill(preparationTrackColor(for: state.tone))
-                    .frame(height: 7)
+                    .frame(height: preparationBarHeight)
             }
 
             if !state.message.isEmpty {
@@ -662,7 +880,7 @@ struct LocalDatasetDetailView: View {
                     showStartOnBatteryConfirm = true
                 }
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.industrial(.prominent))
             .confirmationDialog(Text(LocalizedStringKey("Proceed on battery power?")), isPresented: $showStartOnBatteryConfirm, titleVisibility: .visible) {
                 Button(LocalizedStringKey("Proceed")) {
                     Task {
@@ -713,6 +931,16 @@ struct LocalDatasetDetailView: View {
         case .failure:
             return .orange
         }
+    }
+
+    /// Matches NotificationProgressBar's platform height so the terminal-state
+    /// track doesn't jump thickness against the Mac industrial 2pt bar.
+    private var preparationBarHeight: CGFloat {
+#if os(macOS)
+        2
+#else
+        7
+#endif
     }
 
     private func preparationTrackColor(for tone: PreparationCardTone) -> Color {

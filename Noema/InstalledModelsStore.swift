@@ -1,7 +1,6 @@
-// InstalledModelsStore.swift
 import Foundation
 
-struct InstalledModel: Identifiable, Codable {
+struct InstalledModel: Identifiable, Codable, Sendable {
     let id: UUID
     let modelID: String
     let quantLabel: String
@@ -19,8 +18,10 @@ struct InstalledModel: Identifiable, Codable {
     var moeInfo: MoEInfo? = nil
     var etBackend: ETBackend? = nil
     var alias: String? = nil
+    var pagedPackageFingerprint: String? = nil
+    var pagedPackageBytes: Int64? = nil
 
-    init(id: UUID = UUID(), modelID: String, quantLabel: String, parameterCountLabel: String? = nil, url: URL, format: ModelFormat, sizeBytes: Int64, lastUsed: Date?, installDate: Date, checksum: String?, isFavourite: Bool, totalLayers: Int, isMultimodal: Bool = false, isToolCapable: Bool = false, moeInfo: MoEInfo? = nil, etBackend: ETBackend? = nil, alias: String? = nil) {
+    init(id: UUID = UUID(), modelID: String, quantLabel: String, parameterCountLabel: String? = nil, url: URL, format: ModelFormat, sizeBytes: Int64, lastUsed: Date?, installDate: Date, checksum: String?, isFavourite: Bool, totalLayers: Int, isMultimodal: Bool = false, isToolCapable: Bool = false, moeInfo: MoEInfo? = nil, etBackend: ETBackend? = nil, alias: String? = nil, pagedPackageFingerprint: String? = nil, pagedPackageBytes: Int64? = nil) {
         self.id = id
         self.modelID = modelID
         self.quantLabel = quantLabel
@@ -38,6 +39,8 @@ struct InstalledModel: Identifiable, Codable {
         self.moeInfo = moeInfo
         self.etBackend = etBackend
         self.alias = alias
+        self.pagedPackageFingerprint = pagedPackageFingerprint
+        self.pagedPackageBytes = pagedPackageBytes
     }
 }
 
@@ -71,10 +74,12 @@ final class InstalledModelsStore {
     }
 
     func isInstalled(id: String, quantLabel: String) -> Bool {
-        items.contains { $0.modelID == id && $0.quantLabel == quantLabel }
+        queue.sync {
+            items.contains { $0.modelID == id && $0.quantLabel == quantLabel }
+        }
     }
 
-    func all() -> [InstalledModel] { items }
+    func all() -> [InstalledModel] { queue.sync { items } }
 
     func add(_ m: InstalledModel) {
         queue.sync {
@@ -95,7 +100,9 @@ final class InstalledModelsStore {
                                           isToolCapable: m.isToolCapable,
                                           moeInfo: m.moeInfo,
                                           etBackend: m.etBackend,
-                                          alias: m.alias)
+                                          alias: m.alias,
+                                          pagedPackageFingerprint: m.pagedPackageFingerprint,
+                                          pagedPackageBytes: m.pagedPackageBytes)
             self.items.append(newModel)
             self.save()
         }
@@ -120,7 +127,9 @@ final class InstalledModelsStore {
                                           isToolCapable: m.isToolCapable,
                                           moeInfo: m.moeInfo,
                                           etBackend: m.etBackend,
-                                          alias: m.alias)
+                                          alias: m.alias,
+                                          pagedPackageFingerprint: m.pagedPackageFingerprint,
+                                          pagedPackageBytes: m.pagedPackageBytes)
             if let index = self.items.firstIndex(where: { $0.modelID == m.modelID && $0.quantLabel == m.quantLabel }) {
                 self.items[index] = newModel
             } else {
@@ -206,40 +215,25 @@ final class InstalledModelsStore {
     }
 
     func reload() {
-        guard let data = try? Data(contentsOf: url) else { return }
-        if let decoded = try? JSONDecoder().decode([InstalledModel].self, from: data) {
+        let reloaded = queue.sync { () -> Bool in
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode([InstalledModel].self, from: data) else {
+                return false
+            }
             items = decoded
-            _ = migrateLegacySLMEntries()
+            return true
+        }
+        if reloaded {
             _ = migratePaths()
         }
     }
 
     private func save() {
-        let data = try? JSONEncoder().encode(items)
-        try? data?.write(to: url)
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        try? data.write(to: url, options: [.atomic])
     }
 
-    var totalSizeBytes: Int64 { items.reduce(0) { $0 + $1.sizeBytes } }
-
-    /// Removes legacy SLM/Leap bundle records. ET now stores Hugging Face
-    /// `.pte` programs and tokenizer artifacts under `Documents/LocalLLMModels`.
-    @discardableResult
-    func migrateLegacySLMEntries() -> Bool {
-        var changed = false
-        queue.sync {
-            let before = items.count
-            items.removeAll { item in
-                guard item.format == .et else { return false }
-                let path = item.url.path.lowercased()
-                if path.hasSuffix(".bundle") || path.contains(".bundle/") { return true }
-                if item.url.lastPathComponent.lowercased() == "config.yaml" { return true }
-                return false
-            }
-            changed = items.count != before
-            if changed { save() }
-        }
-        return changed
-    }
+    var totalSizeBytes: Int64 { queue.sync { items.reduce(0) { $0 + $1.sizeBytes } } }
 
     /// Migrates GGUF and MLX records to ensure URLs use the canonical shape.
     /// GGUF entries store the `.gguf` file path; MLX entries store the root
@@ -455,6 +449,13 @@ final class InstalledModelsStore {
         let fixed = url.resolvingSymlinksInPath().standardizedFileURL
         switch format {
         case .gguf:
+            // Paged packages canonicalize to their resident GGUF so every
+            // downstream GGUF path (metadata, benchmarks, the loopback lease)
+            // stays on a real .gguf file.
+            if let packageDir = PagedPackageLocator.enclosingPackage(for: fixed) {
+                return PagedPackageLocator.residentGGUF(inPackage: packageDir)
+                    .resolvingSymlinksInPath().standardizedFileURL
+            }
             if fixed.pathExtension.lowercased() == "gguf" { return fixed }
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: fixed.path, isDirectory: &isDir), isDir.boolValue,

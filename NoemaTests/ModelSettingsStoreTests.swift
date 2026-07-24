@@ -3,14 +3,23 @@ import XCTest
 @testable import Noema
 
 final class ModelSettingsStoreTests: XCTestCase {
+    private var temporaryDirectory: URL!
+
     override func setUp() {
         super.setUp()
+        temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NoemaModelSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
+        ModelSettingsStore.directoryOverrideForTesting = temporaryDirectory
         ModelSettingsStore.clear()
         UserDefaults.standard.removeObject(forKey: "modelSettings")
     }
 
     override func tearDown() {
         ModelSettingsStore.clear()
+        ModelSettingsStore.directoryOverrideForTesting = nil
+        if let temporaryDirectory {
+            try? FileManager.default.removeItem(at: temporaryDirectory)
+        }
         UserDefaults.standard.removeObject(forKey: "modelSettings")
         super.tearDown()
     }
@@ -83,6 +92,15 @@ final class ModelSettingsStoreTests: XCTestCase {
         XCTAssertEqual(decoded.resolvedMTPDraftNMax, 6)
     }
 
+    func testMTPAutoTuneUsesSeventyPercentAcceptanceThreshold() {
+        var settings = ModelSettings.SpeculativeDecodingSettings()
+        settings.selection = .mtp
+        settings.mtpAutoTune = true
+        settings.mtpDraftPMin = 0.2
+
+        XCTAssertEqual(settings.effectiveMTPDraftPMin, 0.7, accuracy: 1e-9)
+    }
+
     func testBlankSystemPromptOverrideNormalizesBackToGlobal() {
         var settings = ModelSettings.default(for: .gguf)
         settings.systemPromptMode = .override
@@ -139,6 +157,10 @@ final class ModelSettingsStoreTests: XCTestCase {
         )
 
         XCTAssertEqual(resolved[currentPath]?.contextLength, 16384)
+        XCTAssertEqual(
+            ModelSettingsStore.loadEntries().first(where: { $0.canonicalPath == currentPath })?.settings.contextLength,
+            16384
+        )
     }
 
     func testResolverBackfillsCanonicalPathForLegacyDurableEntryMatchedByModelKey() {
@@ -167,6 +189,109 @@ final class ModelSettingsStoreTests: XCTestCase {
 
         XCTAssertEqual(resolved[model.url.path]?.contextLength, 10240)
         XCTAssertEqual(ModelSettingsStore.loadEntries().first?.canonicalPath, model.url.path)
+    }
+
+    func testModelSettingsDecodeToleratesUnknownEnumRawValues() throws {
+        // Simulates an older build reading settings written by a newer one: unknown
+        // raw values must fall back to defaults instead of failing the whole decode
+        // (a throw here used to permanently drop the durable entry).
+        let json = #"""
+        {
+            "contextLength": 32768,
+            "kCacheQuant": "Q9_9",
+            "vCacheQuant": "SOME_FUTURE_QUANT",
+            "tensorOverride": "hologram",
+            "speculativeDecoding": {"selection": "warp-drive", "mtpDraftNMax": 4}
+        }
+        """#
+
+        let decoded = try JSONDecoder().decode(ModelSettings.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.contextLength, 32768)
+        XCTAssertEqual(decoded.kCacheQuant, .f16)
+        XCTAssertEqual(decoded.vCacheQuant, .f16)
+        XCTAssertEqual(decoded.tensorOverride, .none)
+        XCTAssertEqual(decoded.speculativeDecoding.selection, .off)
+        XCTAssertEqual(decoded.speculativeDecoding.mtpDraftNMax, 4)
+    }
+
+    func testLocalPayloadDecodeSeparatesUnrecognizedEntries() throws {
+        let payload: [String: Any] = [
+            "entries": [
+                [
+                    "modelID": "Qwen/Qwen3-4B-Instruct",
+                    "quantLabel": "Q4_K_M",
+                    "canonicalPath": "/tmp/noema/tests/ok.gguf",
+                    "settings": ["contextLength": 8192]
+                ],
+                [
+                    "modelID": "Future/Model",
+                    "quantLabel": "QX",
+                    "settings": 42
+                ]
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+
+        let decoded = try XCTUnwrap(ModelSettingsPersistenceDecoder.decodeLocalPayload(from: data))
+
+        XCTAssertEqual(decoded.entries.count, 1)
+        XCTAssertEqual(decoded.entries.first?.settings.contextLength, 8192)
+        XCTAssertEqual(decoded.unrecognizedRawEntries.count, 1)
+        XCTAssertEqual(decoded.unrecognizedRawEntries.first?["modelID"] as? String, "Future/Model")
+    }
+
+    func testSavePreservesEntriesFromNewerSchemaAcrossRewrite() throws {
+        // A payload containing one entry this build can decode and one it can't.
+        let payload: [String: Any] = [
+            "entries": [
+                [
+                    "modelID": "Qwen/Qwen3-4B-Instruct",
+                    "quantLabel": "Q4_K_M",
+                    "canonicalPath": "/tmp/noema/tests/known.gguf",
+                    "settings": ["contextLength": 24576]
+                ],
+                [
+                    "modelID": "Future/Model",
+                    "quantLabel": "QX",
+                    "canonicalPath": "/tmp/noema/tests/future.bin",
+                    "settings": 42
+                ]
+            ]
+        ]
+        ModelSettingsStore.replacePayloadForTesting(try JSONSerialization.data(withJSONObject: payload))
+
+        XCTAssertEqual(ModelSettingsStore.loadEntries().count, 1)
+        XCTAssertEqual(ModelSettingsStore.unrecognizedRawEntryCountForTesting, 1)
+
+        // Saving an unrelated model rewrites the payload; the undecodable entry must
+        // ride along instead of being dropped.
+        let other = makeLocalModel(modelID: "Other/Model", path: "/tmp/noema/tests/other.gguf")
+        var otherSettings = ModelSettings.default(for: .gguf)
+        otherSettings.contextLength = 4096
+        ModelSettingsStore.save(settings: otherSettings, for: other)
+
+        let reloaded = ModelSettingsStore.loadEntries()
+        XCTAssertEqual(reloaded.count, 2)
+        XCTAssertEqual(ModelSettingsStore.unrecognizedRawEntryCountForTesting, 1)
+        XCTAssertTrue(reloaded.contains { $0.settings.contextLength == 24576 })
+        XCTAssertTrue(reloaded.contains { $0.modelID == "Other/Model" })
+    }
+
+    func testCorruptPayloadDoesNotGetWipedBySave() throws {
+        // An unreadable payload (e.g. locked keychain surrogate: corrupt JSON in both
+        // stores) must make save() a no-op rather than rebuilding a 1-entry payload.
+        ModelSettingsStore.replacePayloadForTesting(Data("not json at all".utf8))
+
+        let model = makeLocalModel(path: "/tmp/noema/tests/wipe-guard.gguf")
+        var settings = ModelSettings.default(for: .gguf)
+        settings.contextLength = 9999
+        ModelSettingsStore.save(settings: settings, for: model)
+
+        // The corrupt payload is still in place, untouched — nothing was overwritten.
+        let result = ModelSettingsStore.loadEntriesDetailed()
+        XCTAssertFalse(result.storeReadable)
+        XCTAssertTrue(result.entries.isEmpty)
     }
 
     func testCanonicalPathMigrationRewritesDurableEntryPath() {

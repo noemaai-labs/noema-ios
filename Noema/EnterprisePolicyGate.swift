@@ -1,14 +1,3 @@
-// EnterprisePolicyGate.swift
-// Synchronous, background-safe enforcement core for Noema Teams policy.
-//
-// Mirrors how WebToolGate/PythonToolGate stay off the main actor: all checks are
-// static, lock-protected, and read a cached snapshot. When no workspace is
-// connected everything returns true and consumer Noema behaves exactly as before.
-//
-// Failure semantics (fail closed):
-//   - expired within the 72h grace window: cached policy keeps being enforced
-//   - expired past grace / revoked device / invalid policy: allowlist restrictions
-//     and boolean restrictions REMAIN in force, and enterprise datasets are denied
 import Foundation
 
 enum EnterprisePolicyGate {
@@ -107,6 +96,33 @@ enum EnterprisePolicyGate {
         guard let allowed = snapshot.policy.allowedToolNames else { return true }
         return allowed.contains(toolName)
     }
+
+    #if os(macOS)
+    static func allowsMCP(serverID: String, transport: MCPTransportConfiguration, toolAlias: String? = nil) -> Bool {
+        guard let snapshot = current() else { return true }
+        let policy = snapshot.policy
+        guard policy.mcpEnabled ?? true else { return false }
+        if let allowed = policy.allowedMCPServerIDs, !allowed.contains(serverID) { return false }
+        let transportName: String
+        switch transport {
+        case .stdio:
+            guard policy.mcpLocalProcessesAllowed ?? true else { return false }
+            transportName = "stdio"
+        case .streamableHTTP: transportName = "streamable-http"
+        case .legacySSE: transportName = "sse"
+        }
+        if let allowed = policy.allowedMCPTransports, !allowed.contains(transportName) { return false }
+        if let toolAlias {
+            if let allowed = policy.allowedMCPToolAliases, !allowed.contains(toolAlias) { return false }
+            // Existing explicit tool allowlists fail closed for dynamic aliases.
+            if let allowed = policy.allowedToolNames, !allowed.contains(toolAlias) { return false }
+        }
+        return true
+    }
+
+    static var mcpSamplingAllowed: Bool { current()?.policy.mcpSamplingAllowed ?? true }
+    static var mcpElicitationAllowed: Bool { current()?.policy.mcpElicitationAllowed ?? true }
+    #endif
 
     static func allowsModelFormat(_ format: ModelFormat) -> Bool {
         guard let snapshot = current() else { return true }

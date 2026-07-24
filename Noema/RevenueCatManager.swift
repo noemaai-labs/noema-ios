@@ -1,6 +1,3 @@
-// RevenueCatManager.swift
-// RevenueCat support has been removed; this stub remains to satisfy legacy call sites.
-
 import Foundation
 
 @MainActor

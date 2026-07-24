@@ -72,7 +72,7 @@ struct StartupPreferences: Codable, Equatable, Sendable {
 
     func orderedAttempts(offGrid: Bool) -> [Attempt] {
         let trimmedLocal = localModelPath?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let localAttempt: Attempt? = (trimmedLocal?.isEmpty == false) ? .local(path: trimmedLocal!) : nil
+        let localAttempt = trimmedLocal.flatMap { $0.isEmpty ? nil : Attempt.local(path: $0) }
         let remoteAttempts: [Attempt]
         if offGrid {
             remoteAttempts = []
@@ -153,7 +153,7 @@ enum StartupPreferencesStore {
             sanitized.localModelPath = nil
         }
         if !sanitized.remoteSelections.isEmpty {
-            let backendMap = Dictionary(uniqueKeysWithValues: backends.map { ($0.id, $0) })
+            let backendMap = Dictionary(backends.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
             sanitized.remoteSelections = sanitized.remoteSelections.compactMap { selection in
                 guard let backend = backendMap[selection.backendID] else { return nil }
                 var updated = selection
@@ -317,7 +317,10 @@ enum StartupLoader {
                 } catch {
                     await MainActor.run {
                         if chatVM.loadError == nil {
-                            chatVM.loadError = error.localizedDescription
+                            chatVM.loadError = UserFacingErrorFormatter.message(
+                                for: error,
+                                context: .remoteModel
+                            )
                         }
                     }
                     return .failure
@@ -337,7 +340,10 @@ enum StartupLoader {
                     group.cancelAll()
                     await MainActor.run {
                         if chatVM.loadError == nil {
-                            chatVM.loadError = "Remote startup timed out after \(Int(clampedTimeout)) seconds."
+                            chatVM.loadError = UserFacingErrorFormatter.message(
+                                for: URLError(.timedOut),
+                                context: .remoteModel
+                            )
                         }
                     }
                     return false

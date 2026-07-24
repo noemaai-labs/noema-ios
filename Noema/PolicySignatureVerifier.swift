@@ -1,7 +1,3 @@
-// PolicySignatureVerifier.swift
-// v1 ships unsigned policies behind this protocol so real signing (e.g. Ed25519
-// over the raw payload, key pinned in the app) can slot in without touching
-// EnterprisePolicyManager call sites.
 import Foundation
 
 enum EnterprisePolicyError: Error, Equatable {

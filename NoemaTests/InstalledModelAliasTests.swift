@@ -68,6 +68,40 @@ final class InstalledModelAliasTests: XCTestCase {
         XCTAssertEqual(model.displayName, "example/Legacy-7B (Q5_K_M)")
     }
 
+    func testConcurrentReadsAndWritesPreserveEveryModel() async {
+        let filename = "installed-concurrency-\(UUID().uuidString).json"
+        let store = InstalledModelsStore(filename: filename)
+        defer { removeStoreFile(filename) }
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<40 {
+                group.addTask {
+                    store.add(
+                        InstalledModel(
+                            modelID: "example/model-\(index)",
+                            quantLabel: "Q4",
+                            url: FileManager.default.temporaryDirectory.appendingPathComponent("model-\(index).gguf"),
+                            format: .gguf,
+                            sizeBytes: Int64(index),
+                            lastUsed: nil,
+                            installDate: Date(),
+                            checksum: nil,
+                            isFavourite: false,
+                            totalLayers: 0
+                        )
+                    )
+                }
+                group.addTask {
+                    _ = store.all()
+                    _ = store.totalSizeBytes
+                    _ = store.isInstalled(id: "example/model-\(index)", quantLabel: "Q4")
+                }
+            }
+        }
+
+        XCTAssertEqual(store.all().count, 40)
+    }
+
     private func makeInstalledModel(alias: String?) -> InstalledModel {
         InstalledModel(
             modelID: "example/FastTutor-7B",

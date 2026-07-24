@@ -1,15 +1,3 @@
-// NoemaEmbeddingActivityLiveActivity.swift
-//
-//  NoemaEmbeddingActivityLiveActivity.swift
-//  NoemaEmbeddingActivity
-//
-//  Live Activity UI for dataset embedding progress: lock screen banner and
-//  Dynamic Island (compact / minimal / expanded). All user-facing strings
-//  arrive pre-localized inside the content state; this widget only renders.
-//  When `isPaused` is set (app backgrounded, GPU work suspended) the activity
-//  flips to an amber call-to-action urging the user to reopen the app.
-//
-
 import ActivityKit
 import WidgetKit
 import SwiftUI

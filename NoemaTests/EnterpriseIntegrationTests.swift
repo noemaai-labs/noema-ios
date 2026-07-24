@@ -161,9 +161,13 @@ final class EnterpriseStateMachineTests: XCTestCase {
         EnterprisePolicyStorage.directoryOverrideForTesting = nil
         EnterprisePolicyGate.resetForTesting()
         EnterprisePolicyGate.setSnapshot(nil)
+        NetworkKillSwitch.setEnterpriseAllowedHosts([])
+        NetworkKillSwitch.setEnabled(false)
         try? KeychainStore.delete(service: "ai.noema.enterprise", account: "deviceToken")
         try? FileManager.default.removeItem(at: tempDir)
         UserDefaults.standard.removeObject(forKey: "enterpriseAPIBaseURL")
+        UserDefaults.standard.removeObject(forKey: "enterpriseOffGridForced")
+        UserDefaults.standard.removeObject(forKey: "offGrid")
         try await super.tearDown()
     }
 
@@ -250,6 +254,24 @@ final class EnterpriseStateMachineTests: XCTestCase {
         context(.disconnected)
         let manager = EnterprisePolicyManager()
         XCTAssertEqual(manager.state, .disconnected)
+    }
+
+    func testReapplyingPolicyRestoresMandatoryOffGridAfterSettingsReset() {
+        let manager = EnterprisePolicyManager()
+        let snapshot = EnterpriseGateSnapshot(
+            policy: EnterpriseTestFixtures.policy(requiresOffGrid: true),
+            status: .valid
+        )
+        EnterprisePolicyGate.setSnapshot(snapshot)
+        UserDefaults.standard.set(false, forKey: "offGrid")
+        UserDefaults.standard.removeObject(forKey: "enterpriseOffGridForced")
+        NetworkKillSwitch.setEnabled(false)
+
+        manager.reapplyOffGridMapping()
+
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: "offGrid"))
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: "enterpriseOffGridForced"))
+        XCTAssertTrue(NetworkKillSwitch.isEnabled)
     }
 
     func testReconnectDeadlinePassedWipesCompanyData() async throws {

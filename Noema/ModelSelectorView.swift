@@ -1,4 +1,3 @@
-// ModelSelectorView.swift
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -61,7 +60,7 @@ struct ModelSelectorView: View {
                 Group {
                     if let loaded = modelManager.loadedModel {
                         HStack {
-                            Text(loaded.displayName)
+                            Text(modelManager.autoRoutingArmed ? "Autopilot · \(loaded.displayName)" : loaded.displayName)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(12)
                                 .background(Color(uiColor: .systemGray6))
@@ -181,6 +180,7 @@ struct ModelListView: View {
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
     @AppStorage("hideGGUFOffloadWarning") private var hideGGUFOffloadWarning = false
+    @Environment(\.dismiss) private var dismiss
 
     enum SortOption: String, CaseIterable, Identifiable {
         case recent = "Recent"
@@ -208,6 +208,9 @@ struct ModelListView: View {
             .padding(.vertical, 4)
             .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
             .listRowSeparator(.hidden)
+            Section(header: Text(LocalizedStringKey("Automatic"))) {
+                autopilotRow
+            }
             Section(header: Text(LocalizedStringKey("Your Models"))) {
                 ForEach(sortedModels, id: \.id) { model in
                     let row = ModelRow(
@@ -226,11 +229,20 @@ struct ModelListView: View {
                             startLoad(for: model, settings: s)
                         }
                     }
-                    row
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            selectedModel = model
+                    // The paged verdict is memoized per URL so list scrolling
+                    // never re-stats the disk.
+                    VStack(alignment: .leading, spacing: 0) {
+                        row
+                        if model.format == .gguf, OverfitPagedInstallCache.isPaged(model.url) {
+                            OverfitPagedChip()
+                                .padding(.top, 2)
+                                .padding(.bottom, 2)
                         }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedModel = model
+                    }
                 }
             }
             Section(header: Text(LocalizedStringKey("Your Datasets"))) {
@@ -257,7 +269,12 @@ struct ModelListView: View {
                 }
             }
         }
-        .onAppear { modelManager.refresh(); models = modelManager.downloadedModels }
+        // Populate immediately from the current cache, then refresh off the main thread.
+        // `refreshAsync()` performs the heavy disk/GGUF work on a background task and publishes
+        // `downloadedModels`, which the `.onReceive` below mirrors into `models`. The previous
+        // synchronous `refresh()` parsed model metadata on the MainActor during view appearance.
+        .onAppear { models = modelManager.downloadedModels }
+        .task { await modelManager.refreshAsync() }
         .onReceive(modelManager.$downloadedModels) { models = $0 }
         .alert(LocalizedStringKey("Model Load Parameters"), isPresented: $showInfo) {
             Button(LocalizedStringKey("OK"), role: .cancel) {}
@@ -302,6 +319,67 @@ struct ModelListView: View {
                 Text(LocalizedStringKey("This model doesn't support GPU offload and generation speed will be significantly slower. Consider switching to an MLX model."))
             } else {
                 Text(LocalizedStringKey("This model doesn't support GPU offload and generation speed will be significantly slower. Fastest option on this device: use an ET model."))
+            }
+        }
+    }
+
+    private var autopilotRow: some View {
+        let config = AutopilotConfigStore.load()
+        let configured = config.isReadyToArm
+        return HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.cyan.opacity(0.12))
+                .frame(width: 28, height: 28)
+                .overlay(
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.cyan)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text(LocalizedStringKey("Autopilot"))
+                    .font(FontTheme.body)
+                    .fontWeight(.medium)
+                    .foregroundStyle(AppTheme.text)
+                if configured, let escalation = config.escalationDisplayName {
+                    let localName = modelManager.loadedModel?.displayName ?? String(localized: "Local model")
+                    Text(verbatim: "\(localName) → \(escalation)")
+                        .font(FontTheme.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                } else {
+                    Text(LocalizedStringKey("Set up Autopilot"))
+                        .font(FontTheme.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+            }
+            Spacer()
+            if modelManager.autoRoutingArmed {
+                Text(verbatim: "AUTO")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color.cyan)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(Color.cyan.opacity(0.12))
+                    )
+            }
+            if !configured {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if configured {
+                modelManager.autoRoutingArmed = true
+                if modelManager.loadedModel != nil {
+                    tabRouter.selection = .chat
+                }
+            } else {
+                NotificationCenter.default.post(name: .noemaOpenAutopilotSetup, object: nil)
+                dismiss()
             }
         }
     }
@@ -366,7 +444,8 @@ struct ModelListView: View {
                         contextLength: ctx,
                         layerCount: layerHint,
                         moeInfo: model.moeInfo,
-                        kvCacheEstimate: kvCacheEstimate
+                        kvCacheEstimate: kvCacheEstimate,
+                        runtimeConfiguration: .resolved(from: normalizedSettings, modelURL: model.url)
                     ) {
                         AppSoundPlayer.play(.error)
                         Haptics.error()
@@ -562,10 +641,11 @@ extension LocalModel {
             }
             let name: String
             if item.format == .et {
-                let baseName = LeapCatalogService.name(for: item.modelID) ?? item.modelID
+                let baseName = ETModelResolver.displayName(for: item.modelID) ?? item.modelID
                 name = baseName
             } else if item.format == .afm {
-                name = AppleFoundationModelRegistry.modelName
+                name = AppleFoundationModelKind.resolve(modelID: item.modelID)?.modelName
+                    ?? AppleFoundationModelRegistry.modelName
             } else if item.format == .mlx {
                 name = Self.friendlyMLXName(for: item.modelID, quantLabel: item.quantLabel)
             } else {
@@ -597,21 +677,6 @@ extension LocalModel {
         }
     }
 
-}
-
-extension LocalModel {
-    /// Distinguishes ET artifact source so UI can label ExecuTorch vs GGUF-backed installs.
-    var slmSourceFormatLabel: String? {
-        guard format == .et else { return nil }
-        let ext = url.pathExtension.lowercased()
-        if ext == "bundle" { return "EXECUTORCH" }
-        if ext == "gguf" { return "GGUF" }
-        let lowerPath = url.path.lowercased()
-        if lowerPath.contains(".bundle/") || lowerPath.hasSuffix(".bundle") {
-            return "EXECUTORCH"
-        }
-        return nil
-    }
 }
 
 private extension LocalModel {
@@ -700,8 +765,21 @@ extension LocalModel {
         return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Draft compatibility is a model-family/tokenizer property, not an exact
+    /// architecture match: dense qwen35 is a valid draft for qwen35moe. GGUF
+    /// spells MoE variants as a "moe" suffix on the dense architecture name,
+    /// so compare with that suffix stripped.
     func matchesArchitectureFamily(of other: LocalModel) -> Bool {
-        architectureFamily.caseInsensitiveCompare(other.architectureFamily) == .orderedSame
+        let lhs = Self.draftFamily(architectureFamily)
+        let rhs = Self.draftFamily(other.architectureFamily)
+        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
+        return lhs == rhs
+    }
+
+    private static func draftFamily(_ family: String) -> String {
+        let lowered = family.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard lowered.hasSuffix("moe"), lowered.count > 3 else { return lowered }
+        return String(lowered.dropLast(3))
     }
 }
 

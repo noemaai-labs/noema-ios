@@ -1,0 +1,39 @@
+services:
+  web-reader:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      READER_REF_SIGNING_KEY: ${READER_REF_SIGNING_KEY:?set READER_REF_SIGNING_KEY}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 1g
+    cpus: 1.0
+    networks:
+      - noema_reader
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      interval: 20s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    networks:
+      - noema_reader
+
+networks:
+  noema_reader:
+    driver: bridge
+    internal: false

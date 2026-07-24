@@ -28,16 +28,23 @@ public final class CloudKitRelay: @unchecked Sendable {
         fallbackPollTask?.cancel()
     }
 
-    public func configure(containerIdentifier: String, provider: InferenceProvider? = nil) {
-        guard !containerIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
+    @discardableResult
+    public func configure(containerIdentifier: String, provider: InferenceProvider? = nil) -> Bool {
+        let identifier = containerIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let container = RelayCloudKitAccess.containerIfAvailable(identifier) else {
+            stopServerProcessing()
+            container = nil
+            db = nil
+            log("CloudKit is unavailable for container \(identifier)")
+            if let provider { self.provider = provider }
+            return false
         }
         stopServerProcessing()
-        let container = CKContainer(identifier: containerIdentifier)
         self.container = container
         db = container.privateCloudDatabase
         if let provider { self.provider = provider }
-        log("Configured CloudKit container \(containerIdentifier)")
+        log("Configured CloudKit container \(identifier)")
+        return true
     }
 
     public func postFromiOS(_ env: RelayEnvelope) async throws {
@@ -133,10 +140,14 @@ public final class CloudKitRelay: @unchecked Sendable {
 
     private func requestPoll(reason: String) async {
         // Serialize CloudKit queries to avoid overlapping fetch storms.
-        await pollGate.acquire()
-        defer { Task { await pollGate.release() } }
+        do {
+            try await pollGate.acquire()
+        } catch {
+            return
+        }
         log("Polling CloudKit (\(reason))")
         await pollAndProcessOnce()
+        await pollGate.release()
     }
 
     private func startFallbackPolls() {
@@ -144,7 +155,12 @@ public final class CloudKitRelay: @unchecked Sendable {
         fallbackPollTask = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: self.fallbackPollIntervalNanoseconds)
+                do {
+                    try await Task.sleep(nanoseconds: self.fallbackPollIntervalNanoseconds)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
                 await self.requestPoll(reason: "fallback")
             }
         }
@@ -174,9 +190,18 @@ public final class CloudKitRelay: @unchecked Sendable {
                         // Acquire a worker slot, then process on a detached background task.
                         Task.detached(priority: .utility) { [weak self] in
                             guard let self else { return }
-                            await self.workers.acquire()
+                            // Capture the semaphore instance. Reloading performance
+                            // configuration replaces `self.workers`; releasing the new
+                            // instance would corrupt its permit count.
+                            let workers = self.workers
+                            do {
+                                try await workers.acquire()
+                            } catch {
+                                await self.inFlight.remove(key)
+                                return
+                            }
                             defer {
-                                Task { await self.workers.release() }
+                                Task { await workers.release() }
                                 // Keep the key in-flight for 30 seconds after
                                 // processing completes.  CloudKit queries can
                                 // return stale needsResponse==1 results right
@@ -226,11 +251,10 @@ public final class CloudKitRelay: @unchecked Sendable {
             }
             await partialWriter.seal()
             let visibleReply = RelayMessage.visibleText(from: reply)
-            let responseText = visibleReply.isEmpty ? reply : visibleReply
             let response = RelayMessage(
                 conversationID: processingEnvelope.conversationID,
                 role: "assistant",
-                text: responseText,
+                text: visibleReply,
                 fullText: reply
             )
 
@@ -431,9 +455,11 @@ public final class CloudKitRelay: @unchecked Sendable {
         do {
             log("Fetching conversation record \(id.recordName)")
             return try await database.record(for: id)
-        } catch {
+        } catch let error as CKError where error.code == .unknownItem {
             log("Creating new conversation record \(id.recordName)")
             return CKRecord(recordType: "Conversation", recordID: id)
+        } catch {
+            throw error
         }
     }
 
@@ -530,19 +556,13 @@ private actor PartialReplyWriter {
         lastWrite = now
         lastLength = length
 
-        let visible = RelayMessage.visibleText(from: partial)
-        let assistant = RelayMessage(conversationID: conversationID,
-                                     role: "assistant",
-                                     text: visible,
-                                     fullText: partial)
-        let envelope = RelayEnvelope(
-            conversationID: conversationID,
-            messages: base.messages + [assistant],
-            needsResponse: true,
-            parameters: base.parameters,
-            status: .processing,
-            statusUpdatedAt: now,
-            errorMessage: nil
+        let latestEnvelope = (record["conversationData"] as? Data)
+            .flatMap { try? JSONDecoder().decode(RelayEnvelope.self, from: $0) }
+        let envelope = RelayEnvelope.streamingPartial(
+            base: base,
+            latest: latestEnvelope,
+            partial: partial,
+            timestamp: now
         )
         guard let data = try? encoder.encode(envelope) else { return }
         record["conversationData"] = data as CKRecordValue

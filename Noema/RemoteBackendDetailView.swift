@@ -24,7 +24,7 @@ struct RemoteBackendDetailView: View {
     @AppStorage("offGrid") private var offGrid = false
 
     @State private var actionMessage: RemoteBackendActionMessage?
-    @State private var remoteSettingsTarget: RemoteModelSettingsTarget?
+    @State private var presentedModelSheet: PresentedModelSheet?
     @State private var isEditing = false
     @State private var editedDraft: RemoteBackendDraft?
     @State private var hasDraftChanges = false
@@ -45,7 +45,6 @@ struct RemoteBackendDetailView: View {
     @State private var openRouterFavoritesOnly = false
     @State private var openRouterSelectedSupportedParameter: String?
     @State private var openRouterSort: RemoteModel.OpenRouterBrowserSort = .automatic
-    @State private var openRouterInfoTarget: OpenRouterModelInfoTarget?
 #if os(iOS) || os(visionOS)
     @State private var showLANOverrideConfirmation = false
 #endif
@@ -67,6 +66,20 @@ struct RemoteBackendDetailView: View {
 
         var id: String {
             "\(backend.id.uuidString)|info|\(model.id)"
+        }
+    }
+
+    private enum PresentedModelSheet: Identifiable {
+        case settings(RemoteModelSettingsTarget)
+        case info(OpenRouterModelInfoTarget)
+
+        var id: String {
+            switch self {
+            case .settings(let target):
+                return target.id
+            case .info(let target):
+                return target.id
+            }
         }
     }
 
@@ -113,36 +126,42 @@ struct RemoteBackendDetailView: View {
                 dismissButton: .default(Text(LocalizedStringKey("OK")))
             )
         }
-        .sheet(item: $remoteSettingsTarget) { target in
-            let initialSettings = modelManager.remoteSettings(for: target.backend.id, model: target.model)
-            RemoteModelSettingsSheet(
-                model: target.model,
-                endpointType: target.backend.endpointType,
-                initialSettings: initialSettings,
-                maxContextLength: target.model.maxContextLength,
-                resetSettings: target.model.openRouterDefaultSettings(base: initialSettings),
-                onSave: { settings in
-                    modelManager.saveRemoteSettings(settings, for: target.backend.id, model: target.model)
-                    vm.syncActiveRemoteModelPromptSettingsIfNeeded(
-                        backendID: target.backend.id,
-                        modelID: target.model.id,
-                        settings: settings
-                    )
-                },
-                onUse: { settings in
-                    modelManager.saveRemoteSettings(settings, for: target.backend.id, model: target.model)
-                    vm.syncActiveRemoteModelPromptSettingsIfNeeded(
-                        backendID: target.backend.id,
-                        modelID: target.model.id,
-                        settings: settings
-                    )
-                    use(model: target.model, in: target.backend, explicitSettings: settings)
-                }
-            )
+        .sheet(item: $presentedModelSheet) { destination in
+            switch destination {
+            case .settings(let target):
+                remoteModelSettingsSheet(for: target)
+            case .info(let target):
+                OpenRouterModelInfoSheet(model: target.model, backendName: target.backend.name)
+            }
         }
-        .sheet(item: $openRouterInfoTarget) { target in
-            OpenRouterModelInfoSheet(model: target.model, backendName: target.backend.name)
-        }
+    }
+
+    private func remoteModelSettingsSheet(for target: RemoteModelSettingsTarget) -> some View {
+        let initialSettings = modelManager.remoteSettings(for: target.backend.id, model: target.model)
+        return RemoteModelSettingsSheet(
+            model: target.model,
+            endpointType: target.backend.endpointType,
+            initialSettings: initialSettings,
+            maxContextLength: target.model.maxContextLength,
+            resetSettings: target.model.openRouterDefaultSettings(base: initialSettings),
+            onSave: { settings in
+                modelManager.saveRemoteSettings(settings, for: target.backend.id, model: target.model)
+                vm.syncActiveRemoteModelPromptSettingsIfNeeded(
+                    backendID: target.backend.id,
+                    modelID: target.model.id,
+                    settings: settings
+                )
+            },
+            onUse: { settings in
+                modelManager.saveRemoteSettings(settings, for: target.backend.id, model: target.model)
+                vm.syncActiveRemoteModelPromptSettingsIfNeeded(
+                    backendID: target.backend.id,
+                    modelID: target.model.id,
+                    settings: settings
+                )
+                use(model: target.model, in: target.backend, explicitSettings: settings)
+            }
+        )
     }
 
     @ViewBuilder
@@ -824,9 +843,11 @@ struct RemoteBackendDetailView: View {
                     .padding(.vertical, 2)
                 }
                 .frame(minHeight: 280, idealHeight: 420, maxHeight: 420)
+#if os(iOS) || os(visionOS)
                 .simultaneousGesture(TapGesture().onEnded {
                     dismissOpenRouterSearch()
                 })
+#endif
             }
         }
         .padding(16)
@@ -839,9 +860,11 @@ struct RemoteBackendDetailView: View {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .stroke(AppTheme.cardStroke, lineWidth: 1)
         )
+#if os(iOS) || os(visionOS)
         .simultaneousGesture(TapGesture().onEnded {
             dismissOpenRouterSearch()
         })
+#endif
     }
 
     private func standardSortedModels(for backend: RemoteBackend) -> [RemoteModel] {
@@ -903,16 +926,20 @@ struct RemoteBackendDetailView: View {
             useAction: { use(model: model, in: backend) },
             settingsAction: { openRemoteSettings(for: model, backend: backend) },
             favoriteAction: { _ = modelManager.toggleOpenRouterFavorite(backendID: backend.id, modelID: model.id) },
-            infoAction: { openRouterInfoTarget = OpenRouterModelInfoTarget(backend: backend, model: model) }
+            infoAction: {
+                presentedModelSheet = .info(OpenRouterModelInfoTarget(backend: backend, model: model))
+            }
         )
     }
 
     private var openRouterSearchBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
             TextField(LocalizedStringKey("Search models"), text: $openRouterSearchText)
                 .textFieldStyle(.plain)
+                .font(.system(size: 13))
                 .autocorrectionDisabled(true)
                 .focused($openRouterSearchFocused)
 #if os(iOS) || os(visionOS)
@@ -923,20 +950,21 @@ struct RemoteBackendDetailView: View {
                     openRouterSearchText = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 13))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(AppTheme.cardFill)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(AppTheme.cardStroke, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(AppTheme.cardStroke, lineWidth: 0.5)
         )
     }
 
@@ -957,13 +985,34 @@ struct RemoteBackendDetailView: View {
                     }
                     .buttonStyle(.plain)
 
+                    Button {
+                        openRouterFilter = openRouterFilter == .free ? .all : .free
+                    } label: {
+                        openRouterControlPill("Free", isActive: openRouterFilter == .free)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        openRouterFilter = openRouterFilter == .paid ? .all : .paid
+                    } label: {
+                        openRouterControlPill("Paid", isActive: openRouterFilter == .paid)
+                    }
+                    .buttonStyle(.plain)
+
                     Menu {
-                        Picker(selection: $openRouterFilter) {
-                            ForEach(RemoteModel.OpenRouterBrowserFilter.allCases) { filter in
-                                Text(LocalizedStringKey(filter.title)).tag(filter)
+                        // Explicit buttons, not an inline Picker: a Picker with an
+                        // empty label renders as a blank highlighted submenu row on
+                        // macOS instead of inline choices.
+                        ForEach(RemoteModel.OpenRouterBrowserFilter.allCases) { filter in
+                            Button {
+                                openRouterFilter = filter
+                            } label: {
+                                if openRouterFilter == filter {
+                                    Label(LocalizedStringKey(filter.title), systemImage: "checkmark")
+                                } else {
+                                    Text(LocalizedStringKey(filter.title))
+                                }
                             }
-                        } label: {
-                            EmptyView()
                         }
 
                         Divider()
@@ -992,20 +1041,32 @@ struct RemoteBackendDetailView: View {
                             }
                         }
                     } label: {
-                        openRouterControlPill(openRouterFilterMenuTitle, isActive: openRouterFilter != .all || openRouterSelectedSupportedParameter != nil)
+                        openRouterControlPill(
+                            openRouterFilterMenuTitle,
+                            isActive: openRouterFilter != .all || openRouterSelectedSupportedParameter != nil,
+                            systemImage: "line.3.horizontal.decrease"
+                        )
                     }
                     .buttonStyle(.plain)
 
                     Menu {
-                        Picker(selection: $openRouterSort) {
-                            ForEach(RemoteModel.OpenRouterBrowserSort.allCases) { sort in
-                                Text(LocalizedStringKey(sort.title)).tag(sort)
+                        ForEach(RemoteModel.OpenRouterBrowserSort.allCases) { sort in
+                            Button {
+                                openRouterSort = sort
+                            } label: {
+                                if openRouterSort == sort {
+                                    Label(LocalizedStringKey(sort.title), systemImage: "checkmark")
+                                } else {
+                                    Text(LocalizedStringKey(sort.title))
+                                }
                             }
-                        } label: {
-                            EmptyView()
                         }
                     } label: {
-                        openRouterControlPill(openRouterSort.title, isActive: openRouterSort != .automatic)
+                        openRouterControlPill(
+                            openRouterSort.title,
+                            isActive: openRouterSort != .automatic,
+                            systemImage: "chevron.up.chevron.down"
+                        )
                     }
                     .buttonStyle(.plain)
 
@@ -1027,25 +1088,30 @@ struct RemoteBackendDetailView: View {
                     totalCount
                 )
             )
-            .font(.caption)
+            .font(.system(size: 11, design: .monospaced))
             .foregroundStyle(.secondary)
         }
     }
 
-    private func openRouterControlPill(_ text: String, isActive: Bool) -> some View {
-        Text(LocalizedStringKey(text))
-            .font(.caption.weight(.medium))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(
-                Capsule()
-                    .fill(isActive ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.06))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(isActive ? Color.accentColor.opacity(0.3) : Color.primary.opacity(0.08), lineWidth: 1)
-            )
-            .foregroundStyle(isActive ? Color.accentColor : .primary)
+    private func openRouterControlPill(_ text: String, isActive: Bool, systemImage: String? = nil) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 4, style: .continuous)
+        return HStack(spacing: 4) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            Text(LocalizedStringKey(text))
+                .textCase(.uppercase)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .tracking(0.4)
+        }
+        .lineLimit(1)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .foregroundStyle(isActive ? Color.accentColor : Color.primary.opacity(0.65))
+        .background(shape.fill(isActive ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.06)))
+        .overlay(shape.stroke(isActive ? Color.accentColor.opacity(0.35) : Color.primary.opacity(0.1), lineWidth: 0.5))
+        .contentShape(shape)
     }
 
     private var openRouterFilterMenuTitle: String {
@@ -1804,7 +1870,9 @@ struct RemoteBackendDetailView: View {
                 .textCase(.uppercase)
                 .labelStyle(.titleAndIcon)
             Spacer(minLength: 8)
-            if isEditing, let binding = draftBinding(for: keyPath(for: field), backend: backend) {
+            if isEditing,
+               let keyPath = keyPath(for: field),
+               let binding = draftBinding(for: keyPath, backend: backend) {
                 editingFieldContainer {
                     content(binding)
                 }
@@ -1963,7 +2031,7 @@ struct RemoteBackendDetailView: View {
         }
     }
 
-    private func keyPath(for field: EditableField) -> WritableKeyPath<RemoteBackendDraft, String> {
+    private func keyPath(for field: EditableField) -> WritableKeyPath<RemoteBackendDraft, String>? {
         switch field {
         case .name: return \RemoteBackendDraft.name
         case .baseURL: return \RemoteBackendDraft.baseURL
@@ -1972,8 +2040,7 @@ struct RemoteBackendDetailView: View {
         case .modelsPath: return \RemoteBackendDraft.modelsPath
         case .auth: return \RemoteBackendDraft.authHeader
         case .openRouterAPIKey: return \RemoteBackendDraft.openRouterAPIKey
-        case .customModel:
-            fatalError("Custom model fields use a dedicated binding")
+        case .customModel: return nil
         }
     }
 
@@ -2174,8 +2241,10 @@ struct RemoteBackendDetailView: View {
             cfg.timeoutIntervalForResource = 3
             cfg.waitsForConnectivity = false
             let session = URLSession(configuration: cfg)
+            NetworkKillSwitch.track(session: session)
             defer { session.invalidateAndCancel() }
             do {
+                guard !NetworkKillSwitch.shouldBlock(request: req) else { return false }
                 let (_, resp) = try await session.data(for: req)
                 if let http = resp as? HTTPURLResponse { return (200...299).contains(http.statusCode) }
             } catch { /* fall through */ }
@@ -2193,8 +2262,10 @@ struct RemoteBackendDetailView: View {
         configuration.timeoutIntervalForResource = 4
         configuration.waitsForConnectivity = false
         let session = URLSession(configuration: configuration)
+        NetworkKillSwitch.track(session: session)
         defer { session.invalidateAndCancel() }
         do {
+            guard !NetworkKillSwitch.shouldBlock(request: request) else { return false }
             let (_, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return false }
             return (200...499).contains(http.statusCode)
@@ -2267,7 +2338,7 @@ struct RemoteBackendDetailView: View {
 
     private func openRemoteSettings(for model: RemoteModel, backend: RemoteBackend) {
         guard backend.endpointType == .lmStudio || backend.isOpenRouter else { return }
-        remoteSettingsTarget = RemoteModelSettingsTarget(backend: backend, model: model)
+        presentedModelSheet = .settings(RemoteModelSettingsTarget(backend: backend, model: model))
     }
 
     private func modelAvailability(for backend: RemoteBackend) -> RemoteModelRow.Availability {
@@ -2711,8 +2782,8 @@ struct RemoteModelRow: View {
                 HStack(spacing: 6) {
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(isBackendLoaded ? Color.green : Color.gray)
-                            .frame(width: 6, height: 6)
+                            .fill(isBackendLoaded || isRowAvailable ? Color.green : Color.gray)
+                            .frame(width: 5, height: 5)
                         Text(isBackendLoaded ? "Loaded" : "Available")
                     }
 
@@ -2723,12 +2794,19 @@ struct RemoteModelRow: View {
                         Text("·")
                         Text("\(providerContextLength.formatted()) ctx")
                     }
+
+                    if model.isOpenRouterFreeModel {
+                        IndustrialBadge("Free", tint: .green)
+                    } else if let promptPrice = model.promptPricePerMillion,
+                              let completionPrice = model.completionPricePerMillion {
+                        Text("·")
+                        Text(verbatim: "\(priceString(promptPrice, suffix: "/M")) in · \(priceString(completionPrice, suffix: "/M")) out")
+                    }
                 }
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(AppTheme.tertiaryText)
                 .padding(.top, 2)
                 .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
             }
             .contentShape(Rectangle())
             .onTapGesture {
@@ -2776,12 +2854,12 @@ struct RemoteModelRow: View {
                     Button(action: useAction) {
                         if isActivating {
                             ProgressView()
+                                .controlSize(.small)
                         } else {
                             Text("Use")
                         }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .buttonStyle(.industrial(.prominent))
                     .disabled(isActivating)
                 }
             }
@@ -2865,16 +2943,14 @@ struct RemoteModelRow: View {
                 Button(action: { infoAction?() }) {
                     Image(systemName: "info.circle")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                .buttonStyle(.industrial(.quiet))
                 .accessibilityLabel(LocalizedStringKey("Show Model Info"))
             }
             if supportsSettings {
                 Button(action: { settingsAction?() }) {
                     Image(systemName: "gearshape")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                .buttonStyle(.industrial(.quiet))
                 .accessibilityLabel(LocalizedStringKey("Open Settings"))
             }
         }
@@ -3010,6 +3086,11 @@ struct RemoteModelRow: View {
         !isOllama
     }
 
+    private var isRowAvailable: Bool {
+        if case .available = availability { return true }
+        return false
+    }
+
     private var supportsSettings: Bool {
         settingsAction != nil
     }
@@ -3112,7 +3193,13 @@ private struct RemoteModelSettingsSheet: View {
                     }
                 }
                 Section(LocalizedStringKey("Sampling")) {
-                    sliderRow(title: LocalizedStringKey("Temperature"), value: $settings.temperature, range: 0...2, step: 0.05)
+                    sliderRow(
+                        title: LocalizedStringKey("Temperature"),
+                        value: $settings.temperature,
+                        range: 0...2,
+                        step: 0.05,
+                        valueLabel: valueString(settings.temperature)
+                    )
                     sliderRow(
                         title: LocalizedStringKey("Top-p"),
                         value: $settings.topP,

@@ -170,7 +170,7 @@ final class CoreAITokenizer: @unchecked Sendable {
             var bestID = 0
             for special in specialTokens {
                 if let range = remaining.range(of: special.content) {
-                    if bestRange == nil || range.lowerBound < bestRange!.lowerBound {
+                    if bestRange.map({ range.lowerBound < $0.lowerBound }) ?? true {
                         bestRange = range
                         bestID = special.id
                     }
@@ -260,7 +260,7 @@ final class CoreAITokenizer: @unchecked Sendable {
     /// GPT-2 byte<->unicode reversible mapping.
     private static func byteLevelMaps() -> ([UInt8: Character], [Character: UInt8]) {
         var bs: [Int] = []
-        bs.append(contentsOf: Int(Character("!").asciiValue!)...Int(Character("~").asciiValue!))
+        bs.append(contentsOf: 33...126)
         bs.append(contentsOf: Int(0xA1)...Int(0xAC))
         bs.append(contentsOf: Int(0xAE)...Int(0xFF))
         var cs = bs

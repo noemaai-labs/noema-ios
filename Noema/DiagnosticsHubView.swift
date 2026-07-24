@@ -1,86 +1,120 @@
-// DiagnosticsHubView.swift
-//
-// A single destination that consolidates the previously sprawling list of
-// runtime/model diagnostic tools. Instead of rendering ~17 always-on summary
-// cards inline in Settings (each firing its own background `.task` on every
-// Settings open), these tools now live one tap away as lightweight grouped
-// navigation rows. The heavy tool views — and their background work — only
-// load when the user actually opens a specific tool.
-//
-// Tightly-overlapping tools are merged behind a segmented control so they read
-// as a single capability:
-//   • Loopback Server      = Loopback Health  +  Runtime Fixes
-//   • Model Internals      = Model Metadata   +  Model Dependencies
-//   • Speculative Decoding = Speculative Wizard + MTP Acceptance Dashboard
-//
-// The underlying tool views are reused verbatim; nothing about their internals
-// changes here.
-
 import SwiftUI
+
+// MARK: - Single source of truth for the diagnostics catalog
+
+/// The canonical list of tools shown on the "Diagnostics & Tools" page. Adding,
+/// removing, or relabeling a tool is a one-line change here that updates iOS,
+/// macOS, and visionOS at once.
+enum DiagnosticsTool: String, CaseIterable, Identifiable {
+    case modelDoctor
+    case modelInternals
+    case storageAdvisor
+    case speculativeDecoding
+    case datasetHealth
+    case toolStore
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .modelDoctor: return "cross.case"
+        case .modelInternals: return "cube"
+        case .storageAdvisor: return "internaldrive"
+        case .speculativeDecoding: return "hare"
+        case .datasetHealth: return "checkmark.seal"
+        case .toolStore: return "wrench.and.screwdriver"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .modelDoctor: return .red
+        case .modelInternals: return .purple
+        case .storageAdvisor: return .brown
+        case .speculativeDecoding: return .mint
+        case .datasetHealth: return .cyan
+        case .toolStore: return .gray
+        }
+    }
+
+    var title: LocalizedStringKey {
+        switch self {
+        case .modelDoctor: return "Model Doctor"
+        case .modelInternals: return "Model Internals"
+        case .storageAdvisor: return "Storage Advisor"
+        case .speculativeDecoding: return "Speculative Decoding"
+        case .datasetHealth: return "Dataset Health"
+        case .toolStore: return "Tool Store"
+        }
+    }
+
+    var subtitle: LocalizedStringKey {
+        switch self {
+        case .modelDoctor: return "Readiness checks for installed models"
+        case .modelInternals: return "Metadata & dependency graph"
+        case .storageAdvisor: return "Disk usage & cleanup suggestions"
+        case .speculativeDecoding: return "Set up drafting & monitor acceptance"
+        case .datasetHealth: return "Index status of your datasets"
+        case .toolStore: return "Enable model tools & integrations"
+        }
+    }
+
+    /// The screen this tool opens. This is the single definition consumed by the
+    /// iOS hub's `NavigationLink` and by `SettingsView.settingsDestinationView`.
+    @MainActor @ViewBuilder
+    var destination: some View {
+        switch self {
+        case .modelDoctor: ModelDoctorView()
+        case .modelInternals: ModelInternalsHubView()
+        case .storageAdvisor: ModelStorageAdvisorView()
+        case .speculativeDecoding: SpeculativeDecodingHubView()
+        case .datasetHealth: DatasetHealthDashboardView()
+        case .toolStore: ToolStoreView()
+        }
+    }
+
+    /// A section of related tools, used to lay out both the iOS list and the
+    /// macOS cards.
+    struct Group: Identifiable {
+        let id: String
+        let header: LocalizedStringKey
+        /// SF Symbol shown next to the section title on macOS.
+        let icon: String
+        let tools: [DiagnosticsTool]
+    }
+
+    static var groups: [Group] {
+        [
+            Group(id: "inspection", header: "Model Inspection", icon: "cube",
+                  tools: [.modelDoctor, .modelInternals, .storageAdvisor]),
+            Group(id: "performance", header: "Performance", icon: "hare",
+                  tools: [.speculativeDecoding]),
+            Group(id: "data", header: "Data & Tools", icon: "wrench.and.screwdriver",
+                  tools: [.datasetHealth, .toolStore]),
+        ]
+    }
+}
+
+// MARK: - iOS / visionOS hub
 
 struct DiagnosticsHubView: View {
     var body: some View {
         List {
-            Section {
-                row(icon: "waveform.path.ecg", tint: .blue,
-                    title: "Runtime Diagnostics",
-                    subtitle: "Engine status & live session health") { RuntimeDiagnosticsView() }
-                row(icon: "chart.bar.xaxis", tint: .indigo,
-                    title: "Runtime Timeline",
-                    subtitle: "Recent load & inference events") { RuntimeTimelineView() }
-                row(icon: "network", tint: .teal,
-                    title: "Loopback Server",
-                    subtitle: "Local server health & fixes") { LoopbackServerHubView() }
-                row(icon: "doc.text.magnifyingglass", tint: .orange,
-                    title: "Load Receipt",
-                    subtitle: "What happened on the last model load") { ModelLoadReceiptView() }
-                row(icon: "arrow.down.circle", tint: .pink,
-                    title: "Unload Verifier",
-                    subtitle: "Confirm memory is reclaimed on unload") { ModelUnloadVerificationView() }
-            } header: {
-                Text(LocalizedStringKey("Runtime & Server"))
-            }
-
-            Section {
-                row(icon: "cross.case", tint: .red,
-                    title: "Model Doctor",
-                    subtitle: "Readiness checks for installed models") { ModelDoctorView() }
-                row(icon: "cube", tint: .purple,
-                    title: "Model Internals",
-                    subtitle: "Metadata & dependency graph") { ModelInternalsHubView() }
-                row(icon: "internaldrive", tint: .brown,
-                    title: "Storage Advisor",
-                    subtitle: "Disk usage & cleanup suggestions") { ModelStorageAdvisorView() }
-                row(icon: "sparkles", tint: .yellow,
-                    title: "Model Recommendations",
-                    subtitle: "Benchmarked picks for your device") { ModelBenchmarkRecommendationsView() }
-            } header: {
-                Text(LocalizedStringKey("Model Inspection"))
-            }
-
-            Section {
-                row(icon: "slider.horizontal.3", tint: .green,
-                    title: "Auto-Tuner",
-                    subtitle: "Tune runtime parameters automatically") { ModelAutoTunerView() }
-                row(icon: "hare", tint: .mint,
-                    title: "Speculative Decoding",
-                    subtitle: "Set up drafting & monitor acceptance") { SpeculativeDecodingHubView() }
-            } header: {
-                Text(LocalizedStringKey("Performance"))
-            }
-
-            Section {
-                row(icon: "checkmark.seal", tint: .cyan,
-                    title: "Dataset Health",
-                    subtitle: "Index status of your datasets") { DatasetHealthDashboardView() }
-                row(icon: "text.magnifyingglass", tint: .blue,
-                    title: "RAG Inspector",
-                    subtitle: "Inspect retrieval for the last answer") { RAGInspectorView() }
-                row(icon: "wrench.and.screwdriver", tint: .gray,
-                    title: "Tool Store",
-                    subtitle: "Enable model tools & integrations") { ToolStoreView() }
-            } header: {
-                Text(LocalizedStringKey("Data & Tools"))
+            ForEach(DiagnosticsTool.groups) { group in
+                Section {
+                    ForEach(group.tools) { tool in
+                        NavigationLink {
+                            tool.destination
+                        } label: {
+                            DiagnosticsToolRow(icon: tool.icon,
+                                               tint: tool.tint,
+                                               title: tool.title,
+                                               subtitle: tool.subtitle)
+                        }
+                    }
+                } header: {
+                    Text(group.header)
+                }
             }
         }
 #if os(iOS)
@@ -88,19 +122,6 @@ struct DiagnosticsHubView: View {
         .navigationBarTitleDisplayMode(.inline)
 #endif
         .navigationTitle(LocalizedStringKey("Diagnostics & Tools"))
-    }
-
-    @ViewBuilder
-    private func row<Destination: View>(icon: String,
-                                        tint: Color,
-                                        title: LocalizedStringKey,
-                                        subtitle: LocalizedStringKey,
-                                        @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink {
-            destination()
-        } label: {
-            DiagnosticsToolRow(icon: icon, tint: tint, title: title, subtitle: subtitle)
-        }
     }
 }
 
@@ -165,16 +186,6 @@ private struct SegmentedToolPair<First: View, Second: View>: View {
             } else {
                 first()
             }
-        }
-    }
-}
-
-struct LoopbackServerHubView: View {
-    var body: some View {
-        SegmentedToolPair(firstLabel: "Health", secondLabel: "Fixes") {
-            LoopbackServerHealthView()
-        } second: {
-            LoopbackRemediationView()
         }
     }
 }

@@ -1,4 +1,3 @@
-// DatasetFileViewer.swift
 import SwiftUI
 import Foundation
 #if canImport(PDFKit)
@@ -56,42 +55,48 @@ struct DatasetFileViewer: View {
 
     private func load() {
         if isPDF || isEPUB { return }
+        let fileURL = url
         let ext = url.pathExtension.lowercased()
-        guard let data = try? Data(contentsOf: url) else {
-            error = "Unable to load file"
-            return
+        Task { @MainActor in
+            let result = await Self.parse(fileURL, ext: ext)
+            self.error = result.error
+            self.isMarkdown = result.isMarkdown
+            self.content = result.content
         }
-        switch ext {
-        case "md":
-            isMarkdown = true
-            content = String(decoding: data, as: UTF8.self)
-        case "json":
-            if let obj = try? JSONSerialization.jsonObject(with: data),
-               let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
-               let str = String(data: pretty, encoding: .utf8) {
-                content = str
-            } else {
-                content = String(decoding: data, as: UTF8.self)
+    }
+
+    /// Read + format off the main thread — dataset corpora are multi-MB, and the previous
+    /// synchronous `Data(contentsOf:)` + per-line JSONL pretty-print blocked the MainActor on push.
+    nonisolated private static func parse(_ url: URL, ext: String) async -> (content: String, isMarkdown: Bool, error: String?) {
+        await Task.detached(priority: .utility) { () -> (content: String, isMarkdown: Bool, error: String?) in
+            guard let data = try? Data(contentsOf: url) else {
+                return ("", false, "Unable to load file")
             }
-        case "jsonl":
-            let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").map { line -> String in
-                if let objData = line.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: objData),
+            switch ext {
+            case "md":
+                return (String(decoding: data, as: UTF8.self), true, nil)
+            case "json":
+                if let obj = try? JSONSerialization.jsonObject(with: data),
                    let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
                    let str = String(data: pretty, encoding: .utf8) {
-                    return str
-                } else {
+                    return (str, false, nil)
+                }
+                return (String(decoding: data, as: UTF8.self), false, nil)
+            case "jsonl":
+                let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").map { line -> String in
+                    if let objData = line.data(using: .utf8),
+                       let obj = try? JSONSerialization.jsonObject(with: objData),
+                       let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+                       let str = String(data: pretty, encoding: .utf8) {
+                        return str
+                    }
                     return String(line)
                 }
+                return (lines.joined(separator: "\n\n"), false, nil)
+            default:
+                return (String(decoding: data, as: UTF8.self), false, nil)
             }
-            content = lines.joined(separator: "\n\n")
-        default:
-            if let str = String(data: data, encoding: .utf8) {
-                content = str
-            } else {
-                content = String(decoding: data, as: UTF8.self)
-            }
-        }
+        }.value
     }
 }
 
@@ -201,6 +206,8 @@ final class QLPreviewPanelHostController: NSViewController, QLPreviewPanelDataSo
     private weak var panel: QLPreviewPanel?
 
     init(url: URL) { self.url = url; super.init(nibName: nil, bundle: nil) }
+    // Created only programmatically (never from a coder/storyboard); fail loudly if
+    // that assumption is ever violated instead of returning a silently broken controller.
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     // MARK: View lifecycle

@@ -1,6 +1,6 @@
 import Foundation
 
-public enum RelayStatus: String, Codable, Sendable {
+public enum RelayStatus: String, Codable, Equatable, Sendable {
     case pending
     case acknowledged
     case processing
@@ -33,17 +33,34 @@ public struct RelayMessage: Codable, Equatable, Sendable {
     }
 
     public static func visibleText(from text: String) -> String {
-        guard text.contains("<think>") else {
-            return text
-        }
-        let pattern = "<think>[\\s\\S]*?</think>"
-        let range = NSRange(text.startIndex..., in: text)
         var sanitized = text
-        if let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators, .caseInsensitive]) {
-            sanitized = regex.stringByReplacingMatches(in: sanitized, options: [], range: range, withTemplate: "")
+
+        // Remove complete reasoning blocks first, then hide any unfinished
+        // block at the end of a streaming partial. Matching is case-insensitive
+        // because remote backends do not consistently preserve tag casing.
+        for pattern in [#"<think>[\s\S]*?</think>"#, #"<think>[\s\S]*$"#] {
+            guard let regex = try? NSRegularExpression(
+                pattern: pattern,
+                options: [.dotMatchesLineSeparators, .caseInsensitive]
+            ) else { continue }
+            let range = NSRange(sanitized.startIndex..., in: sanitized)
+            sanitized = regex.stringByReplacingMatches(
+                in: sanitized,
+                options: [],
+                range: range,
+                withTemplate: ""
+            )
         }
-        sanitized = sanitized.replacingOccurrences(of: "<think>", with: "")
-        sanitized = sanitized.replacingOccurrences(of: "</think>", with: "")
+
+        if let tagRegex = try? NSRegularExpression(pattern: #"</?think>"#, options: [.caseInsensitive]) {
+            let range = NSRange(sanitized.startIndex..., in: sanitized)
+            sanitized = tagRegex.stringByReplacingMatches(
+                in: sanitized,
+                options: [],
+                range: range,
+                withTemplate: ""
+            )
+        }
         return sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
@@ -94,6 +111,47 @@ public struct RelayEnvelope: Codable, Sendable {
         status = try container.decodeIfPresent(RelayStatus.self, forKey: .status) ?? .pending
         statusUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .statusUpdatedAt)
         errorMessage = try container.decodeIfPresent(String.self, forKey: .errorMessage)
+    }
+}
+
+extension RelayEnvelope {
+    /// Builds a partial streaming update without discarding inbound turns that
+    /// arrived after generation began. Prior partial assistant messages are
+    /// replaced by the latest accumulated partial.
+    static func streamingPartial(
+        base: RelayEnvelope,
+        latest: RelayEnvelope?,
+        partial: String,
+        timestamp: Date
+    ) -> RelayEnvelope {
+        let assistant = RelayMessage(
+            conversationID: base.conversationID,
+            role: "assistant",
+            text: RelayMessage.visibleText(from: partial),
+            fullText: partial,
+            createdAt: timestamp
+        )
+
+        var messages = base.messages + [assistant]
+        var seenIdentifiers = Set(base.messages.map(\.id))
+        seenIdentifiers.insert(assistant.id)
+
+        if let latest {
+            let inboundSuffix = latest.messages.filter {
+                !seenIdentifiers.contains($0.id) && $0.role.lowercased() != "assistant"
+            }
+            messages.append(contentsOf: inboundSuffix)
+        }
+
+        return RelayEnvelope(
+            conversationID: base.conversationID,
+            messages: messages,
+            needsResponse: true,
+            parameters: latest?.parameters ?? base.parameters,
+            status: .processing,
+            statusUpdatedAt: timestamp,
+            errorMessage: nil
+        )
     }
 }
 

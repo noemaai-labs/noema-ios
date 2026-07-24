@@ -10,7 +10,10 @@ import AppKit
 struct ContentView: View {
     @State private var showSplash = true
     @State private var showOnboarding = false
+    @State private var showUpdate = false
+    @State private var showAutopilotSetup = false
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    @AppStorage(NoemaUpdateView.lastPresentedVersionDefaultsKey) private var lastPresentedUpdateVersion = ""
     @EnvironmentObject private var tabRouter: TabRouter
     @EnvironmentObject private var chatVM: ChatVM
     @EnvironmentObject private var modelManager: AppModelManager
@@ -33,6 +36,13 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("noemaOpenAutopilotSetup"))) { _ in
+            showAutopilotSetup = true
+        }
+        .sheet(isPresented: $showAutopilotSetup) {
+            AutopilotSetupView()
+                .environmentObject(modelManager)
+        }
         .fullScreenCover(isPresented: $showOnboarding) {
             OnboardingView(showOnboarding: $showOnboarding)
                 .environmentObject(tabRouter)
@@ -41,6 +51,11 @@ struct ContentView: View {
                 .environmentObject(datasetManager)
                 .environmentObject(downloadController)
                 .environmentObject(walkthroughManager)
+        }
+        .fullScreenCover(isPresented: $showUpdate, onDismiss: markUpdatePresented) {
+            NoemaUpdateView {
+                showUpdate = false
+            }
         }
         .onAppear {
             print("[Noema] app launched 🚀")
@@ -53,11 +68,18 @@ struct ContentView: View {
                 withAnimation {
                     showSplash = false
                     if !hasCompletedOnboarding {
+                        markUpdatePresented()
                         showOnboarding = true
+                    } else if lastPresentedUpdateVersion != NoemaUpdateView.releaseVersion {
+                        showUpdate = true
                     }
                 }
             }
         }
+    }
+
+    private func markUpdatePresented() {
+        lastPresentedUpdateVersion = NoemaUpdateView.releaseVersion
     }
 }
 
@@ -82,7 +104,10 @@ private struct SplashView: View {
 struct ContentView: View {
     @State private var showSplash = true
     @State private var showOnboarding = false
+    @State private var showUpdate = false
+    @State private var showAutopilotSetup = false
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    @AppStorage(NoemaUpdateView.lastPresentedVersionDefaultsKey) private var lastPresentedUpdateVersion = ""
     @EnvironmentObject private var tabRouter: TabRouter
     @EnvironmentObject private var chatVM: ChatVM
     @EnvironmentObject private var modelManager: AppModelManager
@@ -105,6 +130,27 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("noemaOpenAutopilotSetup"))) { _ in
+            showAutopilotSetup = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .mcpServerAdded)) { notification in
+            var serverIDs = MCPChatDefaults.consumePendingServerIDs()
+            if let serverID = notification.object as? String { serverIDs.insert(serverID) }
+            for serverID in serverIDs {
+                chatVM.setMCPServerPermissionForActiveSession(serverID, enabled: true)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .mcpCatalogChanged)) { _ in
+            chatVM.toolSpecsCache = []
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .mcpToolApprovalResolved)) { notification in
+            if let alias = notification.object as? String { chatVM.markMCPToolExecuting(alias: alias) }
+        }
+        .mcpInteractionPresenter(chatVM: chatVM)
+        .sheet(isPresented: $showAutopilotSetup) {
+            AutopilotSetupView()
+                .environmentObject(modelManager)
+        }
         .sheet(isPresented: $showOnboarding) {
             MacOnboardingView(showOnboarding: $showOnboarding) {
                 hasCompletedOnboarding = true
@@ -116,7 +162,16 @@ struct ContentView: View {
             .environmentObject(downloadController)
             .environmentObject(walkthroughManager)
         }
+        .sheet(isPresented: $showUpdate, onDismiss: markUpdatePresented) {
+            NoemaUpdateView {
+                showUpdate = false
+            }
+        }
         .onAppear {
+            for serverID in MCPChatDefaults.consumePendingServerIDs() {
+                chatVM.setMCPServerPermissionForActiveSession(serverID, enabled: true)
+            }
+            chatVM.installMCPSamplingProvider()
             walkthroughManager.configure(tabRouter: tabRouter,
                                          chatVM: chatVM,
                                          modelManager: modelManager,
@@ -126,11 +181,18 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     showSplash = false
                     if !hasCompletedOnboarding {
+                        markUpdatePresented()
                         showOnboarding = true
+                    } else if lastPresentedUpdateVersion != NoemaUpdateView.releaseVersion {
+                        showUpdate = true
                     }
                 }
             }
         }
+    }
+
+    private func markUpdatePresented() {
+        lastPresentedUpdateVersion = NoemaUpdateView.releaseVersion
     }
 }
 
@@ -190,13 +252,13 @@ struct MacOnboardingView: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.industrial(.prominent))
             }
         }
         .padding(32)
         .frame(minWidth: 620, minHeight: 480)
         .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(colorScheme == .dark ? Color(nsColor: .windowBackgroundColor) : Color(nsColor: .controlBackgroundColor))
         )
         .padding()

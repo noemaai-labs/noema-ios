@@ -1,4 +1,3 @@
-// HFHubRequestManager.swift
 import Foundation
 
 actor HFHubRequestManager {

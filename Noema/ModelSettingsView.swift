@@ -1,5 +1,5 @@
-// ModelSettingsView.swift
 import SwiftUI
+import NoemaPackages
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -56,7 +56,21 @@ private enum ModelRuntimePreset: String, CaseIterable, Identifiable {
 
     /// One-line summary of what the preset actually changes, surfaced beneath the
     /// preset grid so the runtime behaviour is explained without cluttering each card.
-    var detailKey: LocalizedStringKey {
+    func detailKey(for format: ModelFormat) -> LocalizedStringKey {
+        if format == .mlx {
+            switch self {
+            case .batterySaver:
+                return "4-bit KV cache and smaller prefill batches reduce memory use."
+            case .balanced:
+                return "8-bit KV cache, prompt reuse, and standard prefill batches."
+            case .maxSpeed:
+                return "Full-precision KV cache and larger prefill batches prioritize throughput."
+            case .maxContext:
+                return "4-bit KV cache stretches the longest supported context."
+            case .maxContextAggressive, .visionHeavy, .toolHeavy:
+                return "MLX runtime preset"
+            }
+        }
         switch self {
         case .batterySaver:
             return "Scales context to your device — about 4K, or up to 8K for small models with memory to spare — with fewer CPU threads and a compact q8_0 KV cache. Lowest memory and power use."
@@ -80,17 +94,26 @@ private enum ModelRuntimePreset: String, CaseIterable, Identifiable {
 /// grid controls. Stored globally (JSON in UserDefaults) so it can be applied to
 /// any model, and clamped to what each model/device can actually fit on apply.
 struct CustomRuntimePreset: Codable, Identifiable, Equatable {
+    static let promptCacheDefaultsVersion = 1
+
     var id: UUID = UUID()
     var name: String
     var contextLength: Double
     var cpuThreads: Int
     var keepInMemory: Bool
     var kvCacheOffload: Bool
+    var unifiedKVCache: Bool
     var flashAttention: Bool
     var kCacheQuant: CacheQuant
     var vCacheQuant: CacheQuant
     var promptCacheEnabled: Bool
     var gpuLayers: Int
+    var mlxPromptCacheEnabled: Bool
+    var mlxKVCacheQuantization: MLXKVCacheQuantization
+    var mlxKVCacheGroupSize: Int
+    var mlxKVCacheQuantizationStart: Int
+    var mlxKVCacheLimit: Int
+    var mlxPrefillStepSize: Int
 
     /// Captures the runtime-relevant fields from a live `ModelSettings`.
     init(name: String, settings: ModelSettings) {
@@ -100,24 +123,94 @@ struct CustomRuntimePreset: Codable, Identifiable, Equatable {
         self.cpuThreads = settings.cpuThreads
         self.keepInMemory = settings.keepInMemory
         self.kvCacheOffload = settings.kvCacheOffload
+        self.unifiedKVCache = settings.unifiedKVCache
         self.flashAttention = settings.flashAttention
         self.kCacheQuant = settings.kCacheQuant
         self.vCacheQuant = settings.vCacheQuant
         self.promptCacheEnabled = settings.promptCacheEnabled
         self.gpuLayers = settings.gpuLayers
+        self.mlxPromptCacheEnabled = settings.mlxPromptCacheEnabled
+        self.mlxKVCacheQuantization = settings.mlxKVCacheQuantization
+        self.mlxKVCacheGroupSize = settings.mlxKVCacheGroupSize
+        self.mlxKVCacheQuantizationStart = settings.mlxKVCacheQuantizationStart
+        self.mlxKVCacheLimit = settings.mlxKVCacheLimit
+        self.mlxPrefillStepSize = settings.mlxPrefillStepSize
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, contextLength, cpuThreads, keepInMemory, kvCacheOffload, unifiedKVCache
+        case flashAttention, kCacheQuant, vCacheQuant, promptCacheEnabled, promptCacheDefaultsVersion, gpuLayers
+        case mlxPromptCacheEnabled, mlxKVCacheQuantization, mlxKVCacheGroupSize
+        case mlxKVCacheQuantizationStart, mlxKVCacheLimit, mlxPrefillStepSize
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = ModelSettings()
+        id = (try? container.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        name = (try? container.decodeIfPresent(String.self, forKey: .name)) ?? ""
+        contextLength = (try? container.decodeIfPresent(Double.self, forKey: .contextLength)) ?? defaults.contextLength
+        cpuThreads = (try? container.decodeIfPresent(Int.self, forKey: .cpuThreads)) ?? defaults.cpuThreads
+        keepInMemory = (try? container.decodeIfPresent(Bool.self, forKey: .keepInMemory)) ?? defaults.keepInMemory
+        kvCacheOffload = (try? container.decodeIfPresent(Bool.self, forKey: .kvCacheOffload)) ?? defaults.kvCacheOffload
+        unifiedKVCache = (try? container.decodeIfPresent(Bool.self, forKey: .unifiedKVCache)) ?? defaults.unifiedKVCache
+        flashAttention = (try? container.decodeIfPresent(Bool.self, forKey: .flashAttention)) ?? defaults.flashAttention
+        kCacheQuant = (try? container.decodeIfPresent(CacheQuant.self, forKey: .kCacheQuant)) ?? defaults.kCacheQuant
+        vCacheQuant = (try? container.decodeIfPresent(CacheQuant.self, forKey: .vCacheQuant)) ?? defaults.vCacheQuant
+        let decodedPromptCacheEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .promptCacheEnabled)) ?? defaults.promptCacheEnabled
+        let promptCacheDefaultsVersion = (try? container.decodeIfPresent(Int.self, forKey: .promptCacheDefaultsVersion)) ?? 0
+        promptCacheEnabled = promptCacheDefaultsVersion < Self.promptCacheDefaultsVersion
+            ? true
+            : decodedPromptCacheEnabled
+        gpuLayers = (try? container.decodeIfPresent(Int.self, forKey: .gpuLayers)) ?? defaults.gpuLayers
+        mlxPromptCacheEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .mlxPromptCacheEnabled)) ?? defaults.mlxPromptCacheEnabled
+        mlxKVCacheQuantization = (try? container.decodeIfPresent(MLXKVCacheQuantization.self, forKey: .mlxKVCacheQuantization)) ?? defaults.mlxKVCacheQuantization
+        mlxKVCacheGroupSize = (try? container.decodeIfPresent(Int.self, forKey: .mlxKVCacheGroupSize)) ?? defaults.mlxKVCacheGroupSize
+        mlxKVCacheQuantizationStart = (try? container.decodeIfPresent(Int.self, forKey: .mlxKVCacheQuantizationStart)) ?? defaults.mlxKVCacheQuantizationStart
+        mlxKVCacheLimit = (try? container.decodeIfPresent(Int.self, forKey: .mlxKVCacheLimit)) ?? defaults.mlxKVCacheLimit
+        mlxPrefillStepSize = (try? container.decodeIfPresent(Int.self, forKey: .mlxPrefillStepSize)) ?? defaults.mlxPrefillStepSize
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(contextLength, forKey: .contextLength)
+        try container.encode(cpuThreads, forKey: .cpuThreads)
+        try container.encode(keepInMemory, forKey: .keepInMemory)
+        try container.encode(kvCacheOffload, forKey: .kvCacheOffload)
+        try container.encode(unifiedKVCache, forKey: .unifiedKVCache)
+        try container.encode(flashAttention, forKey: .flashAttention)
+        try container.encode(kCacheQuant, forKey: .kCacheQuant)
+        try container.encode(vCacheQuant, forKey: .vCacheQuant)
+        try container.encode(promptCacheEnabled, forKey: .promptCacheEnabled)
+        try container.encode(Self.promptCacheDefaultsVersion, forKey: .promptCacheDefaultsVersion)
+        try container.encode(gpuLayers, forKey: .gpuLayers)
+        try container.encode(mlxPromptCacheEnabled, forKey: .mlxPromptCacheEnabled)
+        try container.encode(mlxKVCacheQuantization, forKey: .mlxKVCacheQuantization)
+        try container.encode(mlxKVCacheGroupSize, forKey: .mlxKVCacheGroupSize)
+        try container.encode(mlxKVCacheQuantizationStart, forKey: .mlxKVCacheQuantizationStart)
+        try container.encode(mlxKVCacheLimit, forKey: .mlxKVCacheLimit)
+        try container.encode(mlxPrefillStepSize, forKey: .mlxPrefillStepSize)
     }
 }
 
 enum ModelSettingsSectionID: String, Codable, CaseIterable, Sendable {
-    case overview
-    case provenance
-    case chatTemplatePreview
-    case formatSpecific
-    case sampling
-    case speculativeDecoding
-    case benchmark
-    case maintenance
-    case files
+    case essentials
+    case performance
+    case behavior
+    case advanced
+    case details
+
+    var systemImage: String {
+        switch self {
+        case .essentials: return "dial.medium"
+        case .performance: return "bolt"
+        case .behavior: return "brain"
+        case .advanced: return "slider.horizontal.3"
+        case .details: return "info.circle"
+        }
+    }
 }
 
 struct ModelSettingsSectionSnapshot: Codable, Equatable, Identifiable, Sendable {
@@ -130,35 +223,23 @@ struct ModelSettingsSectionSnapshot: Codable, Equatable, Identifiable, Sendable 
     let title: String
 
     static func sections(
-        for format: ModelFormat,
+        for _: ModelFormat,
         isAdvancedMode: Bool,
-        platform: Platform
+        platform _: Platform
     ) -> [ModelSettingsSectionSnapshot] {
+        // Every device uses the same mental model. Platform-specific layout
+        // changes navigation and density, not the order or ownership of controls.
         var sections: [ModelSettingsSectionSnapshot] = [
-            .init(id: .overview, title: format.displayName)
+            .init(id: .essentials, title: "Essentials"),
+            .init(id: .performance, title: "Performance"),
+            .init(id: .behavior, title: "Behavior")
         ]
 
-        if platform == .iOSForm {
-            sections.append(.init(id: .chatTemplatePreview, title: "Chat Template Preview"))
-        }
-
-        sections.append(.init(id: .formatSpecific, title: format == .gguf ? "GGUF" : format.displayName))
-
         if isAdvancedMode {
-            sections.append(.init(id: .sampling, title: "Sampling"))
-            if format == .gguf {
-                sections.append(.init(id: .speculativeDecoding, title: "Speculative Decoding"))
-            }
+            sections.append(.init(id: .advanced, title: "Advanced"))
         }
 
-        sections.append(.init(id: .benchmark, title: "Benchmark"))
-        sections.append(.init(id: .maintenance, title: "Maintenance"))
-
-        if format == .gguf {
-            sections.append(.init(id: .files, title: "Files"))
-        }
-
-        sections.append(.init(id: .provenance, title: "Provenance"))
+        sections.append(.init(id: .details, title: "Model Details"))
 
         return sections
     }
@@ -231,11 +312,21 @@ private struct ContextLengthControl: View {
     @Binding var contextLength: Double
     let range: ClosedRange<Double>
     let format: ModelFormat
+    let fixedContextLength: Int?
+    let showsRAMEstimate: Bool
     let sizeBytes: Int64
     let layerCount: Int?
     let moeInfo: MoEInfo?
     let supportedMaxContextLength: Int?
     let kvCacheEstimate: ModelRAMAdvisor.GGUFKVCacheEstimate
+    let runtimeConfiguration: ModelRAMAdvisor.RuntimeConfiguration
+    /// Context already loaded successfully with these same memory-affecting settings.
+    let knownWorkingContextLength: Int?
+    /// Paged (Noema Overfit) installs must size through the paged native
+    /// contract so bank/staging accounting reaches the estimate; nil for
+    /// resident models. Resolved by the parent via
+    /// GGUFServerConfigurationResolver.resolveWithPlan.
+    var pagedServerConfiguration: LlamaServerBridge.StartConfiguration? = nil
     /// When a helper draft model is configured, its working set is added on top of
     /// the target model's so the estimate reflects what both models need loaded
     /// together (weights + KV cache, at the same context length and cache quant).
@@ -249,6 +340,7 @@ private struct ContextLengthControl: View {
         let sizeBytes: Int64
         let layerCount: Int?
         let moeInfo: MoEInfo?
+        let runtimeConfiguration: ModelRAMAdvisor.RuntimeConfiguration
     }
 
     @State private var draft: Double = 0
@@ -256,7 +348,67 @@ private struct ContextLengthControl: View {
 
     private var draftFingerprint: String {
         guard let d = draftEstimateInput else { return "none" }
-        return "\(d.format.rawValue)|\(d.sizeBytes)|\(d.layerCount ?? -1)"
+        return "\(d.format.rawValue)|\(d.sizeBytes)|\(d.layerCount ?? -1)|\(d.runtimeConfiguration.evaluationBatchSize)|\(d.runtimeConfiguration.physicalBatchSize)|\(d.runtimeConfiguration.flashAttention)|\(d.runtimeConfiguration.projectorFileBytes)"
+    }
+
+    /// Every input the RAM estimate depends on, bundled so a single `onChange` drives the
+    /// recompute. `kvCacheEstimate` is included so the estimate refreshes when the KV-cache
+    /// quant settles in after the sheet opens.
+    private struct RAMInputs: Equatable {
+        var ctx: Int
+        var kv: ModelRAMAdvisor.GGUFKVCacheEstimate
+        var layers: Int
+        var draft: String
+        var size: Int64
+        var runtime: ModelRAMAdvisor.RuntimeConfiguration
+        var knownWorkingContext: Int
+    }
+    private var ramInputsFingerprint: RAMInputs {
+        RAMInputs(ctx: Int(displayValue),
+                  kv: kvCacheEstimate,
+                  layers: layerCount ?? -1,
+                  draft: draftFingerprint,
+                  size: sizeBytes,
+                  runtime: runtimeConfiguration,
+                  knownWorkingContext: knownWorkingContextLength ?? 0)
+    }
+
+    /// Inputs that define one llama.cpp allocation curve. Context is deliberately excluded:
+    /// changing only the slider position must not restart curve calibration.
+    private struct ExactProfileInputs: Equatable {
+        var kv: ModelRAMAdvisor.GGUFKVCacheEstimate
+        var runtime: ModelRAMAdvisor.RuntimeConfiguration
+        var paged: LlamaServerBridge.StartConfiguration?
+        var lowerContext: Int
+        var upperContext: Int
+        var isApplicable: Bool
+    }
+
+    private var exactProfileFingerprint: ExactProfileInputs {
+        ExactProfileInputs(
+            kv: kvCacheEstimate,
+            runtime: runtimeConfiguration,
+            paged: pagedServerConfiguration,
+            lowerContext: Int(range.lowerBound),
+            upperContext: Int(range.upperBound),
+            isApplicable: format == .gguf
+                && runtimeConfiguration.modelPath != nil
+                && draftEstimateInput == nil
+        )
+    }
+
+    /// Exact verification follows the committed binding, not the rapidly changing local draft.
+    /// Cached exact samples are used when available; otherwise live updates stay arithmetic-only.
+    private struct ExactAssessmentInputs: Equatable {
+        var profile: ExactProfileInputs
+        var contextLength: Int
+    }
+
+    private var exactAssessmentFingerprint: ExactAssessmentInputs {
+        ExactAssessmentInputs(
+            profile: exactProfileFingerprint,
+            contextLength: Int(contextLength)
+        )
     }
 
     // Cached RAM estimate. The math is cheap, but it allocates two
@@ -266,30 +418,112 @@ private struct ContextLengthControl: View {
     private struct RAMEstimate: Equatable {
         var estimate: Int64 = 0
         var budget: Int64? = nil
+        var workingSet: Int64 = 0
+        var nominalWorkingSetLimit: Int64? = nil
+        var advisoryWorkingSetLimit: Int64? = nil
         var maxCtx: Int? = nil
-        var estStr: String = "--"
-        var budStr: String = "--"
+        var workingSetStr: String = "--"
+        var workingSetLimitStr: String = "--"
         /// Target + draft model working set, when a helper draft model is set.
         var combined: Int64? = nil
         var combinedStr: String = "--"
     }
     @State private var ram = RAMEstimate()
 
+    private enum ExactFitState: Equatable {
+        case notApplicable
+        case calculating
+        case fits
+        case doesNotFit
+        case unavailable
+    }
+    @State private var exactFitState: ExactFitState = .notApplicable
+    @State private var exactCurveCalibrating = false
+
+    private struct ExactSizingAnchor: Equatable {
+        let contextLength: Int
+        let kvCacheEstimate: ModelRAMAdvisor.GGUFKVCacheEstimate
+        let runtimeConfiguration: ModelRAMAdvisor.RuntimeConfiguration
+    }
+    @State private var exactSizingAnchor: ExactSizingAnchor?
+
+    private var matchingExactAnchorContextLength: Int? {
+        guard let exactSizingAnchor,
+              exactSizingAnchor.kvCacheEstimate == kvCacheEstimate,
+              exactSizingAnchor.runtimeConfiguration == runtimeConfiguration else { return nil }
+        return exactSizingAnchor.contextLength
+    }
+
     private var isSliderFormat: Bool {
         format == .gguf || format == .mlx || format == .et || format == .coreai
     }
 
     private var displayValue: Double {
-        isEditing ? draft : contextLength
+        if let fixedContextLength {
+            return Double(fixedContextLength)
+        }
+        return isEditing ? draft : contextLength
+    }
+
+    /// Keep the trailing token count from resizing the slider as it crosses digit boundaries.
+    private var contextValueColumnWidth: CGFloat {
+        let characters = max(5, String(max(0, Int(range.upperBound))).count)
+        return max(48, CGFloat(characters) * 7.25)
+    }
+
+    private var afmContextDescription: String {
+        let locale = LocalizationManager.preferredLocale()
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        let count = formatter.string(from: NSNumber(value: Int(displayValue)))
+            ?? String(Int(displayValue))
+        return String.localizedStringWithFormat(
+            String(localized: "Current context window: %@ tokens.", locale: locale),
+            count
+        )
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(format == .afm ? "Fixed Context Length" : "Context Length")
-                    .font(FontTheme.subheadline)
-                    .foregroundStyle(AppTheme.text)
-                if isSliderFormat {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Text(format == .afm ? "Fixed Context Length" : "Context Length")
+                        .textCase(.uppercase)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.3)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                }
+                .padding(.bottom, 7)
+                IndustrialHairline()
+            }
+
+            if isSliderFormat {
+                HStack(spacing: 10) {
+#if os(macOS)
+                    // Stepped sliders draw tick marks on macOS; quantize in the
+                    // binding instead so the rail stays clean.
+                    Slider(
+                        value: Binding(
+                            get: { isEditing ? draft : contextLength },
+                            set: { draft = ($0 / 256).rounded() * 256 }
+                        ),
+                        in: range,
+                        onEditingChanged: { editing in
+                            if editing {
+                                draft = contextLength
+                                isEditing = true
+                            } else {
+                                contextLength = draft
+                                isEditing = false
+                            }
+                        }
+                    )
+                    .controlSize(.small)
+                    .guideHighlightIfActive(attachWalkthroughHighlight, .modelSettingsContext)
+#else
                     Slider(
                         value: Binding(
                             get: { isEditing ? draft : contextLength },
@@ -308,14 +542,21 @@ private struct ContextLengthControl: View {
                         }
                     )
                     .guideHighlightIfActive(attachWalkthroughHighlight, .modelSettingsContext)
-                } else {
-                    HStack {
-                        Text("\(Int(contextLength)) tokens")
-                            .monospacedDigit()
-                        Spacer()
-                    }
-                    .padding(.vertical, 8)
+#endif
+
+                    Text(verbatim: "\(Int(displayValue))")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.primary.opacity(0.7))
+                        .frame(width: contextValueColumnWidth, alignment: .trailing)
                 }
+            } else {
+                HStack {
+                    Text("\(Int(displayValue)) tokens")
+                        .monospacedDigit()
+                    Spacer()
+                }
+                .padding(.vertical, 8)
             }
 
             if format == .ane {
@@ -323,45 +564,179 @@ private struct ContextLengthControl: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if format == .afm {
-                Text("Apple Foundation Models only support a 4096-token context in Noema.")
+                Text(verbatim: afmContextDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                Text("\(Int(displayValue)) tokens")
             }
 
-            ramEstimateRows()
+            if showsRAMEstimate {
+                ramEstimateRows()
+            }
 
             if isSliderFormat && displayValue > 8192 {
                 Text("High context lengths use more memory")
                     .font(.caption)
-                    .foregroundColor(.red)
+                    .foregroundColor(pressureColor(for: currentPressureBand))
             }
         }
-        .onAppear { recomputeRAM() }
-        .onChange(of: Int(displayValue)) { _ in recomputeRAM() }
-        .onChange(of: kvCacheEstimate) { _ in recomputeRAM() }
-        .onChange(of: layerCount) { _ in recomputeRAM() }
-        .onChange(of: draftFingerprint) { _ in recomputeRAM() }
+        // One trigger over all inputs, computed on appear (`initial: true`) and on any
+        // change. Crucially this includes `kvCacheEstimate`: the per-model settings (KV
+        // quant, flash attention) load a frame *after* the sheet first appears, flipping
+        // it from the default f16/f16. Keying recompute on the combined fingerprint makes
+        // the estimate refresh then — previously it stayed on the default cache cost until
+        // the slider was nudged.
+        .onChange(of: ramInputsFingerprint, initial: true) { _, _ in recomputeRAM() }
+        .task(id: exactProfileFingerprint) {
+            await warmExactGGUFSizingCurve(for: exactProfileFingerprint)
+        }
+        .task(id: exactAssessmentFingerprint) {
+            await refreshExactGGUFFit(for: exactAssessmentFingerprint)
+        }
     }
 
-    private func recomputeRAM() {
+    private func warmExactGGUFSizingCurve(for profile: ExactProfileInputs) async {
+        guard profile.isApplicable else {
+            exactCurveCalibrating = false
+            return
+        }
+
+        // Stored per-model settings settle one frame after presentation. Debounce before
+        // entering the non-cancellable native sizing call so the superseded default profile
+        // cannot queue an additional GGUF/context construction pass.
+        do {
+            try await Task.sleep(nanoseconds: 350_000_000)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled, profile == exactProfileFingerprint else { return }
+
+        exactCurveCalibrating = true
+        let contexts = ModelRAMAdvisor.settingsExactSizingContexts(
+            selectedContext: Int(contextLength),
+            lowerBound: profile.lowerContext,
+            upperBound: profile.upperContext,
+            runtimeConfiguration: profile.runtime
+        )
+        for context in contexts {
+            // A paged configuration carries its own (cap-clamped) context, so
+            // every calibration point sizes the shape the launch will use.
+            _ = await ModelRAMAdvisor.definitiveGGUFLaunchFitAssessment(
+                contextLength: context,
+                kvCacheEstimate: profile.kv,
+                runtimeConfiguration: profile.runtime,
+                serverConfiguration: profile.paged
+            )
+            guard !Task.isCancelled, profile == exactProfileFingerprint else { return }
+        }
+
+        exactCurveCalibrating = false
+        // The bounded exact samples now serve live slider movement through interpolation or
+        // extrapolation. No GGUF scan or graph setup occurs on individual slider ticks.
+        recomputeRAM()
+    }
+
+    private func refreshExactGGUFFit(for inputs: ExactAssessmentInputs) async {
+        guard inputs.profile.isApplicable else {
+            exactFitState = .notApplicable
+            exactSizingAnchor = nil
+            return
+        }
+        // Paged launches clamp context at the plan cap, so the effective sized
+        // context is the configuration's, not the slider's.
+        let sizedContext = inputs.profile.paged.map { Int($0.contextSize) } ?? inputs.contextLength
+        guard ModelRAMAdvisor.permitsSettingsExactSizing(
+            contextLength: sizedContext,
+            runtimeConfiguration: inputs.profile.runtime
+        ) else {
+            // The bounded exact curve still feeds the estimate. The launch path performs the
+            // authoritative point check for contexts outside the settings-safe window.
+            exactFitState = .unavailable
+            exactSizingAnchor = nil
+            recomputeRAM()
+            return
+        }
+
+        exactFitState = .calculating
+        do {
+            // Avoid starting a metadata/graph sizing pass for every intermediate slider tick.
+            try await Task.sleep(nanoseconds: 300_000_000)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+
+        let assessedContext = sizedContext
+        let assessment = await ModelRAMAdvisor.definitiveGGUFLaunchFitAssessment(
+            contextLength: assessedContext,
+            kvCacheEstimate: inputs.profile.kv,
+            runtimeConfiguration: inputs.profile.runtime,
+            serverConfiguration: inputs.profile.paged
+        )
+        guard !Task.isCancelled, inputs == exactAssessmentFingerprint else { return }
+
+        switch assessment.status {
+        case .fits:
+            exactFitState = .fits
+            exactSizingAnchor = ExactSizingAnchor(
+                contextLength: assessedContext,
+                kvCacheEstimate: inputs.profile.kv,
+                runtimeConfiguration: inputs.profile.runtime
+            )
+        case .doesNotFit:
+            exactFitState = .doesNotFit
+            exactSizingAnchor = ExactSizingAnchor(
+                contextLength: assessedContext,
+                kvCacheEstimate: inputs.profile.kv,
+                runtimeConfiguration: inputs.profile.runtime
+            )
+        case .unavailable:
+            exactFitState = .unavailable
+        }
+        // The sizing pass populated the exact cache. Recompute the hard launch allocation and
+        // the separate total-working-set pressure recommendation from that breakdown.
+        recomputeRAM(exactAnchorContextLength: assessedContext)
+    }
+
+    private func recomputeRAM(exactAnchorContextLength: Int? = nil) {
         let ctx = Int(displayValue)
+        let exactAnchorContextLength = exactAnchorContextLength
+            ?? matchingExactAnchorContextLength
         let (estimate, budget) = ModelRAMAdvisor.estimateAndBudget(
             format: format,
             sizeBytes: sizeBytes,
             contextLength: ctx,
             layerCount: layerCount,
             moeInfo: moeInfo,
-            kvCacheEstimate: kvCacheEstimate
+            kvCacheEstimate: kvCacheEstimate,
+            runtimeConfiguration: runtimeConfiguration,
+            knownWorkingContextLength: knownWorkingContextLength
         )
-        let maxCtx = ModelRAMAdvisor.maxContextUnderBudget(
+        let nominalWorkingSetLimit = ModelRAMAdvisor.currentMemoryBudgetSnapshot().bytes
+        let advisoryWorkingSetLimit = ModelRAMAdvisor.advisoryWorkingSetLimitBytes(
+            processLimitBytes: nominalWorkingSetLimit,
+            runtimeConfiguration: runtimeConfiguration
+        )
+        let maxCtx = ModelRAMAdvisor.maxContextUnderAdvisoryWorkingSet(
             format: format,
             sizeBytes: sizeBytes,
             layerCount: layerCount,
             moeInfo: moeInfo,
             upperBound: supportedMaxContextLength,
-            kvCacheEstimate: kvCacheEstimate
+            kvCacheEstimate: kvCacheEstimate,
+            runtimeConfiguration: runtimeConfiguration,
+            processLimitBytes: nominalWorkingSetLimit,
+            exactAnchorContextLength: exactAnchorContextLength,
+            knownWorkingContextLength: knownWorkingContextLength
+        )
+        var workingSet = ModelRAMAdvisor.advisoryWorkingSetEstimate(
+            format: format,
+            sizeBytes: sizeBytes,
+            contextLength: ctx,
+            layerCount: layerCount,
+            moeInfo: moeInfo,
+            kvCacheEstimate: kvCacheEstimate,
+            runtimeConfiguration: runtimeConfiguration,
+            exactAnchorContextLength: exactAnchorContextLength
         )
         var combined: Int64? = nil
         var combinedStr = "--"
@@ -372,18 +747,36 @@ private struct ContextLengthControl: View {
                 contextLength: ctx,
                 layerCount: draft.layerCount,
                 moeInfo: draft.moeInfo,
-                kvCacheEstimate: kvCacheEstimate
+                kvCacheEstimate: kvCacheEstimate,
+                runtimeConfiguration: draft.runtimeConfiguration
             )
             let total = estimate + draftEstimate
             combined = total
             combinedStr = ByteCountFormatter.string(fromByteCount: total, countStyle: .memory)
+            workingSet = ModelRAMAdvisor.saturatedAdding(
+                workingSet,
+                ModelRAMAdvisor.estimateBreakdown(
+                    format: draft.format,
+                    sizeBytes: draft.sizeBytes,
+                    contextLength: ctx,
+                    layerCount: draft.layerCount,
+                    moeInfo: draft.moeInfo,
+                    kvCacheEstimate: kvCacheEstimate,
+                    runtimeConfiguration: draft.runtimeConfiguration
+                ).estimate
+            )
         }
         ram = RAMEstimate(
             estimate: estimate,
             budget: budget,
+            workingSet: workingSet,
+            nominalWorkingSetLimit: nominalWorkingSetLimit,
+            advisoryWorkingSetLimit: advisoryWorkingSetLimit,
             maxCtx: maxCtx,
-            estStr: ByteCountFormatter.string(fromByteCount: estimate, countStyle: .memory),
-            budStr: budget.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory) } ?? "--",
+            workingSetStr: ByteCountFormatter.string(fromByteCount: workingSet, countStyle: .memory),
+            workingSetLimitStr: advisoryWorkingSetLimit.map {
+                ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory)
+            } ?? "--",
             combined: combined,
             combinedStr: combinedStr
         )
@@ -394,59 +787,75 @@ private struct ContextLengthControl: View {
         let locale = LocalizationManager.preferredLocale()
         // When a helper draft model is configured, the fit assessment must judge
         // the combined working set (target + draft), not the target alone.
-        let estimate = ram.combined ?? ram.estimate
-        let budget = ram.budget
         let maxCtx = ram.maxCtx
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: ramFitIcon(estimate: estimate, budget: budget))
-                    .foregroundColor(ramFitColor(estimate: estimate, budget: budget))
-                Text(LocalizedStringKey(ramFitTitle(estimate: estimate, budget: budget)))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(ramFitColor(estimate: estimate, budget: budget))
+        let exactFitConfirmed = exactFitState == .fits
+        let pressureBand = currentPressureBand
+        let isChecking = exactCurveCalibrating || exactFitState == .calculating
+        let displayedWorkingSet = exactCurveCalibrating ? "--" : ram.workingSetStr
+        VStack(alignment: .leading, spacing: 5) {
+            if let pressureLimit = ram.advisoryWorkingSetLimit, pressureLimit > 0 {
+                IndustrialProgressBar(
+                    value: min(1, Double(ram.workingSet) / Double(pressureLimit)),
+                    tint: pressureColor(for: pressureBand)
+                )
+                .accessibilityLabel(Text(LocalizedStringKey(pressureTitle(for: pressureBand))))
+                .padding(.bottom, 2)
             }
-            HStack(spacing: 8) {
-                Image(systemName: "memorychip")
-                    .foregroundColor(.secondary)
+            Text(
+                String.localizedStringWithFormat(
+                    String(localized: "Estimated RAM allocation: %@ · Limit: %@", locale: locale),
+                    displayedWorkingSet,
+                    ram.workingSetLimitStr
+                )
+            )
+            .industrialStat()
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .frame(maxWidth: .infinity, minHeight: 14, alignment: .leading)
+            if ram.combined != nil {
                 Text(
                     String.localizedStringWithFormat(
-                        String(localized: "Estimated working set: %@ · Budget: %@", locale: locale),
-                        ram.estStr,
-                        ram.budStr
+                        String(localized: "With draft model: %@ combined", locale: locale),
+                        ram.combinedStr
                     )
                 )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .industrialStat()
             }
-            if ram.combined != nil {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.stack.3d.up")
-                        .foregroundColor(.secondary)
-                    Text(
-                        String.localizedStringWithFormat(
-                            String(localized: "With draft model: %@ combined", locale: locale),
-                            ram.combinedStr
-                        )
-                    )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            if isChecking {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Checking…")
                 }
+                .industrialStat()
+            } else if exactFitConfirmed {
+                Label(
+                    LocalizedStringKey(pressureTitle(for: pressureBand)),
+                    systemImage: pressureBand == .comfortable
+                        ? "checkmark.circle.fill"
+                        : "exclamationmark.triangle.fill"
+                )
+                    .foregroundStyle(pressureColor(for: pressureBand))
+                    .industrialStat()
+            } else if exactFitState == .doesNotFit {
+                Label(
+                    LocalizedStringKey(pressureTitle(for: .overRecommended)),
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                    .foregroundStyle(pressureColor(for: .overRecommended))
+                    .industrialStat()
             }
             if let maxCtx {
-                HStack(spacing: 8) {
-                    Image(systemName: "gauge")
-                        .foregroundColor(.secondary)
-                    Text(
-                        String.localizedStringWithFormat(
-                            String(localized: "Max recommended context on this device: ~%@ tokens", locale: locale),
-                            "\(maxCtx)"
-                        )
+                Text(
+                    String.localizedStringWithFormat(
+                        String(localized: "Max recommended context on this device: ~%@ tokens", locale: locale),
+                        "\(maxCtx)"
                     )
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                )
+                .industrialStat()
             }
-            if let budget, estimate > budget, let maxCtx {
+            if let maxCtx,
+               (Int(displayValue) > maxCtx || exactFitState == .doesNotFit) {
                 Button {
                     let safe = Double(max(512, maxCtx))
                     contextLength = safe
@@ -455,36 +864,53 @@ private struct ContextLengthControl: View {
                 } label: {
                     Label(LocalizedStringKey("Use Safe Context"), systemImage: "dial.low")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.industrial(.tinted))
                 .controlSize(.small)
-                .padding(.top, 2)
+                .padding(.top, 4)
             }
         }
         .padding(.top, 2)
     }
 
-    private func ramFitTitle(estimate: Int64, budget: Int64?) -> String {
-        guard let budget, budget > 0 else { return "No device budget available" }
-        let ratio = Double(estimate) / Double(budget)
-        if ratio > 1.0 { return "Likely over memory budget" }
-        if ratio >= 0.85 { return "Borderline context" }
-        return "Comfortable context"
+    private enum RAMPressureBand: Equatable {
+        case comfortable
+        case borderline
+        case overRecommended
     }
 
-    private func ramFitIcon(estimate: Int64, budget: Int64?) -> String {
-        guard let budget, budget > 0 else { return "questionmark.circle" }
-        let ratio = Double(estimate) / Double(budget)
-        if ratio > 1.0 { return "exclamationmark.triangle.fill" }
-        if ratio >= 0.85 { return "gauge.medium" }
-        return "checkmark.circle.fill"
+    private var currentPressureBand: RAMPressureBand {
+        guard let nominal = ram.nominalWorkingSetLimit, nominal > 0,
+              let advisory = ram.advisoryWorkingSetLimit, advisory > 0 else {
+            return .borderline
+        }
+        if ram.workingSet > advisory || exactFitState == .doesNotFit {
+            return .overRecommended
+        }
+        if exactCurveCalibrating
+            || exactFitState == .calculating
+            || exactFitState == .unavailable {
+            return .borderline
+        }
+        if ram.workingSet >= Int64(Double(nominal) * 0.85) {
+            return .borderline
+        }
+        return .comfortable
     }
 
-    private func ramFitColor(estimate: Int64, budget: Int64?) -> Color {
-        guard let budget, budget > 0 else { return .secondary }
-        let ratio = Double(estimate) / Double(budget)
-        if ratio > 1.0 { return .orange }
-        if ratio >= 0.85 { return .yellow }
-        return .green
+    private func pressureTitle(for band: RAMPressureBand) -> String {
+        switch band {
+        case .comfortable: return "Fits in RAM (estimated)"
+        case .borderline: return "Borderline context"
+        case .overRecommended: return "Likely over memory budget"
+        }
+    }
+
+    private func pressureColor(for band: RAMPressureBand) -> Color {
+        switch band {
+        case .comfortable: return .green
+        case .borderline: return .yellow
+        case .overRecommended: return .orange
+        }
     }
 }
 
@@ -496,11 +922,17 @@ struct ModelSettingsView: View {
     @EnvironmentObject var walkthrough: GuidedWalkthroughManager
     @AppStorage("isAdvancedMode") private var isAdvancedMode = false
     @AppStorage("huggingFaceToken") private var huggingFaceToken = ""
+    // Global llama.cpp chat-template behavior: keep prior-turn reasoning in context.
+    // Default ON. Read by NoemaLlamaClient as chat_template_kwargs.preserve_thinking.
+    @AppStorage("preserveThinking") private var preserveThinking = true
     @State private var settings = ModelSettings()
     @State private var layerCount: Int = 0
     @State private var scanning = false
     @State private var showKInfo = false
     @State private var showVInfo = false
+    @State private var showVisionProjectorInfo = false
+    @State private var showUnifiedKVCacheInfo = false
+    @State private var showMLXKVCacheInfo = false
     @State private var showDeleteConfirm = false
     @State private var usingDefaultGPULayers = false
     @State private var isFavourite = false
@@ -511,6 +943,7 @@ struct ModelSettingsView: View {
     @State private var benchmarkError: String?
     @State private var benchmarkTask: Task<Void, Never>? = nil
     @State private var benchmarkTaskID: UUID? = nil
+    @State private var showBenchmarkRAMSafetyWarning = false
     @State private var benchmarkProgress: Double = 0
     @State private var benchmarkProgressDetail: String = String(localized: "Benchmark running…")
     @State private var selectedRuntimePreset: ModelRuntimePreset = .balanced
@@ -531,6 +964,10 @@ struct ModelSettingsView: View {
     @State private var modelUpdateResult: ModelUpdateCheckResult?
     @State private var modelUpdateChecking = false
     @State private var modelUpdateError: String?
+    /// The full settings tree performs several metadata-dependent calculations.
+    /// Keep it unmounted until cold file work has completed away from the main actor.
+    @State private var initialStateLoaded = false
+    @State private var selectedSettingsSection: ModelSettingsSectionID = .essentials
     @Environment(\.dismiss) private var dismiss
 #if os(macOS)
     @Environment(\.macModalDismiss) private var macModalDismiss
@@ -542,7 +979,19 @@ struct ModelSettingsView: View {
     @State private var mmprojChecked: Bool = false
     @State private var filesStatusLoaded: Bool = false
     @State private var supportedMaxContextLength: Int? = nil
+    /// Paged (Noema Overfit) sizing configuration for this install, refreshed
+    /// when memory-affecting settings change; nil for resident installs. The
+    /// RAM estimate must size the paged native contract (resident + bank +
+    /// staging), not resident.gguf as an ordinary small GGUF.
+    @State private var pagedSizingConfiguration: LlamaServerBridge.StartConfiguration? = nil
     @State private var isArgmaxANEMLLModel = false
+    /// Disk-backed projector discovery must never run while SwiftUI is building the
+    /// settings view. A cold GGUF header read can otherwise stall the row-tap
+    /// presentation for about a second.
+    @State private var discoveredVisionProjectorSupport = false
+    /// Whether this model's runtime can act on the reasoning toggle. Gates the
+    /// Reasoning control so it never appears as a dead switch. Resolved off-main on appear.
+    @State private var supportsReasoning = false
     // Cached chat-template preview. Rendering the template (Jinja) and reading
     // the on-disk template sources is expensive, and none of it depends on the
     // context-length slider — so cache it and refresh only when the template or
@@ -559,6 +1008,11 @@ struct ModelSettingsView: View {
     private var supportsPresencePenalty: Bool { model.format == .gguf }
     private var supportsFrequencyPenalty: Bool { model.format == .gguf }
     private var supportsSpeculativeDecoding: Bool { model.format == .gguf }
+
+    private var supportsVisionProjectorLoading: Bool {
+        resolvedModel.format == .gguf
+            && (resolvedModel.isMultimodal || discoveredVisionProjectorSupport)
+    }
 
     private var resolvedModel: LocalModel {
         modelManager.downloadedModels.first(where: { $0.id == model.id }) ?? model
@@ -632,6 +1086,119 @@ struct ModelSettingsView: View {
         isArgmaxANEMLLModel = isArgmax
     }
 
+    private func refreshVisionProjectorSupport(for model: LocalModel) async {
+        guard model.format == .gguf, !model.isMultimodal else {
+            discoveredVisionProjectorSupport = false
+            return
+        }
+
+        discoveredVisionProjectorSupport = false
+        let url = model.url
+        let supported = await Task.detached(priority: .utility) {
+            ProjectorLocator.projectorPath(alongside: url) != nil
+                || GGUFMetadata.hasMultimodalProjector(at: url)
+        }.value
+        guard !Task.isCancelled, model.id == resolvedModel.id else { return }
+        discoveredVisionProjectorSupport = supported
+    }
+
+    private func refreshReasoningCapability(for model: LocalModel) async {
+        let url = model.url
+        let format = model.format
+        let capable = await Task.detached(priority: .utility) {
+            ReasoningCapabilityDetector.isReasoningCapableLocal(url: url, format: format)
+        }.value
+        guard !Task.isCancelled, model.id == resolvedModel.id else { return }
+        supportsReasoning = capable
+    }
+
+    private func prepareInitialState(for model: LocalModel) async {
+        initialStateLoaded = false
+        let wasUsingDefaultGPULayers = modelManager.modelSettings[model.url.path] == nil
+        let hasSavedSettings = modelManager.hasUserSavedSettings(for: model)
+        let shouldPrepareDefaults = wasUsingDefaultGPULayers
+            && !hasSavedSettings
+            && model.format != .et
+        let shouldResolveMTP = shouldPrepareDefaults
+            || hasSavedSettings
+            || isAdvancedMode
+            || modelManager.modelSettings[model.url.path]?.speculativeDecoding.mtpEnabled == true
+
+        let preparedDefaults = await Task.detached(priority: .userInitiated) {
+            if model.format == .gguf {
+                // These accessors are memoized and used by settings normalization
+                // or the initial form. Populate only the needed entries here so the
+                // first render is cache-only without delaying it on unrelated scans.
+                _ = GGUFMetadata.contextLength(at: model.url)
+                _ = GGUFMetadata.chatTemplate(at: model.url)
+                _ = ProjectorLocator.projectorPath(alongside: model.url)
+                if shouldResolveMTP {
+                    _ = GGUFMetadata.hasMTP(at: model.url)
+                }
+            }
+
+            guard shouldPrepareDefaults else { return nil as ModelSettings? }
+            var prepared = ModelSettings.fromConfig(for: model)
+            if model.format == .gguf {
+                if prepared.gpuLayers == 0 {
+                    prepared.gpuLayers = -1
+                }
+                if prepared.speculativeDecoding.selection == .off,
+                   MtpLocator.hasMtpFileCached(alongside: model.url)
+                    || GGUFMetadata.hasMTP(at: model.url) {
+                    prepared.speculativeDecoding.selection = .mtp
+                    prepared.speculativeDecoding.mtpAutoTune = true
+                }
+            }
+            return prepared.normalizedForLocalModel(model)
+        }.value
+
+        guard !Task.isCancelled, model.id == resolvedModel.id else { return }
+        if let preparedDefaults,
+           modelManager.modelSettings[model.url.path] == nil,
+           !modelManager.hasUserSavedSettings(for: model) {
+            // This is the same in-memory caching performed by settings(for:), but
+            // the disk-backed construction above happened off the main actor.
+            modelManager.modelSettings[model.url.path] = preparedDefaults
+        }
+
+        usingDefaultGPULayers = wasUsingDefaultGPULayers
+        modelAlias = resolvedModel.alias ?? ""
+        settings = modelManager.settings(for: model)
+        supportedMaxContextLength = ModelSettings.supportedMaxContextLength(for: model)
+        if settings.kCacheQuant == .iq4_nl {
+            settings.kCacheQuant = .f16
+        }
+        if let current = modelManager.downloadedModels.first(where: { $0.id == model.id }) {
+            isFavourite = current.isFavourite
+        } else {
+            isFavourite = model.isFavourite
+        }
+        layerCount = model.totalLayers
+        if layerCount == 0 {
+            scanning = true
+            Task.detached {
+                let count = ModelScanner.layerCount(for: model.url, format: model.format)
+                await MainActor.run {
+                    guard model.id == resolvedModel.id else { return }
+                    if count > 0 {
+                        layerCount = count
+                    }
+                    scanning = false
+                    updateGPULayers()
+                }
+            }
+        } else {
+            updateGPULayers()
+        }
+        updateMoESettingsIfNeeded(with: resolvedMoEInfo)
+        refreshFileStatuses()
+        recomputeBenchmarkFitsRAM()
+        refreshTemplatePreview()
+        appliedRuntimeFingerprint = runtimeConfigFingerprint
+        initialStateLoaded = true
+    }
+
     private func updateMoESettingsIfNeeded(with info: MoEInfo?) {
         guard let info else { return }
         if let total = info.totalLayerCount, total > 0 {
@@ -664,7 +1231,14 @@ struct ModelSettingsView: View {
     }
 
     private var mainContent: some View {
-        settingsContainer
+        Group {
+            if initialStateLoaded {
+                settingsContainer
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
             // Only collect highlight anchors / mount the overlay while the walkthrough is
             // running. When idle this avoids per-frame preference propagation that
             // otherwise makes scrolling (e.g. with the context slider visible) janky.
@@ -686,79 +1260,8 @@ struct ModelSettingsView: View {
                     }
                     .disabled(benchmarking)
                 }
-                ToolbarItemGroup(placement: .confirmationAction) {
-                    Button(action: {
-#if canImport(UIKit) && !os(visionOS)
-                        Haptics.impact(.light)
-#endif
-                        // Save only; do not load. Close sheet.
-                        persistModelAliasIfNeeded()
-                        modelManager.updateSettings(settings, for: model)
-                        vm.syncActiveLocalModelPromptSettingsIfNeeded(model: model, settings: settings)
-                        close()
-                    }) {
-                        Text("Save")
-                            .fixedSize()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(benchmarking)
-
-                    Button(action: {
-#if canImport(UIKit) && !os(visionOS)
-                        Haptics.impact(.medium)
-#endif
-                        // Persist settings and trigger load
-                        persistModelAliasIfNeeded()
-                        modelManager.updateSettings(settings, for: model)
-                        vm.syncActiveLocalModelPromptSettingsIfNeeded(model: model, settings: settings)
-                        loadAction(settings)
-                        close()
-                    }) {
-                        if vm.loading { ProgressView() } else { Text("Load") }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .disabled(vm.loading || benchmarking)
-                }
             }
         #endif
-            .onAppear {
-                usingDefaultGPULayers = modelManager.modelSettings[model.url.path] == nil
-                modelAlias = resolvedModel.alias ?? ""
-                settings = modelManager.settings(for: model)
-                supportedMaxContextLength = ModelSettings.supportedMaxContextLength(for: model)
-                if settings.kCacheQuant == .iq4_nl {
-                    settings.kCacheQuant = .f16
-                }
-                if let current = modelManager.downloadedModels.first(where: { $0.id == model.id }) {
-                    isFavourite = current.isFavourite
-                } else {
-                    isFavourite = model.isFavourite
-                }
-                layerCount = model.totalLayers
-                if layerCount == 0 {
-                    scanning = true
-                    Task.detached {
-                        let count = ModelScanner.layerCount(for: model.url, format: model.format)
-                        await MainActor.run {
-                            if count > 0 {
-                                layerCount = count
-                            }
-                            scanning = false
-                            updateGPULayers()
-                        }
-                    }
-                } else {
-                    updateGPULayers()
-                }
-                updateMoESettingsIfNeeded(with: resolvedMoEInfo)
-                refreshFileStatuses()
-                recomputeBenchmarkFitsRAM()
-                refreshTemplatePreview()
-                // Baseline for the runtime preset "Custom" detection: the loaded
-                // settings are the starting point; later hand-edits drift from it.
-                appliedRuntimeFingerprint = runtimeConfigFingerprint
-            }
             .onReceive(modelManager.$downloadedModels) { models in
                 if let current = models.first(where: { $0.id == model.id }) {
                     isFavourite = current.isFavourite
@@ -766,8 +1269,15 @@ struct ModelSettingsView: View {
                 }
             }
             .task(id: resolvedModel.url.path) {
+                await prepareInitialState(for: resolvedModel)
+                guard !Task.isCancelled else { return }
+                await refreshVisionProjectorSupport(for: resolvedModel)
                 await refreshArgmaxCapability(for: resolvedModel)
+                await refreshReasoningCapability(for: resolvedModel)
                 await refreshModelUpdateStatus()
+            }
+            .task(id: pagedSizingFingerprint) {
+                refreshPagedSizingConfiguration()
             }
             .onDisappear {
                 benchmarkTask?.cancel()
@@ -780,8 +1290,16 @@ struct ModelSettingsView: View {
             .onChange(of: settings.kCacheQuant) { _ in recomputeBenchmarkFitsRAM() }
             .onChange(of: settings.vCacheQuant) { _ in recomputeBenchmarkFitsRAM() }
             .onChange(of: settings.flashAttention) { _ in recomputeBenchmarkFitsRAM() }
+            .onChange(of: settings.unifiedKVCache) { _ in recomputeBenchmarkFitsRAM() }
+            .onChange(of: settings.mlxKVCacheQuantization) { _ in recomputeBenchmarkFitsRAM() }
+            .onChange(of: settings.mlxKVCacheLimit) { _ in recomputeBenchmarkFitsRAM() }
             .onChange(of: settings.moeActiveExperts) { _ in recomputeBenchmarkFitsRAM() }
             .onChange(of: settings.gpuLayers) { _ in usingDefaultGPULayers = false }
+            .onChange(of: isAdvancedMode) { enabled in
+                if !enabled, selectedSettingsSection == .advanced {
+                    selectedSettingsSection = .details
+                }
+            }
             .onChange(of: settings.promptTemplate) { _ in
                 refreshTemplatePreview()
                 refreshTemplateSources()
@@ -806,6 +1324,19 @@ struct ModelSettingsView: View {
             } message: {
                 Text("Quantize the runtime value cache to save memory when Flash Attention is enabled. Experimental.")
             }
+            .alert("MLX KV Cache", isPresented: $showMLXKVCacheInfo) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Quantization reduces KV-cache memory with some compute and quality cost. A sliding limit bounds memory by overwriting older entries except the first four tokens.")
+            }
+            .alert(LocalizedStringKey("RAM Safety Checks"), isPresented: $showBenchmarkRAMSafetyWarning) {
+                Button(LocalizedStringKey("Continue"), role: .destructive) {
+                    runBenchmark(bypassRAMCheck: true)
+                }
+                Button(LocalizedStringKey("Cancel"), role: .cancel) {}
+            } message: {
+                Text(LocalizedStringKey("Model likely exceeds memory budget. Lower context size or use a smaller quant/model."))
+            }
             .alert(
                 String.localizedStringWithFormat(String(localized: "Delete %@?"), resolvedModel.displayName),
                 isPresented: $showDeleteConfirm
@@ -822,76 +1353,6 @@ struct ModelSettingsView: View {
                 Button("Cancel", role: .cancel) { showDeleteConfirm = false }
             }
     }
-
-#if os(macOS)
-private struct MacSettingsBlock<Content: View>: View {
-    let title: String?
-    let format: ModelFormat?
-    let iconName: String?
-    let content: Content
-
-    init(title: String? = nil, format: ModelFormat? = nil, iconName: String? = nil, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.format = format
-        self.iconName = iconName
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            if title != nil || format != nil || iconName != nil {
-                HStack(spacing: 12) {
-                    if let format {
-                        ModelFormatTagView(format: format)
-                    } else if let iconName {
-                        Image(systemName: iconName)
-                            .font(.title3.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(10)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-
-                    if let title {
-                        Text(title)
-                            .font(FontTheme.heading(size: 20))
-                            .foregroundStyle(AppTheme.text)
-                    }
-
-                    Spacer()
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 16) {
-                content
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.vertical, 20)
-        .padding(.horizontal, 28)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .bottom) {
-            Divider()
-        }
-        .controlSize(.large)
-    }
-}
-
-private struct ModelFormatTagView: View {
-    let format: ModelFormat
-
-    var body: some View {
-        Text(format.displayName)
-            .font(FontTheme.caption.weight(.semibold))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(format.tagGradient)
-            .clipShape(Capsule())
-            .foregroundStyle(.white)
-            .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 4)
-    }
-}
-
-#endif
 
 private struct ModelProvenanceValueRow: View {
     let title: LocalizedStringKey
@@ -913,199 +1374,319 @@ private struct ModelProvenanceValueRow: View {
     }
 }
 
+private struct MinimalSettingsGroup<Content: View>: View {
+    let id: ModelSettingsSectionID
+    let title: LocalizedStringKey
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppTheme.text)
+                    Spacer(minLength: 8)
+                }
+                .padding(.bottom, 9)
+                IndustrialHairline()
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .id(id)
+    }
+}
+
+private struct ModelSettingsSectionNavigation: View {
+    let modelName: String
+    let modelDetail: String
+    let sections: [ModelSettingsSectionSnapshot]
+    let selected: ModelSettingsSectionID
+    let select: (ModelSettingsSectionID) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(verbatim: modelName)
+                    .font(.system(size: 14, weight: .semibold))
+                    .lineLimit(2)
+                Text(verbatim: modelDetail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+
+            VStack(spacing: 3) {
+                ForEach(sections) { section in
+                    Button {
+                        select(section.id)
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: section.id.systemImage)
+                                .font(.system(size: 12, weight: .medium))
+                                .frame(width: 16)
+                                .foregroundStyle(selected == section.id ? Color.accentColor : Color.secondary)
+                            Text(LocalizedStringKey(section.title))
+                                .font(.system(size: 13, weight: selected == section.id ? .semibold : .regular))
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 10)
+                        .frame(minHeight: 36)
+                        .contentShape(Rectangle())
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(selected == section.id ? Color.primary.opacity(0.07) : .clear)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 24)
+        .frame(width: 202)
+        .background(AppTheme.sidebarBackground)
+    }
+}
+
     @ViewBuilder
     private var settingsContainer: some View {
-#if os(macOS)
-        ZStack {
-            Color(nsColor: .windowBackgroundColor)
-                .ignoresSafeArea()
-
-            ScrollView {
-                VStack(spacing: 0) {
-                    VStack(spacing: 24) {
-                        MacSettingsBlock(title: "General", format: model.format, iconName: "square.grid.2x2") {
-                            VStack(alignment: .leading, spacing: 12) {
-                                modelAliasContent
-                                favoriteToggle
+        GeometryReader { geometry in
+            ScrollViewReader { scrollProxy in
+                HStack(spacing: 0) {
+                    if geometry.size.width >= 760 {
+                        ModelSettingsSectionNavigation(
+                            modelName: resolvedModel.displayName,
+                            modelDetail: modelNavigationDetail,
+                            sections: settingsSectionSnapshots,
+                            selected: selectedSettingsSection
+                        ) { section in
+                            selectedSettingsSection = section
+                            withAnimation(.easeInOut(duration: 0.24)) {
+                                scrollProxy.scrollTo(section, anchor: .top)
                             }
                         }
-
-                        if model.format == .afm, AFMLLMClient.supportsPrivateCloudCompute {
-                            MacSettingsBlock(title: "Private Cloud Compute", iconName: "lock.icloud") {
-                                afmSettingsContent
-                            }
-                        }
-
-                        MacSettingsBlock {
-                            contextLengthControl
-                        }
-
-                        if model.format != .afm {
-                            MacSettingsBlock {
-                                runtimePresetContent
-                            }
-                        }
-
-                        MacSettingsBlock {
-                            systemPromptSettingsContent
-                        }
-
-                        if model.format == .gguf {
-                            MacSettingsBlock(title: "GGUF", iconName: "circle.hexagongrid") {
-                                ggufSettingsContent
-                            }
-                        } else if model.format != .afm {
-                            // AFM settings (Private Cloud Compute) are surfaced near the top instead.
-                            MacSettingsBlock(title: model.format.displayName, iconName: "slider.horizontal.2.square") {
-                                if model.format == .et {
-                                    etSettingsContent
-                                } else if model.format == .ane {
-                                    aneSettingsContent
-                                } else {
-                                    mlxSettingsContent
-                                }
-                            }
-                        }
-
-                        if isAdvancedMode {
-                            MacSettingsBlock(title: "Sampling", iconName: "slider.horizontal.3") {
-                                samplingSectionContent
-                            }
-#if os(macOS)
-                            if supportsSpeculativeDecoding {
-                                MacSettingsBlock(title: "Speculative Decoding", iconName: "sparkles") {
-                                    speculativeDecodingContent
-                                }
-                            }
-#endif
-                        }
-
-                        MacSettingsBlock(title: "Benchmark", iconName: "speedometer") {
-                            benchmarkSectionContent
-                        }
-
-                        MacSettingsBlock(title: "Maintenance", iconName: "arrow.clockwise") {
-                            resetActionsContent
-                        }
-
-                        if model.format == .gguf {
-                            MacSettingsBlock(title: "Files", iconName: "externaldrive") {
-                                filesSectionContent
-                            }
-                        }
-
-                        MacSettingsBlock(title: "Provenance", iconName: "info.circle") {
-                            provenanceSectionContent
-                        }
+                        Divider()
                     }
-                    .frame(maxWidth: 720)
-                    .padding(.horizontal, 32)
-                    .padding(.vertical, 40)
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 34) {
+                            modelIdentityHeader
+                            settingsSections
+                        }
+                        .frame(maxWidth: 720, alignment: .leading)
+                        .padding(.horizontal, geometry.size.width < 520 ? 20 : 32)
+                        .padding(.top, geometry.size.width < 520 ? 24 : 32)
+                        .padding(.bottom, 36)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        settingsActionBar
+                    }
                 }
-                .frame(maxWidth: .infinity)
+                .background(AppTheme.windowBackground)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay(alignment: .bottom) {
-            // Inline action bar to avoid window toolbar on macOS
-            VStack(spacing: 0) {
-                Divider()
-                HStack {
-                    Button {
-                        close()
-                    } label: {
-                        Label("Back", systemImage: "chevron.backward")
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(benchmarking)
+    }
 
-                    Spacer()
-
-                    Button(action: {
-                        modelManager.updateSettings(settings, for: model)
-                        vm.syncActiveLocalModelPromptSettingsIfNeeded(model: model, settings: settings)
-                        close()
-                    }) {
-                        Text("Save")
-                            .foregroundColor(.primary)
-                            .opacity(0.75)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(benchmarking)
-
-                    Button(action: {
-                        modelManager.updateSettings(settings, for: model)
-                        vm.syncActiveLocalModelPromptSettingsIfNeeded(model: model, settings: settings)
-                        loadAction(settings)
-                        close()
-                    }) {
-                        if vm.loading { ProgressView() } else { Text("Load") }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .disabled(vm.loading || benchmarking)
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 10)
-                .background(Color(nsColor: .windowBackgroundColor))
-            }
-        }
+    private var settingsSectionSnapshots: [ModelSettingsSectionSnapshot] {
+#if os(macOS)
+        let platform: ModelSettingsSectionSnapshot.Platform = .macOS
 #else
-        Form {
-            settingsSections
-        }
+        let platform: ModelSettingsSectionSnapshot.Platform = .iOSForm
 #endif
+        return ModelSettingsSectionSnapshot.sections(
+            for: model.format,
+            isAdvancedMode: isAdvancedMode,
+            platform: platform
+        )
+    }
+
+    private var modelNavigationDetail: String {
+        let quant = provenanceSnapshot.quantLabel
+        return quant.isEmpty ? model.format.displayName : "\(model.format.displayName) · \(quant)"
     }
 
     @ViewBuilder
     private var settingsSections: some View {
-        ForEach(ModelSettingsSectionSnapshot.sections(for: model.format, isAdvancedMode: isAdvancedMode, platform: .iOSForm)) { section in
+        ForEach(settingsSectionSnapshots) { section in
             switch section.id {
-            case .overview:
-                Section(header: Text(model.format.displayName)) {
-                    modelAliasContent
-                    favoriteToggle
-                }
-                if model.format == .afm, AFMLLMClient.supportsPrivateCloudCompute {
-                    Section(header: Text(LocalizedStringKey("Private Cloud Compute"))) {
-                        afmSettingsContent
-                    }
-                }
-                Section {
+            case .essentials:
+                MinimalSettingsGroup(id: section.id, title: LocalizedStringKey(section.title)) {
                     contextLengthControl
-                }
-                if model.format != .afm {
-                    Section {
+                    if model.format != .afm {
                         runtimePresetContent
                     }
                 }
-                Section {
-                    systemPromptSettingsContent
+
+            case .performance:
+                MinimalSettingsGroup(id: section.id, title: LocalizedStringKey(section.title)) {
+                    performanceSettingsContent
                 }
-            case .provenance:
-                provenanceSection
-            case .chatTemplatePreview:
-                chatTemplatePreviewSection
-            case .formatSpecific:
-                if model.format == .gguf {
-                    ggufSettings
-                } else if model.format != .afm {
-                    // AFM settings (Private Cloud Compute) are surfaced near the top instead.
-                    nonGGUFSettings
+
+            case .behavior:
+                MinimalSettingsGroup(id: section.id, title: LocalizedStringKey(section.title)) {
+                    behaviorSettingsContent
                 }
-            case .sampling:
-                samplingSection
-            case .speculativeDecoding:
-                speculativeDecodingSection
-            case .benchmark:
-                benchmarkSection
-            case .maintenance:
-                Section {
-                    resetActionsContent
+
+            case .advanced:
+                MinimalSettingsGroup(id: section.id, title: LocalizedStringKey(section.title)) {
+                    advancedSettingsContent
                 }
-            case .files:
-                filesSection
+
+            case .details:
+                MinimalSettingsGroup(id: section.id, title: LocalizedStringKey(section.title)) {
+                    modelDetailsContent
+                }
             }
+        }
+    }
+
+    private var modelIdentityHeader: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text(LocalizedStringKey("Local Model"))
+                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .tracking(0.5)
+                    .foregroundStyle(.secondary)
+                Text(verbatim: resolvedModel.displayName)
+                    .font(.system(size: 30, weight: .semibold))
+                    .tracking(-0.7)
+                    .foregroundStyle(AppTheme.text)
+                    .lineLimit(2)
+                Text(verbatim: modelIdentityDetail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 12)
+            favoriteButton
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var modelIdentityDetail: String {
+        let snapshot = provenanceSnapshot
+        let size = ByteCountFormatter.string(fromByteCount: snapshot.sizeBytes, countStyle: .file)
+        var parts = [model.format.displayName]
+        if !snapshot.quantLabel.isEmpty { parts.append(snapshot.quantLabel) }
+        parts.append(size)
+        if snapshot.isMultimodal { parts.append(String(localized: "Vision")) }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder
+    private var performanceSettingsContent: some View {
+        if AppleFoundationModelKind.resolve(modelID: model.modelID) == .privateCloudCompute {
+            privateCloudSettingsContent
+        } else if model.format == .gguf {
+            ggufSettingsContent
+        } else if model.format == .et {
+            etSettingsContent
+        } else if model.format == .ane {
+            aneSettingsContent
+        } else if model.format == .afm {
+            Text(LocalizedStringKey("This format manages runtime optimizations automatically."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            mlxSettingsContent
+        }
+    }
+
+    @ViewBuilder
+    private var behaviorSettingsContent: some View {
+        systemPromptSettingsContent
+        if model.format == .gguf {
+            ggufBehaviorSettingsContent
+        }
+        if supportsReasoning {
+            reasoningSettingsContent
+        }
+    }
+
+    private var samplingHeadline: String {
+        String(format: "temp %.2f · top-p %.2f · top-k %d", settings.temperature, settings.topP, settings.topK)
+    }
+
+    @ViewBuilder
+    private var advancedSettingsContent: some View {
+        IndustrialDisclosureRow("Sampling", headline: samplingHeadline) {
+            samplingSectionContent
+        }
+        if supportsSpeculativeDecoding {
+            IndustrialDisclosureRow(
+                "Speculative Decoding",
+                headline: settings.speculativeDecoding.selection.title
+            ) {
+                speculativeDecodingContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modelDetailsContent: some View {
+        IndustrialDisclosureRow("Model Alias", headline: modelAliasSummary) {
+            modelAliasContent
+            favoriteToggle
+        }
+        chatTemplatePreviewSection
+        benchmarkSection
+        if model.format == .gguf {
+            filesSection
+        }
+        provenanceSection
+        IndustrialDisclosureRow("Maintenance") {
+            resetActionsContent
+        }
+    }
+
+    private var modelAliasSummary: String {
+        modelAliasNormalized(resolvedModel.alias) ?? String(localized: "No alias")
+    }
+
+    private var settingsActionBar: some View {
+        HStack(spacing: 9) {
+#if os(macOS)
+            Button {
+                close()
+            } label: {
+                Label("Back", systemImage: "chevron.backward")
+            }
+            .buttonStyle(.industrial(.quiet))
+            .disabled(benchmarking)
+#endif
+
+            Spacer(minLength: 12)
+
+            Button(action: saveAndClose) {
+                Text("Save")
+            }
+            .buttonStyle(.industrial(.quiet))
+            .disabled(benchmarking || !initialStateLoaded)
+
+            Button(action: loadAndClose) {
+                if vm.loading { ProgressView() } else { Text("Load") }
+            }
+            .buttonStyle(.industrial(.prominent))
+            .keyboardShortcut(.defaultAction)
+            .disabled(vm.loading || benchmarking || !initialStateLoaded)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 11)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            IndustrialHairline()
         }
     }
 
@@ -1116,32 +1697,95 @@ private struct ModelProvenanceValueRow: View {
             contextLength: $settings.contextLength,
             range: contextLengthSliderRange,
             format: model.format,
+            fixedContextLength: ModelSettings.fixedContextLength(for: model),
+            showsRAMEstimate: AppleFoundationModelKind.resolve(modelID: model.modelID) != .privateCloudCompute,
             sizeBytes: Int64(model.sizeGB * 1_073_741_824.0),
             layerCount: layerCount > 0 ? layerCount : nil,
             moeInfo: effectiveMoEInfo,
             supportedMaxContextLength: supportedMaxContextLength,
             kvCacheEstimate: ModelRAMAdvisor.GGUFKVCacheEstimate.resolved(from: settings),
-            draftEstimateInput: resolvedDraftEstimateInput,
+            // Paged installs estimate against the paged runtime shape (single
+            // slot, one-token micro-batch, capped context), matching what the
+            // launch actually starts.
+            runtimeConfiguration: pagedSizingConfiguration.map { .resolved(from: $0) }
+                ?? .resolved(from: settings, modelURL: model.url),
+            knownWorkingContextLength: knownWorkingContextLength,
+            pagedServerConfiguration: pagedSizingConfiguration,
             attachWalkthroughHighlight: walkthrough.isActive
         )
     }
 
-    /// The configured helper draft model resolved to its memory-estimate inputs,
-    /// so the context control can show a combined (target + draft) RAM estimate.
-    private var resolvedDraftEstimateInput: ContextLengthControl.DraftEstimateInput? {
-        guard settings.speculativeDecoding.selection == .helperDraftModel,
-              let id = settings.speculativeDecoding.helperModelID,
-              let draft = modelManager.downloadedModels.first(where: { $0.id == id }) else { return nil }
-        return ContextLengthControl.DraftEstimateInput(
-            format: draft.format,
-            sizeBytes: Int64(draft.sizeGB * 1_073_741_824.0),
-            layerCount: draft.totalLayers > 0 ? draft.totalLayers : nil,
-            moeInfo: draft.moeInfo
+    /// Memory-affecting inputs of the paged sizing configuration. Kept narrow
+    /// so sampling/template edits don't re-run the plan resolver, which decodes
+    /// the (multi-MB) package manifest.
+    private struct PagedSizingInputs: Equatable {
+        var path: String
+        var contextLength: Int
+        var kCache: CacheQuant
+        var vCache: CacheQuant
+        var flashAttention: Bool
+        var gpuLayers: Int
+        var evaluationBatch: Int
+        var kvOffload: Bool
+        var unifiedKVCache: Bool
+        var threads: Int
+        var overfitMode: ModelSettings.OverfitMode
+    }
+
+    private var pagedSizingFingerprint: PagedSizingInputs {
+        PagedSizingInputs(
+            path: model.url.path,
+            contextLength: Int(settings.contextLength),
+            kCache: settings.kCacheQuant,
+            vCache: settings.vCacheQuant,
+            flashAttention: settings.flashAttention,
+            gpuLayers: settings.gpuLayers,
+            evaluationBatch: settings.resolvedEvaluationBatchSize,
+            kvOffload: settings.kvCacheOffload,
+            unifiedKVCache: settings.unifiedKVCache,
+            threads: settings.cpuThreads,
+            overfitMode: settings.overfitMode
         )
     }
 
-    private var favoriteToggle: some View {
-        Toggle("Favorite Model", isOn: Binding(
+    @MainActor
+    private func refreshPagedSizingConfiguration() {
+        guard model.format == .gguf, OverfitPagedInstallCache.isPaged(model.url) else {
+            if pagedSizingConfiguration != nil { pagedSizingConfiguration = nil }
+            return
+        }
+        // Context shift is server behavior, not a memory-sizing input.
+        let (configuration, plan) = GGUFServerConfigurationResolver.resolveWithPlan(
+            modelURL: model.url,
+            settings: settings,
+            mmprojPath: nil,
+            contextShiftEnabled: true,
+            purpose: .chat
+        )
+        pagedSizingConfiguration = plan.isPaged ? configuration : nil
+    }
+
+    /// Use the active runtime as an empirical lower bound only while the settings that affect
+    /// memory still match. Moving the context slider is allowed; changing batch/KV/projector
+    /// settings invalidates the proof until the model is loaded again.
+    private var knownWorkingContextLength: Int? {
+        guard let loadedURL = vm.loadedModelURL,
+              let loaded = vm.loadedModelSettings,
+              settings.speculativeDecoding.selection != .helperDraftModel else { return nil }
+        let currentRuntime = ModelRAMAdvisor.RuntimeConfiguration.resolved(from: settings, modelURL: model.url)
+        let loadedRuntime = ModelRAMAdvisor.RuntimeConfiguration.resolved(from: loaded, modelURL: loadedURL)
+        // Catalog entries may point at an installation directory while ChatVM retains the
+        // resolved GGUF file. Compare the resolved runtime paths instead of LocalModel IDs,
+        // which can differ even though both values identify the same loaded model.
+        guard currentRuntime.modelPath == loadedRuntime.modelPath,
+              currentRuntime == loadedRuntime,
+              ModelRAMAdvisor.GGUFKVCacheEstimate.resolved(from: settings)
+                == ModelRAMAdvisor.GGUFKVCacheEstimate.resolved(from: loaded) else { return nil }
+        return max(512, Int(loaded.contextLength))
+    }
+
+    private var favoriteBinding: Binding<Bool> {
+        Binding(
             get: { isFavourite },
             set: { newValue in
                 if newValue {
@@ -1156,7 +1800,33 @@ private struct ModelProvenanceValueRow: View {
                     isFavourite = false
                 }
             }
-        ))
+        )
+    }
+
+    private var favoriteToggle: some View {
+        Toggle("Favorite Model", isOn: favoriteBinding)
+    }
+
+    private var favoriteButton: some View {
+        Button {
+            favoriteBinding.wrappedValue.toggle()
+        } label: {
+            Image(systemName: isFavourite ? "star.fill" : "star")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(isFavourite ? Color.orange : Color.secondary)
+                .frame(width: 38, height: 38)
+                .background(
+                    Circle()
+                        .fill(isFavourite ? Color.orange.opacity(0.10) : Color.primary.opacity(0.04))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(isFavourite ? Color.orange.opacity(0.35) : AppTheme.cardStroke, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(LocalizedStringKey("Favorite Model"))
+        .accessibilityValue(isFavourite ? Text("On") : Text("Off"))
     }
 
     @ViewBuilder
@@ -1171,7 +1841,7 @@ private struct ModelProvenanceValueRow: View {
                 Button("Apply Alias") {
                     persistModelAliasIfNeeded()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.industrial(.quiet))
                 .disabled(!modelAliasHasChanges)
 
                 if modelAliasNormalized(resolvedModel.alias) != nil || modelAliasNormalized(modelAlias) != nil {
@@ -1209,9 +1879,15 @@ private struct ModelProvenanceValueRow: View {
 
     @ViewBuilder
     private var provenanceSection: some View {
-        Section(LocalizedStringKey("Provenance")) {
+        IndustrialDisclosureRow("Provenance", headline: provenanceHeadline) {
             provenanceSectionContent
         }
+    }
+
+    private var provenanceHeadline: String {
+        let snapshot = provenanceSnapshot
+        let size = ByteCountFormatter.string(fromByteCount: snapshot.sizeBytes, countStyle: .file)
+        return snapshot.quantLabel.isEmpty ? size : "\(snapshot.quantLabel) · \(size)"
     }
 
     @ViewBuilder
@@ -1271,7 +1947,7 @@ private struct ModelProvenanceValueRow: View {
                 } label: {
                     Label("Check for Updates", systemImage: "arrow.triangle.2.circlepath")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.industrial(.quiet))
                 .font(.caption)
                 .disabled(modelUpdateChecking)
             }
@@ -1368,7 +2044,12 @@ private struct ModelProvenanceValueRow: View {
     }
 
     private var chatTemplatePreviewSection: some View {
-        Section(LocalizedStringKey("Chat Template Preview")) {
+        IndustrialDisclosureRow(
+            "Chat Template Preview",
+            headline: templateStopTokens.isEmpty
+                ? cachedTemplateKindLabel
+                : "\(cachedTemplateKindLabel) · \(templateStopTokens.count)"
+        ) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -1445,9 +2126,19 @@ private struct ModelProvenanceValueRow: View {
     @ViewBuilder
     private var systemPromptSettingsContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(LocalizedStringKey("System Prompt"))
-                .font(FontTheme.subheadline)
-                .foregroundStyle(AppTheme.text)
+            VStack(spacing: 0) {
+                HStack {
+                    Text(LocalizedStringKey("System Prompt"))
+                        .textCase(.uppercase)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.3)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.bottom, 7)
+                IndustrialHairline()
+            }
 
             Picker(LocalizedStringKey("System Prompt"), selection: $settings.systemPromptMode) {
                 Text(LocalizedStringKey("Use Global Default")).tag(SystemPromptMode.inheritGlobal)
@@ -1731,12 +2422,34 @@ private struct ModelProvenanceValueRow: View {
     private var runtimePresetContent: some View {
         if model.format != .afm {
             VStack(alignment: .leading, spacing: 10) {
-                Text(LocalizedStringKey("Runtime Presets"))
-                    .font(FontTheme.subheadline)
-                    .foregroundStyle(AppTheme.text)
+                VStack(spacing: 0) {
+                    HStack(spacing: 8) {
+                        Text(LocalizedStringKey("Runtime Presets"))
+                            .textCase(.uppercase)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .tracking(0.3)
+                            .foregroundStyle(Color.primary.opacity(0.6))
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Button {
+#if canImport(UIKit) && !os(visionOS)
+                            Haptics.impact(.light)
+#endif
+                            newPresetName = ""
+                            showingSavePresetAlert = true
+                        } label: {
+                            Label(LocalizedStringKey("Save Preset"), systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.industrial(.quiet))
+                        .controlSize(.small)
+                        .accessibilityLabel(LocalizedStringKey("Save current settings as a preset"))
+                    }
+                    .padding(.bottom, 7)
+                    IndustrialHairline()
+                }
 
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
-                    ForEach(runtimePresets) { preset in
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 6)], alignment: .leading, spacing: 6) {
+                    ForEach(primaryRuntimePresets) { preset in
                         let isActive = selectedCustomPresetID == nil && !runtimeConfigIsCustom && selectedRuntimePreset == preset
                         Button {
 #if canImport(UIKit) && !os(visionOS)
@@ -1746,15 +2459,34 @@ private struct ModelProvenanceValueRow: View {
                             selectedRuntimePreset = preset
                             applyRuntimePreset(preset)
                         } label: {
-                            presetCard(
-                                systemImage: preset.systemImage,
-                                title: Text(preset.titleKey),
-                                subtitle: Text(preset.subtitleKey),
-                                isActive: isActive
-                            )
+                            presetChip(title: Text(preset.titleKey), isActive: isActive)
                         }
                         .buttonStyle(.plain)
+                        .help(preset.detailKey(for: model.format))
                         .accessibilityAddTraits(isActive ? .isSelected : [])
+                    }
+
+                    if !additionalRuntimePresets.isEmpty {
+                        let isAdditionalPresetActive = selectedCustomPresetID == nil
+                            && !runtimeConfigIsCustom
+                            && additionalRuntimePresets.contains(selectedRuntimePreset)
+                        Menu {
+                            ForEach(additionalRuntimePresets) { preset in
+                                let isActive = selectedCustomPresetID == nil
+                                    && !runtimeConfigIsCustom
+                                    && selectedRuntimePreset == preset
+                                Button {
+                                    selectedCustomPresetID = nil
+                                    selectedRuntimePreset = preset
+                                    applyRuntimePreset(preset)
+                                } label: {
+                                    Label(preset.titleKey, systemImage: isActive ? "checkmark" : preset.systemImage)
+                                }
+                            }
+                        } label: {
+                            presetChip(title: Text("More"), isActive: isAdditionalPresetActive)
+                        }
+                        .buttonStyle(.plain)
                     }
 
                     ForEach(customRuntimePresets) { preset in
@@ -1765,14 +2497,10 @@ private struct ModelProvenanceValueRow: View {
 #endif
                             applyCustomPreset(preset)
                         } label: {
-                            presetCard(
-                                systemImage: "bookmark.fill",
-                                title: Text(verbatim: preset.name),
-                                subtitle: Text(LocalizedStringKey("Saved preset")),
-                                isActive: isActive
-                            )
+                            presetChip(title: Text(verbatim: preset.name), isActive: isActive)
                         }
                         .buttonStyle(.plain)
+                        .help(LocalizedStringKey("Your saved preset. Long-press it above to delete."))
                         .accessibilityAddTraits(isActive ? .isSelected : [])
                         .contextMenu {
                             Button(role: .destructive) {
@@ -1783,19 +2511,6 @@ private struct ModelProvenanceValueRow: View {
                         }
                     }
                 }
-
-                Button {
-#if canImport(UIKit) && !os(visionOS)
-                    Haptics.impact(.light)
-#endif
-                    newPresetName = ""
-                    showingSavePresetAlert = true
-                } label: {
-                    Label(LocalizedStringKey("Save current settings as a preset"), systemImage: "square.and.arrow.down")
-                        .font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
 
                 runtimePresetSummary
             }
@@ -1814,36 +2529,45 @@ private struct ModelProvenanceValueRow: View {
         }
     }
 
-    /// Shared card chrome for both built-in and user-saved preset buttons.
+    /// Shared chip chrome for both built-in and user-saved preset buttons.
     @ViewBuilder
-    private func presetCard(systemImage: String, title: Text, subtitle: Text, isActive: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Image(systemName: systemImage)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(isActive ? Color.accentColor : AppTheme.text)
-            title
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(AppTheme.text)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-            subtitle
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .minimumScaleFactor(0.8)
-                .fixedSize(horizontal: false, vertical: true)
+    private func presetChip(title: Text, isActive: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 5, style: .continuous)
+        title
+            .textCase(.uppercase)
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .tracking(0.3)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 8)
+            .padding(.vertical, presetChipVerticalPadding)
+            .foregroundStyle(isActive ? Color.accentColor : Color.primary.opacity(0.65))
+            .background(shape.fill(isActive ? Color.accentColor.opacity(0.16) : .clear))
+            .overlay(shape.stroke(isActive ? Color.clear : Color.primary.opacity(0.15), lineWidth: 1))
+            .contentShape(shape)
+    }
+
+#if os(macOS)
+    private var presetChipVerticalPadding: CGFloat { 5 }
+#else
+    private var presetChipVerticalPadding: CGFloat { 9 }
+#endif
+
+    /// One mono line of the resolved runtime config — doubles as the "did I
+    /// hand-tune this?" indicator next to the active preset badge.
+    private var runtimeConfigStatLine: String {
+        var parts: [String] = ["CTX \(Int(settings.contextLength))"]
+        if model.format == .gguf {
+            parts.append("KV \(settings.kCacheQuant.rawValue.uppercased())")
+            if settings.flashAttention { parts.append("FLASH") }
+            parts.append("THREADS \(settings.cpuThreads)")
+        } else if model.format == .mlx {
+            parts.append("KV \(settings.mlxKVCacheQuantization.shortLabel)")
+            parts.append("PREFILL \(settings.mlxPrefillStepSize)")
+            if settings.mlxPromptCacheEnabled { parts.append("REUSE") }
         }
-        .frame(maxWidth: .infinity, minHeight: 74, alignment: .leading)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isActive ? Color.accentColor.opacity(0.14) : AppTheme.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(isActive ? Color.accentColor.opacity(0.45) : AppTheme.cardStroke, lineWidth: 1)
-        )
+        return parts.joined(separator: " · ")
     }
 
     /// True once the live runtime fingerprint drifts from the snapshot taken when
@@ -1854,7 +2578,10 @@ private struct ModelProvenanceValueRow: View {
 
     /// Hashable signature of the runtime-relevant settings the presets control.
     private var runtimeConfigFingerprint: String {
-        "\(Int(settings.contextLength))|\(settings.kCacheQuant.rawValue)|\(settings.vCacheQuant.rawValue)|\(settings.flashAttention)|\(settings.keepInMemory)|\(settings.kvCacheOffload)|\(settings.cpuThreads)|\(settings.promptCacheEnabled)"
+        if model.format == .mlx {
+            return "\(Int(settings.contextLength))|\(settings.mlxPromptCacheEnabled)|\(settings.mlxKVCacheQuantization.rawValue)|\(settings.mlxKVCacheGroupSize)|\(settings.mlxKVCacheQuantizationStart)|\(settings.mlxKVCacheLimit)|\(settings.mlxPrefillStepSize)"
+        }
+        return "\(Int(settings.contextLength))|\(settings.kCacheQuant.rawValue)|\(settings.vCacheQuant.rawValue)|\(settings.flashAttention)|\(settings.keepInMemory)|\(settings.kvCacheOffload)|\(settings.unifiedKVCache)|\(settings.cpuThreads)|\(settings.promptCacheEnabled)"
     }
 
     /// The user-saved preset currently selected, if any.
@@ -1863,56 +2590,36 @@ private struct ModelProvenanceValueRow: View {
         return customRuntimePresets.first { $0.id == id }
     }
 
-    /// Compact line beneath the preset grid describing what the active preset
-    /// changes, or a "Custom" state once the user hand-tunes a control. Keeps the
-    /// runtime behaviour explained without cluttering each preset card.
+    /// Mono stat line of the resolved config plus the active-preset badge —
+    /// flips to a "Custom" badge once the user hand-tunes a control. The full
+    /// preset descriptions live in each chip's tooltip.
     @ViewBuilder
     private var runtimePresetSummary: some View {
-        let summaryIcon: String = {
-            if runtimeConfigIsCustom { return "slider.horizontal.3" }
-            if activeCustomPreset != nil { return "bookmark.fill" }
-            return selectedRuntimePreset.systemImage
-        }()
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: summaryIcon)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                if runtimeConfigIsCustom {
-                    Text(LocalizedStringKey("Custom"))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(AppTheme.text)
-                    Text(LocalizedStringKey("Manual settings that don't match a preset. Tap a preset above to start from a known baseline."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if let custom = activeCustomPreset {
-                    Text(verbatim: custom.name)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(AppTheme.text)
-                    Text(LocalizedStringKey("Your saved preset. Long-press it above to delete."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    Text(selectedRuntimePreset.titleKey)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(AppTheme.text)
-                    Text(selectedRuntimePreset.detailKey)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+        HStack(spacing: 8) {
+            Text(verbatim: runtimeConfigStatLine)
+                .industrialStat()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer(minLength: 8)
+            if runtimeConfigIsCustom {
+                IndustrialBadge("Custom", tint: .orange)
+                    .help(LocalizedStringKey("Manual settings that don't match a preset. Tap a preset above to start from a known baseline."))
+            } else if let custom = activeCustomPreset {
+                IndustrialBadge(verbatim: custom.name, tint: .accentColor)
+            } else {
+                IndustrialBadge(selectedRuntimePreset.titleKey, tint: .accentColor)
+                    .help(selectedRuntimePreset.detailKey(for: model.format))
             }
-            Spacer(minLength: 0)
         }
         .padding(.top, 2)
         .animation(.easeInOut(duration: 0.2), value: runtimeConfigIsCustom)
     }
 
     private var runtimePresets: [ModelRuntimePreset] {
-        ModelRuntimePreset.allCases.filter { preset in
+        if model.format == .mlx {
+            return [.batterySaver, .balanced, .maxSpeed, .maxContext]
+        }
+        return ModelRuntimePreset.allCases.filter { preset in
             switch preset {
             case .visionHeavy:
                 return model.isMultimodal || model.format == .gguf
@@ -1922,6 +2629,15 @@ private struct ModelProvenanceValueRow: View {
                 return true
             }
         }
+    }
+
+    private var primaryRuntimePresets: [ModelRuntimePreset] {
+        let primary: [ModelRuntimePreset] = [.batterySaver, .balanced, .maxSpeed, .maxContext]
+        return runtimePresets.filter(primary.contains)
+    }
+
+    private var additionalRuntimePresets: [ModelRuntimePreset] {
+        runtimePresets.filter { !primaryRuntimePresets.contains($0) }
     }
 
     @ViewBuilder
@@ -1935,6 +2651,7 @@ private struct ModelProvenanceValueRow: View {
             if model.format == .gguf { settings.gpuLayers = -1 }
             updateMoESettingsIfNeeded(with: resolvedMoEInfo)
         }
+        .buttonStyle(.industrial(.quiet))
         .disabled(vm.loading)
 
         if model.format == .afm {
@@ -1947,6 +2664,7 @@ private struct ModelProvenanceValueRow: View {
                 tabRouter.showAFMHiddenNotice()
                 close()
             }
+            .buttonStyle(.industrial(.destructive))
         } else {
             Button("Delete Model", role: .destructive) {
 #if canImport(UIKit) && !os(visionOS)
@@ -1954,12 +2672,13 @@ private struct ModelProvenanceValueRow: View {
 #endif
                 showDeleteConfirm = true
             }
+            .buttonStyle(.industrial(.destructive))
         }
     }
 
     @ViewBuilder
     private var filesSection: some View {
-        Section("Files") {
+        IndustrialDisclosureRow("Files") {
             filesSectionContent
         }
     }
@@ -2031,48 +2750,69 @@ private struct ModelProvenanceValueRow: View {
         }
     }
 
+    // The reasoning preference lives in ModelSettings, so it follows the same
+    // draft-then-Save/Load flow as every other control here — edits only persist when
+    // the user taps Save or Load. The context bar edits the same value but writes through
+    // immediately. Only shown when `supportsReasoning`.
     @ViewBuilder
-    private var ggufSettings: some View {
-        Section("GGUF") {
-            ggufSettingsContent
+    private var reasoningSettingsContent: some View {
+        Toggle("Reasoning", isOn: $settings.reasoningEnabled)
+            .help("Let the model think through the problem before answering. Turn it off for faster, more direct replies.")
+        Text("Let the model think through the problem before answering. Turn it off for faster, more direct replies.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var ggufBehaviorSettingsContent: some View {
+        if supportsVisionProjectorLoading {
+            HStack(spacing: 8) {
+                Toggle("Load Vision Projector", isOn: $settings.loadVisionProjector)
+                Button {
+                    showVisionProjectorInfo = true
+                } label: {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("About Vision Projector Loading")
+            }
+            .alert("Vision Projector Loading", isPresented: $showVisionProjectorInfo) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text("Loads the companion mmproj so this model can accept images. Turn it off to reduce memory use. Image attachments stay unavailable until the model is loaded again with this setting enabled.")
+            }
         }
+        Toggle("Preserve Thinking", isOn: $preserveThinking)
+            .help("Keeps the model's earlier reasoning in context on later turns so it can build on its own prior thinking. Improves multi-step and follow-up answers, at the cost of a little more context per turn.")
     }
 
     @ViewBuilder
     private var ggufSettingsContent: some View {
+        #if os(macOS)
         Toggle("Keep Model In Memory", isOn: $settings.keepInMemory)
+        #endif
+        Toggle("Prompt Cache", isOn: $settings.promptCacheEnabled)
         if scanning {
             VStack(alignment: .leading) { ProgressView() }
         } else if DeviceGPUInfo.supportsGPUOffload {
-            VStack(alignment: .leading, spacing: 8) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(LocalizedStringKey("GPU Offload Layers"))
-                        .font(FontTheme.subheadline)
-                        .foregroundStyle(AppTheme.text)
-                    Slider(
-                        value: Binding(get: {
-                            Double(settings.gpuLayers < 0 ? (layerCount + 1) : settings.gpuLayers)
-                        }, set: { newVal in
-                            let v = Int(newVal)
-                            if v >= layerCount + 1 {
-                                settings.gpuLayers = -1
-                            } else {
-                                settings.gpuLayers = max(0, min(layerCount, v))
-                            }
-                        }),
-                        in: 0...Double(layerCount + 1),
-                        step: 1
-                    )
-                }
-                let offloadValue = settings.gpuLayers < 0 ? String(localized: "All") : "\(settings.gpuLayers)"
-                let layerCountLabel = "\(layerCount)"
-                Text(String.localizedStringWithFormat(
-                    String(localized: "GPU Offload Layers: %@/%@"),
-                    offloadValue,
-                    layerCountLabel
-                ))
-                    .font(.footnote.monospacedDigit())
-            }
+            let offloadValue = settings.gpuLayers < 0 ? String(localized: "All") : "\(settings.gpuLayers)"
+            IndustrialSliderRow(
+                label: "GPU Offload Layers",
+                value: Binding(get: {
+                    Double(settings.gpuLayers < 0 ? (layerCount + 1) : settings.gpuLayers)
+                }, set: { newVal in
+                    let v = Int(newVal)
+                    if v >= layerCount + 1 {
+                        settings.gpuLayers = -1
+                    } else {
+                        settings.gpuLayers = max(0, min(layerCount, v))
+                    }
+                }),
+                range: 0...Double(layerCount + 1),
+                step: 1,
+                display: "\(offloadValue)/\(layerCount)"
+            )
         } else {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -2087,59 +2827,108 @@ private struct ModelProvenanceValueRow: View {
             moeSettings(for: moeInfo)
         }
         if isAdvancedMode {
-            Stepper(
-                String.localizedStringWithFormat(String(localized: "CPU Threads: %@"), "\(settings.cpuThreads)"),
-                value: $settings.cpuThreads,
-                in: 1...ModelSettings.maxInferenceThreadCount
-            )
-            if DeviceGPUInfo.supportsGPUOffload {
-                Toggle("Offload KV Cache to GPU", isOn: $settings.kvCacheOffload)
-            }
-            Toggle("Use mmap()", isOn: $settings.useMmap)
-            Toggle("Skip llama.cpp Warmup", isOn: $settings.disableWarmup)
-                .help("Skips llama.cpp's empty-run warmup. Model load finishes sooner, but the first request may take longer.")
-            HStack {
-                Text("Seed")
-                TextField("Random", text: Binding(
-                    get: { settings.seed.map(String.init) ?? "" },
-                    set: { newVal in
-                        let digits = newVal.filter { $0.isNumber }
-                        if let val = Int(digits) { settings.seed = val } else { settings.seed = nil }
+            IndustrialDisclosureRow("Advanced", headline: advancedRuntimeHeadline) {
+                Stepper(
+                    String.localizedStringWithFormat(String(localized: "CPU Threads: %@"), "\(settings.cpuThreads)"),
+                    value: $settings.cpuThreads,
+                    in: 1...ModelSettings.maxInferenceThreadCount
+                )
+                Stepper(
+                    value: Binding(
+                        get: { settings.evaluationBatchSize },
+                        set: { newValue in
+                            settings.evaluationBatchSize = newValue
+                            settings.physicalBatchSize = min(settings.physicalBatchSize, newValue)
+                        }
+                    ),
+                    in: ModelSettings.minimumBatchSize...ModelSettings.maximumBatchSize,
+                    step: 32
+                ) {
+                    HStack {
+                        Text("Evaluation Batch Size")
+                        Spacer()
+                        Text(verbatim: "\(settings.evaluationBatchSize)")
+                            .foregroundStyle(.secondary)
                     }
-                ))
-                .platformKeyboardType(.numberPad)
-            }
-
-            Picker(selection: $settings.kCacheQuant) {
-                ForEach(availableKCacheQuants) { q in
-                    Text(q.rawValue).tag(q)
                 }
-            } label: {
-                HStack {
-                    Text("K Cache Quant")
+                Stepper(
+                    value: $settings.physicalBatchSize,
+                    in: ModelSettings.minimumBatchSize...max(ModelSettings.minimumBatchSize, settings.evaluationBatchSize),
+                    step: 32
+                ) {
+                    HStack {
+                        Text("Physical Batch Size")
+                        Spacer()
+                        Text(verbatim: "\(settings.physicalBatchSize)")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if DeviceGPUInfo.supportsGPUOffload {
+                    Toggle("Offload KV Cache to GPU", isOn: $settings.kvCacheOffload)
+                }
+                HStack(spacing: 8) {
+                    Toggle("Unified KV Cache", isOn: $settings.unifiedKVCache)
                     Button {
-                        showKInfo = true
+                        showUnifiedKVCacheInfo = true
                     } label: {
                         Image(systemName: "questionmark.circle")
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("About Unified KV Cache")
                 }
-            }
-            .pickerStyle(.menu)
-            .help("Quantize the runtime key cache to save memory. Experimental.")
+                .alert("Unified KV Cache", isPresented: $showUnifiedKVCacheInfo) {
+                    Button("OK", role: .cancel) { }
+                } message: {
+                    Text("Shares one KV buffer across server slots. Active requests can use otherwise-idle context capacity, and freed slot space becomes reusable, which can improve memory use and throughput with parallel clients. The tradeoff is less predictable per-slot capacity: long requests compete for the same context pool and can cause more cache eviction. With Noema's usual single chat slot, the difference is typically small.")
+                }
+                Toggle("Use mmap()", isOn: $settings.useMmap)
+                Toggle("Skip llama.cpp Warmup", isOn: $settings.disableWarmup)
+                    .help("Skips llama.cpp's empty-run warmup. Model load finishes sooner, but the first request may take longer.")
+                HStack {
+                    Text("Seed")
+                    TextField("Random", text: Binding(
+                        get: { settings.seed.map(String.init) ?? "" },
+                        set: { newVal in
+                            let digits = newVal.filter { $0.isNumber }
+                            if let val = Int(digits) { settings.seed = val } else { settings.seed = nil }
+                        }
+                    ))
+                    .platformKeyboardType(.numberPad)
+                }
 
-            Toggle("Flash Attention", isOn: $settings.flashAttention)
-
-            if settings.flashAttention {
-                Picker(selection: $settings.vCacheQuant) {
-                    ForEach(CacheQuant.allCases) { q in
+                #if os(iOS)
+                HStack(spacing: 8) {
+                    HStack {
+                        Text("K Cache Quant")
+                        Button {
+                            showKInfo = true
+                        } label: {
+                            Image(systemName: "questionmark.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("K Cache Quantization")
+                    }
+                    Spacer(minLength: 8)
+                    Picker("K Cache Quant", selection: $settings.kCacheQuant) {
+                        ForEach(availableKCacheQuants) { q in
+                            Text(q.rawValue).tag(q)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                .help("Quantize the runtime key cache to save memory. Experimental.")
+                #else
+                Picker(selection: $settings.kCacheQuant) {
+                    ForEach(availableKCacheQuants) { q in
                         Text(q.rawValue).tag(q)
                     }
                 } label: {
                     HStack {
-                        Text("V Cache Quant")
+                        Text("K Cache Quant")
                         Button {
-                            showVInfo = true
+                            showKInfo = true
                         } label: {
                             Image(systemName: "questionmark.circle")
                         }
@@ -2147,9 +2936,62 @@ private struct ModelProvenanceValueRow: View {
                     }
                 }
                 .pickerStyle(.menu)
-                .help("Quantize the runtime value cache to save memory when Flash Attention is enabled. Experimental.")
+                .help("Quantize the runtime key cache to save memory. Experimental.")
+                #endif
+
+                Toggle("Flash Attention", isOn: $settings.flashAttention)
+
+                if settings.flashAttention {
+                    #if os(iOS)
+                    HStack(spacing: 8) {
+                        HStack {
+                            Text("V Cache Quant")
+                            Button {
+                                showVInfo = true
+                            } label: {
+                                Image(systemName: "questionmark.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("V Cache Quantization")
+                        }
+                        Spacer(minLength: 8)
+                        Picker("V Cache Quant", selection: $settings.vCacheQuant) {
+                            ForEach(CacheQuant.allCases) { q in
+                                Text(q.rawValue).tag(q)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                    }
+                    .help("Quantize the runtime value cache to save memory when Flash Attention is enabled. Experimental.")
+                    #else
+                    Picker(selection: $settings.vCacheQuant) {
+                        ForEach(CacheQuant.allCases) { q in
+                            Text(q.rawValue).tag(q)
+                        }
+                    } label: {
+                        HStack {
+                            Text("V Cache Quant")
+                            Button {
+                                showVInfo = true
+                            } label: {
+                                Image(systemName: "questionmark.circle")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .help("Quantize the runtime value cache to save memory when Flash Attention is enabled. Experimental.")
+                    #endif
+                }
             }
         }
+    }
+
+    private var advancedRuntimeHeadline: String {
+        var parts = ["\(settings.cpuThreads) threads", "kv \(settings.kCacheQuant.rawValue)"]
+        if settings.flashAttention { parts.append("flash") }
+        return parts.joined(separator: " · ")
     }
 
     @ViewBuilder
@@ -2175,25 +3017,23 @@ private struct ModelProvenanceValueRow: View {
                         .foregroundStyle(.secondary)
                 }
                 if totalExperts > 1, allowsMoEExpertSelection {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Experts Per Token")
-                            .font(.subheadline.weight(.semibold))
-                        Slider(
-                            value: Binding<Double>(
-                                get: { Double(resolvedActiveExperts(for: info)) },
-                                set: { newValue in
-                                    let resolved = min(max(1, Int(newValue.rounded())), totalExperts)
-                                    settings.moeActiveExperts = resolved
-                                }
-                            ),
-                            in: 1...Double(totalExperts),
-                            step: 1
-                        )
-                    }
+                    IndustrialSliderRow(
+                        label: "Experts Per Token",
+                        value: Binding<Double>(
+                            get: { Double(resolvedActiveExperts(for: info)) },
+                            set: { newValue in
+                                let resolved = min(max(1, Int(newValue.rounded())), totalExperts)
+                                settings.moeActiveExperts = resolved
+                            }
+                        ),
+                        range: 1...Double(totalExperts),
+                        display: "\(currentValue)/\(totalExperts)"
+                    )
+                } else {
+                    Text("Active experts per token: \(currentValue) of \(totalExperts)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                Text("Active experts per token: \(currentValue) of \(totalExperts)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 if totalExperts > 1 {
                     if allowsMoEExpertSelection {
                         Text("Selecting more experts keeps additional expert weights resident in RAM and increases memory usage.")
@@ -2239,12 +3079,8 @@ private struct ModelProvenanceValueRow: View {
             }
             .padding(.top, 4)
         }
-    }
-
-    @ViewBuilder
-    private var samplingSection: some View {
-        Section(LocalizedStringKey("Sampling")) {
-            samplingSectionContent
+        if model.format == .gguf, OverfitPagedInstallCache.isPaged(model.url) {
+            OverfitSettingsBlock(model: resolvedModel, settings: $settings, isAdvancedMode: isAdvancedMode)
         }
     }
 
@@ -2260,67 +3096,58 @@ private struct ModelProvenanceValueRow: View {
             }
         } else if model.format == .et {
             VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(LocalizedStringKey("Temperature"))
-                        .font(.subheadline.weight(.semibold))
-                    Slider(value: $settings.temperature, in: 0...2, step: 0.05)
-                }
-                Text(String(format: "%.2f", settings.temperature))
-                    .font(.footnote.monospacedDigit())
+                IndustrialSliderRow(
+                    label: "Temperature",
+                    value: $settings.temperature,
+                    range: 0...2,
+                    step: 0.05,
+                    display: String(format: "%.2f", settings.temperature)
+                )
                 Text(LocalizedStringKey("Top-k, top-p, and repetition penalties are not available for ET runtime in this build."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         } else {
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(LocalizedStringKey("Temperature"))
-                        .font(.subheadline.weight(.semibold))
-                    Slider(value: $settings.temperature, in: 0...2, step: 0.05)
-                }
-                HStack {
-                    Text(String(format: "%.2f", settings.temperature))
-                        .font(.footnote.monospacedDigit())
-                    Spacer()
-                    Text(LocalizedStringKey("Low = focused. High = varied."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(LocalizedStringKey("Top-p"))
-                        .font(.subheadline.weight(.semibold))
-                    Slider(value: $settings.topP, in: 0...1, step: 0.01)
-                }
-                Text(String(format: "%.2f", settings.topP))
-                    .font(.footnote.monospacedDigit())
-            }
-
-            Stepper(value: $settings.topK, in: 1...2048, step: 1) {
-                Text(
-                    String.localizedStringWithFormat(
-                        String(localized: "Top-k: %@"),
-                        NumberFormatter.localizedString(from: NSNumber(value: settings.topK), number: .decimal)
-                    )
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 24)], alignment: .leading, spacing: 6) {
+                IndustrialSliderRow(
+                    label: "Temperature",
+                    value: $settings.temperature,
+                    range: 0...2,
+                    step: 0.05,
+                    display: String(format: "%.2f", settings.temperature)
                 )
+                .help(LocalizedStringKey("Low = focused. High = varied."))
+
+                IndustrialSliderRow(
+                    label: "Top-p",
+                    value: $settings.topP,
+                    range: 0...1,
+                    step: 0.01,
+                    display: String(format: "%.2f", settings.topP)
+                )
+
+                IndustrialStepperRow(
+                    label: "Top-k",
+                    display: NumberFormatter.localizedString(from: NSNumber(value: settings.topK), number: .decimal),
+                    value: $settings.topK,
+                    range: 1...2048
+                )
+
+#if os(macOS)
+                if supportsMinP {
+                    IndustrialSliderRow(
+                        label: "Min-p",
+                        value: $settings.minP,
+                        range: 0...1,
+                        step: 0.01,
+                        display: String(format: "%.2f", settings.minP)
+                    )
+                }
+#endif
             }
 
 #if os(macOS)
-            if supportsMinP {
-                VStack(alignment: .leading, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(LocalizedStringKey("Min-p"))
-                            .font(.subheadline.weight(.semibold))
-                        Slider(value: $settings.minP, in: 0...1, step: 0.01)
-                    }
-                    Text(String(format: "%.2f", settings.minP))
-                        .font(.footnote.monospacedDigit())
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 12) {
+            IndustrialDisclosureRow("Advanced", headline: repetitionControlsHeadline) {
                 Stepper(
                     value: Binding(
                         get: { Double(settings.repetitionPenalty) },
@@ -2370,16 +3197,16 @@ private struct ModelProvenanceValueRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .controlSize(.small)
 #endif
         }
     }
 
-    @ViewBuilder
-    private var speculativeDecodingSection: some View {
-        Section("Speculative Decoding") {
-            speculativeDecodingContent
-        }
+#if os(macOS)
+    private var repetitionControlsHeadline: String {
+        String(format: "penalty %.2f · last %d", Double(settings.repetitionPenalty), settings.repeatLastN)
     }
+#endif
 
     @ViewBuilder
     private var speculativeDecodingContent: some View {
@@ -2401,21 +3228,35 @@ private struct ModelProvenanceValueRow: View {
 
         if !modelHasMTPSupport {
             mtpUnavailableNotice
+        } else if settings.speculativeDecoding.selection == .off {
+            mtpAvailableNotice
         }
 
         if settings.speculativeDecoding.selection == .mtp {
-            Stepper(value: $settings.speculativeDecoding.mtpDraftNMax, in: 1...6, step: 1) {
-                Text(String.localizedStringWithFormat(String(localized: "MTP draft tokens: %@"), "\(settings.speculativeDecoding.resolvedMTPDraftNMax)"))
+            Toggle(isOn: $settings.speculativeDecoding.mtpAutoTune) {
+                Text("Auto-tune draft length")
             }
-            Stepper(value: $settings.speculativeDecoding.mtpDraftNMin, in: 0...6, step: 1) {
-                Text(String.localizedStringWithFormat(String(localized: "MTP min draft tokens: %@"), "\(settings.speculativeDecoding.resolvedMTPDraftNMin)"))
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Text(String.localizedStringWithFormat(String(localized: "MTP draft probability floor: %@"), String(format: "%.2f", settings.speculativeDecoding.resolvedMTPDraftPMin)))
-                Slider(value: $settings.speculativeDecoding.mtpDraftPMin, in: 0.0...1.0, step: 0.05)
-                Text("Lower values let the MTP head draft more tokens before bailing (more speculation, lower per-token acceptance). 0.75 is the conservative llama.cpp default.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if settings.speculativeDecoding.mtpAutoTune {
+                Text(String.localizedStringWithFormat(
+                    String(localized: "Noema drafts up to %@ tokens on this device and adapts the length while generating. Speculation pauses automatically when drafts stop being accepted."),
+                    "\(SpeculativeAutoTune.deviceDraftCap)"
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                Stepper(value: $settings.speculativeDecoding.mtpDraftNMax, in: 1...6, step: 1) {
+                    Text(String.localizedStringWithFormat(String(localized: "MTP draft tokens: %@"), "\(settings.speculativeDecoding.resolvedMTPDraftNMax)"))
+                }
+                Stepper(value: $settings.speculativeDecoding.mtpDraftNMin, in: 0...6, step: 1) {
+                    Text(String.localizedStringWithFormat(String(localized: "MTP min draft tokens: %@"), "\(settings.speculativeDecoding.resolvedMTPDraftNMin)"))
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String.localizedStringWithFormat(String(localized: "MTP draft probability floor: %@"), String(format: "%.2f", settings.speculativeDecoding.resolvedMTPDraftPMin)))
+                    IndustrialSliderRow(value: $settings.speculativeDecoding.mtpDraftPMin, range: 0.0...1.0, step: 0.05)
+                    Text("MTP confidence is measured before top-k filtering. Set the probability floor to 0 to disable it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
 
@@ -2432,7 +3273,7 @@ private struct ModelProvenanceValueRow: View {
 
         if settings.speculativeDecoding.helperModelID == nil {
             if options.isEmpty {
-                Text("Install another model with the same architecture and equal or smaller size to enable speculative decoding.")
+                Text("Install another model from the same model family with equal or smaller size to enable speculative decoding.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2449,7 +3290,10 @@ private struct ModelProvenanceValueRow: View {
                 case .tokens:
                     Text("Draft tokens: \(settings.speculativeDecoding.value)")
                 case .max:
-                    Text("Draft window: \(settings.speculativeDecoding.value)")
+                    Text(String.localizedStringWithFormat(
+                        String(localized: "Adaptive draft limit: %@"),
+                        "\(settings.speculativeDecoding.value)"
+                    ))
                 }
             }
 
@@ -2459,9 +3303,7 @@ private struct ModelProvenanceValueRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .max:
-                Text("Draft window — the furthest the helper model may run ahead of the target. The two models work in parallel up to this many tokens, so a larger window allows more overlap but discards more work when the target rejects a draft.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                EmptyView()
             }
         }
         }
@@ -2479,6 +3321,31 @@ private struct ModelProvenanceValueRow: View {
                 settings.speculativeDecoding.selection = (selection == .mtp && !modelHasMTPSupport) ? .off : selection
             }
         )
+    }
+
+    @ViewBuilder
+    private var mtpAvailableNotice: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text("This model supports Multi-Token Prediction. Turn it on for faster generation with identical output.")
+            } icon: {
+                Image(systemName: "bolt.fill")
+            }
+            .font(.caption)
+            .foregroundStyle(.green)
+            Button {
+                settings.speculativeDecoding.selection = .mtp
+                settings.speculativeDecoding.mtpAutoTune = true
+            } label: {
+                Text("Enable MTP")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     @ViewBuilder
@@ -2502,14 +3369,18 @@ private struct ModelProvenanceValueRow: View {
     }
 
     private var modelHasMTPSupport: Bool {
-        MtpLocator.hasMtpFile(alongside: resolvedModel.url) || GGUFMetadata.hasMTP(at: resolvedModel.url)
+        MtpLocator.hasMtpFileCached(alongside: resolvedModel.url) || GGUFMetadata.hasMTP(at: resolvedModel.url)
     }
 
     private var speculativeDraftCandidates: [LocalModel] {
         let base = resolvedModel
         return modelManager.downloadedModels.filter { candidate in
             guard candidate.id != base.id else { return false }
+            guard candidate.format == .gguf else { return false }
             guard candidate.matchesArchitectureFamily(of: base) else { return false }
+            // A paged install cannot load resident as the draft; ChatVM rejects
+            // it at launch, so the picker must not offer it.
+            guard !OverfitPagedInstallCache.isPaged(candidate.url) else { return false }
             let baseSize = base.sizeGB
             let candidateSize = candidate.sizeGB
             if baseSize > 0, candidateSize > 0, candidateSize - baseSize > 0.01 {
@@ -2520,47 +3391,107 @@ private struct ModelProvenanceValueRow: View {
     }
 
     @ViewBuilder
-    private var nonGGUFSettings: some View {
-        Section(model.format.displayName) {
-            if model.format == .et {
-                etSettingsContent
-            } else if model.format == .ane {
-                aneSettingsContent
-            } else {
-                // AFM is handled separately (Private Cloud Compute, shown near the top).
-                mlxSettingsContent
+    private var mlxSettingsContent: some View {
+        Toggle("Reuse Prompt Cache", isOn: $settings.mlxPromptCacheEnabled)
+            .help("Reuse the shared prompt prefix between turns to reduce time to first token.")
+        Picker(selection: $settings.mlxKVCacheQuantization) {
+            ForEach(MLXKVCacheQuantization.allCases) { quantization in
+                Text(LocalizedStringKey(quantization.titleKey)).tag(quantization)
+            }
+        } label: {
+            HStack {
+                Text("KV Cache Precision")
+                Button {
+                    showMLXKVCacheInfo = true
+                } label: {
+                    Image(systemName: "questionmark.circle")
+                }
+                .buttonStyle(.borderless)
             }
         }
-    }
-
-    @ViewBuilder
-    private var mlxSettingsContent: some View {
-        Text("GPU off-load is not supported for this model.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        .pickerStyle(.menu)
         if let moeInfo = resolvedMoEInfo {
             moeSettings(for: moeInfo)
         }
         if isAdvancedMode {
-            HStack {
-                Text("Seed")
-                TextField("Random", text: Binding(
-                    get: { settings.seed.map(String.init) ?? "" },
-                    set: { newVal in
-                        let digits = newVal.filter { $0.isNumber }
-                        if let val = Int(digits) { settings.seed = val } else { settings.seed = nil }
+            IndustrialDisclosureRow("Advanced", headline: mlxAdvancedRuntimeHeadline) {
+                if settings.mlxKVCacheQuantization != .fullPrecision {
+                    Picker("Quantization Group Size", selection: $settings.mlxKVCacheGroupSize) {
+                        ForEach(ModelSettings.mlxKVCacheGroupSizes, id: \.self) { size in
+                            Text(verbatim: "\(size)").tag(size)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    Stepper(
+                        value: $settings.mlxKVCacheQuantizationStart,
+                        in: 0...max(0, Int(settings.contextLength)),
+                        step: 256
+                    ) {
+                        HStack {
+                            Text("Quantization Start")
+                            Spacer()
+                            Text(verbatim: "\(settings.mlxKVCacheQuantizationStart)")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Toggle("Sliding KV Cache", isOn: Binding(
+                    get: { settings.mlxKVCacheLimit > 0 },
+                    set: { enabled in
+                        settings.mlxKVCacheLimit = enabled
+                            ? min(max(128, Int(settings.contextLength)), 4096)
+                            : 0
                     }
                 ))
-                .platformKeyboardType(.numberPad)
+                if settings.mlxKVCacheLimit > 0 {
+                    Stepper(
+                        value: $settings.mlxKVCacheLimit,
+                        in: 128...max(128, Int(settings.contextLength)),
+                        step: 128
+                    ) {
+                        HStack {
+                            Text("KV Cache Limit")
+                            Spacer()
+                            Text(verbatim: "\(settings.mlxKVCacheLimit)")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Picker("Prefill Batch Size", selection: $settings.mlxPrefillStepSize) {
+                    ForEach(ModelSettings.mlxPrefillStepSizes, id: \.self) { size in
+                        Text(verbatim: "\(size)").tag(size)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                HStack {
+                    Text("Seed")
+                    TextField("Random", text: Binding(
+                        get: { settings.seed.map(String.init) ?? "" },
+                        set: { newVal in
+                            let digits = newVal.filter { $0.isNumber }
+                            if let val = Int(digits) { settings.seed = val } else { settings.seed = nil }
+                        }
+                    ))
+                    .platformKeyboardType(.numberPad)
+                }
+                TextField("Tokenizer Path (tokenizer.json)", text: Binding(
+                    get: { settings.tokenizerPath ?? "" },
+                    set: { settings.tokenizerPath = $0.isEmpty ? nil : $0 }
+                ))
+                .platformAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.caption)
             }
-            TextField("Tokenizer Path (tokenizer.json)", text: Binding(
-                get: { settings.tokenizerPath ?? "" },
-                set: { settings.tokenizerPath = $0.isEmpty ? nil : $0 }
-            ))
-            .platformAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .font(.caption)
         }
+    }
+
+    private var mlxAdvancedRuntimeHeadline: String {
+        let window = settings.mlxKVCacheLimit > 0 ? " · window \(settings.mlxKVCacheLimit)" : ""
+        return "prefill \(settings.mlxPrefillStepSize)\(window)"
     }
 
     @ViewBuilder
@@ -2630,32 +3561,57 @@ private struct ModelProvenanceValueRow: View {
     }
 
     @ViewBuilder
-    private var afmSettingsContent: some View {
+    private var privateCloudSettingsContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(LocalizedStringKey("Choose how this model uses Apple's Private Cloud Compute."))
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(ApplePrivateCloudComputeAvailability.status.isAvailableForRequests ? Color.green : Color.orange)
+                    .frame(width: 7, height: 7)
+                Text(ApplePrivateCloudComputeAvailability.status.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(LocalizedStringKey("Private Cloud Compute requests use Apple's privacy-preserving servers and require a network connection."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Picker(LocalizedStringKey("Private Cloud Compute"), selection: $settings.afmPrivateCloudComputeMode) {
-                ForEach(AFMPrivateCloudComputeMode.allCases) { mode in
-                    Text(LocalizedStringKey(mode.titleKey)).tag(mode)
+            Picker(LocalizedStringKey("Reasoning Level"), selection: $settings.pccReasoningLevel) {
+                ForEach(PCCReasoningLevel.allCases) { level in
+                    Text(LocalizedStringKey(level.titleKey)).tag(level)
                 }
             }
-            .pickerStyle(.segmented)
-            .accessibilityLabel(LocalizedStringKey("Private Cloud Compute"))
+            .pickerStyle(.menu)
 
-            Text(LocalizedStringKey(settings.afmPrivateCloudComputeMode.detailKey))
+            Text(LocalizedStringKey(settings.pccReasoningLevel.detailKey))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            switch ApplePrivateCloudComputeAvailability.status {
+            case .approachingLimit, .limitReached:
+                if ApplePrivateCloudComputeAvailability.canShowQuotaOptions {
+                    Button(LocalizedStringKey("View Usage Options")) {
+                        ApplePrivateCloudComputeAvailability.showQuotaOptions()
+                    }
+                    .buttonStyle(.borderless)
+                }
+            case .available, .unavailable:
+                EmptyView()
+            }
         }
     }
 
     @ViewBuilder
     private var benchmarkSection: some View {
-        Section("Benchmark") {
+        IndustrialDisclosureRow("Benchmark", headline: benchmarkHeadline, dotColor: benchmarkResult != nil ? .accentColor : nil, initiallyExpanded: benchmarking) {
             benchmarkSectionContent
         }
+    }
+
+    private var benchmarkHeadline: String? {
+        guard let result = benchmarkResult else { return nil }
+        return String(format: "%.1f tok/s · %@", result.generationRate, result.completedAt.formatted(date: .abbreviated, time: .omitted))
     }
 
     @ViewBuilder
@@ -2673,21 +3629,23 @@ private struct ModelProvenanceValueRow: View {
                 let fitsRAM = cachedBenchmarkFitsRAM
                 let ramGuardActive = !fitsRAM && !benchmarking
                 Button {
-                    runBenchmark()
+                    if ramGuardActive {
+                        showBenchmarkRAMSafetyWarning = true
+                    } else {
+                        runBenchmark()
+                    }
                 } label: {
                     HStack {
                         Image(systemName: "speedometer")
                         Text(benchmarking ? "Benchmarking…" : "Run Benchmark")
-                            .fontWeight(.semibold)
                     }
-                    .frame(maxWidth: .infinity)
+                    .industrialCTAWidth()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.accentColor)
-                .disabled(benchmarking || ramGuardActive)
+                .buttonStyle(.industrial(.prominent))
+                .disabled(benchmarking)
 
                 if ramGuardActive {
-                    Text("This configuration exceeds the current RAM safety guard, so benchmarking is disabled.")
+                    Text("Model likely exceeds memory budget. Lower context size or use a smaller quant/model.")
                         .font(.caption2)
                         .foregroundStyle(.red)
                 }
@@ -2731,11 +3689,10 @@ private struct ModelProvenanceValueRow: View {
                         HStack {
                             Image(systemName: "stop.circle")
                             Text("Cancel Benchmark")
-                                .fontWeight(.semibold)
                         }
-                        .frame(maxWidth: .infinity)
+                        .industrialCTAWidth()
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.industrial(.destructive))
                     .tint(.red)
                 }
 
@@ -2835,7 +3792,43 @@ private struct BenchmarkSummaryCard: View {
             }
             badges.append(OptimizationDescriptor(id: "mtp", title: String(localized: "MTP"), value: mtpValue, icon: "forward.end.fill", isActive: settings.speculativeDecoding.mtpEnabled))
             return badges
-        case .mlx, .et, .ane, .afm, .coreai:
+        case .mlx:
+            let onText = String(localized: "On")
+            let offText = String(localized: "Off")
+            var badges: [OptimizationDescriptor] = [
+                OptimizationDescriptor(
+                    id: "mlx-kv",
+                    title: String(localized: "KV Cache Precision"),
+                    value: String(localized: String.LocalizationValue(settings.mlxKVCacheQuantization.titleKey)),
+                    icon: "memorychip",
+                    isActive: settings.mlxKVCacheQuantization != .fullPrecision
+                ),
+                OptimizationDescriptor(
+                    id: "mlx-prompt-reuse",
+                    title: String(localized: "Reuse Prompt Cache"),
+                    value: settings.mlxPromptCacheEnabled ? onText : offText,
+                    icon: "arrow.triangle.2.circlepath",
+                    isActive: settings.mlxPromptCacheEnabled
+                ),
+                OptimizationDescriptor(
+                    id: "mlx-prefill",
+                    title: String(localized: "Prefill Batch Size"),
+                    value: "\(settings.mlxPrefillStepSize)",
+                    icon: "square.stack.3d.up",
+                    isActive: settings.mlxPrefillStepSize != 512
+                )
+            ]
+            if settings.mlxKVCacheLimit > 0 {
+                badges.append(OptimizationDescriptor(
+                    id: "mlx-window",
+                    title: String(localized: "Sliding KV Cache"),
+                    value: "\(settings.mlxKVCacheLimit)",
+                    icon: "rectangle.compress.vertical",
+                    isActive: true
+                ))
+            }
+            return badges
+        case .et, .ane, .afm, .coreai:
             return []
         }
     }
@@ -2881,11 +3874,8 @@ private struct BenchmarkSummaryCard: View {
                 Spacer()
             }
 
-            // Hide optimization details entirely for MLX benchmarks.
-            if format != .mlx {
-                VStack(alignment: .leading, spacing: 8) {
-                    optimizationSection
-                }
+            VStack(alignment: .leading, spacing: 8) {
+                optimizationSection
             }
 
             Divider()
@@ -3243,6 +4233,52 @@ private struct ModelSettingsWalkthroughOverlay: View {
 
 private extension ModelSettingsView {
     func applyRuntimePreset(_ preset: ModelRuntimePreset) {
+        if model.format == .mlx {
+            settings.mlxKVCacheGroupSize = 64
+            settings.mlxKVCacheQuantizationStart = 0
+            // Presets never silently discard old attention state. The sliding
+            // window remains an explicit advanced choice.
+            settings.mlxKVCacheLimit = 0
+
+            switch preset {
+            case .batterySaver:
+                settings.mlxPromptCacheEnabled = false
+                settings.mlxKVCacheQuantization = .fourBit
+                settings.mlxPrefillStepSize = 256
+                settings.contextLength = Double(presetContext(upTo: batterySaverContextTarget(), preferSafe: true))
+            case .balanced:
+                settings.mlxPromptCacheEnabled = true
+                settings.mlxKVCacheQuantization = .eightBit
+                settings.mlxPrefillStepSize = 512
+                settings.contextLength = Double(presetContext(upTo: 8192, preferSafe: true))
+            case .maxSpeed:
+                settings.mlxPromptCacheEnabled = true
+                settings.mlxKVCacheQuantization = .fullPrecision
+#if os(macOS)
+                settings.mlxPrefillStepSize = 1024
+#else
+                settings.mlxPrefillStepSize = 512
+#endif
+                settings.contextLength = Double(presetContext(upTo: 8192, preferSafe: true))
+            case .maxContext:
+                settings.mlxPromptCacheEnabled = true
+                settings.mlxKVCacheQuantization = .fourBit
+                settings.mlxPrefillStepSize = 256
+                settings.contextLength = Double(
+                    presetContext(upTo: supportedMaxContextLength ?? 65_536, preferSafe: true)
+                )
+            case .maxContextAggressive, .visionHeavy, .toolHeavy:
+                break
+            }
+
+            settings = settings.normalizedForLocalModel(model)
+            settings.gpuLayers = 0
+            updateMoESettingsIfNeeded(with: resolvedMoEInfo)
+            recomputeBenchmarkFitsRAM()
+            appliedRuntimeFingerprint = runtimeConfigFingerprint
+            return
+        }
+
         switch preset {
         case .batterySaver:
             settings.cpuThreads = max(1, ProcessInfo.processInfo.activeProcessorCount / 2)
@@ -3252,6 +4288,7 @@ private extension ModelSettingsView {
             // Flexible: don't hard-cap small models on roomy devices at 4K.
             settings.contextLength = Double(presetContext(upTo: batterySaverContextTarget(), preferSafe: true))
             if model.format == .gguf {
+                settings.promptCacheEnabled = false
                 settings.gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0
                 settings.kCacheQuant = .q8_0
                 settings.vCacheQuant = .q8_0
@@ -3262,6 +4299,7 @@ private extension ModelSettingsView {
             settings.keepInMemory = true
             settings.kvCacheOffload = DeviceGPUInfo.supportsGPUOffload
             if model.format == .gguf {
+                settings.promptCacheEnabled = true
                 settings.gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0
                 settings.flashAttention = false
                 settings.kCacheQuant = .f16
@@ -3274,6 +4312,7 @@ private extension ModelSettingsView {
             settings.disableWarmup = false
             settings.kvCacheOffload = DeviceGPUInfo.supportsGPUOffload
             if model.format == .gguf {
+                settings.promptCacheEnabled = true
                 settings.gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0
                 settings.flashAttention = true
                 // Keep K/V cache at F16 for raw speed: quantizing the cache saves
@@ -3287,6 +4326,7 @@ private extension ModelSettingsView {
             settings.keepInMemory = true
             settings.kvCacheOffload = DeviceGPUInfo.supportsGPUOffload
             if model.format == .gguf {
+                settings.promptCacheEnabled = false
                 settings.gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0
                 // Climb only as far as needed: full-precision KV first, escalate to
                 // a compact q8_0 cache + flash attention if the model's full context
@@ -3310,6 +4350,7 @@ private extension ModelSettingsView {
             settings.keepInMemory = true
             settings.kvCacheOffload = DeviceGPUInfo.supportsGPUOffload
             if model.format == .gguf {
+                settings.promptCacheEnabled = false
                 settings.gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0
                 // Same escalation, but willing to go all the way to a heavily
                 // quantized KV cache (Q4 keys, IQ4_NL values) + flash attention to
@@ -3337,6 +4378,7 @@ private extension ModelSettingsView {
             settings.keepInMemory = true
             settings.kvCacheOffload = DeviceGPUInfo.supportsGPUOffload
             if model.format == .gguf {
+                settings.promptCacheEnabled = false
                 settings.gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0
                 settings.flashAttention = true
                 settings.kCacheQuant = .f16
@@ -3387,7 +4429,10 @@ private extension ModelSettingsView {
     /// Runtime fingerprint of a saved preset, in the same shape as
     /// `runtimeConfigFingerprint`, so an active saved preset can be highlighted.
     func fingerprint(for preset: CustomRuntimePreset) -> String {
-        "\(Int(preset.contextLength))|\(preset.kCacheQuant.rawValue)|\(preset.vCacheQuant.rawValue)|\(preset.flashAttention)|\(preset.keepInMemory)|\(preset.kvCacheOffload)|\(preset.cpuThreads)|\(preset.promptCacheEnabled)"
+        if model.format == .mlx {
+            return "\(Int(preset.contextLength))|\(preset.mlxPromptCacheEnabled)|\(preset.mlxKVCacheQuantization.rawValue)|\(preset.mlxKVCacheGroupSize)|\(preset.mlxKVCacheQuantizationStart)|\(preset.mlxKVCacheLimit)|\(preset.mlxPrefillStepSize)"
+        }
+        return "\(Int(preset.contextLength))|\(preset.kCacheQuant.rawValue)|\(preset.vCacheQuant.rawValue)|\(preset.flashAttention)|\(preset.keepInMemory)|\(preset.kvCacheOffload)|\(preset.unifiedKVCache)|\(preset.cpuThreads)|\(preset.promptCacheEnabled)"
     }
 
     func saveCurrentSettingsAsPreset(named rawName: String) {
@@ -3419,10 +4464,20 @@ private extension ModelSettingsView {
     }
 
     func applyCustomPreset(_ preset: CustomRuntimePreset) {
-        settings.cpuThreads = preset.cpuThreads
-        settings.keepInMemory = preset.keepInMemory
-        settings.kvCacheOffload = preset.kvCacheOffload
-        settings.promptCacheEnabled = preset.promptCacheEnabled
+        if model.format == .mlx {
+            settings.mlxPromptCacheEnabled = preset.mlxPromptCacheEnabled
+            settings.mlxKVCacheQuantization = preset.mlxKVCacheQuantization
+            settings.mlxKVCacheGroupSize = preset.mlxKVCacheGroupSize
+            settings.mlxKVCacheQuantizationStart = preset.mlxKVCacheQuantizationStart
+            settings.mlxKVCacheLimit = preset.mlxKVCacheLimit
+            settings.mlxPrefillStepSize = preset.mlxPrefillStepSize
+        } else {
+            settings.cpuThreads = preset.cpuThreads
+            settings.keepInMemory = preset.keepInMemory
+            settings.kvCacheOffload = preset.kvCacheOffload
+            settings.unifiedKVCache = preset.unifiedKVCache
+            settings.promptCacheEnabled = preset.promptCacheEnabled
+        }
         if model.format == .gguf {
             settings.flashAttention = preset.flashAttention
             settings.kCacheQuant = preset.kCacheQuant
@@ -3491,7 +4546,9 @@ private extension ModelSettingsView {
                 layerCount: layerHint,
                 moeInfo: effectiveMoEInfo,
                 upperBound: upper,
-                kvCacheEstimate: estimate
+                kvCacheEstimate: estimate,
+                runtimeConfiguration: .resolved(from: settings, modelURL: model.url),
+                knownWorkingContextLength: knownWorkingContextLength
             ) ?? clampedTarget
             let achievable = max(512, min(clampedTarget, fittable))
             fallback = (achievable, plan)
@@ -3522,7 +4579,9 @@ private extension ModelSettingsView {
             layerCount: layerHint,
             moeInfo: effectiveMoEInfo,
             upperBound: supportedMaxContextLength,
-            kvCacheEstimate: estimate
+            kvCacheEstimate: estimate,
+            runtimeConfiguration: .resolved(from: settings, modelURL: model.url),
+            knownWorkingContextLength: knownWorkingContextLength
         ) ?? base
         return fittable >= generous ? generous : base
     }
@@ -3540,7 +4599,9 @@ private extension ModelSettingsView {
             layerCount: (layerCount > 0 ? layerCount : nil),
             moeInfo: effectiveMoEInfo,
             upperBound: upperBound,
-            kvCacheEstimate: kvCacheEstimate
+            kvCacheEstimate: kvCacheEstimate,
+            runtimeConfiguration: .resolved(from: settings, modelURL: model.url),
+            knownWorkingContextLength: knownWorkingContextLength
         ) else {
             return requestedBound
         }
@@ -3560,11 +4621,12 @@ private extension ModelSettingsView {
             contextLength: context,
             layerCount: layerHint,
             moeInfo: effectiveMoEInfo,
-            kvCacheEstimate: kvCacheEstimate
+            kvCacheEstimate: kvCacheEstimate,
+            runtimeConfiguration: .resolved(from: settings, modelURL: model.url)
         )
     }
 
-    func runBenchmark() {
+    func runBenchmark(bypassRAMCheck: Bool = false) {
         guard !benchmarking, model.format != .ane else { return }
 #if canImport(UIKit) && !os(visionOS)
         Haptics.impact(.light)
@@ -3582,7 +4644,8 @@ private extension ModelSettingsView {
                 let result = try await ModelBenchmarkService.run(
                     model: model,
                     settings: currentSettings,
-                    vm: vm
+                    vm: vm,
+                    bypassRAMCheck: bypassRAMCheck
                 ) { update in
                     benchmarkProgress = update.fraction
                     benchmarkProgressDetail = update.detail
@@ -3599,6 +4662,18 @@ private extension ModelSettingsView {
                 await MainActor.run {
                     if benchmarkTaskID == taskID {
                         benchmarkError = nil
+                    }
+                }
+            } catch ModelBenchmarkError.ramSafetyBlocked {
+                await MainActor.run {
+                    if benchmarkTaskID == taskID {
+                        if bypassRAMCheck {
+                            benchmarkError = ModelBenchmarkError.ramSafetyBlocked.localizedDescription
+                        } else {
+                            vm.loadError = nil
+                            benchmarkError = nil
+                            showBenchmarkRAMSafetyWarning = true
+                        }
                     }
                 }
             } catch {
@@ -3633,6 +4708,27 @@ private extension ModelSettingsView {
         vm.loadingProgressTracker.completeLoading()
         benchmarkProgress = 0
         benchmarkProgressDetail = String(localized: "Benchmark running…")
+    }
+
+    private func saveAndClose() {
+#if canImport(UIKit) && !os(visionOS)
+        Haptics.impact(.light)
+#endif
+        persistModelAliasIfNeeded()
+        modelManager.updateSettings(settings, for: model)
+        vm.syncActiveLocalModelPromptSettingsIfNeeded(model: model, settings: settings)
+        close()
+    }
+
+    private func loadAndClose() {
+#if canImport(UIKit) && !os(visionOS)
+        Haptics.impact(.medium)
+#endif
+        persistModelAliasIfNeeded()
+        modelManager.updateSettings(settings, for: model)
+        vm.syncActiveLocalModelPromptSettingsIfNeeded(model: model, settings: settings)
+        loadAction(settings)
+        close()
     }
 
     func close() {
@@ -3723,3 +4819,158 @@ private extension View {
     }
 }
 #endif
+
+/// Overfit (paged experts) controls for a `.noema-paged` GGUF install: mode
+/// picker, canary status, and the canary launcher. Package + stored-canary
+/// state loads off-main because manifest reads touch disk.
+private struct OverfitSettingsBlock: View {
+    let model: LocalModel
+    @Binding var settings: ModelSettings
+    let isAdvancedMode: Bool
+    @Environment(\.locale) private var locale
+
+    @State private var package: NoemaPagedPackage?
+    @State private var packageDirectory: URL?
+    @State private var canaryRecord: OverfitCanaryRecord?
+    @State private var showCanarySheet = false
+    @State private var canaryPhase: OverfitCanaryPhase = .validating
+    @State private var canaryError: String?
+    @State private var canaryTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Overfit (Paged Experts)")
+                .textCase(.uppercase)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .tracking(0.3)
+                .foregroundStyle(Color.primary.opacity(0.6))
+                .lineLimit(1)
+            modePicker
+            Text("Streams expert weights from storage on demand. Speed depends on this device's storage.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let canaryRecord {
+                HStack(spacing: 8) {
+                    OverfitClassificationChip(classification: canaryRecord.classification)
+                    Text(verbatim: canarySummary(for: canaryRecord))
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.5))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                }
+            }
+            Button("Run Canary Test") { runCanary() }
+                .buttonStyle(.industrial)
+                .disabled(package == nil || showCanarySheet)
+        }
+        .padding(.top, 4)
+        .task(id: model.url) { await loadPackageState() }
+        .sheet(isPresented: $showCanarySheet) {
+            OverfitCanaryProgressSheet(phase: canaryPhase, error: canaryError) {
+                canaryTask?.cancel()
+                canaryTask = nil
+                showCanarySheet = false
+            }
+        }
+    }
+
+    /// `.forceExperimental` stays selectable outside advanced mode only while
+    /// it is the current value, so the control never shows an impossible state.
+    private var showsForceMode: Bool {
+        isAdvancedMode || settings.overfitMode == .forceExperimental
+    }
+
+    @ViewBuilder
+    private var modePicker: some View {
+#if os(macOS)
+        HStack(spacing: 6) {
+            modeButton("Off", mode: .off)
+            modeButton("Automatic", mode: .automatic)
+            if showsForceMode {
+                modeButton("Force (Experimental)", mode: .forceExperimental)
+            }
+        }
+#else
+        Picker("Overfit (Paged Experts)", selection: $settings.overfitMode) {
+            Text("Off").tag(ModelSettings.OverfitMode.off)
+            Text("Automatic").tag(ModelSettings.OverfitMode.automatic)
+            if showsForceMode {
+                Text("Force (Experimental)").tag(ModelSettings.OverfitMode.forceExperimental)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+#endif
+    }
+
+#if os(macOS)
+    private func modeButton(_ title: LocalizedStringKey, mode: ModelSettings.OverfitMode) -> some View {
+        Button(title) { settings.overfitMode = mode }
+            .buttonStyle(.industrial(settings.overfitMode == mode ? .tinted : .quiet))
+    }
+#endif
+
+    private func canarySummary(for record: OverfitCanaryRecord) -> String {
+        let measured = String.localizedStringWithFormat(
+            String(localized: "Measured %@ tok/s · %@ MB/s", locale: locale),
+            String(format: "%.1f", record.generationRate),
+            String(format: "%.0f", record.storageAlignedReadMBps)
+        )
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        formatter.locale = locale
+        let relative = formatter.localizedString(for: record.completedAt, relativeTo: Date())
+        return "\(measured) · \(relative)"
+    }
+
+    private func loadPackageState() async {
+        let modelURL = model.url
+        let loaded: (URL, NoemaPagedPackage, OverfitCanaryRecord?)? = await Task.detached(priority: .utility) {
+            guard let directory = PagedPackageLocator.enclosingPackage(for: modelURL),
+                  let package = try? NoemaPagedPackage.load(at: directory) else {
+                return nil
+            }
+            let record = OverfitCanaryStore.shared.record(
+                fingerprint: package.manifest.fingerprint,
+                device: OverfitEnvironmentIdentity.deviceModelIdentifier,
+                volume: OverfitEnvironmentIdentity.volumeIdentifier(for: directory),
+                contractVersion: OverfitEnvironmentIdentity.nativeContractVersion,
+                appBuild: OverfitEnvironmentIdentity.appBuild
+            )
+            return (directory, package, record)
+        }.value
+        guard let loaded else { return }
+        packageDirectory = loaded.0
+        package = loaded.1
+        canaryRecord = loaded.2
+    }
+
+    private func runCanary() {
+        guard let package else { return }
+        canaryError = nil
+        canaryPhase = .validating
+        showCanarySheet = true
+        let modelURL = model.url
+        let runSettings = settings
+        canaryTask = Task { @MainActor in
+            do {
+                _ = try await OverfitCanaryService.run(
+                    package: package,
+                    modelURL: modelURL,
+                    settings: runSettings,
+                    progress: { phase in
+                        Task { @MainActor in canaryPhase = phase }
+                    }
+                )
+                canaryPhase = .finished
+                await loadPackageState()
+            } catch is CancellationError {
+                showCanarySheet = false
+            } catch {
+                canaryError = error.localizedDescription
+            }
+            canaryTask = nil
+        }
+    }
+}

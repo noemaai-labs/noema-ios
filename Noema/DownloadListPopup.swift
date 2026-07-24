@@ -1,8 +1,8 @@
-// DownloadListPopup.swift
 import SwiftUI
 
 struct DownloadListPopup: View {
     @EnvironmentObject var controller: DownloadController
+    @ObservedObject private var presentationUpdates = DownloadPresentationUpdates.shared
     @Environment(\.dismiss) private var dismiss
 
     var onClose: (() -> Void)? = nil
@@ -17,50 +17,115 @@ struct DownloadListPopup: View {
 
     private var isEmpty: Bool {
         controller.items.isEmpty
-            && controller.leapItems.isEmpty
             && controller.datasetItems.isEmpty
             && controller.embeddingItems.isEmpty
             && controller.whisperItems.isEmpty
     }
 
     var body: some View {
+#if os(macOS)
+        // Chrome (title + close) comes from the MacModalHost card.
+        content
+#else
         NavigationStack {
-            Group {
-                if isEmpty {
-                    emptyState
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            ForEach(controller.items) { item in
-                                row(for: item)
-                            }
-                            ForEach(controller.leapItems) { item in
-                                leapRow(for: item)
-                            }
-                            ForEach(controller.datasetItems) { item in
-                                datasetRow(for: item)
-                            }
-                            ForEach(controller.embeddingItems) { item in
-                                embeddingRow(for: item)
-                            }
-                            ForEach(controller.whisperItems) { item in
-                                whisperRow(for: item)
-                            }
-                            Text(LocalizedStringKey("Downloads continue on iPhone and iPad while Noema remains available in the background. Force-quitting the app stops automatic resume."))
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.top, 8)
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 16)
+            content
+                .navigationTitle("Downloads")
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { close() } } }
+        }
+#endif
+    }
+
+    private var content: some View {
+        Group {
+            if isEmpty {
+                emptyState
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: listSpacing) {
+                        listRows
+                        footerNote
                     }
+                    .padding(.horizontal, listHorizontalPadding)
+                    .padding(.vertical, 16)
                 }
             }
-            .animation(.default, value: isEmpty)
-            .navigationTitle("Downloads")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { close() } } }
         }
+        .animation(.default, value: isEmpty)
+    }
+
+    private var listSpacing: CGFloat {
+#if os(macOS)
+        0
+#else
+        12
+#endif
+    }
+
+    private var listHorizontalPadding: CGFloat {
+#if os(macOS)
+        24
+#else
+        20
+#endif
+    }
+
+    @ViewBuilder
+    private var listRows: some View {
+#if os(macOS)
+        if !controller.items.isEmpty {
+            sectionHeader("Models")
+        }
+#endif
+        ForEach(controller.items) { item in
+            row(for: item)
+        }
+#if os(macOS)
+        if !controller.datasetItems.isEmpty {
+            sectionHeader("Datasets")
+        }
+#endif
+        ForEach(controller.datasetItems) { item in
+            datasetRow(for: item)
+        }
+#if os(macOS)
+        if !controller.embeddingItems.isEmpty {
+            sectionHeader("Embeddings")
+        }
+#endif
+        ForEach(controller.embeddingItems) { item in
+            embeddingRow(for: item)
+        }
+#if os(macOS)
+        if !controller.whisperItems.isEmpty {
+            sectionHeader("Speech / ASR")
+        }
+#endif
+        ForEach(controller.whisperItems) { item in
+            whisperRow(for: item)
+        }
+    }
+
+#if os(macOS)
+    private func sectionHeader(_ title: LocalizedStringKey) -> some View {
+        IndustrialSectionHeader(title)
+            .padding(.top, 10)
+    }
+#endif
+
+    private var footerNote: some View {
+        Group {
+#if os(macOS)
+            Text("Downloads continue while Noema is running. Quitting the app pauses them; they resume on next launch.")
+#elseif os(visionOS)
+            Text("Downloads continue on Apple Vision Pro while Noema remains available in the background. Force-quitting the app stops automatic resume.")
+#else
+            Text("Downloads continue on iPhone and iPad while Noema remains available in the background. Force-quitting the app stops automatic resume.")
+#endif
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
     }
 
     private var emptyState: some View {
@@ -89,33 +154,12 @@ struct DownloadListPopup: View {
             subtitle: item.quant.label,
             progress: item.progress,
             statusKey: item.status.statusLabelKey,
-            percent: percent(item.progress),
-            speed: speedText(item.speed),
+            speed: item.speed,
             bytes: byteLine(written: totalWritten, expected: totalExpected),
             error: item.error?.localizedDescription,
             canResume: item.canResume,
             canPause: item.canPause && item.error == nil,
             canSchedule: item.canPause && item.error == nil && item.status != .scheduled,
-            resume: { controller.resume(itemID: item.id) },
-            pause: { controller.pause(itemID: item.id) },
-            schedule: { controller.schedule(itemID: item.id) },
-            cancel: { controller.cancel(itemID: item.id) }
-        )
-    }
-
-    @ViewBuilder
-    private func leapRow(for item: DownloadController.LeapItem) -> some View {
-        DownloadRowCard(
-            title: item.entry.displayName,
-            subtitle: item.entry.slug,
-            progress: item.progress,
-            statusKey: item.status.statusLabelKey,
-            percent: percent(item.progress),
-            speed: speedText(item.speed),
-            bytes: byteLine(written: estimatedWritten(progress: item.progress, expected: item.expectedBytes), expected: item.expectedBytes),
-            canResume: item.canResume,
-            canPause: item.canPause,
-            canSchedule: item.canPause && item.status != .scheduled,
             resume: { controller.resume(itemID: item.id) },
             pause: { controller.pause(itemID: item.id) },
             schedule: { controller.schedule(itemID: item.id) },
@@ -133,8 +177,7 @@ struct DownloadListPopup: View {
             subtitle: item.detail.id,
             progress: progress,
             statusKey: item.status.statusLabelKey,
-            percent: percent(progress),
-            speed: speedText(item.speed),
+            speed: item.speed,
             bytes: byteLine(written: item.downloadedBytes, expected: item.expectedBytes),
             error: item.error?.localizedDescription,
             canResume: item.canResume,
@@ -154,7 +197,6 @@ struct DownloadListPopup: View {
             subtitle: item.repoID,
             progress: item.progress,
             statusKey: item.status.statusLabelKey,
-            percent: percent(item.progress),
             bytes: byteLine(written: estimatedWritten(progress: item.progress, expected: item.expectedBytes), expected: item.expectedBytes),
             error: item.error?.localizedDescription,
             canResume: item.canResume,
@@ -174,8 +216,7 @@ struct DownloadListPopup: View {
             subtitle: item.repoID,
             progress: item.progress,
             statusKey: item.status.statusLabelKey,
-            percent: percent(item.progress),
-            speed: speedText(item.speed),
+            speed: item.speed,
             bytes: byteLine(written: item.downloadedBytes, expected: item.expectedBytes),
             error: item.error?.localizedDescription,
             canResume: item.canResume,
@@ -186,13 +227,6 @@ struct DownloadListPopup: View {
             schedule: { controller.schedule(itemID: item.id) },
             cancel: { controller.cancel(itemID: item.id) }
         )
-    }
-
-    private func speedText(_ speed: Double) -> String? {
-        guard speed > 0 else { return nil }
-        let kb = speed / 1024
-        if kb > 1024 { return String(format: "%.1f MB/s", kb / 1024) }
-        return String(format: "%.0f KB/s", kb)
     }
 
     private func byteLine(written: Int64, expected: Int64) -> String? {
@@ -207,10 +241,6 @@ struct DownloadListPopup: View {
     private func estimatedWritten(progress: Double, expected: Int64) -> Int64 {
         guard expected > 0 else { return 0 }
         return Int64(Double(expected) * clamped(progress))
-    }
-
-    private func percent(_ progress: Double) -> Int {
-        Int((clamped(progress) * 100).rounded())
     }
 
     private func clamped(_ value: Double) -> Double {
@@ -232,8 +262,7 @@ private struct DownloadRowCard: View {
     let subtitle: String?
     let progress: Double
     let statusKey: String
-    let percent: Int
-    var speed: String? = nil
+    var speed: Double? = nil
     var bytes: String? = nil
     var error: String? = nil
     let canResume: Bool
@@ -247,6 +276,22 @@ private struct DownloadRowCard: View {
     @State private var confirmStop = false
 
     var body: some View {
+#if os(macOS)
+        VStack(spacing: 0) {
+            IndustrialHoverRow {
+                rowContent
+                    .padding(.vertical, 10)
+            }
+            IndustrialHairline()
+        }
+#else
+        rowContent
+            .padding(16)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+#endif
+    }
+
+    private var rowContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
@@ -270,102 +315,77 @@ private struct DownloadRowCard: View {
                 controls
             }
 
-            ProgressView(value: clampedProgress)
-                .tint(.accentColor)
+            DownloadProgressCluster(
+                progress: progress,
+                speed: speed,
+                statusKey: clusterStatusKey
+            )
 
-            VStack(alignment: .leading, spacing: 3) {
-                if let error, !error.isEmpty {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    statusLine
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                if let bytes {
-                    Text(bytes)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                if isScheduled {
-                    Label(LocalizedStringKey("Starts overnight on Wi-Fi while charging."), systemImage: "moon.zzz.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            if hasDetails {
+                detailLines
             }
         }
-        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var detailLines: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let error, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let bytes {
+#if os(macOS)
+                Text(bytes)
+                    .industrialStat()
+#else
+                Text(bytes)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+#endif
+            }
+
+            if isScheduled {
+                Label(LocalizedStringKey("Starts overnight on Wi-Fi while charging."), systemImage: "moon.zzz.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var hasDetails: Bool {
+        (error?.isEmpty == false) || bytes != nil || isScheduled
     }
 
     private var controls: some View {
-        HStack(spacing: 8) {
-            if canResume {
-                Button(action: resume) {
-                    Image(systemName: "play.fill")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: 30, height: 30)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(LocalizedStringKey("Resume Download"))
-            } else if canPause {
-                Button(action: pause) {
-                    Image(systemName: "pause.fill")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: 30, height: 30)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(LocalizedStringKey("Pause Download"))
-            }
-
-            if canSchedule {
-                Button(action: schedule) {
-                    Image(systemName: "clock.badge.pause")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: 30, height: 30)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(LocalizedStringKey("Schedule Download"))
-            }
-
-            Button {
+        DownloadActionCluster(
+            onResume: canResume ? resume : nil,
+            onPause: (!canResume && canPause) ? pause : nil,
+            onSchedule: canSchedule ? schedule : nil,
+            onCancel: {
                 if requiresStopConfirmation {
                     confirmStop = true
                 } else {
                     cancel()
                 }
-            } label: {
-                Image(systemName: "stop.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(width: 30, height: 30)
-                    .foregroundStyle(.red)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(LocalizedStringKey("Stop Download"))
-            .confirmationDialog(
-                Text(LocalizedStringKey("Stop this download?")),
-                isPresented: $confirmStop,
-                titleVisibility: .visible
-            ) {
-                Button(LocalizedStringKey("Stop Download"), role: .destructive) { cancel() }
-                Button(LocalizedStringKey("Keep Downloading"), role: .cancel) {}
-            } message: {
-                Text(LocalizedStringKey("Partially downloaded data will be deleted."))
-            }
+        )
+        .confirmationDialog(
+            Text(LocalizedStringKey("Stop this download?")),
+            isPresented: $confirmStop,
+            titleVisibility: .visible
+        ) {
+            Button(LocalizedStringKey("Stop Download"), role: .destructive) { cancel() }
+            Button(LocalizedStringKey("Keep Downloading"), role: .cancel) {}
+        } message: {
+            Text(LocalizedStringKey("Partially downloaded data will be deleted."))
         }
-        .foregroundStyle(Color.accentColor)
     }
 
     /// Confirm before discarding partial data; completed or failed rows can be dismissed directly.
@@ -373,16 +393,10 @@ private struct DownloadRowCard: View {
         error == nil && statusKey != DownloadJobState.completed.statusLabelKey
     }
 
-    private var statusLine: Text {
-        var text = Text(LocalizedStringKey(statusKey)) + Text("  \(percent)%")
-        if let speed, !speed.isEmpty {
-            text = text + Text("  \(speed)")
-        }
-        return text
-    }
-
-    private var clampedProgress: Double {
-        min(max(progress, 0), 1)
+    private var clusterStatusKey: LocalizedStringKey? {
+        statusKey == DownloadJobState.downloading.statusLabelKey
+            ? nil
+            : LocalizedStringKey(statusKey)
     }
 
     private var isScheduled: Bool {

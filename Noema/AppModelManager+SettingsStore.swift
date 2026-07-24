@@ -1,4 +1,3 @@
-// AppModelManager+SettingsStore.swift
 import Foundation
 
 struct DecodedModelSettingsMap {
@@ -8,7 +7,12 @@ struct DecodedModelSettingsMap {
 
 struct DecodedLocalModelSettingsPayload {
     let entries: [ModelSettingsStore.Entry]
-    let droppedInvalidEntries: Bool
+    /// Raw JSON objects that no schema this build knows could decode (typically
+    /// written by a newer app version). They are preserved verbatim across saves
+    /// instead of being dropped, so running an older build can't destroy them.
+    let unrecognizedRawEntries: [[String: Any]]
+
+    var droppedInvalidEntries: Bool { !unrecognizedRawEntries.isEmpty }
 }
 
 enum ModelSettingsPersistenceDecoder {
@@ -24,19 +28,20 @@ enum ModelSettingsPersistenceDecoder {
 
         let decoder = JSONDecoder()
         var entries: [ModelSettingsStore.Entry] = []
-        var droppedInvalidEntries = false
+        var unrecognized: [[String: Any]] = []
 
         for rawEntry in rawEntries {
-            guard JSONSerialization.isValidJSONObject(rawEntry),
-                  let entryData = try? JSONSerialization.data(withJSONObject: rawEntry),
-                  let entry = try? decoder.decode(ModelSettingsStore.Entry.self, from: entryData) else {
-                droppedInvalidEntries = true
-                continue
+            guard let entryObject = rawEntry as? [String: Any] else { continue }
+            if JSONSerialization.isValidJSONObject(entryObject),
+               let entryData = try? JSONSerialization.data(withJSONObject: entryObject),
+               let entry = try? decoder.decode(ModelSettingsStore.Entry.self, from: entryData) {
+                entries.append(entry)
+            } else {
+                unrecognized.append(entryObject)
             }
-            entries.append(entry)
         }
 
-        return DecodedLocalModelSettingsPayload(entries: entries, droppedInvalidEntries: droppedInvalidEntries)
+        return DecodedLocalModelSettingsPayload(entries: entries, unrecognizedRawEntries: unrecognized)
     }
 
     static func decodeRemoteSettingsMap(from data: Data) -> DecodedModelSettingsMap? {
@@ -69,11 +74,11 @@ enum ModelSettingsPersistenceDecoder {
     }
 }
 
-/// Durable per-model settings persistence using Keychain with a local JSON mirror.
-/// This survives app reinstalls (via Keychain) and also maintains a readable file for diagnostics.
+/// Durable per-model settings persistence in Application Support.
+/// Model settings are not secrets, so keeping them out of Keychain avoids macOS
+/// authorization prompts when the app's development signature changes.
 enum ModelSettingsStore {
-    private static let service = "Noema.ModelSettings"
-    private static let account = "perModel.v1"
+    nonisolated(unsafe) static var directoryOverrideForTesting: URL?
 
     struct Entry: Codable, Equatable {
         let modelID: String
@@ -82,77 +87,154 @@ enum ModelSettingsStore {
         let settings: ModelSettings
     }
 
-    fileprivate struct Payload: Codable {
-        var entries: [Entry]
+    /// Result of reading the durable payload. `storeReadable` is false when a payload
+    /// exists but could not be read. Writers must not rebuild the payload from an
+    /// unreadable result: doing so would wipe every entry that is still on disk.
+    struct DurableLoadResult {
+        let entries: [Entry]
+        let storeReadable: Bool
     }
 
-    private static func mirrorURL() -> URL? {
-        // Store a human-readable mirror under Documents/ModelSettings/model_settings.json
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        return docs?
+    /// Passthrough pen for raw entries the current build can't decode (see
+    /// `DecodedLocalModelSettingsPayload.unrecognizedRawEntries`). Refilled on every
+    /// load, re-emitted on every save.
+    private final class UnrecognizedEntryPen: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [[String: Any]] = []
+
+        func set(_ raw: [[String: Any]]) {
+            lock.lock()
+            defer { lock.unlock() }
+            entries = raw
+        }
+
+        func current() -> [[String: Any]] {
+            lock.lock()
+            defer { lock.unlock() }
+            return entries
+        }
+    }
+
+    private static let unrecognizedPen = UnrecognizedEntryPen()
+
+    private static func setUnrecognizedRawEntries(_ raw: [[String: Any]]) {
+        unrecognizedPen.set(raw)
+    }
+
+    private static func currentUnrecognizedRawEntries() -> [[String: Any]] {
+        unrecognizedPen.current()
+    }
+
+    static var unrecognizedRawEntryCountForTesting: Int {
+        currentUnrecognizedRawEntries().count
+    }
+
+    /// Overwrites the raw payload directly, bypassing entry encoding — lets tests
+    /// simulate a payload written by a different (e.g. newer) app version.
+    static func replacePayloadForTesting(_ data: Data) {
+        try? writePayload(data)
+    }
+
+    private static func storageURL() -> URL? {
+        if let directoryOverrideForTesting {
+            return directoryOverrideForTesting.appendingPathComponent("model_settings.json")
+        }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Noema", isDirectory: true)
+            .appendingPathComponent("ModelSettings", isDirectory: true)
+            .appendingPathComponent("model_settings.json")
+    }
+
+    /// Previous builds already maintained this JSON mirror alongside Keychain.
+    /// Read it once when the Application Support file does not exist, then migrate
+    /// its exact payload without ever touching the legacy Keychain item.
+    private static func legacyMirrorURL() -> URL? {
+        guard directoryOverrideForTesting == nil else { return nil }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
             .appendingPathComponent("ModelSettings", isDirectory: true)
             .appendingPathComponent("model_settings.json")
     }
 
     /// Loads durable entries, preserving canonical paths when present.
     static func loadEntries() -> [Entry] {
-        // Try Keychain first
-        if let data = try? KeychainStore.read(service: service, account: account) {
-            if let decoded = ModelSettingsPersistenceDecoder.decodeLocalPayload(from: data) {
-                let normalized = normalizedEntries(decoded.entries)
-                if decoded.droppedInvalidEntries || normalized != decoded.entries {
-                    save(entries: normalized)
-                }
-                return normalized
-            }
-        }
-        // Fallback to mirror file
-        if let url = mirrorURL(), let data = try? Data(contentsOf: url) {
-            if let decoded = ModelSettingsPersistenceDecoder.decodeLocalPayload(from: data) {
-                let normalized = normalizedEntries(decoded.entries)
-                if decoded.droppedInvalidEntries || normalized != decoded.entries {
-                    save(entries: normalized)
-                }
-                return normalized
-            }
-        }
-        return []
+        loadEntriesDetailed().entries
     }
 
-    /// Loads settings map keyed by (modelID, quantLabel).
-    static func load() -> [String: ModelSettings] {
-        var map: [String: ModelSettings] = [:]
-        for entry in loadEntries() {
-            map[entryKey(modelID: entry.modelID, quantLabel: entry.quantLabel)] = entry.settings
+    static func loadEntriesDetailed() -> DurableLoadResult {
+        if let url = storageURL(), FileManager.default.fileExists(atPath: url.path) {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = ModelSettingsPersistenceDecoder.decodeLocalPayload(from: data) else {
+                setUnrecognizedRawEntries([])
+                return DurableLoadResult(entries: [], storeReadable: false)
+            }
+            return adopt(decoded)
         }
-        return map
+
+        if let legacyURL = legacyMirrorURL(), FileManager.default.fileExists(atPath: legacyURL.path) {
+            guard let data = try? Data(contentsOf: legacyURL),
+                  let decoded = ModelSettingsPersistenceDecoder.decodeLocalPayload(from: data) else {
+                setUnrecognizedRawEntries([])
+                return DurableLoadResult(entries: [], storeReadable: false)
+            }
+            try? writePayload(data)
+            return adopt(decoded)
+        }
+
+        setUnrecognizedRawEntries([])
+        return DurableLoadResult(entries: [], storeReadable: true)
     }
 
-    /// Saves settings map keyed by (modelID|quantLabel) back to Keychain and the mirror file.
-    static func save(_ map: [String: ModelSettings]) {
-        // Convert back to payload
-        let entries: [Entry] = map.compactMap { (k, v) in
-            guard let sep = k.firstIndex(of: "|") else { return nil }
-            let id = String(k[..<sep])
-            let quant = String(k[k.index(after: sep)...])
-            return Entry(modelID: id, quantLabel: quant, canonicalPath: nil, settings: v)
+    private static func adopt(_ decoded: DecodedLocalModelSettingsPayload) -> DurableLoadResult {
+        setUnrecognizedRawEntries(decoded.unrecognizedRawEntries)
+        let normalized = normalizedEntries(decoded.entries)
+        // Persist dedup cleanups, but never as a way of committing entry drops:
+        // undecodable entries ride along via the passthrough pen instead.
+        if normalized != decoded.entries {
+            save(entries: normalized)
         }
-        save(entries: entries)
+        return DurableLoadResult(entries: normalized, storeReadable: true)
     }
 
     static func save(entries: [Entry]) {
-        let payload = Payload(entries: normalizedEntries(entries))
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        // Write Keychain
-        do { try KeychainStore.write(service: service, account: account, data: data) } catch { /* ignore */ }
-        // Write mirror
-        if let url = mirrorURL() {
-            let fm = FileManager.default
-            do {
-                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try data.write(to: url, options: [.atomic])
-            } catch { /* ignore */ }
+        let normalized = normalizedEntries(entries)
+        let encoder = JSONEncoder()
+        var encodedEntries: [Any] = []
+        var claimedModelKeys: Set<String> = []
+        var claimedPaths: Set<String> = []
+
+        for entry in normalized {
+            guard let data = try? encoder.encode(entry),
+                  let object = try? JSONSerialization.jsonObject(with: data) else { continue }
+            encodedEntries.append(object)
+            claimedModelKeys.insert(entryKey(modelID: entry.modelID, quantLabel: entry.quantLabel))
+            if let path = entry.canonicalPath {
+                claimedPaths.insert(path)
+            }
         }
+
+        for raw in currentUnrecognizedRawEntries() {
+            if let modelID = raw["modelID"] as? String,
+               let quantLabel = raw["quantLabel"] as? String,
+               claimedModelKeys.contains(entryKey(modelID: modelID, quantLabel: quantLabel)) {
+                continue
+            }
+            if let path = raw["canonicalPath"] as? String, claimedPaths.contains(path) {
+                continue
+            }
+            encodedEntries.append(raw)
+        }
+
+        let root: [String: Any] = ["entries": encodedEntries]
+        guard JSONSerialization.isValidJSONObject(root),
+              let data = try? JSONSerialization.data(withJSONObject: root) else { return }
+        try? writePayload(data)
+    }
+
+    private static func writePayload(_ data: Data) throws {
+        guard let url = storageURL() else { return }
+        let fm = FileManager.default
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: [.atomic])
     }
 
     private static func normalizedEntries(_ entries: [Entry]) -> [Entry] {
@@ -223,6 +305,16 @@ enum ModelSettingsStore {
 
             if let legacy = legacySettingsByPath[currentPath] {
                 resolved[currentPath] = legacy
+                let entry = Entry(
+                    modelID: item.modelID,
+                    quantLabel: item.quantLabel,
+                    canonicalPath: currentPath,
+                    settings: legacy
+                )
+                entries.append(entry)
+                entriesByPath[currentPath] = entries.count - 1
+                entriesByModelKey[modelKey] = entries.count - 1
+                shouldPersist = true
             }
         }
 
@@ -233,7 +325,7 @@ enum ModelSettingsStore {
         return resolved
     }
 
-    /// Updates a single model entry in persistent storage (Keychain + mirror).
+    /// Updates a single model entry in persistent storage.
     static func save(settings: ModelSettings, for model: LocalModel) {
         let canonicalPath = InstalledModelsStore.canonicalURL(for: model.url, format: model.format).path
         let newEntry = Entry(
@@ -242,7 +334,14 @@ enum ModelSettingsStore {
             canonicalPath: canonicalPath,
             settings: settings
         )
-        var current = loadEntries()
+        let loaded = loadEntriesDetailed()
+        guard loaded.storeReadable else {
+            // Rebuilding a corrupt payload from a failed read would wipe every other
+            // model's settings, so keep the in-memory/legacy copies and skip this write.
+            return
+        }
+        var current = loaded.entries
+        guard !current.contains(newEntry) else { return }
         current.removeAll {
             entryKey(modelID: $0.modelID, quantLabel: $0.quantLabel) == entryKey(modelID: model.modelID, quantLabel: model.quant)
                 || $0.canonicalPath == canonicalPath
@@ -277,7 +376,9 @@ enum ModelSettingsStore {
 
     static func remove(modelID: String, quantLabel: String, canonicalPath: String?) {
         let modelKey = entryKey(modelID: modelID, quantLabel: quantLabel)
-        var entries = loadEntries()
+        let loaded = loadEntriesDetailed()
+        guard loaded.storeReadable else { return }
+        var entries = loaded.entries
         let before = entries.count
         entries.removeAll { entry in
             entryKey(modelID: entry.modelID, quantLabel: entry.quantLabel) == modelKey
@@ -292,9 +393,10 @@ enum ModelSettingsStore {
     }
 
     static func clear() {
-        // Remove durable entries from Keychain and delete the local mirror.
-        _ = try? KeychainStore.delete(service: service, account: account)
-        if let url = mirrorURL() {
+        // Never query or mutate the legacy Keychain item here: even deleting that
+        // item can trigger the authorization prompt this file-backed store avoids.
+        setUnrecognizedRawEntries([])
+        for url in [storageURL(), legacyMirrorURL()].compactMap({ $0 }) {
             let fm = FileManager.default
             do {
                 if fm.fileExists(atPath: url.path) {

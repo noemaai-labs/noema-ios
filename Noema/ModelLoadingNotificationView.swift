@@ -1,5 +1,3 @@
-// ModelLoadingNotificationView.swift
-
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -134,8 +132,15 @@ struct ModelLoadingNotificationView<Manager: ModelLoadingManaging>: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 9) {
             Text(LocalizedStringKey("Loading"))
+#if os(macOS)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .textCase(.uppercase)
+                .tracking(0.3)
+                .foregroundStyle(.secondary)
+#else
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(primaryTextColor)
+#endif
                 .compactStatusText()
 
             NotificationProgressBar(value: loadingTracker.progress, height: 8)
@@ -144,10 +149,12 @@ struct ModelLoadingNotificationView<Manager: ModelLoadingManaging>: View {
         .padding(.vertical, 12)
         .frame(width: pillWidth)
         .glassPill(cornerRadius: 20)
+#if !os(macOS)
         .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.24), lineWidth: 0.8)
         )
+#endif
         .padding(.horizontal, horizontalPadding)
         .opacity(animateOut ? 0.0 : 1.0)
         .scaleEffect(animateOut ? 0.92 : (animateIn ? 1.0 : 0.96))

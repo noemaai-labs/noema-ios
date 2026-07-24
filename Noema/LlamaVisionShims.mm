@@ -1,4 +1,3 @@
-// LlamaVisionShims.mm
 #import "LlamaVisionShims.h"
 #import <dlfcn.h>
 #import "NoemaLlamaConfig.h"

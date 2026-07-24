@@ -15,12 +15,13 @@ Sources:
 | Case | Raw value | Display name | Default overrides |
 | --- | --- | --- | --- |
 | `.gguf` | `GGUF` | GGUF | `cpuThreads = ModelSettings.recommendedInferenceThreadCount` |
-| `.mlx` | `MLX` | MLX | `gpuLayers = 0`<br>`cpuThreads = ModelSettings.recommendedInferenceThreadCount` |
+| `.mlx` | `MLX` | MLX | `gpuLayers = 0`<br>`cpuThreads = ModelSettings.recommendedInferenceThreadCount`<br>`mlxPromptCacheEnabled = true` |
 | `.et` | `ET` | ET | `cpuThreads = ModelSettings.recommendedInferenceThreadCount`<br>`etBackend = .xnnpack` |
 | `.ane` | `ANE` | CML | `cpuThreads = ModelSettings.recommendedInferenceThreadCount`<br>`processingUnitConfiguration = .cpuAndNeuralEngine` |
 | `.afm` | `AFM` | AFM | `cpuThreads = ModelSettings.recommendedInferenceThreadCount`<br>`gpuLayers = 0` |
+| `.coreai` | `CoreAI` | CoreAI | `cpuThreads = ModelSettings.recommendedInferenceThreadCount`<br>`gpuLayers = 0` |
 
-Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `SLM` maps to `.et`, and `APPLE`/`CML` map to `.ane`.
+Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `APPLE` and `CML` map to `.ane`.
 
 ## Runtime Setting Enums
 
@@ -39,11 +40,15 @@ Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `SLM` map
 | `contextLength` | `Double` | `4096` |  |
 | `gpuLayers` | `Int` | `-1` | -1 means: auto/offload all available layers (default). 0+ means explicit override |
 | `cpuThreads` | `Int` | `0` |  |
+| `evaluationBatchSize` | `Int` | `ModelSettings.defaultEvaluationBatchSize` | Logical maximum number of prompt tokens submitted to llama.cpp per decode. |
+| `physicalBatchSize` | `Int` | `ModelSettings.defaultPhysicalBatchSize` | Physical micro-batch used by llama.cpp while processing a logical batch. |
+| `loadVisionProjector` | `Bool` | `true` | Whether llama.cpp should discover and load a companion vision projector. Defaults to true so settings saved by older app versions keep their behavior. |
 | `kvCacheOffload` | `Bool` | `true` |  |
+| `unifiedKVCache` | `Bool` | `true` | Share one llama.cpp KV allocation across server slots instead of statically partitioning the context between them. |
 | `keepInMemory` | `Bool` | `true` |  |
 | `useMmap` | `Bool` | `true` |  |
 | `disableWarmup` | `Bool` | `true` |  |
-| `flashAttention` | `Bool` | `false` |  |
+| `flashAttention` | `Bool` | `true` |  |
 | `seed` | `Int?` | `nil` |  |
 | `kCacheQuant` | `CacheQuant` | `.f16` |  |
 | `vCacheQuant` | `CacheQuant` | `.f16` |  |
@@ -64,13 +69,22 @@ Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `SLM` map
 | `promptCacheEnabled` | `Bool` | `false` |  |
 | `promptCachePath` | `String` | `""` |  |
 | `promptCacheAll` | `Bool` | `false` |  |
+| `mlxPromptCacheEnabled` | `Bool` | `true` | Reuse the in-memory MLX KV cache across turns with a shared prompt prefix. |
+| `mlxKVCacheQuantization` | `MLXKVCacheQuantization` | `.fullPrecision` | MLX KV-cache precision. Full precision matches the upstream default. |
+| `mlxKVCacheGroupSize` | `Int` | `64` | Quantization group size passed to mlx-swift-lm. |
+| `mlxKVCacheQuantizationStart` | `Int` | `0` | Number of cached tokens to keep full precision before MLX quantizes the cache. |
+| `mlxKVCacheLimit` | `Int` | `0` | Maximum rotating KV-cache length. Zero keeps the full cache. |
+| `mlxPrefillStepSize` | `Int` | `512` | Prompt prefill chunk size used by mlx-swift-lm. |
 | `tensorOverride` | `TensorOverridePreset` | `.none` |  |
+| `overfitMode` | `OverfitMode` | `.automatic` |  |
 | `moeActiveExperts` | `Int?` | `nil` | Optional override for the number of experts to use when running MoE models. |
 | `etBackend` | `ETBackend` | `.xnnpack` |  |
 | `processingUnitConfiguration` | `ProcessingUnitConfiguration?` | `nil` | Optional so older persisted settings decode cleanly; defaults to `.all` at use sites. |
-| `afmGuardrails` | `AFMGuardrailsMode` | `.default` |  |
+| `afmGuardrails` | `AFMGuardrailsMode` | `.permissiveContentTransformations` | Always pinned to the most permissive guardrails — see `AFMLLMClient.resolvedGuardrailsMode(from:)`, which ignores any stored value so new installs *and* anyone updating from a build that persisted `.default` run with the lax content-transformation guardrails. |
+| `pccReasoningLevel` | `PCCReasoningLevel` | `.moderate` | Extended reasoning used only by the explicit Apple Private Cloud Compute model. |
 | `systemPromptMode` | `SystemPromptMode` | `.inheritGlobal` |  |
 | `systemPromptOverride` | `String?` | `nil` |  |
+| `reasoningEnabled` | `Bool` | `true` | Whether the model is allowed to reason (emit a `<think>` block) before answering. Per-request via `LLMGenerationOptions.reasoningEnabled`; a no-op for models whose chat template doesn't honor it (see `ReasoningCapabilityDetector`). Default ON — reasoning-capable models think by default. |
 
 ## Runtime Presets
 
@@ -80,6 +94,7 @@ Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `SLM` map
 | `balanced` / Balanced | Everyday chat | `gauge.medium` | All formats |
 | `maxSpeed` / Max Speed | Fast first tokens | `bolt.fill` | All formats except CML |
 | `maxContext` / Max Context | Long documents | `rectangle.expand.vertical` | All formats except CML |
+| `maxContextAggressive` / Max Context (Aggressive) | Longest context | `flame.fill` | All formats except CML |
 | `visionHeavy` / Vision Heavy | Images and OCR | `photo.on.rectangle.angled` | Multimodal models or GGUF |
 | `toolHeavy` / Tool Heavy | Tools and RAG | `wrench.and.screwdriver` | All formats |
 
@@ -87,9 +102,10 @@ Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `SLM` map
 
 | Preset | Settings touched |
 | --- | --- |
-| `batterySaver` | `contextLength = Double(presetContext(upTo: 4096, preferSafe: true))`<br>`cpuThreads = max(1, ProcessInfo.processInfo.activeProcessorCount / 2)`<br>`keepInMemory = false`<br>`kvCacheOffload = DeviceGPUInfo.supportsGPUOffload`<br>`flashAttention = false`<br>`gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0`<br>`kCacheQuant = .q8_0`<br>`vCacheQuant = .q8_0` |
-| `balanced` | `contextLength = Double(presetContext(upTo: 8192, preferSafe: true))`<br>`cpuThreads = ModelSettings.maxInferenceThreadCount`<br>`keepInMemory = true`<br>`kvCacheOffload = DeviceGPUInfo.supportsGPUOffload`<br>`gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0`<br>`flashAttention = false`<br>`kCacheQuant = .f16`<br>`vCacheQuant = .f16` |
-| `maxSpeed` | `contextLength = Double(presetContext(upTo: 8192, preferSafe: true))`<br>`cpuThreads = ModelSettings.maxInferenceThreadCount`<br>`keepInMemory = true`<br>`disableWarmup = false`<br>`kvCacheOffload = DeviceGPUInfo.supportsGPUOffload`<br>`gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0`<br>`flashAttention = true`<br>`kCacheQuant = .f16`<br>`vCacheQuant = .f16` |
-| `maxContext` | `flashAttention = true`<br>`kCacheQuant = .q8_0`<br>`vCacheQuant = .q8_0`<br>`contextLength = Double(presetContext(upTo: supportedMaxContextLength ?? 65_536, preferSafe: true))`<br>`cpuThreads = ModelSettings.maxInferenceThreadCount`<br>`keepInMemory = true`<br>`kvCacheOffload = DeviceGPUInfo.supportsGPUOffload`<br>`gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0` |
-| `visionHeavy` | `contextLength = Double(presetContext(upTo: 12_288, preferSafe: true))`<br>`cpuThreads = ModelSettings.maxInferenceThreadCount`<br>`keepInMemory = true`<br>`kvCacheOffload = DeviceGPUInfo.supportsGPUOffload`<br>`gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0`<br>`flashAttention = true`<br>`kCacheQuant = .f16`<br>`vCacheQuant = .f16` |
-| `toolHeavy` | `contextLength = Double(presetContext(upTo: 16_384, preferSafe: true))`<br>`cpuThreads = ModelSettings.maxInferenceThreadCount`<br>`keepInMemory = true`<br>`kvCacheOffload = DeviceGPUInfo.supportsGPUOffload`<br>`gpuLayers = DeviceGPUInfo.supportsGPUOffload ? -1 : 0`<br>`flashAttention = true`<br>`kCacheQuant = .f16`<br>`vCacheQuant = .f16`<br>`promptCacheEnabled = true`<br>`promptCachePath = defaultPromptCachePath()`<br>`promptCacheAll = false` |
+| `batterySaver` | `mlxPromptCacheEnabled = false`<br>`mlxKVCacheQuantization = .fourBit`<br>`mlxPrefillStepSize = 256`<br>`contextLength = Double(presetContext(upTo: batterySaverContextTarget(), preferSafe: true))` |
+| `balanced` | `mlxPromptCacheEnabled = true`<br>`mlxKVCacheQuantization = .eightBit`<br>`mlxPrefillStepSize = 512`<br>`contextLength = Double(presetContext(upTo: 8192, preferSafe: true))` |
+| `maxSpeed` | `mlxPromptCacheEnabled = true`<br>`mlxKVCacheQuantization = .fullPrecision`<br>`mlxPrefillStepSize = 1024`<br>`mlxPrefillStepSize = 512`<br>`contextLength = Double(presetContext(upTo: 8192, preferSafe: true))` |
+| `maxContext` | `mlxPromptCacheEnabled = true`<br>`mlxKVCacheQuantization = .fourBit`<br>`mlxPrefillStepSize = 256`<br>`contextLength = Double(` |
+| `maxContextAggressive` | Base defaults |
+| `visionHeavy` | Base defaults |
+| `toolHeavy` | Base defaults |

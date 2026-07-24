@@ -96,6 +96,19 @@ final class MemoryToolTests: XCTestCase {
         XCTAssertFalse(memoryToolAvailableWhenRemote)
     }
 
+    func testMemoryToolUnavailableForLocalMLX() async {
+        defaults.set(true, forKey: "memoryEnabled")
+        defaults.set(true, forKey: "currentModelSupportsFunctionCalling")
+        defaults.set(ModelFormat.mlx.rawValue, forKey: "currentModelFormat")
+        defaults.set(false, forKey: "currentModelIsRemote")
+
+        let memoryToolAvailableForLocalMLX = await ToolManager.shared.isToolAvailable("noema.memory")
+
+        XCTAssertFalse(MemoryToolGate.isAvailable())
+        XCTAssertFalse(ToolAvailability.current(currentFormat: .mlx).memory)
+        XCTAssertFalse(memoryToolAvailableForLocalMLX)
+    }
+
     @MainActor
     func testMemoryStoreEnforcesMaximumEntryCount() throws {
         let url = FileManager.default.temporaryDirectory
@@ -233,7 +246,7 @@ final class MemoryToolTests: XCTestCase {
         XCTAssertTrue(prompt.hasPrefix(SystemPreset.defaultEditableIntro))
         XCTAssertTrue(prompt.contains("#### Math and notation"))
         XCTAssertTrue(prompt.contains("#### Style and safety"))
-        XCTAssertTrue(prompt.contains("Current date and time:"))
+        XCTAssertTrue(prompt.contains("Current date:"))
     }
 
     func testSystemPromptResolverUsesCustomEditableIntroWithoutRemovingLockedSections() {
@@ -281,7 +294,7 @@ final class MemoryToolTests: XCTestCase {
         XCTAssertFalse(prompt.contains("Global intro that should be excluded."))
         XCTAssertTrue(prompt.contains("#### Math and notation"))
         XCTAssertTrue(prompt.contains("#### Style and safety"))
-        XCTAssertTrue(prompt.contains("Current date and time:"))
+        XCTAssertTrue(prompt.contains("Current date:"))
     }
 
     func testSystemPromptResolverUsesExplicitEditableIntroOverride() {
@@ -419,7 +432,7 @@ final class MemoryToolTests: XCTestCase {
         XCTAssertFalse(systemMessage.text.contains(globalIntro))
         XCTAssertTrue(systemMessage.text.contains("#### Math and notation"))
         XCTAssertTrue(systemMessage.text.contains("#### Style and safety"))
-        XCTAssertTrue(systemMessage.text.contains("Current date and time:"))
+        XCTAssertTrue(systemMessage.text.contains("Current date:"))
     }
 
     @MainActor

@@ -1,4 +1,3 @@
-// LlamaEmbeddingBackend.swift
 import Foundation
 
 final class LlamaEmbeddingBackend: EmbeddingsBackend {
@@ -29,6 +28,7 @@ final class LlamaEmbeddingBackend: EmbeddingsBackend {
     private let record: EmbeddingModelRecord
     private var embedder: LlamaEmbedder?
     private var didPrimeFirstEmbeddingPass = false
+    private var flatOutputScratch: [Float] = []
     private(set) var dimension: Int = 0
     var isReady: Bool { (embedder?.isReady() ?? false) && dimension > 0 }
 
@@ -47,7 +47,11 @@ final class LlamaEmbeddingBackend: EmbeddingsBackend {
         // Reasonable defaults for iOS
         let pathMsg = "[Embed] load_model path=\(modelPath)"
         Task.detached(priority: .utility) { await logger.log(pathMsg) }
-        let threadCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        // Reserve cores for the main/render thread so embedding does not starve the UI.
+        // Mirrors the chat-generation policy (ModelSettings.recommendedInferenceThreadCount =
+        // activeProcessorCount - 2); previously this grabbed every core, which caused UI jank
+        // during dataset indexing / RAG embedding even though the work is off the main thread.
+        let threadCount = ModelSettings.recommendedInferenceThreadCount
         Task.detached(priority: .utility) { await logger.log("[Embed] Using \(threadCount) threads") }
 
         let desiredGpuLayers: Int32 = {
@@ -197,55 +201,65 @@ final class LlamaEmbeddingBackend: EmbeddingsBackend {
         case .generic: Task.detached(priority: .utility) { await logger.log("[Embed] task=generic pooling=\(pooling) normalize=\(normalize)") }
         }
         
+        let formatted = try payloads.enumerated().map { index, payload -> String in
+            let text = record.templates.format(payload.text, task: task, title: payload.title)
+            let maxCharacters = LlamaEmbeddingBackend.maxFormattedCharacters(for: record)
+            guard !text.isEmpty && text.count < maxCharacters else {
+                Task.detached(priority: .utility) {
+                    await logger.log("[Embed] ❌ Invalid text length at \(index): \(text.count)")
+                }
+                throw EmbeddingError.embedFailed
+            }
+            return text
+        }
+
         var results: [[Float]] = []
         results.reserveCapacity(payloads.count)
-        
-        for (index, payload) in payloads.enumerated() {
-            if Task.isCancelled { break }
-            do {
-                let s = record.templates.format(payload.text, task: task, title: payload.title)
+        let nativeBatchCapacity = 8
+        for groupStart in stride(from: 0, to: formatted.count, by: nativeBatchCapacity) {
+            try Task.checkCancellation()
+            let groupEnd = min(formatted.count, groupStart + nativeBatchCapacity)
+            let group = Array(formatted[groupStart..<groupEnd])
+            let requiredFloats = group.count * dim
+            if flatOutputScratch.count < requiredFloats {
+                flatOutputScratch = Array(repeating: 0, count: requiredFloats)
+            }
+            let heartbeat = makeHeartbeatTask(
+                current: groupStart + 1,
+                total: payloads.count,
+                onEvent: onEvent
+            )
+            let ok = flatOutputScratch.withUnsafeMutableBufferPointer { buffer -> Bool in
+                guard let base = buffer.baseAddress else { return false }
+                return embedder.embedTexts(group, intoBuffer: base, rowStride: Int32(dim))
+            }
+            heartbeat.cancel()
+            guard ok else {
+                Task.detached(priority: .utility) {
+                    await logger.log("[Embed] ❌ Native batch failed at item \(groupStart)")
+                }
+                throw EmbeddingError.embedFailed
+            }
 
-                // Validate input text. The cap is a safety rail against
-                // pathological inputs; actual tokenization clamps to the
-                // model context inside LlamaEmbedder. Character counts
-                // over-approximate tokens for multilingual (CJK/Thai/Arabic)
-                // text, so use a generous multiplier instead of 4× context.
-                let maxCharacters = LlamaEmbeddingBackend.maxFormattedCharacters(for: record)
-                guard !s.isEmpty && s.count < maxCharacters else {
-                    Task.detached(priority: .utility) { await logger.log("[Embed] ❌ Invalid text length: \(s.count)") }
-                    throw EmbeddingError.embedFailed
-                }
-                
-                var vec = Array(repeating: Float(0), count: Int(dim))
-                let current = index + 1
-                let total = payloads.count
-                let heartbeatTask = makeHeartbeatTask(current: current, total: total, onEvent: onEvent)
-                let ok = vec.withUnsafeMutableBufferPointer { buf -> Bool in
-                    guard let base = buf.baseAddress else { return false }
-                    // Return the model-configured pooled sequence embedding for this text.
-                    return embedder.embedText(s, intoBuffer: base, length: Int32(dim))
-                }
-                heartbeatTask.cancel()
-                if !ok {
-                    Task.detached(priority: .utility) { await logger.log("[Embed] ❌ Embedding failed for text \(index)") }
-                    throw EmbeddingError.embedFailed
-                }
-                
+            for row in 0..<group.count {
+                let start = row * dim
+                var vector = Array(flatOutputScratch[start..<(start + dim)])
                 if normalize {
-                    let n = sqrt(vec.reduce(0) { $0 + $1 * $1 })
-                    if n > 0 { for i in 0..<vec.count { vec[i] /= Float(n) } }
+                    let magnitude = sqrt(vector.reduce(0) { $0 + $1 * $1 })
+                    if magnitude > 0 {
+                        for index in vector.indices { vector[index] /= magnitude }
+                    }
                 }
-                results.append(vec)
-                
-                // Log progress for longer sequences
-                if payloads.count > 1 {
-                    Task.detached(priority: .utility) { await logger.log("[Embed] Progress: \(current)/\(total)") }
+                results.append(vector)
+                let completed = groupStart + row + 1
+                onEvent?(.itemCompleted(completed: completed, total: payloads.count))
+            }
+            if payloads.count > 1 {
+                let completed = groupEnd
+                let total = payloads.count
+                Task.detached(priority: .utility) {
+                    await logger.log("[Embed] Progress: \(completed)/\(total)")
                 }
-                onEvent?(.itemCompleted(completed: current, total: total))
-                
-            } catch {
-                Task.detached(priority: .utility) { await logger.log("[Embed] ❌ Exception during embedding text \(index): \(error.localizedDescription)") }
-                throw error
             }
         }
         
@@ -288,6 +302,7 @@ final class LlamaEmbeddingBackend: EmbeddingsBackend {
         embedder?.unload()
         embedder = nil
         didPrimeFirstEmbeddingPass = false
+        flatOutputScratch.removeAll(keepingCapacity: false)
         dimension = 0
         Task.detached(priority: .utility) { await logger.log("[Embed] Backend unloaded and freed from memory") }
     }
@@ -309,18 +324,34 @@ final class LlamaEmbeddingBackend: EmbeddingsBackend {
         let withEmpty = record.templates.format("", task: task, title: titleSeed)
         let templateOverhead = max(withSentinel.count - sentinel.count, withEmpty.count)
         let probeBudget = max(1, maxCharacters - templateOverhead - 1)
-        var repetitions = max(32, targetTokens)
-        var probe = String(repeating: seed, count: repetitions).trimmingCharacters(in: .whitespacesAndNewlines)
-        if probe.count > probeBudget {
-            probe = String(probe.prefix(probeBudget))
-        }
-        var formattedTokenCount = try countTokens(record.templates.format(probe, task: task, title: titleSeed))
-        while formattedTokenCount < targetTokens && probe.count < (probeBudget - seed.count) {
-            repetitions += max(16, targetTokens / 4)
-            let candidate = String(repeating: seed, count: repetitions).trimmingCharacters(in: .whitespacesAndNewlines)
-            if candidate.count > probeBudget { break }
-            probe = candidate
-            formattedTokenCount = try countTokens(record.templates.format(probe, task: task, title: titleSeed))
+        let source = String(
+            String(repeating: seed, count: max(32, targetTokens)).prefix(probeBudget)
+        )
+        var lowerBound = 1
+        var upperBound = source.count
+        var probe = "warmup"
+        var formattedTokenCount = try countTokens(
+            record.templates.format(probe, task: task, title: titleSeed)
+        )
+
+        // Token density varies substantially by tokenizer. Find the longest
+        // probe that stays within the requested token budget instead of using
+        // targetTokens as a repetition count (which produced 2,401 tokens for
+        // a 1,200-token Qwen3 warm-up and made every warm-up fail).
+        while lowerBound <= upperBound {
+            let candidateLength = lowerBound + (upperBound - lowerBound) / 2
+            let candidate = String(source.prefix(candidateLength))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidateTokenCount = try countTokens(
+                record.templates.format(candidate, task: task, title: titleSeed)
+            )
+            if candidateTokenCount <= targetTokens {
+                probe = candidate
+                formattedTokenCount = candidateTokenCount
+                lowerBound = candidateLength + 1
+            } else {
+                upperBound = candidateLength - 1
+            }
         }
         return (probe, formattedTokenCount)
     }

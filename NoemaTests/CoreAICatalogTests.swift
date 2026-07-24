@@ -268,23 +268,20 @@ final class CoreAICatalogTests: XCTestCase {
 
     // MARK: - PCC settings persistence
 
-    func testPrivateCloudComputeModePersistsThroughCodable() throws {
+    func testPrivateCloudReasoningLevelPersistsThroughCodable() throws {
         var settings = ModelSettings.default(for: .afm)
-        settings.afmPrivateCloudComputeMode = .always
+        settings.pccReasoningLevel = .deep
 
         let data = try JSONEncoder().encode(settings)
         let decoded = try JSONDecoder().decode(ModelSettings.self, from: data)
-        XCTAssertEqual(decoded.afmPrivateCloudComputeMode, .always)
+        XCTAssertEqual(decoded.pccReasoningLevel, .deep)
     }
 
-    func testLegacyPrivateCloudComputeBoolMigratesToMode() throws {
-        // Settings persisted before the enum migration only carried the boolean key.
-        let legacyJSON = "{\"afmUsePrivateCloudCompute\": true}"
+    func testLegacyHiddenPCCSettingsAreIgnored() throws {
+        let legacyJSON = """
+        {"afmUsePrivateCloudCompute":true,"afmPrivateCloudComputeMode":"always"}
+        """
         let decoded = try JSONDecoder().decode(ModelSettings.self, from: Data(legacyJSON.utf8))
-        XCTAssertEqual(decoded.afmPrivateCloudComputeMode, .always)
-
-        let legacyOffJSON = "{\"afmUsePrivateCloudCompute\": false}"
-        let decodedOff = try JSONDecoder().decode(ModelSettings.self, from: Data(legacyOffJSON.utf8))
-        XCTAssertEqual(decodedOff.afmPrivateCloudComputeMode, .smart)
+        XCTAssertEqual(decoded.pccReasoningLevel, .moderate)
     }
 }

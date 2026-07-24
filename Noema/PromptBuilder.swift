@@ -1,4 +1,3 @@
-// PromptBuilder.swift
 import Foundation
 import NoemaPackages
 
@@ -29,10 +28,11 @@ struct PromptBuilder {
         let user: String?
         let assistant: String?
     }
-    private static func loadDeepSeekMarkers() -> DSMarkers? {
-        // Use LLAMA_TOKENIZER_PATH if available
-        guard let c = getenv("LLAMA_TOKENIZER_PATH") else { return nil }
-        let tokPath = String(cString: c)
+    private static func loadDeepSeekMarkers(tokenizerPath: String? = nil) -> DSMarkers? {
+        // GGUF tokenizers are interpreted inside llama-server. This optional
+        // reader remains available only for a backend that explicitly supplies
+        // a supported tokenizer path; process-wide environment state is ignored.
+        guard let tokPath = tokenizerPath, !tokPath.isEmpty else { return nil }
 
         func readJSON(_ url: URL) -> Any? {
             guard let data = try? Data(contentsOf: url) else { return nil }

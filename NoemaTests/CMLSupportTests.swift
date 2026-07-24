@@ -2025,6 +2025,40 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
         XCTAssertEqual(json["min_p"] as? Double, 0.1)
         XCTAssertEqual(json["repetition_penalty"] as? Double, 1.1)
         XCTAssertEqual(json["stop"] as? [String], ["STOP"])
+
+        let structuredRequest = try await service.buildChatRequestForTesting(
+            input: LLMInput(.messages([
+                ChatMessage(role: "system", content: "System policy"),
+                ChatMessage(role: "user", content: "Find the training hardware"),
+                ChatMessage(
+                    role: "assistant",
+                    content: "",
+                    toolCalls: [
+                        ToolCall(
+                            id: "pdf-call-1",
+                            name: "noema.pdf.read",
+                            arguments: #"{"action":"grep","query":"hardware"}"#
+                        )
+                    ]
+                ),
+                ChatMessage(
+                    role: "tool",
+                    content: #"{"matches":[{"page":6}]}"#,
+                    toolCallId: "pdf-call-1"
+                )
+            ]))
+        )
+        let structuredBody = try XCTUnwrap(structuredRequest.httpBody)
+        let structuredJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: structuredBody) as? [String: Any]
+        )
+        let messages = try XCTUnwrap(structuredJSON["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.compactMap { $0["role"] as? String }, ["system", "user", "assistant", "tool"])
+        XCTAssertTrue(messages[2]["content"] is NSNull)
+        let toolCalls = try XCTUnwrap(messages[2]["tool_calls"] as? [[String: Any]])
+        XCTAssertEqual(toolCalls.first?["id"] as? String, "pdf-call-1")
+        XCTAssertEqual(messages[3]["tool_call_id"] as? String, "pdf-call-1")
+        XCTAssertFalse(messages.contains { ($0["content"] as? String)?.contains("User:") == true })
     }
 
     func testOpenRouterStreamingErrorDecodesToRemoteChatError() throws {
@@ -2186,12 +2220,20 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
         XCTAssertEqual(decoded.contextLength, 2048)
         XCTAssertEqual(decoded.gpuLayers, 8)
         XCTAssertEqual(decoded.cpuThreads, 4)
+        XCTAssertEqual(decoded.evaluationBatchSize, ModelSettings.defaultEvaluationBatchSize)
+        XCTAssertEqual(decoded.physicalBatchSize, ModelSettings.defaultPhysicalBatchSize)
         XCTAssertEqual(decoded.temperature, 0.55)
         XCTAssertEqual(decoded.topK, 51)
         XCTAssertEqual(decoded.topP, 0.91)
         XCTAssertTrue(decoded.disableWarmup)
         XCTAssertEqual(decoded.speculativeDecoding, .init())
-        XCTAssertFalse(decoded.promptCacheEnabled)
+        XCTAssertTrue(decoded.promptCacheEnabled)
+        XCTAssertTrue(decoded.mlxPromptCacheEnabled)
+        XCTAssertEqual(decoded.mlxKVCacheQuantization, .fullPrecision)
+        XCTAssertEqual(decoded.mlxKVCacheGroupSize, 64)
+        XCTAssertEqual(decoded.mlxKVCacheQuantizationStart, 0)
+        XCTAssertEqual(decoded.mlxKVCacheLimit, 0)
+        XCTAssertEqual(decoded.mlxPrefillStepSize, 512)
         XCTAssertEqual(decoded.tensorOverride, .none)
         XCTAssertEqual(decoded.etBackend, .xnnpack)
         XCTAssertEqual(decoded.afmGuardrails, .permissiveContentTransformations)
@@ -2206,6 +2248,105 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
 
         XCTAssertFalse(warmupEnabled.disableWarmup)
         XCTAssertTrue(warmupDisabled.disableWarmup)
+    }
+
+    func testModelSettingsClampPhysicalBatchToEvaluationBatch() {
+        var settings = ModelSettings()
+        settings.evaluationBatchSize = 512
+        settings.physicalBatchSize = 2048
+
+        XCTAssertEqual(settings.resolvedEvaluationBatchSize, 512)
+        XCTAssertEqual(settings.resolvedPhysicalBatchSize, 512)
+    }
+
+    func testModelSettingsUseConservativeGGUFBatchDefaults() {
+        let settings = ModelSettings.default(for: .gguf)
+
+        XCTAssertEqual(settings.resolvedEvaluationBatchSize, 512)
+        XCTAssertEqual(settings.resolvedPhysicalBatchSize, 256)
+        XCTAssertTrue(settings.promptCacheEnabled)
+    }
+
+    func testModelSettingsMigratesLegacyHighBatchDefaults() throws {
+        let legacyData = try JSONSerialization.data(withJSONObject: [
+            "evaluationBatchSize": 2048,
+            "physicalBatchSize": 1024
+        ])
+
+        let settings = try JSONDecoder().decode(ModelSettings.self, from: legacyData)
+
+        XCTAssertEqual(settings.resolvedEvaluationBatchSize, 512)
+        XCTAssertEqual(settings.resolvedPhysicalBatchSize, 256)
+    }
+
+    func testModelSettingsPreservesExplicitHighBatchSizesAfterMigration() throws {
+        let currentData = try JSONSerialization.data(withJSONObject: [
+            "evaluationBatchSize": 2048,
+            "physicalBatchSize": 1024,
+            "batchSizingDefaultsVersion": ModelSettings.batchSizingDefaultsVersion
+        ])
+
+        let settings = try JSONDecoder().decode(ModelSettings.self, from: currentData)
+
+        XCTAssertEqual(settings.resolvedEvaluationBatchSize, 2048)
+        XCTAssertEqual(settings.resolvedPhysicalBatchSize, 1024)
+    }
+
+    func testModelSettingsMigratesLegacyPromptCacheDefaultToEnabled() throws {
+        let legacyData = try JSONSerialization.data(withJSONObject: [
+            "promptCacheEnabled": false
+        ])
+
+        let settings = try JSONDecoder().decode(ModelSettings.self, from: legacyData)
+
+        XCTAssertTrue(settings.promptCacheEnabled)
+    }
+
+    func testModelSettingsPreservesPromptCacheOptOutAfterMigration() throws {
+        let currentData = try JSONSerialization.data(withJSONObject: [
+            "promptCacheEnabled": false,
+            "promptCacheDefaultsVersion": ModelSettings.promptCacheDefaultsVersion
+        ])
+
+        let settings = try JSONDecoder().decode(ModelSettings.self, from: currentData)
+
+        XCTAssertFalse(settings.promptCacheEnabled)
+    }
+
+    func testCustomRuntimePresetMigratesLegacyPromptCacheDefaultToEnabled() throws {
+        let legacyData = try JSONSerialization.data(withJSONObject: [
+            "name": "Legacy Custom",
+            "promptCacheEnabled": false
+        ])
+
+        let preset = try JSONDecoder().decode(CustomRuntimePreset.self, from: legacyData)
+
+        XCTAssertTrue(preset.promptCacheEnabled)
+    }
+
+    func testCustomRuntimePresetPreservesPromptCacheOptOutAfterMigration() throws {
+        var settings = ModelSettings.default(for: .gguf)
+        settings.promptCacheEnabled = false
+        let preset = CustomRuntimePreset(name: "Current Custom", settings: settings)
+
+        let data = try JSONEncoder().encode(preset)
+        let decoded = try JSONDecoder().decode(CustomRuntimePreset.self, from: data)
+
+        XCTAssertFalse(decoded.promptCacheEnabled)
+    }
+
+    func testModelSettingsResolveMLXRuntimeBounds() {
+        var settings = ModelSettings.default(for: .mlx)
+        settings.contextLength = 2048
+        settings.mlxKVCacheGroupSize = 90
+        settings.mlxKVCacheQuantizationStart = 4096
+        settings.mlxKVCacheLimit = -1
+        settings.mlxPrefillStepSize = 1500
+
+        XCTAssertEqual(settings.resolvedMLXKVCacheGroupSize, 64)
+        XCTAssertEqual(settings.resolvedMLXKVCacheQuantizationStart, 2048)
+        XCTAssertNil(settings.resolvedMLXKVCacheLimit)
+        XCTAssertEqual(settings.resolvedMLXPrefillStepSize, 1024)
     }
 
     func testLossyLocalModelSettingsPayloadRecoveryKeepsValidEntries() throws {
@@ -2266,11 +2407,44 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
         XCTAssertTrue(ModelSettings.default(for: .afm).disableWarmup)
     }
 
+    func testModelSettingsDefaultToNeutralRepetitionPenaltyForAllFormats() {
+        for format in ModelFormat.allCases {
+            XCTAssertEqual(
+                ModelSettings.default(for: format).repetitionPenalty,
+                1.0,
+                "\(format.rawValue) should not penalize repeated tokens by default"
+            )
+        }
+    }
+
+    func testModelSettingsMigratesLegacyRepetitionPenaltyDefaultToNeutral() throws {
+        let legacyData = try JSONSerialization.data(withJSONObject: [
+            "repetitionPenalty": 1.1
+        ])
+
+        let settings = try JSONDecoder().decode(ModelSettings.self, from: legacyData)
+
+        XCTAssertEqual(settings.repetitionPenalty, 1.0)
+    }
+
+    func testModelSettingsPreservesExplicitRepetitionPenaltyAfterMigration() throws {
+        let currentData = try JSONSerialization.data(withJSONObject: [
+            "repetitionPenalty": 1.1,
+            "repetitionPenaltyDefaultsVersion": ModelSettings.repetitionPenaltyDefaultsVersion
+        ])
+
+        let settings = try JSONDecoder().decode(ModelSettings.self, from: currentData)
+
+        XCTAssertEqual(settings.repetitionPenalty, 1.1)
+    }
+
     private func fullyPopulatedModelSettings() -> ModelSettings {
         var settings = ModelSettings()
         settings.contextLength = 8192
         settings.gpuLayers = 24
         settings.cpuThreads = 6
+        settings.evaluationBatchSize = 4096
+        settings.physicalBatchSize = 1024
         settings.kvCacheOffload = false
         settings.keepInMemory = false
         settings.useMmap = false
@@ -2296,7 +2470,14 @@ final class RemoteBackendOpenRouterTests: XCTestCase {
         settings.promptCacheEnabled = true
         settings.promptCachePath = "/tmp/prompt-cache.bin"
         settings.promptCacheAll = true
+        settings.mlxPromptCacheEnabled = false
+        settings.mlxKVCacheQuantization = .fiveBit
+        settings.mlxKVCacheGroupSize = 32
+        settings.mlxKVCacheQuantizationStart = 512
+        settings.mlxKVCacheLimit = 4096
+        settings.mlxPrefillStepSize = 1024
         settings.tensorOverride = .expertsCPU
+        settings.overfitMode = .forceExperimental
         settings.moeActiveExperts = 7
         settings.etBackend = .mps
         settings.processingUnitConfiguration = .cpuAndGPU

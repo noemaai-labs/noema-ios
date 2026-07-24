@@ -751,6 +751,11 @@ struct RemoteModel: Identifiable, Codable, Equatable {
     var isModerated: Bool?
     var expirationDateRaw: String?
     var descriptionText: String?
+    /// Structured input modalities from the provider catalog (OpenRouter
+    /// `architecture.input_modalities`, e.g. ["text","image"]); nil for
+    /// backends without capability metadata. Optional so persisted
+    /// `cachedModels` from older installs keep decoding.
+    var inputModalities: [String]?
 
     init(id: String,
          name: String,
@@ -785,7 +790,8 @@ struct RemoteModel: Identifiable, Codable, Equatable {
          maxCompletionTokens: Int? = nil,
          isModerated: Bool? = nil,
          expirationDateRaw: String? = nil,
-         descriptionText: String? = nil) {
+         descriptionText: String? = nil,
+         inputModalities: [String]? = nil) {
         self.id = id
         self.name = name
         self.author = author
@@ -820,6 +826,7 @@ struct RemoteModel: Identifiable, Codable, Equatable {
         self.isModerated = isModerated
         self.expirationDateRaw = expirationDateRaw
         self.descriptionText = descriptionText
+        self.inputModalities = inputModalities
     }
 
     static func make(from openAIModel: OpenAIModel) -> RemoteModel {
@@ -877,7 +884,8 @@ struct RemoteModel: Identifiable, Codable, Equatable {
             maxCompletionTokens: openRouterModel.topProvider?.maxCompletionTokens.flatMap { Int($0) },
             isModerated: openRouterModel.topProvider?.isModerated,
             expirationDateRaw: openRouterModel.expirationDate,
-            descriptionText: openRouterModel.description
+            descriptionText: openRouterModel.description,
+            inputModalities: openRouterModel.architecture?.inputModalities
         )
     }
 
@@ -965,6 +973,8 @@ struct RemoteModel: Identifiable, Codable, Equatable {
 extension RemoteModel {
     enum OpenRouterBrowserFilter: String, CaseIterable, Codable, Identifiable {
         case all
+        case free
+        case paid
         case tools
         case structuredOutputs
         case reasoning
@@ -977,6 +987,8 @@ extension RemoteModel {
         var title: String {
             switch self {
             case .all: return "All"
+            case .free: return "Free"
+            case .paid: return "Paid"
             case .tools: return "Tools"
             case .structuredOutputs: return "Structured Outputs"
             case .reasoning: return "Reasoning"
@@ -1127,6 +1139,11 @@ extension RemoteModel {
     }
 
     var isVisionModel: Bool {
+        // The structured catalog signal is authoritative when present; the
+        // string heuristic only decides for backends without metadata.
+        if let modalities = inputModalities {
+            return modalities.contains { $0.lowercased() == "image" }
+        }
         let haystack = [architecture, descriptionText, id, name]
             .compactMap { $0 }
             .joined(separator: " ")
@@ -1176,10 +1193,24 @@ extension RemoteModel {
         return tokens.allSatisfy { haystack.contains($0) }
     }
 
+    /// OpenRouter free variants carry a ":free" id suffix; zero pricing on both
+    /// sides is the fallback signal for models the catalog reports as free.
+    var isOpenRouterFreeModel: Bool {
+        if id.lowercased().hasSuffix(":free") { return true }
+        if let prompt = promptPricePerMillion, let completion = completionPricePerMillion {
+            return prompt == 0 && completion == 0
+        }
+        return false
+    }
+
     func matchesOpenRouterFilter(_ filter: OpenRouterBrowserFilter) -> Bool {
         switch filter {
         case .all:
             return true
+        case .free:
+            return isOpenRouterFreeModel
+        case .paid:
+            return hasOpenRouterPricing && !isOpenRouterFreeModel
         case .tools:
             return supportsTools
         case .structuredOutputs:
@@ -1800,6 +1831,9 @@ enum RemoteBackendAPI {
             request.setValue(value, forHTTPHeaderField: key)
         }
         await logger.log("[RemoteBackendAPI] ⇢ Fetch models request for backend=\(backend.name) type=\(backend.endpointType.rawValue) localEndpoint=\(localEndpoint)\n\(describe(request: request))")
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
         let (data, response): (Data, URLResponse)
         do {
             if localEndpoint {
@@ -1988,6 +2022,10 @@ enum RemoteBackendAPI {
         request.setValue(RemoteBackend.openRouterTitle, forHTTPHeaderField: "X-OpenRouter-Title")
 
         await logger.log("[RemoteBackendAPI] ⇢ Verifying OpenRouter API key backendID=\(backendID?.uuidString ?? "new")\n\(describe(request: request))")
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RemoteBackendError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {
@@ -2391,6 +2429,10 @@ enum RemoteBackendAPI {
             request.httpBody = try? JSONSerialization.data(withJSONObject: payload, options: [])
             await logger.log("[RemoteBackendAPI] ⇢ Requesting load for model=\(modelID) backend=\(backend.name) path=\(path)\n\(describe(request: request))")
             do {
+                guard !NetworkKillSwitch.shouldBlock(request: request) else {
+                    throw URLError(.notConnectedToInternet)
+                }
+                NetworkKillSwitch.track(session: URLSession.shared)
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse else { throw RemoteBackendError.invalidResponse }
                 guard (200...299).contains(http.statusCode) else {
@@ -2441,6 +2483,10 @@ enum RemoteBackendAPI {
         }
 
         await logger.log("[RemoteBackendAPI] ⇢ Requesting LM Studio download backend=\(backend.name)\n\(describe(request: request))")
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RemoteBackendError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {
@@ -2480,6 +2526,10 @@ enum RemoteBackendAPI {
         }
 
         await logger.log("[RemoteBackendAPI] ⇢ Requesting LM Studio download status backend=\(backend.name) job=\(jobID)\n\(describe(request: request))")
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RemoteBackendError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {
@@ -2520,6 +2570,10 @@ enum RemoteBackendAPI {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
         await logger.log("[RemoteBackendAPI] ⇢ Requesting Ollama load for model=\(modelID) backend=\(backend.name)\n\(describe(request: request))")
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RemoteBackendError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {

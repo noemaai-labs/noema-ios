@@ -1,4 +1,3 @@
-// KeyboardDismiss.swift
 import SwiftUI
 #if canImport(UIKit)
 extension View {

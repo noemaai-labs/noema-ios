@@ -1,6 +1,3 @@
-// EnterpriseModels.swift
-// Noema Teams: policy snapshot, dataset manifest, and connection-state models.
-// The JSON shapes are a contract with server/teams-api (fixtures/policy.json).
 import Foundation
 
 struct EnterpriseSignatureMetadata: Codable, Equatable, Hashable, Sendable {
@@ -27,6 +24,14 @@ struct EnterprisePolicy: Codable, Equatable, Sendable {
     var allowedRemoteBackendIDs: [String]?
     var allowedRemoteEndpointTypes: [String]?
     var allowedToolNames: [String]?
+    /// Optional MCP governance. Missing fields preserve consumer defaults.
+    var mcpEnabled: Bool? = nil
+    var allowedMCPTransports: [String]? = nil
+    var allowedMCPServerIDs: [String]? = nil
+    var allowedMCPToolAliases: [String]? = nil
+    var mcpLocalProcessesAllowed: Bool? = nil
+    var mcpSamplingAllowed: Bool? = nil
+    var mcpElicitationAllowed: Bool? = nil
     var allowedDatasetIDs: [String]
     var requiresOffGrid: Bool
     var remoteInferenceAllowed: Bool

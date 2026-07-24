@@ -1,4 +1,3 @@
-// HuggingFaceDatasetRegistry.swift
 import Foundation
 
 /// Registry for searching datasets on Hugging Face Hub.

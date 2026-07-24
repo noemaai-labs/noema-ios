@@ -33,19 +33,25 @@ enum LocalRemoteRoutingAdvisor {
         var remoteSelectionCount: Int
         var offGrid: Bool
         var lowPowerMode: Bool
+        /// Measured Overfit verdict for the selected local model when it is a
+        /// paged install with a valid canary record. nil (the default) leaves
+        /// every pre-existing decision path untouched.
+        var overfitClassification: OverfitFitClassification?
 
         init(
             preferences: StartupPreferences,
             selectedLocalModel: LocalModelSummary?,
             remoteSelectionCount: Int,
             offGrid: Bool,
-            lowPowerMode: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
+            lowPowerMode: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled,
+            overfitClassification: OverfitFitClassification? = nil
         ) {
             self.preferences = preferences
             self.selectedLocalModel = selectedLocalModel
             self.remoteSelectionCount = remoteSelectionCount
             self.offGrid = offGrid
             self.lowPowerMode = lowPowerMode
+            self.overfitClassification = overfitClassification
         }
     }
 
@@ -80,6 +86,21 @@ enum LocalRemoteRoutingAdvisor {
 
         if !hasLocal, hasRemote {
             return LocalRemoteRoutingAdvice(route: .remoteOnly, detail: .remoteOnly)
+        }
+
+        // Both routes are configured and we are on-grid. A measured Overfit
+        // verdict outranks the heuristics below: it reflects how the paged
+        // model actually ran on this device. Details reuse existing cases
+        // because SettingsView switches over Detail exhaustively.
+        if let classification = context.overfitClassification {
+            switch classification {
+            case .relayRecommended, .offlineOnly:
+                return LocalRemoteRoutingAdvice(route: .remoteThenLocal, detail: .remotePriority)
+            case .pagedSlow:
+                return LocalRemoteRoutingAdvice(route: .localThenRemote, detail: .largeLocalRemoteFallback)
+            case .residentInteractive, .pagedInteractive, .unsupported:
+                break
+            }
         }
 
         if context.lowPowerMode, let model = context.selectedLocalModel, model.isBatteryEfficient {

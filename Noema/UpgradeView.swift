@@ -1,6 +1,3 @@
-// UpgradeView.swift
-// Web search is now free and unlimited, so this view simply informs the user.
-
 import SwiftUI
 
 struct UpgradeView: View {

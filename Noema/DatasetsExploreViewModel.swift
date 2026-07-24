@@ -1,4 +1,3 @@
-// DatasetsExploreViewModel.swift
 import Foundation
 import Combine
 
@@ -9,6 +8,10 @@ enum DatasetSource {
 @MainActor
 final class DatasetsExploreViewModel: ObservableObject {
     @Published private(set) var recommended: [DatasetRecord] = []
+    /// Curated Knowledge Packs, loaded independently of `recommended` so they
+    /// render in their own "Knowledge Packs" lane (each card carries a category
+    /// chip) rather than colliding with the OTL recommended set.
+    @Published private(set) var knowledgePacks: [DatasetRecord] = []
     @Published private(set) var searchResults: [DatasetRecord] = []
     @Published var searchText: String = ""
     @Published private(set) var isSearching = false
@@ -21,6 +24,7 @@ final class DatasetsExploreViewModel: ObservableObject {
     private var registry: any DatasetRegistry
     private var hfRegistry: any DatasetRegistry
     private var otlRegistry: any DatasetRegistry
+    private let packRegistry: any DatasetRegistry = ManualDatasetRegistry(entries: CuratedDatasets.knowledgePacks)
     private var searchTask: Task<Void, Never>?
     private var page = 0
     private var cancellables: Set<AnyCancellable> = []
@@ -54,7 +58,27 @@ final class DatasetsExploreViewModel: ObservableObject {
         }
     }
 
+    /// Loads the curated Knowledge Packs into their own lane (independent of the
+    /// OTL-backed `recommended` set). Re-runs cheaply to refresh `installed`.
+    func loadKnowledgePacks() async {
+        guard let list = try? await packRegistry.curated() else { return }
+        knowledgePacks = list.map { rec in
+            DatasetRecord(id: rec.id,
+                          displayName: rec.displayName,
+                          publisher: rec.publisher,
+                          summary: rec.summary,
+                          installed: Self.isInstalled(rec.id),
+                          category: rec.category,
+                          license: rec.license,
+                          chunkCount: rec.chunkCount)
+        }
+    }
+
     func details(for id: String) async -> DatasetDetails? {
+        // Knowledge Packs are served from their own registry.
+        if id.hasPrefix(KnowledgePackCatalog.idPrefix) {
+            return try? await packRegistry.details(for: id)
+        }
         let reg = registry
         return try? await reg.details(for: id)
     }
@@ -140,16 +164,6 @@ final class DatasetsExploreViewModel: ObservableObject {
             recommended.removeAll()
             searchResults.removeAll()
         }
-    }
-
-    func toggleSource() {
-        // Temporarily disabled: only OTL supported
-        // source = source == .huggingFace ? .openTextbooks : .huggingFace
-        // registry = source == .huggingFace ? hfRegistry : otlRegistry
-        // recommended.removeAll()
-        // searchResults.removeAll()
-        // searchText = ""
-        // Task { await loadCurated() }
     }
 
     private static func isInstalled(_ id: String) -> Bool {

@@ -1,4 +1,3 @@
-// GuidedWalkthroughManager.swift
 import SwiftUI
 import Combine
 
@@ -24,7 +23,7 @@ final class GuidedWalkthroughManager: ObservableObject {
         case exploreSwitchToModels
         case exploreModelTypes
         case exploreMLX
-        case exploreSLM
+        case exploreET
         case settingsIntro
         case settingsHighlights
         case completed
@@ -55,7 +54,6 @@ final class GuidedWalkthroughManager: ObservableObject {
     @Published var pendingModelSettingsID: String?
     @Published var shouldDismissModelSettings = false
 
-    // Recommended starter model state
     @Published var recommendedDetail: ModelDetails?
     @Published var recommendedQuant: QuantInfo?
     @Published var recommendedLoading = false
@@ -66,7 +64,6 @@ final class GuidedWalkthroughManager: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
 
-    // Dependencies
     private weak var tabRouter: TabRouter?
     private weak var chatVM: ChatVM?
     private weak var modelManager: AppModelManager?
@@ -77,6 +74,10 @@ final class GuidedWalkthroughManager: ObservableObject {
     private var skippedRecommendedDownload = false
     private var shouldShowModelSettings = false
     private var recommendedAnchorsLoaded = false
+    // Keep the latest download snapshot without publishing it. This lets an
+    // inactive walkthrough avoid app-wide invalidations while still resyncing
+    // correctly if it is opened again after a download finished or was cancelled.
+    private var latestDownloadItems: [DownloadController.Item] = []
 
     func configure(tabRouter: TabRouter,
                    chatVM: ChatVM,
@@ -110,6 +111,7 @@ final class GuidedWalkthroughManager: ObservableObject {
         shouldShowModelSettings = recommendedModelInstalled
         pendingModelSettingsID = nil
         shouldDismissModelSettings = false
+        updateRecommendedDownloadProgress(with: latestDownloadItems)
         advance(to: .chatIntro)
     }
 
@@ -163,11 +165,11 @@ final class GuidedWalkthroughManager: ObservableObject {
             if DeviceGPUInfo.supportsGPUOffload {
                 advance(to: .exploreMLX)
             } else {
-                advance(to: .exploreSLM)
+                advance(to: .exploreET)
             }
         case .exploreMLX:
-            advance(to: .exploreSLM)
-        case .exploreSLM:
+            advance(to: .exploreET)
+        case .exploreET:
             tabRouter?.selection = .settings
             advance(to: .settingsIntro)
         case .settingsIntro:
@@ -192,6 +194,9 @@ final class GuidedWalkthroughManager: ObservableObject {
     }
 
     func updateAnchors(_ newAnchors: [HighlightID: Anchor<CGRect>]) {
+        // Nothing consumes `anchors` unless the overlay is up. Skipping the write while inactive
+        // keeps this @Published (observed app-wide) from churning on every scroll frame.
+        guard isActive else { return }
         anchors = newAnchors
     }
 
@@ -214,7 +219,7 @@ final class GuidedWalkthroughManager: ObservableObject {
         case .exploreSwitchToModels: return .exploreSwitchBar
         case .exploreModelTypes: return .exploreModelToggle
         case .exploreMLX: return .exploreModelToggle
-        case .exploreSLM: return .exploreModelToggle
+        case .exploreET: return .exploreModelToggle
         case .settingsIntro: return .settingsForm
         case .settingsHighlights: return .settingsOffGrid
         default: return nil
@@ -263,7 +268,7 @@ final class GuidedWalkthroughManager: ObservableObject {
             return ("GGUF Format", "This switch cycles through GGUF, MLX, and ET builds. Start with GGUF for the widest compatibility.", "Next", nil)
         case .exploreMLX:
             return ("MLX Format", "Flip the control to MLX when you want Apple Silicon-optimized builds with excellent speed.", "Next", nil)
-        case .exploreSLM:
+        case .exploreET:
             return ("ET Format", "Choose ET for lightweight models that run quickly and stay efficient on any device.", "Next", nil)
         case .settingsIntro:
             return ("Settings", "Tune Noema to your needs from here—appearance, network modes, and more.", "Next", nil)
@@ -296,6 +301,7 @@ final class GuidedWalkthroughManager: ObservableObject {
             tabRouter?.selection = .chat
         case .storedRecommend:
             ensureRecommendedDetailLoaded()
+            updateRecommendedDownloadProgress(with: latestDownloadItems)
         case .modelSettingsIntro:
             if shouldShowModelSettings {
                 pendingModelSettingsID = recommendedModelID
@@ -353,7 +359,7 @@ final class GuidedWalkthroughManager: ObservableObject {
                 isVision = MLXBridge.isVLMModel(at: url)
             case .et:
                 let slug = detail.id.isEmpty ? url.deletingPathExtension().lastPathComponent : detail.id
-                isVision = LeapCatalogService.isVisionQuantizationSlug(slug)
+                isVision = ETModelResolver.isVisionIdentifier(slug)
             case .ane:
                 isVision = false
             case .afm:
@@ -395,8 +401,13 @@ final class GuidedWalkthroughManager: ObservableObject {
             moeInfo: moeInfo
         )
 
+        let hasSavedSettings = modelManager.hasUserSavedSettings(for: local)
         var settings = modelManager.settings(for: local)
-        settings = tunedSettingsForRecommendedModel(settings, local: local, quant: quant, sizeBytes: effectiveSize)
+        // Tuned walkthrough defaults are for a fresh install only — re-running the
+        // walkthrough must not overwrite settings the user already saved.
+        if !hasSavedSettings {
+            settings = tunedSettingsForRecommendedModel(settings, local: local, quant: quant, sizeBytes: effectiveSize)
+        }
         settings = modelManager.normalizeLocalSettings(settings, for: local)
         await chatVM.unload()
         if await chatVM.load(url: url, settings: settings, format: quant.format) {
@@ -434,6 +445,7 @@ final class GuidedWalkthroughManager: ObservableObject {
                 recommendedLoadFailed = true
             }
             recommendedLoading = false
+            updateRecommendedDownloadProgress(with: latestDownloadItems)
         }
     }
 
@@ -453,15 +465,20 @@ final class GuidedWalkthroughManager: ObservableObject {
     }
 
     private func updateRecommendedDownloadProgress(with items: [DownloadController.Item]) {
+        // The manager is injected above the whole tab tree. Ignore the high-frequency
+        // published writes unless the walkthrough is actually presenting this progress,
+        // but retain the latest value so a later begin can reconcile stale state.
+        latestDownloadItems = items
+        guard isActive else { return }
         guard let detail = recommendedDetail, let quant = recommendedQuant else { return }
         if let item = items.first(where: { $0.detail.id == detail.id && $0.quant.label == quant.label }) {
-            recommendedDownloading = true
-            recommendedProgress = item.progress
-            recommendedSpeed = item.speed
+            if !recommendedDownloading { recommendedDownloading = true }
+            if recommendedProgress != item.progress { recommendedProgress = item.progress }
+            if recommendedSpeed != item.speed { recommendedSpeed = item.speed }
         } else if recommendedDownloading {
             recommendedDownloading = false
-            recommendedProgress = 0
-            recommendedSpeed = 0
+            if recommendedProgress != 0 { recommendedProgress = 0 }
+            if recommendedSpeed != 0 { recommendedSpeed = 0 }
         }
     }
 
@@ -473,7 +490,9 @@ final class GuidedWalkthroughManager: ObservableObject {
                 // Auto-advance after a short delay so the user sees completion
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 600_000_000)
-                    if self.step == .storedRecommend {
+                    // Re-check BOTH conditions: the user may have tapped Skip during the
+                    // delay, which leaves the step on .storedRecommend but sets the flag.
+                    if self.step == .storedRecommend && !self.skippedRecommendedDownload {
                         self.advanceFromOverlay()
                     }
                 }
@@ -499,7 +518,8 @@ final class GuidedWalkthroughManager: ObservableObject {
                 contextLength: requestedContext,
                 layerCount: layerCount,
                 moeInfo: local.moeInfo,
-                kvCacheEstimate: kvCacheEstimate
+                kvCacheEstimate: kvCacheEstimate,
+                runtimeConfiguration: .resolved(from: updated, modelURL: local.url)
             )
             if !fits {
                 if let maxContext = ModelRAMAdvisor.maxContextUnderBudget(
@@ -508,7 +528,8 @@ final class GuidedWalkthroughManager: ObservableObject {
                     layerCount: layerCount,
                     moeInfo: local.moeInfo,
                     upperBound: modelMaxContext,
-                    kvCacheEstimate: kvCacheEstimate
+                    kvCacheEstimate: kvCacheEstimate,
+                    runtimeConfiguration: .resolved(from: updated, modelURL: local.url)
                 ) {
                     let safeContext = max(512, min(requestedContext, maxContext))
                     if Double(safeContext) < updated.contextLength {
@@ -550,9 +571,22 @@ struct GuidedHighlightPreferenceKey: PreferenceKey {
 
 struct GuidedHighlightModifier: ViewModifier {
     let id: GuidedWalkthroughManager.HighlightID
+    @EnvironmentObject private var manager: GuidedWalkthroughManager
 
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content.anchorPreference(key: GuidedHighlightPreferenceKey.self, value: .bounds) { [id: $0] }
+        // Only attach the `.bounds` anchor preference while a walkthrough is actually running.
+        // The anchorPreference machinery re-propagates on EVERY geometry change, and the
+        // resulting `updateAnchors` mutates a `@Published` observed app-wide — so leaving it
+        // attached makes scrolling / large-title collapse janky on every screen that carries a
+        // highlight (Stored, Explore Datasets, Settings, …) even when no walkthrough is up.
+        // Because this modifier now observes `manager`, it re-attaches the anchor the moment the
+        // walkthrough begins, so highlight positioning still works.
+        if manager.isActive {
+            content.anchorPreference(key: GuidedHighlightPreferenceKey.self, value: .bounds) { [id: $0] }
+        } else {
+            content
+        }
     }
 }
 

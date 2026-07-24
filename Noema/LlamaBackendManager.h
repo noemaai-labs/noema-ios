@@ -1,4 +1,3 @@
-// LlamaBackendManager.h
 #import <Foundation/Foundation.h>
 
 #ifdef __cplusplus

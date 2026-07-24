@@ -1,19 +1,7 @@
-// MacSelectableMathText.swift
-//  MacSelectableMathText.swift
-//  Noema
-//
-//  macOS-only. Renders one MathRichText block as a single, continuously
-//  selectable NSTextView (TextKit 1). Text is one NSAttributedString;
-//  inline/block LaTeX become NSTextAttachment images, and the original LaTeX
-//  source is stored on each attachment so copying a selection yields the real
-//  LaTeX instead of the object-replacement character.
-//
-//  This replaces the per-word fragmented SwiftUI renderer on macOS, which
-//  stopped drag-selection at every word boundary.
-
 #if os(macOS)
 import SwiftUI
 import AppKit
+import QuartzCore
 
 // MARK: - Font weight bridge
 
@@ -250,23 +238,51 @@ enum MacMathAttributedStringBuilder {
 
     // MARK: Inline math
 
+    /// Composites the `\boxed{...}` border around a rendered math image; the
+    /// box is drawn host-side because SwiftMath cannot typeset it.
+    private static func boxedMathImage(_ img: NSImage, fontSize: CGFloat, style: Style) -> NSImage {
+        let pad = MathBoxStyle.padding(for: fontSize)
+        let inner = img.size
+        let size = CGSize(width: inner.width + pad.h * 2, height: inner.height + pad.v * 2)
+        let stroke = style.mathColor.withAlphaComponent(MathBoxStyle.strokeOpacity)
+        return NSImage(size: size, flipped: false) { _ in
+            let rect = CGRect(origin: .zero, size: size)
+                .insetBy(dx: MathBoxStyle.lineWidth / 2, dy: MathBoxStyle.lineWidth / 2)
+            let path = NSBezierPath(roundedRect: rect,
+                                    xRadius: MathBoxStyle.cornerRadius,
+                                    yRadius: MathBoxStyle.cornerRadius)
+            stroke.setStroke()
+            path.lineWidth = MathBoxStyle.lineWidth
+            path.stroke()
+            img.draw(in: CGRect(x: pad.h, y: pad.v, width: inner.width, height: inner.height))
+            return true
+        }
+    }
+
     private static func appendInlineMath(latex: String, hadDelimiters: Bool,
                                          style: Style, into result: NSMutableAttributedString) {
         let fontSize = style.inlineMathFontSize
         let insets = MathRenderTuning.inlineInsets(for: fontSize)
-        guard let img = renderMathImage(latex: latex, fontSize: fontSize,
-                                        isDisplayMode: false, color: style.mathColor,
-                                        insets: insets) else {
+        let (inner, boxed) = MathTokenizer.unwrapBoxed(latex)
+        guard let rendered = renderMathImage(latex: inner, fontSize: fontSize,
+                                             isDisplayMode: false, color: style.mathColor,
+                                             insets: insets) else {
             result.append(NSAttributedString(string: latex, attributes: [
                 .foregroundColor: NSColor.systemRed,
                 .font: NSFont.systemFont(ofSize: style.bodyPointSize, weight: style.bodyWeight)
             ]))
             return
         }
+        // Lower the glyph so its typeset baseline sits exactly on the
+        // surrounding text baseline.
+        var img = rendered.image
+        var baselineOffset = rendered.baselineFromBottom
+        if boxed {
+            img = boxedMathImage(img, fontSize: fontSize, style: style)
+            baselineOffset += MathBoxStyle.padding(for: fontSize).v
+        }
         let attachment = NSTextAttachment()
         attachment.image = img
-        // Lower the glyph so its baseline aligns with the surrounding text.
-        let baselineOffset = insets.bottom + fontSize * 0.22
         attachment.bounds = CGRect(x: 0, y: -baselineOffset,
                                    width: img.size.width, height: img.size.height)
         let attaStr = NSMutableAttributedString(attachment: attachment)
@@ -285,10 +301,13 @@ enum MacMathAttributedStringBuilder {
         let fontSize = style.blockMathFontSize
         let insets = MathRenderTuning.blockInsets(for: fontSize)
         let para = NSMutableAttributedString()
+        let (inner, boxed) = MathTokenizer.unwrapBoxed(latex)
 
-        if let img = renderMathImage(latex: latex, fontSize: fontSize,
-                                     isDisplayMode: true, color: style.mathColor,
-                                     insets: insets) {
+        if let rendered = renderMathImage(latex: inner, fontSize: fontSize,
+                                          isDisplayMode: true, color: style.mathColor,
+                                          insets: insets) {
+            var img = rendered.image
+            if boxed { img = boxedMathImage(img, fontSize: fontSize, style: style) }
             let attachment = MathBlockAttachment()
             attachment.image = img
             let attaStr = NSMutableAttributedString(attachment: attachment)
@@ -373,6 +392,94 @@ final class MacLatexTextView: NSTextView {
     private var hoverTrackingArea: NSTrackingArea?
     private var hoverHost: NSHostingView<LatexCopyCapsule>?
     private var hoverCharIndex: Int?
+
+    // MARK: Streaming token fade-in
+
+    /// Armed only for the live streaming bubble (mirrors the SwiftUI
+    /// `streamTokenFadeIn` fragment fade on iOS/visionOS). Appended text fades
+    /// in via NSLayoutManager *temporary* attributes — display-only, so the
+    /// ~30 Hz storage swaps never pay an extra layout pass.
+    var fadeAppendedText = false
+
+    private struct FadeSpan {
+        let start: CFTimeInterval
+        let range: NSRange
+    }
+    private var fadeSpans: [FadeSpan] = []
+    private var fadeDisplayLink: CADisplayLink?
+    private static let fadeDuration: CFTimeInterval = 0.35
+
+    /// Called after each streaming storage swap with the pre-swap string.
+    /// The stable UTF-16 prefix keeps full alpha; the appended tail starts a
+    /// fade span. (A re-rendered tail — e.g. markdown closing mid-word — just
+    /// re-fades from the divergence point, matching the SwiftUI renderer.)
+    func noteTextReplacedForStreamFade(oldString: NSString?) {
+        guard fadeAppendedText, let storage = textStorage else { return }
+        // The storage swap dropped any in-flight temporary attributes, so
+        // re-apply current alphas even when nothing new was appended.
+        defer { stepFadeSpans() }
+        guard let old = oldString else { return }
+        let new = storage.string as NSString
+        let limit = min(old.length, new.length)
+        var prefix = 0
+        while prefix < limit && old.character(at: prefix) == new.character(at: prefix) { prefix += 1 }
+        guard new.length > prefix else { return }
+        fadeSpans.append(FadeSpan(start: CACurrentMediaTime(),
+                                  range: NSRange(location: prefix, length: new.length - prefix)))
+        ensureFadeDisplayLink()
+    }
+
+    func teardownStreamFade() {
+        fadeDisplayLink?.invalidate()
+        fadeDisplayLink = nil
+        fadeSpans.removeAll()
+    }
+
+    private func ensureFadeDisplayLink() {
+        guard fadeDisplayLink == nil else { return }
+        let link = displayLink(target: self, selector: #selector(fadeTick(_:)))
+        link.add(to: .main, forMode: .common)
+        fadeDisplayLink = link
+    }
+
+    @objc private func fadeTick(_ link: CADisplayLink) {
+        stepFadeSpans()
+    }
+
+    private func stepFadeSpans() {
+        guard let lm = layoutManager, let storage = textStorage else { return }
+        let now = CACurrentMediaTime()
+        let full = NSRange(location: 0, length: storage.length)
+        var live: [FadeSpan] = []
+        for span in fadeSpans {
+            let clamped = NSIntersectionRange(span.range, full)
+            guard clamped.length > 0 else { continue }
+            let t = (now - span.start) / Self.fadeDuration
+            if t >= 1 {
+                lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: clamped)
+            } else {
+                let eased = 1 - pow(1 - max(0, t), 2)
+                applyFadeAlpha(CGFloat(eased), in: clamped, layoutManager: lm, storage: storage)
+                live.append(span)
+            }
+        }
+        fadeSpans = live
+        // Dropping the link when idle also breaks its retain of `self`.
+        if fadeSpans.isEmpty {
+            fadeDisplayLink?.invalidate()
+            fadeDisplayLink = nil
+        }
+    }
+
+    /// Fade per base-attribute run so links/code/secondary keep their own hue.
+    private func applyFadeAlpha(_ alpha: CGFloat, in range: NSRange,
+                                layoutManager lm: NSLayoutManager, storage: NSTextStorage) {
+        storage.enumerateAttribute(.foregroundColor, in: range, options: []) { value, sub, _ in
+            let base = (value as? NSColor) ?? .labelColor
+            lm.setTemporaryAttributes([.foregroundColor: base.withAlphaComponent(alpha)],
+                                      forCharacterRange: sub)
+        }
+    }
 
     // MARK: Copy — substitute LaTeX for math attachments
 
@@ -521,6 +628,10 @@ struct MacSelectableMathText: NSViewRepresentable, Equatable {
     let blockMathFontSize: CGFloat
     let isDark: Bool
     var messageHoverCopySuppression: Binding<Bool>?
+    /// Intentionally outside `==`: the flag is constant for the lifetime of a
+    /// bubble subtree (the streaming/static swap replaces the whole view), so
+    /// it must not defeat the streaming-equality render skip.
+    var fadeAppendedText: Bool = false
 
     static func == (lhs: MacSelectableMathText, rhs: MacSelectableMathText) -> Bool {
         lhs.source == rhs.source
@@ -577,6 +688,7 @@ struct MacSelectableMathText: NSViewRepresentable, Equatable {
         ]
         textView.displaysLinkToolTips = true
         textView.messageHoverCopySuppression = messageHoverCopySuppression
+        textView.fadeAppendedText = fadeAppendedText
 
         let attributed = MacMathAttributedStringBuilder.build(source: source, style: style)
         textView.textStorage?.setAttributedString(attributed)
@@ -587,14 +699,19 @@ struct MacSelectableMathText: NSViewRepresentable, Equatable {
 
     func updateNSView(_ nsView: MacLatexTextView, context: Context) {
         nsView.messageHoverCopySuppression = messageHoverCopySuppression
+        nsView.fadeAppendedText = fadeAppendedText
         applyAppearance(to: nsView)
 
         let newKey = buildKey
         guard context.coordinator.buildKey != newKey else { return }
 
         let saved = nsView.selectedRanges
+        // Snapshot (copy) the pre-swap string so the appended tail can fade in.
+        let oldString: NSString? = fadeAppendedText
+            ? NSString(string: nsView.textStorage?.string ?? "") : nil
         let attributed = MacMathAttributedStringBuilder.build(source: source, style: style)
         nsView.textStorage?.setAttributedString(attributed)
+        nsView.noteTextReplacedForStreamFade(oldString: oldString)
         context.coordinator.buildKey = newKey
         context.coordinator.sizeCache.removeAll()
 
@@ -632,6 +749,7 @@ struct MacSelectableMathText: NSViewRepresentable, Equatable {
 
     static func dismantleNSView(_ nsView: MacLatexTextView, coordinator: Coordinator) {
         nsView.teardownHover()
+        nsView.teardownStreamFade()
     }
 
     private func applyAppearance(to textView: MacLatexTextView) {

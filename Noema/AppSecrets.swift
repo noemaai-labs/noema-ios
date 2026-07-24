@@ -1,10 +1,23 @@
-// AppSecrets.swift
 import Foundation
 
 /// Centralizes access to secrets that are supplied via `Secrets.plist`
 /// (kept locally and ignored by git) or environment variables when running
 /// from the command line.
 enum AppSecrets {
+    enum SecretError: LocalizedError {
+        case missing(Key)
+        case invalidURL(Key)
+
+        var errorDescription: String? {
+            switch self {
+            case .missing(let key):
+                return "Missing secret for key \(key.rawValue)."
+            case .invalidURL(let key):
+                return "Missing or invalid URL for key \(key.rawValue)."
+            }
+        }
+    }
+
     enum Key: String {
         case searxngURL = "SearXNGURL"
         case searxngAPIKey = "SearXNGAPIKey"
@@ -57,9 +70,9 @@ enum AppSecrets {
         return trimmedValue(stored)
     }
 
-    static func requireString(for key: Key) -> String {
+    static func requireString(for key: Key) throws -> String {
         guard let value = string(for: key) else {
-            fatalError("Missing secret for key \(key.rawValue). Provide it in Secrets.plist or via environment variables.")
+            throw SecretError.missing(key)
         }
         return value
     }
@@ -69,9 +82,9 @@ enum AppSecrets {
         return URL(string: urlString)
     }
 
-    static func requireURL(for key: Key) -> URL {
+    static func requireURL(for key: Key) throws -> URL {
         guard let url = url(for: key) else {
-            fatalError("Missing or invalid URL for key \(key.rawValue). Provide a valid entry in Secrets.plist or via environment variables.")
+            throw SecretError.invalidURL(key)
         }
         return url
     }

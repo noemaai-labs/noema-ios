@@ -1,4 +1,3 @@
-// StateCodec.swift
 import Foundation
 import CryptoKit
 

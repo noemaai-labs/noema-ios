@@ -1,7 +1,3 @@
-// ChatTheme.swift
-// Shared design tokens and small reusable components for the chat surface.
-// Keep chat styling here instead of scattering one-off values across views.
-
 import SwiftUI
 
 @MainActor
@@ -66,6 +62,36 @@ enum ChatTheme {
     static let readyTint: Color = .green
     static let busyTint: Color = .orange
     static let idleTint: Color = Color.secondary.opacity(0.5)
+}
+
+// MARK: - Motion
+
+/// Shared, reduce-motion-aware animation tokens for page and submenu transitions.
+/// Kept lightweight (spring/opacity/scale) so transitions stay smooth even while
+/// the chat or explore content underneath is rendering.
+enum AppMotion {
+    /// Switching between the top-level pages (chat / stored / explore / settings).
+    static var page: Animation { .spring(response: 0.40, dampingFraction: 0.86) }
+    /// Pushing / popping a settings submenu.
+    static var submenu: Animation { .spring(response: 0.36, dampingFraction: 0.88) }
+    /// Quick micro-interactions (chips, disclosure rows).
+    static var snappy: Animation { .snappy(duration: 0.26, extraBounce: 0.02) }
+
+    /// Returns `animation` unless Reduce Motion is enabled, in which case the
+    /// change applies instantly. Callers pass `\.accessibilityReduceMotion`.
+    static func resolve(_ animation: Animation, reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : animation
+    }
+
+    /// Gentle cross-page transition: fade + a hair of scale. Direction-agnostic
+    /// so it reads well regardless of which page you came from, and cheap enough
+    /// not to stutter when heavy content mounts behind it.
+    static var pageTransition: AnyTransition {
+        .asymmetric(
+            insertion: .opacity.combined(with: .scale(scale: 0.985, anchor: .center)),
+            removal: .opacity
+        )
+    }
 }
 
 // MARK: - Reusable components

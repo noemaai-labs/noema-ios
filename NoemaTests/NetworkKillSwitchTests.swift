@@ -70,6 +70,31 @@ final class NetworkKillSwitchTests: XCTestCase {
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
         XCTAssertEqual(String(decoding: data, as: UTF8.self), "{\"ok\":true}")
     }
+
+    func testTrackedSessionRemainsReusableAfterOffGridCancelsItsTask() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DelayedExternalURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        NetworkKillSwitch.track(session: session)
+        let url = try XCTUnwrap(URL(string: "https://example.com/resource"))
+
+        let first = Task { try await session.data(from: url) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        NetworkKillSwitch.setEnabled(true)
+
+        do {
+            _ = try await first.value
+            XCTFail("Expected the in-flight external request to be cancelled")
+        } catch {
+            // Expected: enabling off-grid cancels the blocked task.
+        }
+
+        NetworkKillSwitch.setEnabled(false)
+        let (data, response) = try await session.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "ok")
+    }
 }
 
 private final class DelayedLoopbackURLProtocol: URLProtocol {
@@ -95,6 +120,33 @@ private final class DelayedLoopbackURLProtocol: URLProtocol {
             )!
             client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client.urlProtocol(self, didLoad: Data("{\"ok\":true}".utf8))
+            client.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {
+        responseTask?.cancel()
+    }
+}
+
+private final class DelayedExternalURLProtocol: URLProtocol {
+    private var responseTask: Task<Void, Never>?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        responseTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, let self, let client, let url = request.url,
+                  let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "text/plain"]
+                  ) else { return }
+            client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client.urlProtocol(self, didLoad: Data("ok".utf8))
             client.urlProtocolDidFinishLoading(self)
         }
     }

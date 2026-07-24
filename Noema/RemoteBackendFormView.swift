@@ -512,7 +512,7 @@ struct RemoteBackendFormView: View {
             if let backendError = error as? RemoteBackendError {
                 errorMessage = backendError.errorDescription ?? "Unknown error"
             } else {
-                errorMessage = error.localizedDescription
+                errorMessage = RemoteBackend.localizedErrorDescription(for: error)
             }
         }
         isSaving = false

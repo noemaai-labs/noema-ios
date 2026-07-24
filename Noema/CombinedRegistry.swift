@@ -1,4 +1,3 @@
-// CombinedRegistry.swift
 import Foundation
 
 /// Combines results from multiple registries for curated models.
@@ -20,7 +19,9 @@ final class CombinedRegistry: ModelRegistry, @unchecked Sendable {
 
         for reg in extras {
             do {
-                results += try await reg.curated().filter { $0.id != AppleFoundationModelRegistry.modelID }
+                results += try await reg.curated().filter {
+                    AppleFoundationModelKind.resolve(modelID: $0.id) == nil
+                }
             } catch {}
         }
         // CoreAI is not browsable from Explore; its catalog entries are intentionally
@@ -53,5 +54,9 @@ final class CombinedRegistry: ModelRegistry, @unchecked Sendable {
             if let d = try? await reg.details(for: id) { return d }
         }
         return try await primary.details(for: id)
+    }
+
+    func trending(format: ModelFormat?) async throws -> [ModelRecord] {
+        try await primary.trending(format: format)
     }
 }

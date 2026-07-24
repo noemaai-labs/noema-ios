@@ -182,16 +182,22 @@ final class RelayManagementViewModel: ObservableObject {
     init(dependencies: RelayLifecycleDependencies) {
         self.dependencies = dependencies
         advertiser.$state
+            .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
-                self?.bluetoothState = state
+                if self?.bluetoothState != state {
+                    self?.bluetoothState = state
+                }
             }
             .store(in: &cancellables)
 
         advertiser.$lastPayload
+            .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] payload in
-                self?.payload = payload
+                if self?.payload != payload {
+                    self?.payload = payload
+                }
             }
             .store(in: &cancellables)
 
@@ -374,9 +380,13 @@ final class RelayManagementViewModel: ObservableObject {
     }
 
     private func configureCatalogPublisher() async {
-        await catalogPublisher.configure(containerIdentifier: RelayConfiguration.containerIdentifier,
-                                          hostDeviceID: hostDeviceID)
-        await catalogPublisher.ensureCommandSubscription()
+        let configured = await catalogPublisher.configure(
+            containerIdentifier: RelayConfiguration.containerIdentifier,
+            hostDeviceID: hostDeviceID
+        )
+        if configured {
+            await catalogPublisher.ensureCommandSubscription()
+        }
         hasFinishedInitialLoad = true
         Task { await serverEngine.updateDescriptors(availableModels) }
         Task { await serverEngine.updateActiveModel(activeModelID) }
@@ -399,7 +409,16 @@ final class RelayManagementViewModel: ObservableObject {
             return
         }
 
-        let container = CKContainer(identifier: containerID)
+        guard let container = RelayCloudKitAccess.containerIfAvailable(containerID) else {
+            cloudKitAccountStatus = nil
+            cloudKitAccountError = String(
+                localized: "CloudKit unavailable",
+                locale: LocalizationManager.preferredLocale()
+            )
+            isCheckingCloudKitAccount = false
+            return
+        }
+
         do {
             let status = try await container.accountStatus()
             cloudKitAccountStatus = status
@@ -441,11 +460,17 @@ final class RelayManagementViewModel: ObservableObject {
                                remoteBackends: [RemoteBackend],
                                appLoadedModel: LocalModel?) {
         let descriptors = buildDescriptors(localModels: localModels, remoteBackends: remoteBackends)
-        availableModels = descriptors
+        if availableModels != descriptors {
+            availableModels = descriptors
+        }
 
         Task { await serverEngine.updateDescriptors(descriptors) }
 
-        mergeCatalogEntries(with: descriptors)
+        let openRouterOriginPrefixes = Set(
+            remoteBackends.filter(\.isOpenRouter)
+                .map { "remote|\($0.id.uuidString.lowercased())|" }
+        )
+        mergeCatalogEntries(with: descriptors, droppingOriginsPrefixedBy: openRouterOriginPrefixes)
         appLoadedDescriptorID = descriptorID(for: appLoadedModel, in: descriptors)
         recomputeLoadedModels()
 
@@ -476,13 +501,19 @@ final class RelayManagementViewModel: ObservableObject {
         for snapshot in relaySnapshots {
             relayByID[snapshot.descriptor.id] = snapshot
         }
+        var lastCheckedByModelID: [String: Date] = [:]
+        for entry in catalogEntries {
+            if let lastChecked = entry.lastChecked, lastCheckedByModelID[entry.modelID] == nil {
+                lastCheckedByModelID[entry.modelID] = lastChecked
+            }
+        }
 
-        loadedModels = availableModels.map { descriptor in
+        let updated = availableModels.map { descriptor in
             var snapshot = relayByID[descriptor.id] ?? RelayServerEngine.ModelSnapshot(
                 id: descriptor.identifier,
                 displayName: descriptor.displayName,
                 ownedBy: descriptor.provider.displayName,
-                created: catalogEntries.first(where: { $0.modelID == descriptor.id })?.lastChecked ?? Date(),
+                created: lastCheckedByModelID[descriptor.id] ?? .distantPast,
                 isLoaded: false,
                 contextLength: descriptor.context,
                 quant: descriptor.quant,
@@ -500,6 +531,9 @@ final class RelayManagementViewModel: ObservableObject {
             snapshot.descriptor = descriptor
             snapshot.isLoaded = snapshot.isLoaded || (appLoadedDescriptorID == descriptor.id)
             return snapshot
+        }
+        if updated != loadedModels {
+            loadedModels = updated
         }
     }
 
@@ -664,9 +698,16 @@ final class RelayManagementViewModel: ObservableObject {
             descriptors.append(makeDescriptor(for: model))
         }
 
-        for backend in remoteBackends {
+        // OpenRouter is never relayed: clients can talk to OpenRouter directly,
+        // so exposing it through the relay adds a pointless hop.
+        for backend in remoteBackends where !backend.isOpenRouter {
+            // Embed a copy without the model catalog: each descriptor otherwise
+            // carries the backend's entire cachedModels array, making descriptor
+            // arrays O(models²) to copy, diff, and snapshot.
+            var slimBackend = backend
+            slimBackend.cachedModels = []
             for remote in backend.cachedModels {
-                descriptors.append(makeDescriptor(for: backend, remoteModel: remote))
+                descriptors.append(makeDescriptor(for: slimBackend, remoteModel: remote))
             }
         }
 
@@ -772,11 +813,15 @@ final class RelayManagementViewModel: ObservableObject {
     }
 
     private func stableModelID(for originIdentifier: String) -> String {
-        let pattern = try! NSRegularExpression(pattern: "[^a-z0-9]+", options: [.caseInsensitive])
         let lower = originIdentifier.lowercased()
-        let range = NSRange(location: 0, length: lower.utf16.count)
-        let normalized = pattern.stringByReplacingMatches(in: lower, options: [], range: range, withTemplate: "-")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let normalized: String
+        if let pattern = try? NSRegularExpression(pattern: "[^a-z0-9]+", options: [.caseInsensitive]) {
+            let range = NSRange(location: 0, length: lower.utf16.count)
+            normalized = pattern.stringByReplacingMatches(in: lower, options: [], range: range, withTemplate: "-")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        } else {
+            normalized = lower
+        }
         let hash = SHA256.hash(data: Data(originIdentifier.utf8))
         let shortHash = hash.map { String(format: "%02x", $0) }.joined().prefix(12)
         if normalized.isEmpty {
@@ -789,8 +834,9 @@ final class RelayManagementViewModel: ObservableObject {
         "endpoint-\(backend.id.uuidString.lowercased())"
     }
 
-    private func mergeCatalogEntries(with descriptors: [RelayModelDescriptor]) {
-        var existing = Dictionary(uniqueKeysWithValues: catalogEntries.map { ($0.originIdentifier, $0) })
+    private func mergeCatalogEntries(with descriptors: [RelayModelDescriptor],
+                                     droppingOriginsPrefixedBy droppedOriginPrefixes: Set<String> = []) {
+        var existing = Dictionary(catalogEntries.map { ($0.originIdentifier, $0) }, uniquingKeysWith: { _, latest in latest })
         var merged: [RelayCatalogEntry] = []
 
         for descriptor in descriptors {
@@ -829,13 +875,20 @@ final class RelayManagementViewModel: ObservableObject {
         }
 
         for (_, var orphan) in existing {
+            // Drop stale entries for backends excluded from the relay (OpenRouter)
+            // instead of keeping them around as "missing" rows.
+            if droppedOriginPrefixes.contains(where: { orphan.originIdentifier.hasPrefix($0) }) {
+                continue
+            }
             orphan.health = .missing
             orphan.exposed = false
             merged.append(orphan)
         }
 
         merged.sort { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-        catalogEntries = merged
+        if catalogEntries != merged {
+            catalogEntries = merged
+        }
     }
 
     private func persistCatalogEntries() {
@@ -1262,10 +1315,9 @@ final class RelayManagementViewModel: ObservableObject {
         guard let manager else {
             throw RelayError.notConfigured
         }
-        
-        // Identify targets
+
         let targets: [RemoteBackend] = await MainActor.run {
-            manager.remoteBackends.filter { !$0.endpointType.isRelay }
+            manager.remoteBackends.filter { !$0.endpointType.isRelay && !$0.isOpenRouter }
         }
         guard !targets.isEmpty else { return }
         
@@ -1600,7 +1652,7 @@ final class RelayManagementViewModel: ObservableObject {
 
         // Apply backend updates on the main actor to keep state in sync with the UI.
         await MainActor.run {
-            guard runID == nil || self.isCurrentRun(runID!) else { return }
+            guard runID.map(self.isCurrentRun) ?? true else { return }
             for (backendID, result) in results {
                 switch result {
                 case .success(let fetchResult):
@@ -1629,7 +1681,7 @@ final class RelayManagementViewModel: ObservableObject {
         }
 
         return await MainActor.run {
-            guard runID == nil || self.isCurrentRun(runID!) else {
+            guard runID.map(self.isCurrentRun) ?? true else {
                 return .empty
             }
             var offlineBackends: [RemoteBackend.ID: Bool] = [:]
@@ -1768,7 +1820,10 @@ final class RelayManagementViewModel: ObservableObject {
             localized: "This Mac",
             locale: LocalizationManager.preferredLocale()
         )
-        let payload = RelayBluetoothPayload(
+        // Stamp updatedAt only when the content actually changed. A fresh Date()
+        // on every call made each refresh publish a "new" payload, and every
+        // publish re-rendered the whole page.
+        var payload = RelayBluetoothPayload(
             id: relayIdentifier,
             containerID: RelayConfiguration.containerIdentifier,
             deviceName: Host.current().localizedName ?? fallbackDeviceName,
@@ -1777,20 +1832,37 @@ final class RelayManagementViewModel: ObservableObject {
             lanURL: lanCandidate,
             apiToken: serverConfiguration.apiToken,
             wifiSSID: nil,
-            updatedAt: Date()
+            updatedAt: self.payload?.updatedAt ?? Date()
         )
-        if payload != self.payload,
-           let lanURL = lanCandidate {
-            RelayLog.record(category: "RelayServer",
-                            message: "LAN ready ⇒ \(lanURL)",
-                            style: .lanTransition)
+        let contentChanged = payload != self.payload
+        if contentChanged {
+            payload = RelayBluetoothPayload(
+                id: payload.id,
+                containerID: payload.containerID,
+                deviceName: payload.deviceName,
+                provider: payload.provider,
+                hostDeviceID: payload.hostDeviceID,
+                lanURL: payload.lanURL,
+                apiToken: payload.apiToken,
+                wifiSSID: payload.wifiSSID,
+                updatedAt: Date()
+            )
+            if let lanURL = lanCandidate {
+                RelayLog.record(category: "RelayServer",
+                                message: "LAN ready ⇒ \(lanURL)",
+                                style: .lanTransition)
+            }
         }
         if serverState == .running || serverState == .starting {
-            advertiser.startAdvertising(payload: payload)
+            if contentChanged || !advertiser.isAdvertisingActive {
+                advertiser.startAdvertising(payload: payload)
+            }
         } else {
             advertiser.stopAdvertising()
         }
-        self.payload = payload
+        if contentChanged {
+            self.payload = payload
+        }
     }
 
     /// Sync loaded model snapshots from server engine on-demand.
@@ -1835,8 +1907,10 @@ final class RelayManagementViewModel: ObservableObject {
     nonisolated func refreshConnectedClientsSnapshot(for runID: UUID? = nil) async {
         let snapshot = await serverEngine.connectedClientsSnapshot()
         await MainActor.run {
-            guard runID == nil || self.isCurrentRun(runID!) else { return }
-            self.connectedClients = snapshot
+            guard runID.map(self.isCurrentRun) ?? true else { return }
+            if self.connectedClients != snapshot {
+                self.connectedClients = snapshot
+            }
         }
     }
 
@@ -2028,7 +2102,9 @@ struct RelayManagementView: View {
     // Removed Cloud Relay worker/log overrides to simplify settings.
 
     var body: some View {
-        VStack(spacing: 0) {
+        let _ = Self._printChanges()
+        let _ = print("RELAYDBG body eval \(Date().timeIntervalSince1970) avail=\(viewModel.availableModels.count) cat=\(viewModel.catalogEntries.count) loaded=\(viewModel.loadedModels.count) clients=\(viewModel.connectedClients.count)")
+        return VStack(spacing: 0) {
             RelayChromeBar(
                 state: viewModel.serverState,
                 statusMessage: viewModel.statusMessage,
@@ -2131,11 +2207,11 @@ struct RelayManagementView: View {
     private var serverOverviewHeader: some View {
         HStack(alignment: .center, spacing: 16) {
             RelayGlyph()
-                .frame(width: 44, height: 44)
+                .frame(width: 32, height: 32)
             VStack(alignment: .leading, spacing: 4) {
                 Text(LocalizedStringKey("NOEMA SERVER"))
-                    .font(.caption)
-                    .fontWeight(.bold)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .tracking(0.3)
                     .foregroundStyle(AppTheme.text)
                 Text(viewModel.statusMessage)
                     .font(.system(.caption, design: .monospaced))
@@ -2155,7 +2231,7 @@ struct RelayManagementView: View {
                 Text(viewModel.serverState == .running ? String(localized: "RUNNING") : String(localized: "STOPPED"))
                     .font(.system(.caption, design: .monospaced, weight: .bold))
             }
-            .toggleStyle(ModernToggleStyle())
+            .toggleStyle(IndustrialToggleStyle())
             .disabled(viewModel.serverState == .starting || viewModel.isLANServerStarting)
         }
     }
@@ -2257,7 +2333,7 @@ struct RelayManagementView: View {
         MacSection(LocalizedStringKey("Last Seen Devices")) {
             if viewModel.connectedClients.isEmpty {
                 Text(LocalizedStringKey("No recent devices. We'll list clients the next time they talk to this relay."))
-                    .font(.callout)
+                    .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 12) {
@@ -2277,7 +2353,7 @@ struct RelayManagementView: View {
             let loaded = viewModel.loadedModels.filter { $0.isLoaded }
             if loaded.isEmpty {
                 Text(LocalizedStringKey("No models loaded right now. We'll spin one up when a request arrives."))
-                    .font(.callout)
+                    .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 12) {
@@ -2310,11 +2386,17 @@ struct RelayManagementView: View {
 
         var body: some View {
             VStack(alignment: .leading, spacing: 8) {
-                Text(title)
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .textCase(.uppercase)
-                    .foregroundStyle(AppTheme.secondaryText)
+                VStack(spacing: 6) {
+                    HStack {
+                        Text(title)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .textCase(.uppercase)
+                            .tracking(0.3)
+                            .foregroundStyle(AppTheme.secondaryText)
+                        Spacer(minLength: 0)
+                    }
+                    IndustrialHairline()
+                }
                 content
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -2403,22 +2485,16 @@ struct RelayManagementView: View {
                     .font(.system(.caption, design: .monospaced, weight: .bold))
                     .foregroundStyle(AppTheme.text)
                 if isActive {
-                    Text(LocalizedStringKey("ACTIVE"))
-                        .font(.system(.caption2, design: .monospaced, weight: .bold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.15))
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        .foregroundStyle(Color.accentColor)
+                    IndustrialBadge("ACTIVE", tint: .accentColor)
                 }
                 Spacer(minLength: 0)
                 if case .local = snapshot.descriptor.kind {
                     HStack(spacing: 8) {
                         Button(String(localized: "Settings")) { presentModelSettings(for: snapshot) }
-                            .buttonStyle(GlassButtonStyle())
+                            .buttonStyle(.industrial(.quiet))
                             .controlSize(.small)
                         Button(String(localized: "Unload")) { viewModel.unloadModel(snapshot.descriptor.id) }
-                            .buttonStyle(GlassButtonStyle())
+                            .buttonStyle(.industrial(.quiet))
                             .controlSize(.small)
                     }
                 }
@@ -2435,9 +2511,11 @@ struct RelayManagementView: View {
                     metadataLabel(ByteCountFormatter.string(fromByteCount: size, countStyle: .memory), systemImage: "externaldrive")
                 }
                 Spacer(minLength: 0)
-                Text(String.localizedStringWithFormat(String(localized: "Refreshed %@"), Self.relativeFormatter.localizedString(for: snapshot.created, relativeTo: Date())))
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(AppTheme.tertiaryText)
+                if snapshot.created > .distantPast {
+                    Text(String.localizedStringWithFormat(String(localized: "Refreshed %@"), Self.relativeFormatter.localizedString(for: snapshot.created, relativeTo: Date())))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(AppTheme.tertiaryText)
+                }
             }
         }
         .padding(.vertical, 4)
@@ -2470,12 +2548,10 @@ struct RelayManagementView: View {
                     settingsLabel(LocalizedStringKey("PORT"))
                     HStack(spacing: 8) {
                         TextField(String(localized: "Port"), text: $portText)
-                            .frame(width: 60)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.caption, design: .monospaced))
+                            .industrialField(width: 72)
                             .onSubmit { applyPortText() }
                         Button(String(localized: "Apply")) { applyPortText() }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.industrial(.quiet))
                             .controlSize(.mini)
                     }
                 }
@@ -2486,7 +2562,7 @@ struct RelayManagementView: View {
                         get: { config.serveOnLocalNetwork },
                         set: { viewModel.toggleServeOnLocalNetwork($0) }
                     ))
-                    .toggleStyle(ModernToggleStyle())
+                    .toggleStyle(IndustrialToggleStyle())
                     .labelsHidden()
                 }
 
@@ -2496,7 +2572,7 @@ struct RelayManagementView: View {
                         get: { config.justInTimeLoading },
                         set: { viewModel.toggleJustInTimeLoading($0) }
                     ))
-                    .toggleStyle(ModernToggleStyle())
+                    .toggleStyle(IndustrialToggleStyle())
                     .labelsHidden()
                 }
 
@@ -2506,7 +2582,7 @@ struct RelayManagementView: View {
                         get: { config.autoUnloadJIT },
                         set: { viewModel.toggleAutoUnloadJIT($0) }
                     ))
-                    .toggleStyle(ModernToggleStyle())
+                    .toggleStyle(IndustrialToggleStyle())
                     .labelsHidden()
                 }
 
@@ -2514,12 +2590,10 @@ struct RelayManagementView: View {
                     settingsLabel(LocalizedStringKey("IDLE TTL"))
                     HStack(spacing: 8) {
                         TextField(String(localized: "Mins"), text: $idleTTLText)
-                            .frame(width: 60)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.caption, design: .monospaced))
+                            .industrialField(width: 72)
                             .onSubmit { applyIdleTTLText() }
                         Button(String(localized: "Apply")) { applyIdleTTLText() }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.industrial(.quiet))
                             .controlSize(.mini)
                     }
                 }
@@ -2530,7 +2604,7 @@ struct RelayManagementView: View {
                         get: { config.onlyKeepLastJITModel },
                         set: { viewModel.toggleKeepLastJITModel($0) }
                     ))
-                    .toggleStyle(ModernToggleStyle())
+                    .toggleStyle(IndustrialToggleStyle())
                     .labelsHidden()
                 }
 
@@ -2540,7 +2614,7 @@ struct RelayManagementView: View {
                         get: { config.requestLoggingEnabled },
                         set: { viewModel.toggleRequestLogging($0) }
                     ))
-                    .toggleStyle(ModernToggleStyle())
+                    .toggleStyle(IndustrialToggleStyle())
                     .labelsHidden()
                 }
             }
@@ -2619,14 +2693,23 @@ struct RelayManagementView: View {
     }
 
     private var sourcesSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        // One pass over catalogEntries/loadedModels here instead of per-row
+        // scans: with hundreds of relay sources the per-row lookups were O(n²)
+        // on every body evaluation.
+        let entryIndexByModelID = Dictionary(
+            viewModel.catalogEntries.enumerated().map { ($0.element.modelID, $0.offset) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let loadedIDs = Set(viewModel.loadedModels.lazy.filter(\.isLoaded).map(\.descriptor.id))
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(LocalizedStringKey("RELAY SOURCES"))
                     .font(.caption)
                     .fontWeight(.bold)
                     .foregroundStyle(AppTheme.text)
                 Spacer()
-                exposureBulkControls
+                exposureBulkControls(entryIndexByModelID: entryIndexByModelID)
             }
             if viewModel.availableModels.isEmpty {
                 Text(LocalizedStringKey("No models available. Add downloads or remote connections in Stored to configure the relay."))
@@ -2634,9 +2717,14 @@ struct RelayManagementView: View {
                     .foregroundStyle(AppTheme.secondaryText)
                     .padding(.vertical, 8)
             } else {
-                VStack(spacing: 8) {
+                // Lazy: only visible rows materialize. A plain VStack laid out
+                // every source row at once, which froze the app for large
+                // remote catalogs.
+                LazyVStack(spacing: 8) {
                     ForEach(Array(viewModel.availableModels.enumerated()), id: \.element.id) { index, descriptor in
-                        modelRow(for: descriptor)
+                        modelRow(for: descriptor,
+                                 entryIndex: entryIndexByModelID[descriptor.id],
+                                 isLoaded: loadedIDs.contains(descriptor.id))
                         if index < viewModel.availableModels.count - 1 {
                             Divider()
                         }
@@ -2647,18 +2735,18 @@ struct RelayManagementView: View {
             Divider()
 
             Toggle(LocalizedStringKey("Eject button unloads relay model"), isOn: $viewModel.ejectsModelOnDisconnect)
-                .toggleStyle(ModernToggleStyle())
+                .toggleStyle(IndustrialToggleStyle())
                 .font(.system(.caption, design: .monospaced))
         }
     }
 
     @ViewBuilder
-    private func modelRow(for descriptor: RelayModelDescriptor) -> some View {
+    private func modelRow(for descriptor: RelayModelDescriptor,
+                          entryIndex: Int?,
+                          isLoaded: Bool) -> some View {
         let isActive = viewModel.activeModelID == descriptor.id
-        let entryIndex = viewModel.catalogEntries.firstIndex { $0.modelID == descriptor.id }
         let entry = entryIndex.flatMap { viewModel.catalogEntries[$0] }
         let isUnavailable = entry?.health == .error
-        let isLoaded = viewModel.isModelLoaded(descriptor.id)
 
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .center, spacing: 8) {
@@ -2667,13 +2755,7 @@ struct RelayManagementView: View {
                     .font(.system(.caption, design: .monospaced, weight: .bold))
                     .foregroundStyle(AppTheme.text)
                 if isActive {
-                    Text(LocalizedStringKey("ACTIVE"))
-                        .font(.system(.caption2, design: .monospaced, weight: .bold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.15))
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        .foregroundStyle(Color.accentColor)
+                    IndustrialBadge("ACTIVE", tint: .accentColor)
                 }
                 Spacer(minLength: 0)
                 if let entryIndex = entryIndex {
@@ -2682,7 +2764,7 @@ struct RelayManagementView: View {
                         .foregroundStyle(AppTheme.secondaryText)
                     Toggle("", isOn: $viewModel.catalogEntries[entryIndex].exposed)
                         .labelsHidden()
-                        .toggleStyle(ModernToggleStyle())
+                        .toggleStyle(IndustrialToggleStyle())
                         .disabled(isUnavailable)
                 }
             }
@@ -2703,7 +2785,7 @@ struct RelayManagementView: View {
                 if !isUnavailable {
                     if isLoaded {
                         Button(LocalizedStringKey("Unload")) { viewModel.unloadModel(descriptor.id) }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.industrial(.quiet))
                             .controlSize(.mini)
                     } else {
                         if viewModel.loadingModelIDs.contains(descriptor.id) {
@@ -2715,7 +2797,7 @@ struct RelayManagementView: View {
                             .foregroundStyle(AppTheme.secondaryText)
                         } else {
                             Button(LocalizedStringKey("Load")) { viewModel.loadModel(descriptor.id) }
-                                .buttonStyle(.bordered)
+                                .buttonStyle(.industrial(.quiet))
                                 .controlSize(.mini)
                         }
                     }
@@ -2736,9 +2818,9 @@ struct RelayManagementView: View {
         .opacity(isUnavailable ? 0.45 : 1)
     }
 
-    private var exposureBulkControls: some View {
+    private func exposureBulkControls(entryIndexByModelID: [String: Int]) -> some View {
         let allSelected = viewModel.availableModels.allSatisfy { descriptor in
-            viewModel.catalogEntries.first(where: { $0.modelID == descriptor.id })?.exposed == true
+            entryIndexByModelID[descriptor.id].map { viewModel.catalogEntries[$0].exposed } == true
         }
 
         return HStack {
@@ -2747,7 +2829,7 @@ struct RelayManagementView: View {
             } label: {
                 Text(allSelected ? LocalizedStringKey("Clear All") : LocalizedStringKey("Select All"))
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.industrial(.quiet))
             .help(
                 String(
                     localized: allSelected
@@ -3218,11 +3300,10 @@ private struct RelayChromeBar: View {
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(LocalizedStringKey("Noema Relay"))
-                    .font(FontTheme.heading)
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(AppTheme.text)
                 Text(statusMessage)
-                    .font(FontTheme.caption)
-                    .foregroundStyle(AppTheme.secondaryText)
+                    .industrialStat()
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -3231,14 +3312,13 @@ private struct RelayChromeBar: View {
 
             RelayStateBadge(state: state)
 
-            Button(action: onRestart) {
-                Label(LocalizedStringKey("Restart"), systemImage: "arrow.clockwise")
-                    .labelStyle(.iconOnly)
+            IndustrialIconButton(
+                systemImage: "arrow.clockwise",
+                help: LocalizedStringKey("Restart Relay")
+            ) {
+                onRestart()
             }
-            .buttonStyle(GlassButtonStyle())
-            .controlSize(.small)
             .disabled(!state.canRestartRelay)
-            .help(LocalizedStringKey("Restart Relay"))
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
@@ -3254,16 +3334,7 @@ private struct RelayStateBadge: View {
 
     var body: some View {
         let badge = state.badgeInfo
-        Label(badge.title, systemImage: badge.icon)
-            .font(FontTheme.caption)
-            .fontWeight(.semibold)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-                badge.tint.opacity(0.15),
-                in: Capsule(style: .continuous)
-            )
-            .foregroundStyle(badge.tint)
+        IndustrialBadge(verbatim: badge.title, tint: badge.tint, dot: true)
     }
 }
 
@@ -3468,16 +3539,16 @@ private struct AnimatedBluetoothBadge: View {
 private struct RelayGlyph: View {
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.accentColor.opacity(0.15))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .stroke(Color.accentColor.opacity(0.3), lineWidth: 1)
                 )
             Image(systemName: "bolt.horizontal.fill")
                 .resizable()
                 .scaledToFit()
-                .padding(10)
+                .padding(8)
                 .foregroundStyle(Color.accentColor)
         }
     }

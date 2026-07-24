@@ -1,4 +1,3 @@
-// LlamaRunner.mm
 #import "LlamaRunner.h"
 #import <Foundation/Foundation.h>
 #include <vector>
@@ -267,7 +266,7 @@ static llama_sampler * noema_make_default_sampler() {
   const char *envFrequencyPenalty = getenv("NOEMA_FREQUENCY_PENALTY");
   const char *envPresencePenalty = getenv("NOEMA_PRESENCE_PENALTY");
   const char *envRepeatLastN = getenv("NOEMA_REPEAT_LAST_N");
-  float repeat_penalty = envRepeatPenalty ? strtof(envRepeatPenalty, nullptr) : 1.1f;
+  float repeat_penalty = envRepeatPenalty ? strtof(envRepeatPenalty, nullptr) : 1.0f;
   float frequency_penalty = envFrequencyPenalty ? strtof(envFrequencyPenalty, nullptr) : 0.0f;
   float presence_penalty = envPresencePenalty ? strtof(envPresencePenalty, nullptr) : 0.0f;
   int repeat_last_n = envRepeatLastN ? std::max(0, atoi(envRepeatLastN)) : 64;

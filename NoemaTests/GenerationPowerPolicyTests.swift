@@ -24,7 +24,7 @@ final class GenerationPowerPolicyTests: XCTestCase {
         XCTAssertTrue(decision.settings.keepInMemory)
     }
 
-    func testLowPowerModeReducesThreadsAndCapsContext() {
+    func testLowPowerModeReducesThreadsWithoutChangingContext() {
         var settings = ModelSettings.default(for: .gguf)
         settings.cpuThreads = ModelSettings.maxInferenceThreadCount
         settings.contextLength = 16_384
@@ -44,11 +44,11 @@ final class GenerationPowerPolicyTests: XCTestCase {
         XCTAssertTrue(decision.adapted)
         XCTAssertEqual(decision.reasons, [.lowPowerMode])
         XCTAssertEqual(decision.settings.cpuThreads, min(ModelSettings.maxInferenceThreadCount, activeProcessors / 2))
-        XCTAssertEqual(Int(decision.settings.contextLength), 4096)
+        XCTAssertEqual(decision.settings.contextLength, settings.contextLength)
         XCTAssertFalse(decision.settings.keepInMemory)
     }
 
-    func testCriticalThermalStateUsesStrongerLimits() {
+    func testCriticalThermalStateUsesStrongerLimitsWithoutChangingContext() {
         var settings = ModelSettings.default(for: .mlx)
         settings.cpuThreads = ModelSettings.maxInferenceThreadCount
         settings.contextLength = 16_384
@@ -69,7 +69,7 @@ final class GenerationPowerPolicyTests: XCTestCase {
         XCTAssertTrue(decision.adapted)
         XCTAssertEqual(decision.reasons, [.criticalThermal])
         XCTAssertEqual(decision.settings.cpuThreads, min(ModelSettings.maxInferenceThreadCount, activeProcessors / 3))
-        XCTAssertEqual(Int(decision.settings.contextLength), 2048)
+        XCTAssertEqual(decision.settings.contextLength, settings.contextLength)
         XCTAssertFalse(decision.settings.keepInMemory)
         XCTAssertTrue(decision.settings.disableWarmup)
     }

@@ -1,9 +1,10 @@
-// CuratedDatasets.swift
 import Foundation
 
 enum CuratedDatasets {
-    // Existing HF curated datasets (placeholder)
     static let hf: [ManualDatasetRegistry.Entry] = ManualDatasetRegistry.defaultEntries
+
+    // Curated, ready-to-use offline Knowledge Packs (survival, first aid, …).
+    static let knowledgePacks: [ManualDatasetRegistry.Entry] = KnowledgePackCatalog.registryEntries
 
     // Curated selections from the Open Textbook Library
     static var otl: [ManualDatasetRegistry.Entry] {

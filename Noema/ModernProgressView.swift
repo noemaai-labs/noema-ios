@@ -1,10 +1,9 @@
-// ModernProgressView.swift
 import SwiftUI
 
 /// A modern progress view with fluid animations
 struct ModernProgressView: View {
     let value: Double
-    var tint: Color = .blue
+    var tint: Color = .accentColor
     var height: CGFloat = 4
     
     @State private var animatedValue: Double = 0
@@ -66,7 +65,7 @@ struct ModernCircularProgressView: View {
     @State private var trimEnd: Double = 0.1
     var size: CGFloat = 40
     var lineWidth: CGFloat = 3
-    var tint: Color = .blue
+    var tint: Color = .accentColor
     
     var body: some View {
         Circle()
@@ -163,6 +162,12 @@ struct ProcessingPromptCardView: View {
         colorScheme == .dark ? Color.black.opacity(0.1) : Color.black.opacity(0.04)
     }
 
+#if os(macOS)
+    private static let cardRadius: CGFloat = 10
+#else
+    private static let cardRadius: CGFloat = 18
+#endif
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -171,7 +176,13 @@ struct ProcessingPromptCardView: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(secondaryColor)
                     Text(LocalizedStringKey("Processing Prompt"))
+#if os(macOS)
+                        .textCase(.uppercase)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.3)
+#else
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
+#endif
                         .foregroundStyle(primaryTextColor)
                 }
 
@@ -183,22 +194,28 @@ struct ProcessingPromptCardView: View {
                     .foregroundStyle(secondaryColor)
             }
 
+#if os(macOS)
+            IndustrialProgressBar(value: clampedProgress)
+#else
             ModernProgressView(
                 value: clampedProgress,
                 tint: .accentColor,
                 height: 3
             )
             .frame(height: 3)
+#endif
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .background(surfaceColor)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: Self.cardRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: Self.cardRadius, style: .continuous)
                 .strokeBorder(surfaceBorderColor, lineWidth: 0.6)
         )
+#if !os(macOS)
         .shadow(color: shadowColor, radius: 8, x: 0, y: 4)
+#endif
     }
 }
 

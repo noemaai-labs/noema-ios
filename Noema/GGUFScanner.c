@@ -1,4 +1,3 @@
-// GGUFScanner.c
 
 #include <stdint.h>
 #include <stdio.h>

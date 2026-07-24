@@ -75,6 +75,19 @@ struct ModelStorageAdvisorView: View {
     }
 
     var body: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons), so macOS gets a first-class
+        // industrial-dialect layout instead. The sheet already supplies the
+        // title + close, so no navigationTitle here.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Storage Advisor"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             if snapshot.modelCount == 0 {
                 Section(LocalizedStringKey("Storage Advisor")) {
@@ -92,7 +105,6 @@ struct ModelStorageAdvisorView: View {
                 exportSection
             }
         }
-        .navigationTitle(LocalizedStringKey("Storage Advisor"))
     }
 
     private var overviewSection: some View {
@@ -181,6 +193,77 @@ struct ModelStorageAdvisorView: View {
             exportError = error.localizedDescription
         }
     }
+
+#if os(macOS)
+    // MARK: - macOS industrial layout
+
+    private var macBody: some View {
+        MacSettingsPage {
+            if snapshot.modelCount == 0 {
+                MacSettingsCard(LocalizedStringKey("Storage Advisor")) {
+                    MacSettingsNoteRow(LocalizedStringKey("No local models installed"), divider: false)
+                    MacSettingsNoteRow(LocalizedStringKey("Install local models to see storage totals, duplicate families, stale models, and cleanup candidates."))
+                }
+            } else {
+                MacSettingsCard(LocalizedStringKey("Storage Overview")) {
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Installed Models"), value: "\(snapshot.modelCount)", divider: false)
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Visible Models"), value: "\(snapshot.visibleCount)")
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Hidden Models"), value: "\(snapshot.hiddenCount)")
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Total Model Storage"), value: snapshot.totalSize)
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Largest Model"), value: snapshot.largestModelSummary)
+                    MacSettingsKeyValueRow(title: LocalizedStringKey("Loaded Model"), value: snapshot.loadedModelName)
+                }
+
+                MacSettingsCard(LocalizedStringKey("Cleanup Candidates")) {
+                    let candidates = Array(snapshot.candidates.prefix(8))
+                    if candidates.isEmpty {
+                        MacSettingsNoteRow(LocalizedStringKey("No cleanup candidates"), divider: false)
+                    } else {
+                        ForEach(Array(candidates.enumerated()), id: \.element.id) { index, candidate in
+                            MacStorageCandidateRow(candidate: candidate, divider: index != 0)
+                        }
+                    }
+                }
+
+                MacSettingsCard(LocalizedStringKey("Duplicate Families")) {
+                    let families = snapshot.duplicateFamilies
+                    if families.isEmpty {
+                        MacSettingsNoteRow(LocalizedStringKey("No duplicate families"), divider: false)
+                    } else {
+                        ForEach(Array(families.enumerated()), id: \.element.id) { index, family in
+                            MacStorageDuplicateRow(family: family, divider: index != 0)
+                        }
+                    }
+                }
+
+                MacSettingsCard(LocalizedStringKey("Storage Export")) {
+                    MacSettingsActionRow(divider: false) {
+                        Button {
+                            generateExport()
+                        } label: {
+                            Label(LocalizedStringKey("Generate Storage JSON"), systemImage: "doc.badge.gearshape")
+                        }
+                        .buttonStyle(.industrial(.prominent))
+
+                        if let exportURL {
+                            ShareLink(item: exportURL) {
+                                Label(LocalizedStringKey("Share Storage JSON"), systemImage: "square.and.arrow.up")
+                            }
+                            .buttonStyle(.industrial(.quiet))
+                        }
+                    }
+
+                    if let exportURL {
+                        MacSettingsKeyValueRow(title: LocalizedStringKey("Export File"), value: exportURL.lastPathComponent)
+                    }
+                    if let exportError {
+                        MacSettingsKeyValueRow(title: LocalizedStringKey("Export Error"), value: exportError)
+                    }
+                }
+            }
+        }
+    }
+#endif
 }
 
 private struct StorageCapsuleMetric: View {
@@ -239,6 +322,58 @@ private struct StorageCandidateRow: View {
         .padding(.vertical, 4)
     }
 }
+
+#if os(macOS)
+private struct MacStorageCandidateRow: View {
+    let candidate: ModelStorageCandidate
+    var divider: Bool = true
+
+    var body: some View {
+        MacSettingsRowContainer(divider: divider) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(verbatim: candidate.name)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.8))
+                        .lineLimit(1)
+                    Spacer(minLength: 12)
+                    IndustrialBadge(verbatim: candidate.size)
+                }
+                Text(verbatim: candidate.reason)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct MacStorageDuplicateRow: View {
+    let family: ModelStorageDuplicateFamily
+    var divider: Bool = true
+
+    var body: some View {
+        MacSettingsRowContainer(divider: divider) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(verbatim: family.name)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.8))
+                        .lineLimit(1)
+                    Spacer(minLength: 12)
+                    IndustrialBadge(verbatim: family.totalSize)
+                }
+                Text(verbatim: family.detail)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+#endif
 
 struct ModelStorageCandidate: Identifiable {
     let id: String

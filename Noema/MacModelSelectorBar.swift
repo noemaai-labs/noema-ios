@@ -1,8 +1,13 @@
 import SwiftUI
+
+extension Notification.Name {
+    static let noemaOpenAutopilotSetup = Notification.Name("noemaOpenAutopilotSetup")
+}
+
 #if os(macOS)
 import AppKit
 
-private func performMediumImpact() {
+private func performAlignmentHaptic() {
     NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
 }
 
@@ -32,7 +37,9 @@ struct MacModelSelectorBar: View {
     @EnvironmentObject private var macChatChrome: MacChatChromeState
     @Environment(\.locale) private var locale
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showPicker = false
+    @State private var dotPulsing = false
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
     @AppStorage("hideGGUFOffloadWarning") private var hideGGUFOffloadWarning = false
@@ -46,6 +53,7 @@ struct MacModelSelectorBar: View {
         case loading
         case local(LocalModel)
         case remote(ActiveRemoteSession)
+        case auto(LocalModel)
     }
 
     var body: some View {
@@ -54,16 +62,26 @@ struct MacModelSelectorBar: View {
             if isAdvancedMode {
                 advancedControlsButton
             }
-            if case .local(let model) = status, !chatVM.loading {
+            if case .auto(let model) = status, !chatVM.loading {
+                settingsButton(for: model)
+                // Eject unloads the resident model only; Autopilot stays armed and
+                // re-engages when a model loads again. Disarming lives on the picker's
+                // "Turn Off" control (and Settings), so eject never silently ends it.
+                ejectButton {
+                    performAlignmentHaptic()
+                    modelManager.loadedModel = nil
+                    Task { await chatVM.unload() }
+                }
+            } else if case .local(let model) = status, !chatVM.loading {
                 settingsButton(for: model)
                 ejectButton {
-                    performMediumImpact()
+                    performAlignmentHaptic()
                     modelManager.loadedModel = nil
                     Task { await chatVM.unload() }
                 }
             } else if case .remote = status {
                 ejectButton {
-                    performMediumImpact()
+                    performAlignmentHaptic()
                     chatVM.deactivateRemoteSession()
                 }
             }
@@ -101,7 +119,7 @@ struct MacModelSelectorBar: View {
 
     private var advancedControlsButton: some View {
         Button {
-            performMediumImpact()
+            performAlignmentHaptic()
             withAnimation(.easeInOut(duration: 0.2)) {
                 macChatChrome.showAdvancedControls.toggle()
             }
@@ -126,9 +144,8 @@ struct MacModelSelectorBar: View {
     private var selectorButton: some View {
         let label = selectorLabel
 
-        // Compact native capsule: a small status dot carries the load state,
-        // the title stays plain text, and one quiet surface replaces the old
-        // tinted backgrounds.
+        // Compact quiet surface: a small status dot carries the load state
+        // and the title stays plain text.
         return Button {
             showPicker.toggle()
         } label: {
@@ -136,6 +153,7 @@ struct MacModelSelectorBar: View {
                 Circle()
                     .fill(statusDotColor)
                     .frame(width: 7, height: 7)
+                    .opacity(dotOpacity)
                 Text(label.title)
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(.primary)
@@ -163,18 +181,22 @@ struct MacModelSelectorBar: View {
             .frame(height: controlHeight)
             .padding(.horizontal, 12)
             .background(
-                Capsule()
+                RoundedRectangle(cornerRadius: controlCornerRadius, style: .continuous)
                     .fill(ChatTheme.quietSurface)
                     .overlay(
-                        Capsule()
+                        RoundedRectangle(cornerRadius: controlCornerRadius, style: .continuous)
                             .stroke(ChatTheme.hairline, lineWidth: 1)
                     )
             )
-            .contentShape(Capsule())
+            .contentShape(RoundedRectangle(cornerRadius: controlCornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
         .help(String(localized: "Choose a model (⌘L)"))
         .keyboardShortcut("l", modifiers: [.command])
+        .onAppear { syncDotPulse(deciding: chatVM.autoRoutingStage == .deciding) }
+        .onChange(of: chatVM.autoRoutingStage) { _, stage in
+            syncDotPulse(deciding: stage == .deciding)
+        }
         .popover(isPresented: $showPicker, arrowEdge: .top) {
             MacModelPicker(
                 isPresented: $showPicker,
@@ -185,11 +207,11 @@ struct MacModelSelectorBar: View {
             .environmentObject(datasetManager)
             .environmentObject(tabRouter)
             .environmentObject(walkthrough)
-            .frame(minWidth: 600, maxWidth: 640, minHeight: 520, maxHeight: 700)
+            .frame(minWidth: 440, maxWidth: 480, minHeight: 420, maxHeight: 560)
         }
     }
 
-    private func ejectButton(action: @escaping () -> Void) -> some View {
+    private func ejectButton(help: String = String(localized: "Unload model"), action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: "eject")
                 .font(.system(size: 12, weight: .medium))
@@ -201,7 +223,7 @@ struct MacModelSelectorBar: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
-        .help(String(localized: "Unload model"))
+        .help(help)
     }
 
     private func settingsButton(for model: LocalModel) -> some View {
@@ -240,26 +262,38 @@ struct MacModelSelectorBar: View {
     }
 
     private var status: Status {
+        if modelManager.autoRoutingArmed,
+           chatVM.modelLoaded,
+           let loaded = modelManager.loadedModel,
+           modelManager.activeRemoteSession == nil {
+            return .auto(loaded)
+        }
         if let remote = modelManager.activeRemoteSession {
             return .remote(remote)
         }
         if chatVM.loading {
             return .loading
         }
-        if let loaded = modelManager.loadedModel {
+        // Only treat the model as locally loaded when the runtime is actually resident.
+        // After the background unload controller frees the model on app exit,
+        // `modelManager.loadedModel` lingers as the last selection while `modelLoaded`
+        // flips false — the selector must not keep advertising a freed model.
+        if chatVM.modelLoaded, let loaded = modelManager.loadedModel {
             return .local(loaded)
         }
         return .unloaded
     }
 
-    /// Small status dot in the selector capsule: green = local model ready,
-    /// blue = remote session, orange = loading, gray = nothing loaded.
+    /// Small status dot in the selector button: green = local model ready,
+    /// blue = remote session, cyan = Autopilot, orange = loading, gray = nothing loaded.
     private var statusDotColor: Color {
         switch status {
         case .remote:
             return .blue
         case .local:
             return .green
+        case .auto:
+            return .cyan
         case .loading:
             return .orange
         case .unloaded:
@@ -267,8 +301,30 @@ struct MacModelSelectorBar: View {
         }
     }
 
+    private var dotOpacity: Double {
+        if chatVM.autoRoutingStage == .deciding && reduceMotion { return 0.7 }
+        return dotPulsing ? 0.35 : 1
+    }
+
+    private func syncDotPulse(deciding: Bool) {
+        if deciding, !reduceMotion {
+            guard !dotPulsing else { return }
+            withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                dotPulsing = true
+            }
+        } else if dotPulsing {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                dotPulsing = false
+            }
+        }
+    }
+
     private var selectorLabel: (title: String, subtitle: String?) {
         switch status {
+        case .auto(let model):
+            return (String(localized: "Autopilot"), autoSubtitle(for: model))
         case .local(let model):
             return (model.name, statusSubtitle)
         case .remote(let session):
@@ -302,6 +358,16 @@ struct MacModelSelectorBar: View {
         let sizeBytes = Int64(model.sizeGB * 1_073_741_824.0)
         parts.append(localizedByteCountString(bytes: sizeBytes, locale: locale))
         return parts.joined(separator: " · ")
+    }
+
+    private func autoSubtitle(for model: LocalModel) -> String {
+        let config = AutopilotConfigStore.load()
+        guard config.isReadyToArm,
+              EnterprisePolicyGate.remoteInferenceAllowed || !config.requiresCloudConsent,
+              let escalationModelName = config.escalationDisplayName else {
+            return String(localized: "local only")
+        }
+        return "\(model.name) · \(escalationModelName)"
     }
 
     private func remoteSubtitle(for session: ActiveRemoteSession) -> String {
@@ -353,6 +419,9 @@ private struct MacModelPicker: View {
     @State private var pendingLoad: (LocalModel, ModelSettings)?
     @State private var showOffloadWarning = false
     @AppStorage("hideGGUFOffloadWarning") private var hideGGUFOffloadWarning = false
+    @State private var highlightedIndex: Int?
+    @FocusState private var searchFocused: Bool
+    @State private var keyMonitor: Any?
 
     enum SortOption: String, CaseIterable, Identifiable {
         case recent = "Recency"
@@ -371,19 +440,24 @@ private struct MacModelPicker: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             header
             modelList
             footer
         }
-        .padding(20)
+        .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            modelManager.refresh()
             models = modelManager.downloadedModels
+            // Popover focus isn't accepted until the panel finishes presenting.
+            DispatchQueue.main.async { searchFocused = true }
+            installKeyMonitor()
         }
+        .onDisappear { removeKeyMonitor() }
+        .task { await modelManager.refreshAsync() }
         .onReceive(modelManager.$downloadedModels) { models = $0 }
+        .onChange(of: searchText) { _, _ in highlightedIndex = nil }
         .alert("Load Failed", isPresented: Binding(
             get: { chatVM.loadError != nil },
             set: { _ in chatVM.loadError = nil }
@@ -423,29 +497,18 @@ private struct MacModelPicker: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Model Library")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(AppTheme.text)
-                Spacer()
+        VStack(alignment: .leading, spacing: 10) {
+            IndustrialSectionHeader("Model Library") {
                 Button {
-                    tabRouter.selection = .explore
-                    UserDefaults.standard.set(ExploreSection.models.rawValue, forKey: "exploreSection")
-                    isPresented = false
+                    openExplore()
                 } label: {
-                    Label("Open Model Library", systemImage: "arrow.up.right.square")
-                        .font(.system(size: 12, weight: .semibold))
+                    Label("Open Model Library", systemImage: "arrow.up.right")
                 }
-                .buttonStyle(.link)
+                .buttonStyle(.industrial(.quiet))
             }
 
-            TextField(text: $searchText, prompt: Text("Type to filter models…")) {
-                Text("Type to filter models…")
-            }
-            .textFieldStyle(.roundedBorder)
-
-            HStack {
+            HStack(spacing: 8) {
+                searchField
                 Picker(selection: $sort) {
                     ForEach(SortOption.allCases) { option in
                         Text(option.titleKey).tag(option)
@@ -453,69 +516,151 @@ private struct MacModelPicker: View {
                 } label: {
                     Text("Sort")
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .labelsHidden()
-                Spacer()
+                .controlSize(.small)
+                .fixedSize()
             }
+        }
+    }
+
+    private var searchField: some View {
+        let shape = RoundedRectangle(cornerRadius: 4, style: .continuous)
+        return TextField(text: $searchText, prompt: Text("Type to filter models…")) {
+            Text("Type to filter models…")
+        }
+        .textFieldStyle(.plain)
+        .font(.system(size: 11, design: .monospaced))
+        .focused($searchFocused)
+        .onSubmit { activateHighlighted() }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(shape.fill(Color.primary.opacity(0.05)))
+        .overlay(shape.stroke(Color.primary.opacity(0.08), lineWidth: 1))
+    }
+
+    private func openExplore() {
+        tabRouter.selection = .explore
+        UserDefaults.standard.set(ExploreSection.models.rawValue, forKey: "exploreSection")
+        isPresented = false
+    }
+
+    /// The popover's field editor consumes Escape (completion menu) and the
+    /// arrow keys (caret movement) before SwiftUI's .onKeyPress ever sees
+    /// them, so list navigation is intercepted one level down, at the event
+    /// monitor. Return stays with the field's onSubmit.
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            switch event.keyCode {
+            case 53: // Escape
+                if searchText.isEmpty {
+                    isPresented = false
+                } else {
+                    searchText = ""
+                }
+                return nil
+            case 125: // Down arrow
+                moveHighlight(by: 1)
+                return nil
+            case 126: // Up arrow
+                moveHighlight(by: -1)
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+    }
+
+    private func moveHighlight(by delta: Int) {
+        let count = filteredModels.count
+        guard count > 0 else { return }
+        if let current = highlightedIndex {
+            highlightedIndex = ((current + delta) % count + count) % count
+        } else {
+            highlightedIndex = delta > 0 ? 0 : count - 1
+        }
+    }
+
+    private func activateHighlighted() {
+        let list = filteredModels
+        guard !list.isEmpty else { return }
+        activate(list[min(highlightedIndex ?? 0, list.count - 1)])
+    }
+
+    private func activate(_ model: LocalModel) {
+        if manualParams {
+            presentSettings(for: model)
+        } else {
+            startLoad(for: model, settings: modelManager.settings(for: model))
         }
     }
 
     private var modelList: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 14) {
-                if tabRouter.isAFMHiddenNoticeVisible {
-                    afmHiddenNotice
-                }
-                modelSection(title: "Downloaded", models: filteredModels)
-                if filteredModels.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 28))
-                            .foregroundStyle(AppTheme.secondaryText)
-                        Text("No models match your search.")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(AppTheme.text)
-                        Button {
-                            tabRouter.selection = .explore
-                            UserDefaults.standard.set(ExploreSection.models.rawValue, forKey: "exploreSection")
-                            isPresented = false
-                        } label: {
-                            Text("Browse Explore tab")
-                        }
-                        .buttonStyle(.link)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if tabRouter.isAFMHiddenNoticeVisible {
+                        afmHiddenNotice
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 42)
+                    VStack(alignment: .leading, spacing: 4) {
+                        IndustrialSectionHeader("Automatic")
+                        AutopilotPickerRow(isPresented: $isPresented)
+                    }
+                    modelSection(title: "Downloaded", models: filteredModels)
+                    if filteredModels.isEmpty {
+                        VStack(spacing: 10) {
+                            Text("No models match your search.")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Button {
+                                openExplore()
+                            } label: {
+                                Text("Browse Explore tab")
+                            }
+                            .buttonStyle(.industrial(.quiet))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 24)
+                    }
                 }
+                .padding(.vertical, 4)
             }
-            .padding(.vertical, 4)
+            .onChange(of: highlightedIndex) { _, index in
+                guard let index, filteredModels.indices.contains(index) else { return }
+                proxy.scrollTo(filteredModels[index].id, anchor: nil)
+            }
         }
     }
 
     @ViewBuilder
-    private func modelSection(title: String, models: [LocalModel]) -> some View {
+    private func modelSection(title: LocalizedStringKey, models: [LocalModel]) -> some View {
         if !models.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(LocalizedStringKey(title))
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .padding(.horizontal, 4)
+            VStack(alignment: .leading, spacing: 4) {
+                IndustrialSectionHeader(title)
 
-                ForEach(models, id: \.id) { model in
+                ForEach(Array(models.enumerated()), id: \.element.id) { index, model in
                     MacModelRow(
                         model: model,
                         isLoading: loadingModelID == model.id,
                         isActive: chatVM.loadedModelURL?.path == model.url.path,
-                        manualParams: manualParams,
-                        onSelect: {
-                            if manualParams {
-                                presentSettings(for: model)
-                            } else {
-                                let settings = modelManager.settings(for: model)
-                                startLoad(for: model, settings: settings)
-                            }
-                        }
+                        isHighlighted: highlightedIndex == index,
+                        onSelect: { activate(model) },
+                        onLoad: { startLoad(for: model, settings: modelManager.settings(for: model)) },
+                        onSettings: { presentSettings(for: model) }
                     )
+                    .id(model.id)
+                    if index < models.count - 1 {
+                        IndustrialHairline()
+                            .padding(.horizontal, 8)
+                    }
                 }
             }
         }
@@ -524,7 +669,7 @@ private struct MacModelPicker: View {
     private var afmHiddenNotice: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Apple Foundation Model is hidden. You can re-enable it in Settings.")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 12))
             Button {
                 tabRouter.dismissAFMHiddenNotice()
                 tabRouter.selection = .settings
@@ -532,16 +677,16 @@ private struct MacModelPicker: View {
             } label: {
                 Label("Open Settings", systemImage: "gearshape")
             }
-            .buttonStyle(.link)
+            .buttonStyle(.industrial(.quiet))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.primary.opacity(0.06))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
     }
@@ -550,15 +695,17 @@ private struct MacModelPicker: View {
         HStack {
             Toggle(isOn: $manualParams) {
                 Text("Manually choose parameters")
+                    .font(.system(size: 12))
             }
-            .toggleStyle(.switch)
+            .toggleStyle(IndustrialToggleStyle())
             Spacer()
             if let dataset = modelManager.activeDataset {
                 Label {
                     Text("Using \(dataset.name)")
-                        .font(.system(size: 11))
+                        .font(.system(size: 11, design: .monospaced))
                 } icon: {
                     Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 10))
                 }
                 .foregroundColor(.secondary)
             }
@@ -635,223 +782,250 @@ private struct MacModelPicker: View {
     }
 }
 
+private struct AutopilotPickerRow: View {
+    @Binding var isPresented: Bool
+    @EnvironmentObject private var chatVM: ChatVM
+    @EnvironmentObject private var modelManager: AppModelManager
+    @State private var hovering = false
+    @State private var config = AutopilotConfigStore.load()
+
+    private var enterpriseBlocked: Bool {
+        !EnterprisePolicyGate.remoteInferenceAllowed && config.requiresCloudConsent
+    }
+    private var configured: Bool { config.isReadyToArm }
+    private var localModelLoaded: Bool { chatVM.modelLoaded && modelManager.loadedModel != nil }
+
+    var body: some View {
+        Button(action: handleTap) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(configured ? Color.cyan : Color.secondary.opacity(0.45))
+                    .frame(width: 6, height: 6)
+                    .frame(width: 12, height: 12)
+
+                Text("Autopilot")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Text(verbatim: metadata)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(-1)
+
+                Spacer(minLength: 8)
+
+                if enterpriseBlocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.orange)
+                } else if !configured {
+                    Button {
+                        openSetup()
+                    } label: {
+                        Text("Set Up…")
+                    }
+                    .buttonStyle(.industrial(.quiet))
+                }
+                if configured {
+                    if modelManager.autoRoutingArmed {
+                        Button {
+                            modelManager.autoRoutingArmed = false
+                        } label: {
+                            Text("Turn Off")
+                        }
+                        .buttonStyle(.industrial(.quiet))
+                    }
+                    IndustrialBadge("Auto", tint: .cyan)
+                    if modelManager.autoRoutingArmed {
+                        IndustrialBadge("Active", tint: .green)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 34)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(hovering ? Color.primary.opacity(0.045) : .clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .disabled(enterpriseBlocked)
+        .help(modelManager.autoRoutingArmed
+              ? String(localized: "Turn off Autopilot")
+              : String(localized: "Turn on Autopilot"))
+        .onAppear { config = AutopilotConfigStore.load() }
+    }
+
+    private var metadata: String {
+        guard configured, let escalation = config.escalationDisplayName else {
+            return String(localized: "not set up")
+        }
+        guard localModelLoaded, let loaded = modelManager.loadedModel else {
+            return String(localized: "engages when a model loads")
+        }
+        return "\(loaded.name) → \(escalation)"
+    }
+
+    private func handleTap() {
+        if configured {
+            if modelManager.autoRoutingArmed {
+                // Disarm in place so the Active badge visibly drops.
+                modelManager.autoRoutingArmed = false
+            } else {
+                // Arming without a loaded model is fine: Autopilot engages as
+                // soon as a local model loads.
+                modelManager.autoRoutingArmed = true
+                isPresented = false
+            }
+        } else {
+            openSetup()
+        }
+    }
+
+    private func openSetup() {
+        NotificationCenter.default.post(name: .noemaOpenAutopilotSetup, object: nil)
+        isPresented = false
+    }
+}
+
 private struct MacModelRow: View {
     let model: LocalModel
     let isLoading: Bool
     let isActive: Bool
-    let manualParams: Bool
+    let isHighlighted: Bool
     let onSelect: () -> Void
+    let onLoad: () -> Void
+    let onSettings: () -> Void
     @Environment(\.locale) private var locale
+    @State private var hovering = false
 
     var body: some View {
         Button(action: onSelect) {
-            HStack(alignment: .top, spacing: 14) {
-                statusIcon
-                    .padding(.top, 2)
+            HStack(spacing: 8) {
+                statusIndicator
 
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(alignment: .firstTextBaseline, spacing: 7) {
-                        Text(model.name)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(AppTheme.text)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if model.isFavourite {
-                            Image(systemName: "star.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(.yellow)
-                        }
-                        if model.isMultimodal {
-                            Image(systemName: "photo")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                        if model.isToolCapable {
-                            Image(systemName: "wrench.and.screwdriver")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                Text(model.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
-                    statusBadges
+                capabilityGlyphs
 
-                    Text(model.modelID)
-                        .font(.system(size: 12))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .padding(.top, 2)
+                Text(metadata)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(-1)
 
-                    chipRow(items: summaryChips)
-                        .padding(.top, 4)
+                Spacer(minLength: 8)
 
-                    if model.format != .afm {
-                        ModelRAMAdvisor.badge(
-                            format: model.format,
-                            sizeBytes: modelSizeBytes,
-                            contextLength: max(512, Int(model.sizeGB > 0 ? 4096 : 512)),
-                            layerCount: model.totalLayers > 0 ? model.totalLayers : nil,
-                            moeInfo: model.moeInfo
-                        )
-                        .padding(.top, 3)
-                    }
+                if model.format != .afm && !fitsInMemory {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.orange)
+                        .help("Likely over memory budget")
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .trailing, spacing: 10) {
-                    if model.format != .afm {
-                        Text(formattedSize)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(AppTheme.secondaryText)
-                            .lineLimit(1)
-                    }
-                    if isLoading {
-                        ProgressView()
-                            .scaleEffect(0.72)
-                    } else {
-                        Image(systemName: manualParams ? "slider.horizontal.3" : "arrow.right.circle.fill")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(isActive ? Color.green : Color.accentColor.opacity(0.78))
-                    }
+                IndustrialBadge(verbatim: model.format.displayName, tint: formatColor)
+                if isActive {
+                    IndustrialBadge("Active", tint: .green)
                 }
-                .frame(minWidth: 64, alignment: .trailing)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 15)
+            .padding(.horizontal, 8)
+            .frame(minHeight: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(rowBackground)
-            .overlay(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(Color.primary.opacity(isActive ? 0.10 : 0.045), lineWidth: 1)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHighlighted
+                          ? Color.primary.opacity(0.07)
+                          : (hovering ? Color.primary.opacity(0.045) : .clear))
             )
-            .shadow(color: Color.black.opacity(0.035), radius: 12, x: 0, y: 5)
-            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
-    }
-
-    private var statusBadges: some View {
-        HStack(spacing: 6) {
-            if isActive {
-                badge(String(localized: "Active"), color: .green)
-            } else {
-                badge(String(localized: "Downloaded"), color: .blue)
+        .onHover { hovering = $0 }
+        .contextMenu {
+            Button("Load") { onLoad() }
+            Button("Load with Settings…") { onSettings() }
+            Divider()
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([model.url])
             }
-            badge(model.format.displayName, color: formatColor)
-            if let source = model.slmSourceFormatLabel {
-                badge(source, color: .cyan)
-            }
-        }
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
-    private var statusIcon: some View {
-        ZStack {
-            if isLoading {
-                ProgressView()
-                    .scaleEffect(0.7)
-            } else if isActive {
-                Circle()
-                    .fill(.green)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.white)
-            } else {
-                Image(systemName: formatIconName)
-                    .font(.system(size: 27, weight: .medium))
-                    .foregroundStyle(formatColor)
+            Button("Copy Model ID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.modelID, forType: .string)
             }
         }
-        .frame(width: 28, height: 28)
-    }
-
-    private var rowBackground: some View {
-        RoundedRectangle(cornerRadius: 20, style: .continuous)
-            .fill(
-                isActive
-                    ? Color.green.opacity(0.10)
-                    : Color(nsColor: .controlBackgroundColor)
-            )
-    }
-
-    private var summaryChips: [String] {
-        var items: [String] = []
-        if let parameterCountLabel = model.parameterCountLabel, !parameterCountLabel.isEmpty {
-            items.append(parameterCountLabel)
-        }
-        if !model.quant.isEmpty && model.format != .ane {
-            items.append(model.quant)
-        }
-        if !model.architectureFamily.isEmpty && model.format != .et && model.format != .ane && model.format != .afm {
-            items.append(model.architectureFamily.uppercased())
-        }
-        if items.isEmpty {
-            items.append(model.format.displayName)
-        }
-        return items
     }
 
     @ViewBuilder
-    private func chipRow(items: [String]) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    detailChip(label: item)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    ForEach(Array(items.prefix(2).enumerated()), id: \.offset) { _, item in
-                        detailChip(label: item)
-                    }
-                }
-                HStack(spacing: 8) {
-                    ForEach(Array(items.dropFirst(2).enumerated()), id: \.offset) { _, item in
-                        detailChip(label: item)
-                    }
-                }
+    private var statusIndicator: some View {
+        Group {
+            if isLoading {
+                ProgressView()
+                    .scaleEffect(0.5)
+            } else {
+                Circle()
+                    .fill(isActive ? Color.green : Color.secondary.opacity(0.45))
+                    .frame(width: 6, height: 6)
             }
         }
-        .lineLimit(1)
+        .frame(width: 12, height: 12)
     }
 
-    private func badge(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(FontTheme.caption)
-            .fontWeight(.medium)
-            .foregroundStyle(color)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.12), in: Capsule())
-    }
-
-    private func detailChip(label: String) -> some View {
-        Text(label)
-            .font(FontTheme.caption)
-            .foregroundStyle(AppTheme.secondaryText)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(Color.primary.opacity(0.06), in: Capsule())
-    }
-
-    private var formatIconName: String {
-        switch model.format {
-        case .gguf:
-            return "cpu"
-        case .mlx:
-            return "bolt.horizontal.circle"
-        case .et:
-            return "shippingbox.circle"
-        case .ane:
-            return "apple.logo"
-        case .afm:
-            return "sparkles"
-        case .coreai:
-            return "cpu"
+    @ViewBuilder
+    private var capabilityGlyphs: some View {
+        if model.isFavourite {
+            Image(systemName: "star.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.yellow)
         }
+        if model.isMultimodal {
+            Image(systemName: "photo")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        if model.isToolCapable {
+            Image(systemName: "wrench.and.screwdriver")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var metadata: String {
+        var parts: [String] = []
+        if !model.quant.isEmpty {
+            parts.append(model.quant)
+        }
+        parts.append(model.format.displayName)
+        if model.sizeGB > 0 {
+            parts.append(localizedByteCountString(bytes: modelSizeBytes, locale: locale))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var fitsInMemory: Bool {
+        // Paged (Noema Overfit) installs run through the paged plan and are
+        // judged by the canary, never by a resident-alone or package-total
+        // file size. The probe is memoized per URL.
+        if model.format == .gguf, OverfitPagedInstallCache.isPaged(model.url) {
+            return true
+        }
+        return ModelRAMAdvisor.fitsInRAM(
+            format: model.format,
+            sizeBytes: modelSizeBytes,
+            contextLength: max(512, Int(model.sizeGB > 0 ? 4096 : 512)),
+            layerCount: model.totalLayers > 0 ? model.totalLayers : nil,
+            moeInfo: model.moeInfo
+        )
     }
 
     private var formatColor: Color {
@@ -873,10 +1047,6 @@ private struct MacModelRow: View {
 
     private var modelSizeBytes: Int64 {
         Int64(model.sizeGB * 1_073_741_824.0)
-    }
-
-    private var formattedSize: String {
-        localizedByteCountString(bytes: modelSizeBytes, locale: locale)
     }
 }
 
@@ -920,7 +1090,8 @@ private func performModelLoad(
             contextLength: context,
             layerCount: layerHint,
             moeInfo: model.moeInfo,
-            kvCacheEstimate: kvCacheEstimate
+            kvCacheEstimate: kvCacheEstimate,
+            runtimeConfiguration: .resolved(from: normalizedSettings, modelURL: model.url)
         ) {
             AppSoundPlayer.play(.error)
             Haptics.error()

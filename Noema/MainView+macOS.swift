@@ -8,6 +8,10 @@ typealias ChatView = MessageView.ChatView
 
 final class MacChatChromeState: ObservableObject {
     @Published var showAdvancedControls = false
+    @Published var showJSpaceLens = false
+    /// Request flag set by the window toolbar; ChatView consumes it and
+    /// presents its runtime-info sheet, then resets the flag.
+    @Published var runtimeInfoRequested = false
 }
 
 struct MainView: View {
@@ -19,11 +23,14 @@ struct MainView: View {
     @EnvironmentObject private var downloadController: DownloadController
     @EnvironmentObject private var walkthrough: GuidedWalkthroughManager
     @AppStorage("offGrid") private var offGrid = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hoveredTab: MainTab?
     @StateObject private var macModalPresenter = MacModalPresenter()
     @StateObject private var macChatChrome = MacChatChromeState()
     @StateObject private var backgroundUnloadController = BackgroundModelUnloadController()
     @State private var didAutoLoad = false
+    @State private var downloadListModalActive = false
+    @State private var downloadListModalID: UUID?
 
     private let mainGuideSteps: Set<GuidedWalkthroughManager.Step> = [
         .chatIntro,
@@ -55,9 +62,11 @@ struct MainView: View {
         .background(AppTheme.windowBackground)
         .background(FullScreenWindowConfigurator())
         .frame(minWidth: 1100, minHeight: 720)
+        .toolbar { windowToolbar }
         .onAppear {
             modelManager.bind(datasetManager: datasetManager)
             downloadController.configure(modelManager: modelManager, datasetManager: datasetManager)
+            downloadController.bootstrapIfNeeded()
             datasetManager.bind(downloadController: downloadController)
             chatVM.modelManager = modelManager
             chatVM.datasetManager = datasetManager
@@ -74,6 +83,8 @@ struct MainView: View {
             switch phase {
             case .active:
                 backgroundUnloadController.cancelPendingUnload()
+                AutopilotAFMBrain.syncWarmState(armed: modelManager.autoRoutingArmed)
+                _ = chatVM.resumeDeferredAutoRoutingIfNeeded()
             case .inactive:
                 backgroundUnloadController.scheduleIfNeeded(
                     sceneState: .inactive,
@@ -81,6 +92,9 @@ struct MainView: View {
                     modelManager: modelManager
                 )
             case .background:
+                AutopilotAFMBrain.syncWarmState(armed: false, cancelInFlight: true)
+                _ = chatVM.deferAutoRoutingLocallyUntilActive(reason: "scene-background")
+                chatVM.flushPendingSessionSavesNow()
                 persistRollingThoughts()
                 backgroundUnloadController.scheduleIfNeeded(
                     sceneState: .background,
@@ -91,6 +105,68 @@ struct MainView: View {
                 break
             }
         }
+    }
+
+    /// The one window toolbar: the model selector rides the leading slot on
+    /// every tab (Xcode scheme-picker style), chat actions join it only on
+    /// the chat tab. Living in the real NSToolbar restores window dragging
+    /// and keeps the controls on screen in fullscreen (auto-hide is opt-in
+    /// on macOS and is never requested here).
+    @ToolbarContentBuilder
+    private var windowToolbar: some ToolbarContent {
+        // The controls draw their own industrial chrome, so each item opts out
+        // of the system's Liquid Glass capsule — otherwise they render
+        // double-wrapped in glass.
+        ToolbarItem(placement: .navigation) {
+            MacModelSelectorBar()
+                .frame(minWidth: 220, idealWidth: 340, maxWidth: 420)
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(walkthrough)
+                .environmentObject(macModalPresenter)
+                .environmentObject(macChatChrome)
+        }
+        .sharedBackgroundVisibility(.hidden)
+        if tabRouter.selection == .chat {
+            ToolbarItem(placement: .primaryAction) {
+                ChatToolbarIconButton(systemImage: "brain", help: "J-Space Lens") {
+                    withAnimation(.easeInOut(duration: 0.2)) { macChatChrome.showJSpaceLens.toggle() }
+                }
+            }
+            .sharedBackgroundVisibility(.hidden)
+            ToolbarItem(placement: .primaryAction) {
+                ChatToolbarIconButton(systemImage: "info.circle", help: "Runtime Information") {
+                    macChatChrome.runtimeInfoRequested = true
+                }
+            }
+            .sharedBackgroundVisibility(.hidden)
+            ToolbarItem(placement: .primaryAction) {
+                ChatToolbarIconButton(systemImage: "square.and.pencil", help: "New Chat") {
+                    chatVM.startNewSession()
+                }
+                .contextMenu {
+                    if chatVM.activeSessionDataset != nil {
+                        Button {
+                            chatVM.startNewSession(carryingActiveDataset: false)
+                        } label: {
+                            Label {
+                                Text(verbatim: "\(String(localized: "New Chat")) · \(String(localized: "No Dataset"))")
+                            } icon: {
+                                Image(systemName: "circle.slash")
+                            }
+                        }
+                    }
+                }
+                .guideHighlight(.chatNewChatButton)
+            }
+            .sharedBackgroundVisibility(.hidden)
+        }
+        ToolbarItem(placement: .primaryAction) {
+            MacRAMUsageIndicator()
+        }
+        .sharedBackgroundVisibility(.hidden)
     }
 
     // Extremely quiet, narrow icon rail: navigation should never compete with
@@ -111,6 +187,7 @@ struct MainView: View {
 
             VStack(spacing: 6) {
                 sidebarButton(for: .relay, systemImage: "bolt.horizontal", help: String(localized: "Mac Relay"))
+                sidebarButton(for: .tools, systemImage: "wrench.and.screwdriver", help: String(localized: "Tools"))
             }
 
             Spacer(minLength: 12)
@@ -164,6 +241,8 @@ struct MainView: View {
         }
         .buttonStyle(.plain)
         .help(help)
+        .animation(AppMotion.resolve(AppMotion.snappy, reduceMotion: reduceMotion), value: isSelected)
+        .animation(AppMotion.resolve(AppMotion.snappy, reduceMotion: reduceMotion), value: isHovered)
         .onHover { hovering in
             hoveredTab = hovering ? tab : (hoveredTab == tab ? nil : hoveredTab)
         }
@@ -187,60 +266,81 @@ struct MainView: View {
     @ViewBuilder
     private var detailContent: some View {
         ZStack {
-            switch tabRouter.selection {
-            case .chat:
-                ChatView()
-                    .environmentObject(chatVM)
-                    .environmentObject(modelManager)
-                    .environmentObject(datasetManager)
-                    .environmentObject(tabRouter)
-                    .environmentObject(downloadController)
-                    .environmentObject(walkthrough)
-            case .stored:
-                StoredView()
-                    .environmentObject(chatVM)
-                    .environmentObject(modelManager)
-                    .environmentObject(datasetManager)
-                    .environmentObject(tabRouter)
-                    .environmentObject(downloadController)
-                    .environmentObject(walkthrough)
-            case .explore:
-                ExploreContainerView()
-                    .environmentObject(chatVM)
-                    .environmentObject(modelManager)
-                    .environmentObject(datasetManager)
-                    .environmentObject(tabRouter)
-                    .environmentObject(downloadController)
-                    .environmentObject(walkthrough)
-            case .relay:
-                RelayManagementView()
-                    .environmentObject(modelManager)
-                    .environmentObject(chatVM)
-                    .environmentObject(downloadController)
-            case .settings:
-                SettingsView()
-                    .environmentObject(chatVM)
-                    .environmentObject(modelManager)
-                    .environmentObject(datasetManager)
-                    .environmentObject(tabRouter)
-                    .environmentObject(downloadController)
-                    .environmentObject(walkthrough)
-            }
+            pageContent
+                // Distinct identity per page so SwiftUI runs the insertion/removal
+                // transition when the sidebar switches tabs.
+                .id(tabRouter.selection)
+                .transition(AppMotion.pageTransition)
+        }
+        .animation(AppMotion.resolve(AppMotion.page, reduceMotion: reduceMotion),
+                   value: tabRouter.selection)
+    }
+
+    @ViewBuilder
+    private var pageContent: some View {
+        switch tabRouter.selection {
+        case .chat:
+            ChatView()
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(downloadController)
+                .environmentObject(walkthrough)
+        case .stored:
+            StoredView()
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(downloadController)
+                .environmentObject(walkthrough)
+        case .explore:
+            ExploreContainerView()
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(downloadController)
+                .environmentObject(walkthrough)
+        case .relay:
+            RelayManagementView()
+                .environmentObject(modelManager)
+                .environmentObject(chatVM)
+                .environmentObject(downloadController)
+        case .tools:
+            ToolsHubView()
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(downloadController)
+                .environmentObject(walkthrough)
+        case .settings:
+            SettingsView()
+                .environmentObject(chatVM)
+                .environmentObject(modelManager)
+                .environmentObject(datasetManager)
+                .environmentObject(tabRouter)
+                .environmentObject(downloadController)
+                .environmentObject(walkthrough)
         }
     }
 
+    // Stored pads itself (its ScrollView applies widePadding) — padding it here
+    // too doubled the inset to 64pt.
     private var detailHorizontalPadding: CGFloat {
         switch tabRouter.selection {
-        case .chat, .explore:
+        case .chat, .explore, .stored:
             return 0
         default:
-            return UIConstants.widePadding // Use new wide padding
+            return UIConstants.widePadding
         }
     }
 
     private var detailTopPadding: CGFloat {
         switch tabRouter.selection {
-        case .chat, .explore:
+        case .chat, .explore, .stored:
             return 0
         default:
             return UIConstants.defaultPadding
@@ -248,13 +348,11 @@ struct MainView: View {
     }
 
     private var detailStackSpacing: CGFloat { tabRouter.selection == .chat ? 0 : 32 } // Increased spacing
-    private var notificationsTopPadding: CGFloat {
-        tabRouter.selection == .chat ? 64 : 24
-    }
+    // The old in-content chat toolbar needed 64/88pt clearances here; with the
+    // controls in the real window toolbar the standard insets apply everywhere.
+    private var notificationsTopPadding: CGFloat { 24 }
     private var notificationsHorizontalPadding: CGFloat { max(detailHorizontalPadding, 24) }
-    private var notificationsTrailingPadding: CGFloat {
-        tabRouter.selection == .chat ? 88 : notificationsHorizontalPadding
-    }
+    private var notificationsTrailingPadding: CGFloat { notificationsHorizontalPadding }
 
     private var detailContainer: some View {
         ZStack(alignment: .topLeading) {
@@ -296,10 +394,30 @@ struct MainView: View {
                 .environmentObject(walkthrough)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .sheet(isPresented: $downloadController.showPopup) {
-            DownloadListPopup()
-                .environmentObject(downloadController)
-                .frame(minWidth: 520, minHeight: 420)
+        .onChange(of: downloadController.showPopup) { show in
+            if show {
+                if !downloadListModalIsCurrent {
+                    presentDownloadList()
+                }
+            } else if downloadListModalActive {
+                let wasCurrent = downloadListModalIsCurrent
+                downloadListModalActive = false
+                downloadListModalID = nil
+                if wasCurrent {
+                    macModalPresenter.dismiss(triggerCallback: false)
+                }
+            }
+        }
+        // MacModalPresenter.present() replaces the current modal without running
+        // its onDismiss, which would strand showPopup/downloadListModalActive and
+        // permanently block reopening the list; reconcile on identity changes.
+        .onChange(of: macModalPresenter.presentation?.id) { id in
+            guard downloadListModalActive, id != downloadListModalID else { return }
+            downloadListModalActive = false
+            downloadListModalID = nil
+            if downloadController.showPopup {
+                downloadController.closeList()
+            }
         }
         .overlay(alignment: .center) {
             MacModalHost()
@@ -307,6 +425,40 @@ struct MainView: View {
                 .allowsHitTesting(macModalPresenter.isPresented)
                 .zIndex(macModalPresenter.isPresented ? 100 : -1)
         }
+    }
+
+    private var downloadListModalIsCurrent: Bool {
+        downloadListModalActive && macModalPresenter.presentation?.id == downloadListModalID
+    }
+
+    private func presentDownloadList() {
+        if macModalPresenter.isPresented {
+            macModalPresenter.dismiss()
+        }
+        downloadListModalActive = true
+        macModalPresenter.present(
+            title: String(localized: "Downloads"),
+            dimensions: MacModalDimensions(
+                minWidth: 520,
+                idealWidth: 560,
+                maxWidth: 640,
+                minHeight: 420,
+                idealHeight: 500,
+                maxHeight: 640
+            ),
+            contentInsets: EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0),
+            onDismiss: {
+                downloadListModalActive = false
+                downloadListModalID = nil
+                if downloadController.showPopup {
+                    downloadController.closeList()
+                }
+            }
+        ) {
+            DownloadListPopup(onClose: { downloadController.closeList() })
+                .environmentObject(downloadController)
+        }
+        downloadListModalID = macModalPresenter.presentation?.id
     }
 
     private var windowBackground: some View {
@@ -343,6 +495,38 @@ struct MainView: View {
         didAutoLoad = true
         await StartupLoader.performStartupLoad(chatVM: chatVM, modelManager: modelManager, offGrid: offGrid)
     }
+}
+
+/// Normalizes a window to Noema's standard resizable chrome.
+///
+/// SwiftUI owns the `NSToolbar` for the main `WindowGroup` window and installs a KVO observer
+/// (`BarAppearanceBridge`) on it. Rewriting `styleMask` / `toolbarStyle` out from under SwiftUI
+/// — especially while fullscreen is engaged — desyncs that bookkeeping and crashes with an
+/// "not registered as an observer" `NSRangeException` during the fullscreen live-resize. So this
+/// leaves `styleMask` / `toolbarStyle` alone while the window is in (or transitioning through)
+/// fullscreen, and otherwise only assigns a value when it actually differs (a bare assignment
+/// still triggers a titlebar/toolbar reshape even when the value is unchanged).
+@MainActor
+func applyStandardWindowChrome(to window: NSWindow) {
+    window.collectionBehavior.remove(.fullScreenNone)
+    window.collectionBehavior.insert([.fullScreenPrimary, .fullScreenAllowsTiling])
+
+    if !window.styleMask.contains(.fullScreen) {
+        let unwanted: NSWindow.StyleMask = [.borderless, .fullSizeContentView]
+        if !window.styleMask.isDisjoint(with: unwanted) { window.styleMask.subtract(unwanted) }
+
+        let required: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+        let missing = required.subtracting(window.styleMask)
+        if !missing.isEmpty { window.styleMask.formUnion(missing) }
+
+        if #available(macOS 11.0, *), window.toolbarStyle != .automatic {
+            window.toolbarStyle = .automatic
+        }
+    }
+
+    if window.titleVisibility != .visible { window.titleVisibility = .visible }
+    if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
+    if window.isMovableByWindowBackground { window.isMovableByWindowBackground = false }
 }
 
 private struct FullScreenWindowConfigurator: NSViewRepresentable {
@@ -408,20 +592,9 @@ private struct FullScreenWindowConfigurator: NSViewRepresentable {
                 return
             }
 
-            window.collectionBehavior.remove(.fullScreenNone)
-            window.collectionBehavior.insert([.fullScreenPrimary, .fullScreenAllowsTiling])
-            window.styleMask.remove(.borderless)
             // Favor the standard macOS chrome to avoid duplicated titlebars/traffic lights.
-            window.styleMask.remove(.fullSizeContentView)
-            window.styleMask.insert([.titled, .closable, .miniaturizable, .resizable])
-            window.titleVisibility = .visible
-            window.titlebarAppearsTransparent = false
-            window.isMovableByWindowBackground = false
-            // Let macOS decide toolbar styling; do not force unified/overlay styles.
-            if #available(macOS 11.0, *) {
-                window.toolbarStyle = .automatic
-            }
-            window.isOpaque = true
+            applyStandardWindowChrome(to: window)
+            if !window.isOpaque { window.isOpaque = true }
             window.backgroundColor = NSColor.windowBackgroundColor
 
             // No need to tweak the standard buttons or titlebar container when using default chrome,

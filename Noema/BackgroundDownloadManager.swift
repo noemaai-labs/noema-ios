@@ -56,30 +56,57 @@ struct BackgroundDownloadTaskSnapshot: Equatable, Sendable {
     let byteAccounting: DownloadByteAccountingSnapshot?
 }
 
-private final class ProgressThrottler<Key: Hashable> {
+/// Pure transport selection policy so OS-availability branches cannot silently
+/// route an active app onto the system-paced background session.
+enum DownloadTransportPolicy {
+    enum Kind: Equatable {
+        case foreground
+        case background
+    }
+
+    /// A running Mac app keeps transfers in-process for predictable throughput.
+    /// Window focus is deliberately irrelevant; an App Nap assertion protects
+    /// active downloads, and quit-time resume capture provides durability.
+    static let macOSActiveProcess: Kind = .foreground
+
+    static func preferred(isAppActive: Bool,
+                          supportsContinuedProcessing: Bool,
+                          hasContinuedProcessingTask: Bool) -> Kind {
+        if isAppActive { return .foreground }
+        if supportsContinuedProcessing && hasContinuedProcessingTask { return .foreground }
+        return .background
+    }
+}
+
+final class ProgressThrottler<Key: Hashable> {
     private let minimumInterval: Double
+    private let nowSeconds: () -> Double
     private var lastFireSeconds: [Key: Double] = [:]
     private let lock = NSLock()
 
-    init(interval: TimeInterval) {
+    init(interval: TimeInterval,
+         nowSeconds: @escaping () -> Double = {
+             Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+         }) {
         self.minimumInterval = interval
+        self.nowSeconds = nowSeconds
     }
 
     func shouldAllow(key: Key, force: Bool = false) -> Bool {
-        let nowSeconds = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let currentSeconds = nowSeconds()
         lock.lock()
         defer { lock.unlock() }
 
         if force {
-            lastFireSeconds[key] = nowSeconds
+            lastFireSeconds[key] = currentSeconds
             return true
         }
 
-        if let last = lastFireSeconds[key], (nowSeconds - last) < minimumInterval {
+        if let last = lastFireSeconds[key], (currentSeconds - last) < minimumInterval {
             return false
         }
 
-        lastFireSeconds[key] = nowSeconds
+        lastFireSeconds[key] = currentSeconds
         return true
     }
 
@@ -99,8 +126,39 @@ private final class CompletionBox: @unchecked Sendable {
     init(_ value: (() -> Void)?) { self.value = value }
 }
 
-/// Manages large downloads that should continue while the app is suspended or terminated.
-/// Uses a background URLSession with a fixed identifier and exposes a simple async API.
+#if canImport(UIKit)
+@MainActor
+private final class DownloadExpirationGracePeriod {
+    var identifier = UIBackgroundTaskIdentifier.invalid
+
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
+    }
+}
+
+@MainActor
+private final class DownloadExpirationCompletion {
+    private var body: (@MainActor () -> Void)?
+
+    init(_ body: @escaping @MainActor () -> Void) {
+        self.body = body
+    }
+
+    func finish() {
+        let body = body
+        self.body = nil
+        body?()
+    }
+}
+#endif
+
+/// Manages large downloads that should continue when the app is not frontmost.
+/// iOS 26 uses a high-throughput default session under continued-processing
+/// protection, with a fixed-identifier background session as the durable fallback.
+/// macOS keeps the high-throughput default session while the process is running and
+/// captures resume data on quit so the transfer can continue on the next launch.
 @MainActor
 final class BackgroundDownloadManager: NSObject {
     static let shared = BackgroundDownloadManager()
@@ -119,6 +177,11 @@ final class BackgroundDownloadManager: NSObject {
         /// Where a resume-data task continued from. Display/bookkeeping only (never added
         /// to byte totals); lets us detect a server that ignored the resume (HTTP 200).
         let resumedAtOffset: Int64?
+        /// Whether the task was created while the app was not active (such
+        /// background-session tasks are discretionary — the system ignores
+        /// isDiscretionary=false for them). Informational only.
+        /// Optional so records persisted by older builds still decode.
+        var createdInBackground: Bool?
 
         enum CodingKeys: String, CodingKey {
             case jobID
@@ -128,6 +191,7 @@ final class BackgroundDownloadManager: NSObject {
             case resumeOffset
             case appendsToExistingFile
             case resumedAtOffset
+            case createdInBackground
         }
 
         init(jobID: String?,
@@ -136,7 +200,8 @@ final class BackgroundDownloadManager: NSObject {
              expectedSize: Int64?,
              resumeOffset: Int64?,
              appendsToExistingFile: Bool,
-             resumedAtOffset: Int64? = nil) {
+             resumedAtOffset: Int64? = nil,
+             createdInBackground: Bool? = nil) {
             self.jobID = jobID
             self.artifactID = artifactID
             self.destination = destination
@@ -144,6 +209,7 @@ final class BackgroundDownloadManager: NSObject {
             self.resumeOffset = resumeOffset
             self.appendsToExistingFile = appendsToExistingFile
             self.resumedAtOffset = resumedAtOffset
+            self.createdInBackground = createdInBackground
         }
 
         init(from decoder: Decoder) throws {
@@ -155,6 +221,7 @@ final class BackgroundDownloadManager: NSObject {
             resumeOffset = try container.decodeIfPresent(Int64.self, forKey: .resumeOffset)
             appendsToExistingFile = try container.decodeIfPresent(Bool.self, forKey: .appendsToExistingFile) ?? false
             resumedAtOffset = try container.decodeIfPresent(Int64.self, forKey: .resumedAtOffset)
+            createdInBackground = try container.decodeIfPresent(Bool.self, forKey: .createdInBackground)
         }
     }
 
@@ -175,18 +242,14 @@ final class BackgroundDownloadManager: NSObject {
         config.allowsExpensiveNetworkAccess = true
         // Allow more parallel connections for cases where multiple assets fetch concurrently (e.g., mmproj + weights)
         config.httpMaximumConnectionsPerHost = 8
-        #if os(iOS) || os(tvOS) || os(watchOS)
-        if #available(iOS 15.0, tvOS 15.0, watchOS 8.0, *) {
-            config.multipathServiceType = .handover
-        }
-        #endif
         let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         s.sessionDescription = "Noema background downloads"
         NetworkKillSwitch.track(session: s)
         return s
     }()
 
-    // Fast foreground session used while the app is active; noticeably improves throughput
+    // Fast in-process session. On iOS 26 it remains usable in the background only
+    // while BGContinuedProcessingTask protection is active.
     private lazy var foregroundSession: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = true
@@ -194,7 +257,6 @@ final class BackgroundDownloadManager: NSObject {
         cfg.allowsConstrainedNetworkAccess = true
         cfg.allowsExpensiveNetworkAccess = true
         cfg.httpMaximumConnectionsPerHost = 12
-        cfg.httpShouldUsePipelining = true
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         s.sessionDescription = "Noema foreground downloads"
         NetworkKillSwitch.track(session: s)
@@ -208,8 +270,9 @@ final class BackgroundDownloadManager: NSObject {
         let taskID: Int
     }
 
-    // Throttle progress events to ~10 Hz per download to avoid flooding the main actor.
-    nonisolated(unsafe) private let progressThrottler = ProgressThrottler<TaskKey>(interval: 0.1)
+    // Two updates per second keeps progress/speed readable while preventing parallel
+    // model shards from flooding the main actor with dozens of callbacks per second.
+    nonisolated(unsafe) private let progressThrottler = ProgressThrottler<TaskKey>(interval: 0.5)
 
     private var destinations: [TaskKey: URL] = [:]
     private var completions: [TaskKey: (Result<URL, Error>) -> Void] = [:]
@@ -222,10 +285,10 @@ final class BackgroundDownloadManager: NSObject {
     // snapshots and to detect a server restarting the file from zero — never added to totals.
     private var resumedFromOffsets: [TaskKey: Int64] = [:]
     private var loggedProgressModes: [TaskKey: DownloadProgressExpectationMode] = [:]
-    // Per-task byte logging is throttled hard: at 10 Hz per task the log lines
-    // (string interpolation + file write + stderr flush) measurably drag the app.
+    // Detailed byte logging performs file and stderr I/O, so keep it far below the
+    // already-coalesced UI cadence.
     private var lastBytesLogAt: [TaskKey: Date] = [:]
-    private let bytesLogInterval: TimeInterval = 2.0
+    private let bytesLogInterval: TimeInterval = 10.0
     private var backgroundCompletionHandler: (() -> Void)?
     // Map destination path → current task key
     private var taskIdByDestination: [String: TaskKey] = [:]
@@ -240,8 +303,18 @@ final class BackgroundDownloadManager: NSObject {
     // Keys whose task is being intentionally cancelled to hand off to the other
     // URLSession. Their cancellation must NOT be surfaced as a download failure.
     private var migratingKeys: Set<TaskKey> = []
-    private var isMigrating = false
-    private var pendingMigration: (from: SessionKind, to: SessionKind, reason: String)? = nil
+    // Old keys whose migration already finished but whose NSURLErrorCancelled
+    // delegate event hasn't been delivered yet (URLSession fires the cancel
+    // callback before didCompleteWithError, so the migration continuation runs
+    // first). Mapped to the replacement key so cleanup can purge stale entries.
+    private var suppressedCancellations: [TaskKey: TaskKey] = [:]
+    // Serializes fg⇄bg migration passes: a resign→active bounce queues the second
+    // pass behind the first instead of skipping it, so the last lifecycle event
+    // always decides which session the tasks end up on.
+    private var migrationChain: Task<Void, Never>?
+    // macOS startup migration is launched during singleton initialization, then
+    // awaited by DownloadController before it reattaches persisted jobs.
+    private var restorationTask: Task<Void, Never>?
 
     private override init() {
         super.init()
@@ -261,9 +334,19 @@ final class BackgroundDownloadManager: NSObject {
     private func installLifecycleObservers() {
 #if canImport(UIKit)
         let center = NotificationCenter.default
+        lifecycleObservers.append(center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor [weak self] in
+                #if os(iOS)
+                await logger.log("[Download][App] willResignActive – evaluating continued-processing protection")
+                #else
+                await logger.log("[Download][App] willResignActive – handing transfers to the background session")
+                #endif
+                await self?.handleWillResignActive()
+            }
+        })
         lifecycleObservers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
             Task { @MainActor [weak self] in
-                await logger.log("[Download][App] didEnterBackground – migrating active transfers to background URLSession")
+                await logger.log("[Download][App] didEnterBackground – transfers continue on the selected protected transport")
                 await self?.handleEnterBackground()
             }
         })
@@ -272,7 +355,11 @@ final class BackgroundDownloadManager: NSObject {
         })
         lifecycleObservers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             Task { @MainActor [weak self] in
-                await logger.log("[Download][App] didBecomeActive – migrating durable transfers to foreground URLSession")
+                #if os(iOS)
+                await logger.log("[Download][App] didBecomeActive – restoring foreground-speed transfers")
+                #else
+                await logger.log("[Download][App] didBecomeActive – pulling transfers onto the foreground session")
+                #endif
                 await self?.handleBecomeActive()
             }
         })
@@ -311,6 +398,10 @@ final class BackgroundDownloadManager: NSObject {
     }
 
     private func persistResumeData(_ data: Data, for record: TaskRecord) {
+        // Resume data from a Range/append task covers only the tail segment; consuming
+        // it later as a whole-file resume would replace the staging partial with just
+        // that tail. The partial on disk already captures the progress for those tasks.
+        guard !record.appendsToExistingFile else { return }
         resumeDataStore[record.destination.path] = data
         guard let url = resumeDataURL(for: record) else { return }
         try? data.write(to: url, options: .atomic)
@@ -357,6 +448,7 @@ final class BackgroundDownloadManager: NSObject {
                 self.liveSnapshots = self.liveSnapshots.filter { $0.key.sessionID != sessionID }
                 for task in tasks {
                     guard let downloadTask = task as? URLSessionDownloadTask else { continue }
+                    downloadTask.priority = URLSessionTask.highPriority
                     let key = self.key(for: session, taskID: downloadTask.taskIdentifier)
                     self.liveTasks[key] = downloadTask
                     guard let record = self.record(for: downloadTask.taskDescription) else { continue }
@@ -430,7 +522,7 @@ final class BackgroundDownloadManager: NSObject {
                   expectedSize: Int64? = nil,
                   progress: ((Double) -> Void)? = nil,
                   progressBytes: ((Int64, Int64) -> Void)? = nil) async throws -> URL {
-        var req = URLRequest(url: remote)
+        let req = URLRequest(url: remote)
         return try await download(
             request: req,
             to: local,
@@ -454,10 +546,36 @@ final class BackgroundDownloadManager: NSObject {
         // Route Hugging Face URLs through the configured mirror/endpoint. Done here
         // so every task creation, HEAD probe and restart path below uses one host.
         let request = HFEndpoint.rewrite(request)
-        // Try to refine the expected size with a HEAD request; this fixes UI lag when registry
-        // metadata overestimates the real file size. We only do this for the initial call
-        // (resume path below already has a persisted expectedSize).
-        let headLength = await remoteContentLength(for: request)
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        let headLength: Int64?
+        #if os(iOS)
+        // Do not put an awaited probe between the user's foreground action and
+        // creation of the transfer. It delays continued-processing startup and,
+        // on fallback paths, can make the eventual background-session download
+        // discretionary. The GET response supplies the authoritative length.
+        headLength = nil
+        #else
+        // Refine the expected size with a HEAD probe only when we know nothing. A caller
+        // that already has a size, or a transfer resuming from stored resume data, gets
+        // the authoritative length from the GET response itself (normalizeProgressTotals
+        // prefers the task's Content-Length); the extra round-trip — up to 10 s on a bad
+        // network — would only delay every start and resume.
+        let resumeProbe = TaskRecord(
+            jobID: jobID,
+            artifactID: artifactID,
+            destination: local,
+            expectedSize: expectedSize,
+            resumeOffset: nil,
+            appendsToExistingFile: false
+        )
+        let needsHeadProbe = (expectedSize ?? 0) <= 0 && loadResumeData(for: resumeProbe) == nil
+        headLength = needsHeadProbe ? await remoteContentLength(for: request) : nil
+        #endif
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
         let refinedExpected: Int64? = {
             if let head = headLength, head > 0 { return head }
             return expectedSize
@@ -484,9 +602,16 @@ final class BackgroundDownloadManager: NSObject {
                 resumeOffset: nil,
                 appendsToExistingFile: false
             )
+            // A staging partial on disk supersedes any stored resume blob: the blob may
+            // describe only a tail segment or predate the partial, and consuming it would
+            // replace the partial with a truncated file. Prefer the Range-from-partial path.
+            if self.readExistingPartialSize(at: local) > 0 {
+                self.clearResumeData(for: resumeRecord)
+            }
             if let resume = self.loadResumeData(for: resumeRecord) {
                 let offset = Self.extractResumeOffset(from: resume)
                 let task = session.downloadTask(withResumeData: resume)
+                task.priority = URLSessionTask.highPriority
                 // Resume-data tasks report absolute totals (didWriteData already includes
                 // the resumed bytes), so the record carries NO additive resumeOffset —
                 // only the non-additive resume point for display and restart detection.
@@ -497,7 +622,8 @@ final class BackgroundDownloadManager: NSObject {
                     expectedSize: refinedExpected,
                     resumeOffset: nil,
                     appendsToExistingFile: false,
-                    resumedAtOffset: offset > 0 ? offset : nil
+                    resumedAtOffset: offset > 0 ? offset : nil,
+                    createdInBackground: !self.appIsActiveNow()
                 )
                 if let data = try? JSONEncoder().encode(record) {
                     task.taskDescription = String(data: data, encoding: .utf8)
@@ -563,8 +689,22 @@ final class BackgroundDownloadManager: NSObject {
                                    progress: ((Double) -> Void)?,
                                    progressBytes: ((Int64, Int64) -> Void)?,
                                    completion: @escaping (Result<URL, Error>) -> Void) {
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            completion(.failure(URLError(.notConnectedToInternet)))
+            return
+        }
         let session = self.preferredSession()
         let existingPartialBytes = allowRangeResume ? self.readExistingPartialSize(at: local) : 0
+        if Self.canAdoptCompletedStagingFile(
+            existingBytes: existingPartialBytes,
+            expectedBytes: refinedExpected
+        ) {
+            Task { await logger.log("[Download][Resume] adopting complete staging file \(local.lastPathComponent) bytes=\(existingPartialBytes)") }
+            progress?(1)
+            progressBytes?(existingPartialBytes, existingPartialBytes)
+            completion(.success(local))
+            return
+        }
         let shouldAttemptRangeResume = existingPartialBytes > 0
         var requestToStart = request
         requestToStart.setValue(nil, forHTTPHeaderField: "Range")
@@ -572,13 +712,15 @@ final class BackgroundDownloadManager: NSObject {
             requestToStart.setValue("bytes=\(existingPartialBytes)-", forHTTPHeaderField: "Range")
         }
         let task = session.downloadTask(with: requestToStart)
+        task.priority = URLSessionTask.highPriority
         let record = TaskRecord(
             jobID: jobID,
             artifactID: artifactID,
             destination: local,
             expectedSize: refinedExpected,
             resumeOffset: shouldAttemptRangeResume ? existingPartialBytes : nil,
-            appendsToExistingFile: shouldAttemptRangeResume
+            appendsToExistingFile: shouldAttemptRangeResume,
+            createdInBackground: !appIsActiveNow()
         )
         if let data = try? JSONEncoder().encode(record) {
             task.taskDescription = String(data: data, encoding: .utf8)
@@ -615,6 +757,16 @@ final class BackgroundDownloadManager: NSObject {
             completions[key] = completion
         }
         task.resume()
+    }
+
+    /// A previous process may have finished moving URLSession's temporary file into Noema's
+    /// staging location and then exited before owner-specific validation/finalization ran.
+    /// Reusing an exact-size staging file lets that validation continue without issuing a
+    /// Range request that would receive HTTP 416 and unnecessarily restart from zero.
+    nonisolated static func canAdoptCompletedStagingFile(existingBytes: Int64,
+                                                         expectedBytes: Int64?) -> Bool {
+        guard existingBytes > 0, let expectedBytes, expectedBytes > 0 else { return false }
+        return existingBytes == expectedBytes
     }
 
     /// Marker error for HTTP responses outside 2xx detected at download completion.
@@ -694,6 +846,35 @@ final class BackgroundDownloadManager: NSObject {
             }
             task?.cancel()
         }
+    }
+
+    /// Synchronously capture resume state before the process exits. iOS and visionOS
+    /// leave fixed-identifier background tasks with nsurlsessiond; macOS also captures
+    /// legacy background tasks so the next launch can restore them onto its fast session.
+    /// Blocks the calling (main) thread briefly; the resume-data callbacks land
+    /// on the session delegate queue and write straight to disk, never hopping back
+    /// to the main actor, so waiting here cannot deadlock.
+    func flushForTermination(timeout: TimeInterval = 1.5) {
+        guard !liveTasks.isEmpty else { return }
+        let group = DispatchGroup()
+        for (key, task) in liveTasks {
+            #if !os(macOS)
+            if key.sessionID == sessionIdentifier { continue }
+            #endif
+            guard let record = taskRecordByKey[key], !record.appendsToExistingFile,
+                  let url = resumeDataURL(for: record) else {
+                // Append-mode staging partials are already on disk (a tail-segment blob
+                // would corrupt them); unidentified tasks have nowhere to persist to.
+                task.cancel()
+                continue
+            }
+            group.enter()
+            task.cancel(byProducingResumeData: { data in
+                if let data { try? data.write(to: url, options: .atomic) }
+                group.leave()
+            })
+        }
+        _ = group.wait(timeout: .now() + timeout)
     }
 
     func attachObservers(jobID: String?,
@@ -798,7 +979,8 @@ final class BackgroundDownloadManager: NSObject {
     func scheduleMaintenance() {
         let request = BGProcessingTaskRequest(identifier: maintenanceTaskIdentifier)
         request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = true
+        // Stalled/paused downloads should reconcile on battery too, not only while charging.
+        request.requiresExternalPower = false
         do { try BGTaskScheduler.shared.submit(request) } catch {
             // Non-fatal; background tasks are best-effort.
             print("Failed to submit BGProcessingTask: \(error)")
@@ -815,15 +997,37 @@ final class BackgroundDownloadManager: NSObject {
     #else
     func scheduleMaintenance() {
         // BGProcessingTask isn't supported on visionOS or macOS. Downloads
-        // still work while the scene is active thanks to the background
-        // URLSession.
+        // still work while the process is active; macOS captures resume data
+        // when the app actually quits.
     }
     #endif
 
     private func restorePersistedTasks() {
+        #if os(macOS)
+        // Builds before the foreground-throughput policy may have left live tasks
+        // owned by nsurlsessiond. Move those tasks once at startup so upgrading does
+        // not strand an existing transfer on the system-paced background transport.
+        // runMigrationPass refreshes the background session before enumerating it;
+        // refresh the foreground session afterward so replacement tasks are the
+        // authoritative restored state before DownloadController reattaches observers.
+        restorationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runMigrationPass(to: .foreground)
+            await self.refreshSessionTasksAsync(session: self.foregroundSession)
+        }
+        #else
         refreshSessionTasks(session: backgroundSession)
-        #if os(macOS) || canImport(UIKit)
+        #if canImport(UIKit)
         refreshSessionTasks(session: foregroundSession)
+        #endif
+        #endif
+    }
+
+    /// Wait until any platform-specific transport restoration is settled before
+    /// higher layers inspect tasks and attach their progress/completion handlers.
+    func prepareForActiveProcess() async {
+        #if os(macOS)
+        await restorationTask?.value
         #endif
     }
 
@@ -833,6 +1037,14 @@ final class BackgroundDownloadManager: NSObject {
             return 0
         }
         return max(0, size)
+    }
+
+    private func appIsActiveNow() -> Bool {
+        #if canImport(UIKit)
+        return UIApplication.sharedIfAvailable?.applicationState == .active
+        #else
+        return true
+        #endif
     }
 }
 
@@ -846,7 +1058,7 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
         let taskID = downloadTask.taskIdentifier
         let key = self.key(for: session, taskID: taskID)
 
-        // Allow the first callback immediately, throttle to 10 Hz afterward.
+        // Allow the first callback immediately, throttle to the UI-safe cadence afterward.
         // Always allow the final chunk even if it falls inside the throttle window.
         let isFinalChunk = totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite
         guard progressThrottler.shouldAllow(key: key, force: isFinalChunk) else { return }
@@ -959,6 +1171,7 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
            !(200...299).contains(statusCode) {
             Task { @MainActor [weak self] in
                 await logger.log("[Download][Error] dest=\(destination.lastPathComponent) HTTP \(statusCode) — discarding response body")
+                self?.seedBookkeepingIfMissing(key: key, record: record)
                 await self?.finalizeFailure(key: key, error: Self.serverRejectionError(statusCode: statusCode))
             }
             return
@@ -979,10 +1192,12 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
                 try FileManager.default.moveItem(at: location, to: destination)
             }
             Task { @MainActor [weak self] in
+                self?.seedBookkeepingIfMissing(key: key, record: record)
                 await self?.finalizeSuccess(key: key, destination: destination)
             }
         } catch {
             Task { @MainActor [weak self] in
+                self?.seedBookkeepingIfMissing(key: key, record: record)
                 await self?.finalizeFailure(key: key, error: error)
             }
         }
@@ -993,21 +1208,30 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
                                 didCompleteWithError error: Error?) {
         guard let error else { return }
         let taskID = task.taskIdentifier
+        let description = task.taskDescription
         Task { @MainActor [weak self] in
             guard let self else { return }
             let key = self.key(for: session, taskID: taskID)
             // The task was cancelled to hand it off to the other URLSession.
             // Don't surface this as a failure; the migration owns the lifecycle.
             if self.migratingKeys.contains(key) { return }
+            // Migration already re-created this transfer and persisted its resume
+            // data; the old task's cancellation error trails behind. Swallow it or
+            // the live replacement gets marked failed.
+            if self.suppressedCancellations.removeValue(forKey: key) != nil { return }
+            // After a process relaunch the in-memory record is gone but the encoded
+            // record still rides in taskDescription — decode it so resume data is
+            // persisted and the failure is routed instead of silently dropped.
+            let record = self.taskRecordByKey[key] ?? Self.decodeTaskRecordNonisolated(from: description)
             // Transport failures (connection lost, timeouts, …) often carry resume data.
             // Persist it so the retry resumes where the transfer broke instead of
             // restarting from zero.
             if let resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data,
-               let record = self.taskRecordByKey[key] {
+               let record {
                 self.persistResumeData(resumeData, for: record)
             }
-            self.completions[key]?(.failure(error))
-            self.cleanup(key: key)
+            self.seedBookkeepingIfMissing(key: key, record: record)
+            await self.finalizeFailure(key: key, error: error)
         }
     }
 
@@ -1067,6 +1291,20 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
         cleanup(key: key)
     }
 
+    /// After a process relaunch delegate events can arrive before the async task
+    /// enumeration repopulates bookkeeping; seed it from the record decoded out of
+    /// taskDescription so finalize paths can still report jobID/destination and
+    /// clear resume data. Never overwrites live entries.
+    @MainActor
+    private func seedBookkeepingIfMissing(key: TaskKey, record: TaskRecord?) {
+        guard taskRecordByKey[key] == nil, let record else { return }
+        taskRecordByKey[key] = record
+        if taskIdByDestination[record.destination.path] == nil {
+            destinations[key] = record.destination
+            taskIdByDestination[record.destination.path] = key
+        }
+    }
+
     @MainActor
     private func cleanup(key: TaskKey) {
         if let dest = destinations[key] {
@@ -1085,22 +1323,41 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
         liveSnapshots[key] = nil
         loggedProgressModes[key] = nil
         lastBytesLogAt[key] = nil
+        if !suppressedCancellations.isEmpty {
+            suppressedCancellations = suppressedCancellations.filter { $0.key != key && $0.value != key }
+        }
     }
 }
 
 extension BackgroundDownloadManager {
     nonisolated private static func appendDownloadedChunk(at chunkURL: URL, to destination: URL) throws {
+        let chunkSize = (try? FileManager.default.attributesOfItem(atPath: chunkURL.path)[.size] as? Int64) ?? 0
         let chunkHandle = try FileHandle(forReadingFrom: chunkURL)
         defer { try? chunkHandle.close() }
         let destinationHandle = try FileHandle(forWritingTo: destination)
         defer { try? destinationHandle.close() }
-        try destinationHandle.seekToEnd()
-        while autoreleasepool(invoking: {
-            let data = try? chunkHandle.read(upToCount: 1_048_576) ?? Data()
-            guard let data, !data.isEmpty else { return false }
-            try? destinationHandle.write(contentsOf: data)
-            return true
-        }) {}
+        let startOffset = try destinationHandle.seekToEnd()
+        var finished = false
+        while !finished {
+            try autoreleasepool {
+                guard let data = try chunkHandle.read(upToCount: 1_048_576), !data.isEmpty else {
+                    finished = true
+                    return
+                }
+                try destinationHandle.write(contentsOf: data)
+            }
+        }
+        // A short append (disk full mid-write, truncated temp file) must fail the
+        // download rather than silently install a corrupt partial as progress.
+        let finalOffset = try destinationHandle.offset()
+        let expectedOffset = startOffset + UInt64(max(0, chunkSize))
+        guard finalOffset == expectedOffset else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: CocoaError.fileWriteUnknown.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "Appended segment size mismatch (expected \(expectedOffset) bytes, have \(finalOffset))"]
+            )
+        }
     }
 
     nonisolated static func makeTaskSnapshot(jobID: String?,
@@ -1153,27 +1410,28 @@ extension BackgroundDownloadManager {
         recordedExpected: Int64?
     ) -> DownloadProgressNormalizationResult {
         let offset = max(0, resumeOffset)
-        let writtenTotal = totalBytesWritten + offset
+        let written = max(0, totalBytesWritten)
+        let writtenTotal = saturatingAdd(written, offset)
         let expectedFromTask = taskExpected.flatMap { $0 > 0 ? $0 : nil }
         let expectedFromRecord = recordedExpected.flatMap { $0 > 0 ? $0 : nil }
 
         if offset == 0 {
             if let expectedFromTask {
                 return DownloadProgressNormalizationResult(
-                    writtenTotal: totalBytesWritten,
+                    writtenTotal: written,
                     fullExpected: expectedFromTask,
                     mode: .freshTask
                 )
             }
             if let expectedFromRecord {
                 return DownloadProgressNormalizationResult(
-                    writtenTotal: totalBytesWritten,
+                    writtenTotal: written,
                     fullExpected: expectedFromRecord,
                     mode: .freshRecorded
                 )
             }
             return DownloadProgressNormalizationResult(
-                writtenTotal: totalBytesWritten,
+                writtenTotal: written,
                 fullExpected: -1,
                 mode: .unknown
             )
@@ -1182,7 +1440,8 @@ extension BackgroundDownloadManager {
         if let expectedFromTask {
             if let expectedFromRecord {
                 let tolerance = max(Int64(512 * 1024), expectedFromRecord / 100)
-                if abs(expectedFromTask - expectedFromRecord) <= tolerance {
+                let difference = max(expectedFromTask, expectedFromRecord) - min(expectedFromTask, expectedFromRecord)
+                if difference <= tolerance {
                     return DownloadProgressNormalizationResult(
                         writtenTotal: writtenTotal,
                         fullExpected: expectedFromRecord,
@@ -1190,8 +1449,8 @@ extension BackgroundDownloadManager {
                     )
                 }
 
-                let remainingExpected = offset + expectedFromTask
-                if expectedFromTask + tolerance < expectedFromRecord {
+                let remainingExpected = saturatingAdd(offset, expectedFromTask)
+                if saturatingAdd(expectedFromTask, tolerance) < expectedFromRecord {
                     return DownloadProgressNormalizationResult(
                         writtenTotal: writtenTotal,
                         fullExpected: remainingExpected,
@@ -1208,7 +1467,7 @@ extension BackgroundDownloadManager {
 
             return DownloadProgressNormalizationResult(
                 writtenTotal: writtenTotal,
-                fullExpected: offset + expectedFromTask,
+                fullExpected: saturatingAdd(offset, expectedFromTask),
                 mode: .resumeNoRecorded
             )
         }
@@ -1228,8 +1487,15 @@ extension BackgroundDownloadManager {
         )
     }
 
+    nonisolated private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        guard overflow else { return value }
+        return rhs >= 0 ? .max : .min
+    }
+
     /// Best-effort HEAD to learn the true Content-Length before starting a download.
     private func remoteContentLength(for request: URLRequest) async -> Int64? {
+        guard !NetworkKillSwitch.shouldBlock(request: request) else { return nil }
         var head = request
         head.httpMethod = "HEAD"
         head.timeoutInterval = 10
@@ -1238,6 +1504,8 @@ extension BackgroundDownloadManager {
         cfg.allowsExpensiveNetworkAccess = true
         cfg.allowsConstrainedNetworkAccess = true
         let session = URLSession(configuration: cfg)
+        NetworkKillSwitch.track(session: session)
+        defer { session.finishTasksAndInvalidate() }
         do {
             let (_, resp) = try await session.data(for: head)
             guard let http = resp as? HTTPURLResponse,
@@ -1262,43 +1530,52 @@ extension BackgroundDownloadManager {
         return try? JSONDecoder().decode(TaskRecord.self, from: data)
     }
 
-    /// Choose the best session for the current app state: prefer a fast foreground session while
-    /// the app is active, fall back to the background-capable session otherwise.
+    /// Choose the session durable transfers run on.
     private func preferredSession() -> URLSession {
         #if os(macOS)
-        // macOS: use a foreground session so downloads start immediately and are visible in Xcode.
-        // Background URLSessions on macOS can be deferred or require additional background modes.
-        logSessionChoice(kind: .foreground, reason: "macOS")
-        return foregroundSession
-        #elseif canImport(UIKit)
-        // iOS/iPadOS: while the app is active, use the fast default URLSession so
-        // throughput and progress callbacks aren't throttled/coalesced by nsurlsessiond.
-        // When the app is not active, use the background-capable session so the
-        // transfer survives suspend/lock. Lifecycle observers migrate in-flight
-        // tasks between the two sessions so both states work seamlessly.
-        let state = UIApplication.sharedIfAvailable?.applicationState
-        let stateLabel: String = {
-            switch state {
-            case .some(.active): return "active"
-            case .some(.background): return "background"
-            case .some(.inactive): return "inactive"
-            default: return "unknown"
-            }
-        }()
-        if state == .active {
-            logSessionChoice(kind: .foreground, reason: "active iOS transfer appState=\(stateLabel)")
+        switch DownloadTransportPolicy.macOSActiveProcess {
+        case .foreground:
+            logSessionChoice(kind: .foreground, reason: "macOS active process")
+            return foregroundSession
+        case .background:
+            logSessionChoice(kind: .background, reason: "macOS durable transport")
+            return backgroundSession
+        }
+        #elseif os(iOS)
+        var supportsContinuedProcessing = false
+        var hasContinuedProcessingTask = false
+        if #available(iOS 26.0, *) {
+            supportsContinuedProcessing = true
+            hasContinuedProcessingTask = ContinuedDownloadCoordinator.shared.protectsForegroundTransport
+        }
+        let decision = DownloadTransportPolicy.preferred(
+            isAppActive: appIsActiveNow(),
+            supportsContinuedProcessing: supportsContinuedProcessing,
+            hasContinuedProcessingTask: hasContinuedProcessingTask
+        )
+        switch decision {
+        case .foreground:
+            let reason = hasContinuedProcessingTask ? "continued processing" : "app active"
+            logSessionChoice(kind: .foreground, reason: reason)
+            return foregroundSession
+        case .background:
+            logSessionChoice(kind: .background, reason: "durable fallback")
+            return backgroundSession
+        }
+        #else
+        // visionOS keeps the foreground-speed optimization and hands the transfer
+        // to its background session during the lifecycle transition.
+        if appIsActiveNow() {
+            logSessionChoice(kind: .foreground, reason: "app active")
             return foregroundSession
         }
-        logSessionChoice(kind: .background, reason: "durable iOS transfer appState=\(stateLabel)")
-        return backgroundSession
-        #else
-        logSessionChoice(kind: .background, reason: "platform default")
+        logSessionChoice(kind: .background, reason: "app not active")
         return backgroundSession
         #endif
     }
 }
 
-// MARK: - Session Migration (iOS foreground ⇄ background handoff)
+// MARK: - Session Migration (lifecycle fallback and visionOS handoff)
 extension BackgroundDownloadManager {
     /// Wrap a completion so a second invocation is a no-op. The underlying
     /// `withCheckedThrowingContinuation` must be resumed exactly once even if
@@ -1426,6 +1703,8 @@ extension BackgroundDownloadManager {
             return
         }
 
+        newTask.priority = URLSessionTask.highPriority
+
         if let record, let enc = try? JSONEncoder().encode(record),
            let desc = String(data: enc, encoding: .utf8) {
             newTask.taskDescription = desc
@@ -1437,42 +1716,55 @@ extension BackgroundDownloadManager {
         transferState(from: oldKey, to: newKey, newTask: newTask, newResumeOffset: newResumeOffset)
         if let resumedMarker { resumedFromOffsets[newKey] = resumedMarker }
         migratingKeys.remove(oldKey)
+        suppressedCancellations[oldKey] = newKey
         newTask.resume()
 
         let dest = record?.destination.lastPathComponent ?? "unknown"
         await logger.log("[Download][Migrate] dest=\(dest) -> \(label(for: target)) resumeData=\(resumeData != nil) rangeOffset=\(newResumeOffset ?? resumeOffsets[newKey] ?? 0) resumedAt=\(resumedMarker ?? 0)")
     }
 
-    /// Hand off all in-flight tasks from one session to the other, preserving
-    /// progress and the awaiting continuation. Re-entrant safe: a request that
-    /// arrives mid-migration is coalesced and run afterward.
-    private func migrateTasks(from source: SessionKind, to target: SessionKind, reason: String) async {
-        if isMigrating {
-            pendingMigration = (source, target, reason)
-            return
+    /// Run a whole-session migration pass, queued behind any in-flight pass so
+    /// bounced lifecycle events (resign→active) can never interleave or strand
+    /// tasks on the wrong session.
+    private func runMigrationPass(to target: SessionKind) async {
+        let previous = migrationChain
+        let pass = Task { @MainActor [weak self] in
+            await previous?.value
+            await self?.migrateAllTasks(to: target)
         }
-        isMigrating = true
-        defer { isMigrating = false }
+        migrationChain = pass
+        await pass.value
+    }
 
-        var work: (from: SessionKind, to: SessionKind, reason: String)? = (source, target, reason)
-        while let job = work {
-            work = nil
-            let srcSession = session(for: job.from)
-            await refreshSessionTasksAsync(session: srcSession)
-            let srcID = sessionID(for: job.from)
-            let keys = liveTasks.compactMap { $0.key.sessionID == srcID ? $0.key : nil }
-            if !keys.isEmpty {
-                await logger.log("[Download][Migrate] start count=\(keys.count) \(label(for: job.from))->\(label(for: job.to)) reason=\(job.reason)")
-            }
-            for oldKey in keys {
-                guard let task = liveTasks[oldKey] else { continue }
-                await migrateOneTask(oldKey: oldKey, task: task, to: job.to, persist: job.to == .background)
-            }
-            if let pending = pendingMigration {
-                pendingMigration = nil
-                work = pending
-            }
+    /// Put cancellation/expiration cleanup in the same serialization chain as
+    /// lifecycle migrations. Once this operation is queued, no older migration
+    /// can create a replacement after cleanup pauses the transfer, and any newer
+    /// migration must wait until cleanup has finished.
+    private func runAfterMigrationPasses(
+        _ operation: @escaping @MainActor () async -> Void
+    ) async {
+        let previous = migrationChain
+        let pass = Task { @MainActor in
+            await previous?.value
+            await operation()
         }
+        migrationChain = pass
+        await pass.value
+    }
+
+    private func migrateAllTasks(to target: SessionKind) async {
+        let source: SessionKind = (target == .foreground) ? .background : .foreground
+        await refreshSessionTasksAsync(session: session(for: source))
+        let sourceID = sessionID(for: source)
+        let keys = liveTasks.compactMap { $0.key.sessionID == sourceID ? $0.key : nil }
+        guard !keys.isEmpty else { return }
+        var migrated = 0
+        for oldKey in keys {
+            guard let task = liveTasks[oldKey] else { continue }
+            await migrateOneTask(oldKey: oldKey, task: task, to: target, persist: true)
+            migrated += 1
+        }
+        await logger.log("[Download][Migrate] moved \(migrated) transfer(s) to the \(label(for: target)) session")
     }
 }
 
@@ -1500,38 +1792,100 @@ private extension BackgroundDownloadManager {
 
 #if canImport(UIKit)
 extension BackgroundDownloadManager {
-    /// App is suspending: move fast (default-session) transfers onto the
-    /// background-capable session so they survive lock/suspend. Hold a
-    /// background-task assertion so the async resume-data callbacks finish
-    /// before the process is suspended.
-    func handleEnterBackground() async {
-        guard !liveTasks.isEmpty else { return }
-        let app = UIApplication.sharedIfAvailable
-        var bgTask: UIBackgroundTaskIdentifier = .invalid
-        var ended = false
-        func endBG() {
-            guard !ended else { return }
-            ended = true
-            if bgTask != .invalid {
-                app?.endBackgroundTask(bgTask)
-                bgTask = .invalid
-            }
+    /// The scheduler may adopt a `.fail` continued-processing request just after
+    /// `willResignActive` has already queued the durable fallback. Queue a second,
+    /// conditional pass behind that handoff so accepted protection always restores
+    /// the high-throughput session instead of leaving the transfer stranded on the
+    /// system-paced background session.
+    func handleContinuedDownloadProtectionBecameActive() async {
+        #if os(iOS)
+        guard #available(iOS 26.0, *) else { return }
+        let previous = migrationChain
+        let pass = Task { @MainActor [weak self] in
+            await previous?.value
+            guard ContinuedDownloadCoordinator.shared.protectsForegroundTransport else { return }
+            await self?.migrateAllTasks(to: .foreground)
         }
-        bgTask = app?.beginBackgroundTask(withName: "noema.download.migrate") {
-            Task { @MainActor in
-                await logger.log("[Download][Migrate] background-task assertion expired before handoff completed")
-                endBG()
-            }
-        } ?? .invalid
-        await migrateTasks(from: .foreground, to: .background, reason: "didEnterBackground")
-        endBG()
+        migrationChain = pass
+        await pass.value
+        #endif
     }
 
-    /// App is active again: move durable (background-session) transfers back
-    /// onto the fast default session for full throughput and live progress.
-    func handleBecomeActive() async {
+    /// App is about to leave the active state (lock, app switcher, control
+    /// center). iOS 26 keeps fast default-session transfers in place while an
+    /// accepted continued-processing task protects them. Without that protection,
+    /// preserve them on the durable session before suspension.
+    func handleWillResignActive() async {
         guard !liveTasks.isEmpty else { return }
-        await migrateTasks(from: .background, to: .foreground, reason: "didBecomeActive")
+        #if os(iOS)
+        if #available(iOS 26.0, *), ContinuedDownloadCoordinator.shared.protectsForegroundTransport {
+            await logger.log("[Download][App] keeping \(liveTasks.count) fast transfer(s) on the default session under continued-processing protection")
+            return
+        }
+        await runMigrationPass(to: .background)
+        #else
+        await runMigrationPass(to: .background)
+        #endif
+    }
+
+    /// App reached the background. Protected iOS 26 transfers continue in-process;
+    /// fallback and visionOS transfers run on the durable session.
+    func handleEnterBackground() async {
+        guard !liveTasks.isEmpty else { return }
+        await logger.log("[Download][App] \(liveTasks.count) transfer(s) continue while the app is backgrounded")
+    }
+
+    /// The app is foreground again, so restore any durable fallback transfer to
+    /// the high-throughput default session. A later lifecycle transition will keep
+    /// it there only when continued-processing protection is active.
+    func handleBecomeActive() async {
+        await runMigrationPass(to: .foreground)
+    }
+
+    /// A continued-processing task expired or was cancelled. Begin UIKit cleanup
+    /// time synchronously before running the caller's cooperative stop/pause work,
+    /// then tell BackgroundTasks that cleanup has finished. Continuing the same
+    /// operation on a different session would ignore a person's system-level Cancel.
+    func handleContinuedDownloadProtectionEnded(
+        cleanup: @escaping @MainActor () async -> Void,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        #if os(iOS)
+        let completionBox = DownloadExpirationCompletion(completion)
+        if appIsActiveNow() {
+            Task { @MainActor [weak self] in
+                if let self {
+                    await self.runAfterMigrationPasses(cleanup)
+                } else {
+                    await cleanup()
+                }
+                completionBox.finish()
+            }
+            return
+        }
+        let application = UIApplication.shared
+        let gracePeriod = DownloadExpirationGracePeriod()
+        gracePeriod.identifier = application.beginBackgroundTask(withName: "Pause downloads") {
+            Task { @MainActor in
+                gracePeriod.end()
+                completionBox.finish()
+            }
+        }
+        Task { @MainActor [weak self] in
+            if let self {
+                await self.runAfterMigrationPasses(cleanup)
+            } else {
+                await cleanup()
+            }
+            gracePeriod.end()
+            completionBox.finish()
+        }
+        #else
+        Task { @MainActor in
+            await cleanup()
+            completion()
+        }
+        #endif
     }
 }
 

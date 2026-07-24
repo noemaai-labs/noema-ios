@@ -1,10 +1,16 @@
-// DatasetDetailView.swift
 import SwiftUI
+
+#if os(macOS)
+private let datasetFileRowVerticalPadding: CGFloat = 6
+#else
+private let datasetFileRowVerticalPadding: CGFloat = 12
+#endif
 
 struct DatasetDetailView: View, Identifiable {
     let id = UUID()
     let detail: DatasetDetails
     @EnvironmentObject var downloadController: DownloadController
+    @ObservedObject private var presentationUpdates = DownloadPresentationUpdates.shared
     @Environment(\.dismiss) private var dismiss
 #if os(macOS)
     @Environment(\.macModalDismiss) private var macModalDismiss
@@ -13,25 +19,26 @@ struct DatasetDetailView: View, Identifiable {
     @StateObject private var readmeLoader: DatasetReadmeLoader
     @AppStorage("huggingFaceToken") private var huggingFaceToken = ""
     @State private var showRecommendation = false
+    @State private var medicalAcknowledged = false
 
     private var isOTL: Bool { detail.id.hasPrefix("OTL/") }
+    private var pack: KnowledgePack? { KnowledgePackCatalog.pack(forID: detail.id) }
+    private var isPack: Bool { pack != nil }
+    /// Curated sources (OTL textbooks, Knowledge Packs) carry their own
+    /// description, so they must NOT fetch a Hugging Face README — for a
+    /// "PACK/…" or "OTL/…" id that request 404s.
+    private var isCurated: Bool { isOTL || isPack }
+    private var requiresMedicalAck: Bool { pack?.disclaimerKey == "medical" }
+    private var embeddingModelInstalled: Bool { EmbeddingModelCatalog.activeRecord().isInstalled }
+    private var hasSourceInfo: Bool {
+        detail.license != nil || detail.attribution != nil || detail.snapshotDate != nil
+    }
     private var activeItem: DownloadController.DatasetItem? {
         downloadController.datasetItems.first { $0.detail.id == detail.id }
     }
     
     private var totalSupportedSize: Int64 {
         DatasetFileSupport.totalSupportedSize(files: detail.files)
-    }
-
-    private var speedFormatter: MeasurementFormatter {
-        let f = MeasurementFormatter()
-        f.locale = locale
-        f.unitOptions = .naturalScale
-        f.unitStyle = .medium
-        f.numberFormatter.locale = locale
-        f.numberFormatter.maximumFractionDigits = 1
-        f.numberFormatter.minimumFractionDigits = 0
-        return f
     }
 
     init(detail: DatasetDetails) {
@@ -48,38 +55,50 @@ struct DatasetDetailView: View, Identifiable {
 #endif
     }
 
+    private func statusKey(for item: DownloadController.DatasetItem) -> LocalizedStringKey? {
+        guard !item.completed else { return nil }
+        switch item.status {
+        case .paused:
+            return "Paused"
+        case .retrying, .waitingForConnectivity:
+            return "Retrying…"
+        case .verifying, .finalizing:
+            return "Finishing…"
+        default:
+            return nil
+        }
+    }
+
     var body: some View {
         #if os(macOS)
         ScrollView {
-            VStack(alignment: .leading, spacing: 32) {
-                // Header
-                VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text(detail.displayName ?? detail.id)
-                        .font(.system(.title, design: .serif))
-                        .fontWeight(.bold)
+                        .font(.system(size: 20, weight: .semibold))
                     if let summary = detail.summary {
                         Text(summary)
-                            .font(.body)
+                            .font(.system(size: 13))
                             .foregroundStyle(.secondary)
-                            .lineSpacing(4)
+                            .lineSpacing(3)
                     }
                 }
-                .padding(.bottom, 8)
 
-                // Readme / Description
-                if !isOTL {
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text(LocalizedStringKey("About"))
-                            .font(.title3)
-                            .fontWeight(.semibold)
-                        
+                if hasSourceInfo {
+                    VStack(alignment: .leading, spacing: 12) {
+                        IndustrialSectionHeader("Source & License")
+                        sourceLicenseContent
+                    }
+                }
+
+                if !isCurated {
+                    VStack(alignment: .leading, spacing: 12) {
+                        IndustrialSectionHeader("About")
+
                         ReadmeCollapseView(markdown: readmeLoader.markdown,
                                           loading: readmeLoader.isLoading,
                                           retry: { readmeLoader.load(force: true) })
                             .frame(minHeight: 100)
-                            .padding()
-                            .background(Color(nsColor: .controlBackgroundColor))
-                            .cornerRadius(12)
                     }
                     .onAppear { readmeLoader.load() }
                     .onDisappear {
@@ -88,31 +107,17 @@ struct DatasetDetailView: View, Identifiable {
                     }
                 }
 
-                // Files
-                VStack(alignment: .leading, spacing: 16) {
-                    Text(LocalizedStringKey("Files"))
-                        .font(.title3)
-                        .fontWeight(.semibold)
-                    
+                VStack(alignment: .leading, spacing: 12) {
+                    IndustrialSectionHeader("Files", detail: "\(detail.files.count)")
                     filesContent
-                        .padding()
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .cornerRadius(12)
                 }
 
-                // Actions
-                VStack(alignment: .leading, spacing: 16) {
-                    Text(LocalizedStringKey("Actions"))
-                        .font(.title3)
-                        .fontWeight(.semibold)
-                    
+                VStack(alignment: .leading, spacing: 12) {
+                    IndustrialHairline()
                     actionsContent
-                        .padding()
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .cornerRadius(12)
                 }
             }
-            .padding(32)
+            .padding(24)
         }
         .sheet(isPresented: $showRecommendation) {
             DatasetRecommendationView(
@@ -124,7 +129,7 @@ struct DatasetDetailView: View, Identifiable {
         NavigationStack {
             List {
                 Section(header: Text(detail.displayName ?? detail.id)) {
-                    if isOTL {
+                    if isCurated {
                         if let summary = detail.summary { Text(summary) }
                     } else {
                         ReadmeCollapseView(markdown: readmeLoader.markdown,
@@ -135,6 +140,11 @@ struct DatasetDetailView: View, Identifiable {
                                 readmeLoader.clearMarkdown()
                                 readmeLoader.cancel()
                             }
+                    }
+                }
+                if hasSourceInfo {
+                    Section(LocalizedStringKey("Source & License")) {
+                        sourceLicenseContent
                     }
                 }
                 Section(LocalizedStringKey("Files")) {
@@ -148,7 +158,7 @@ struct DatasetDetailView: View, Identifiable {
                 ToolbarItem(placement: .cancellationAction) {
                     if let item = activeItem {
                         Button(LocalizedStringKey("Done")) { close() }
-                            .disabled(!item.completed && !isOTL)
+                            .disabled(!item.completed && !isCurated)
                     } else {
                         Button(LocalizedStringKey("Close")) { close() }
                     }
@@ -162,6 +172,29 @@ struct DatasetDetailView: View, Identifiable {
             }
         }
         #endif
+    }
+
+    @ViewBuilder
+    private var sourceLicenseContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let license = detail.license {
+                Label(LocalizedStringKey(license), systemImage: "checkmark.seal")
+                    .font(.callout)
+            }
+            if let snapshot = detail.snapshotDate {
+                Label(snapshot, systemImage: "clock.arrow.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let attribution = detail.attribution {
+                Text(attribution)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -192,7 +225,7 @@ struct DatasetDetailView: View, Identifiable {
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
-                    .padding(.vertical, 12)
+                    .padding(.vertical, datasetFileRowVerticalPadding)
                 }
             }
             
@@ -231,41 +264,45 @@ struct DatasetDetailView: View, Identifiable {
     private var actionsContent: some View {
         let hasUsable = detail.files.contains { DatasetFileSupport.isSupported($0) }
         
-        if let item = activeItem {
+        if let item = activeItem, item.status == .failed {
+            // P1-E: a failed download (e.g. a 404 on an unpublished pack file) must
+            // not leave a frozen "Downloading…" — show the error and offer Retry.
             VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    if item.expectedBytes > 0 {
-                        ProgressView(value: Double(item.downloadedBytes), total: Double(item.expectedBytes))
-                            .frame(maxWidth: .infinity)
-                            .tint(.blue)
-                    } else {
-                        ProgressView(value: item.progress)
-                            .frame(maxWidth: .infinity)
-                            .tint(.blue)
-                    }
-                    let pct = item.expectedBytes > 0
-                        ? Int(Double(item.downloadedBytes) / Double(item.expectedBytes) * 100)
-                        : Int(item.progress * 100)
-                    let speedStr: String = {
-                        if item.speed > 0 {
-                            let measurement = Measurement(value: Double(item.speed), unit: UnitInformationStorage.bytes)
-                            return speedFormatter.string(from: measurement) + "/s"
-                        } else { return "" }
-                    }()
-                    Text(speedStr.isEmpty ? "\(pct)%" : "\(pct)%  ·  \(speedStr)")
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(LocalizedStringKey("Download failed"))
+                        .font(.callout)
+                        .fontWeight(.medium)
                 }
-                Text(item.completed
-                     ? String(localized: "Download complete", locale: locale)
-                     : String(localized: "Downloading…", locale: locale)
+                if let message = item.error?.localizedDescription, !message.isEmpty {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Button {
+                    downloadController.startDataset(detail: detail)
+                } label: {
+                    Label(LocalizedStringKey("Retry"), systemImage: "arrow.clockwise")
+                        .industrialCTAWidth()
+                }
+                .buttonStyle(.industrial(.tinted))
+                .controlSize(.large)
+            }
+        } else if let item = activeItem {
+            VStack(alignment: .leading, spacing: 12) {
+                let progress = item.expectedBytes > 0
+                    ? Double(item.downloadedBytes) / Double(item.expectedBytes)
+                    : item.progress
+                DownloadProgressCluster(
+                    progress: progress,
+                    speed: item.speed,
+                    statusKey: statusKey(for: item)
                 )
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
                 if item.completed {
                     Button(LocalizedStringKey("Done")) { close() }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.industrial(.prominent))
                         .controlSize(.large)
                 }
             }
@@ -275,24 +312,50 @@ struct DatasetDetailView: View, Identifiable {
                     showRecommendation = true
                 } label: {
                     Label(LocalizedStringKey("Check Requirements"), systemImage: "info.circle.fill")
-                        .frame(maxWidth: .infinity)
+                        .industrialCTAWidth()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.industrial(.quiet))
                 .controlSize(.large)
                 .padding(.bottom, 8)
             }
-            
+
+            // P1-B: medical packs require explicit acknowledgement before download.
+            if requiresMedicalAck {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(LocalizedStringKey("This pack is reference information only and is not a substitute for professional medical care."), systemImage: "cross.case")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle(LocalizedStringKey("I understand this is not medical advice"), isOn: $medicalAcknowledged)
+                        .font(.callout)
+                }
+                .padding(.bottom, 8)
+            }
+
+            // P1-F: be honest that indexing may download an embedding model first.
+            if hasUsable && !embeddingModelInstalled {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "arrow.down.circle")
+                    Text(LocalizedStringKey("Setup will first download an on-device embedding model."))
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 8)
+            }
+
+            let downloadDisabled = !hasUsable || (requiresMedicalAck && !medicalAcknowledged)
             Button {
                 downloadController.startDataset(detail: detail)
             } label: {
                 Text(LocalizedStringKey("Download Dataset"))
-                    .frame(maxWidth: .infinity)
+                    .industrialCTAWidth()
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.industrial(.prominent))
             .controlSize(.large)
-            .disabled(!hasUsable)
-            .opacity(hasUsable ? 1 : 0.5)
-            
+            .keyboardShortcut(.defaultAction)
+            .disabled(downloadDisabled)
+            .opacity(downloadDisabled ? 0.5 : 1)
+
             if !hasUsable {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.circle")

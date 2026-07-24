@@ -282,7 +282,7 @@ def render() -> str:
     lines.extend(
         [
             "",
-            "Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `SLM` maps to `.et`, and `APPLE`/`CML` map to `.ane`.",
+            "Compatibility aliases are handled by `ModelFormat.compatibleRawValue`; `APPLE` and `CML` map to `.ane`.",
             "",
             "## Runtime Setting Enums",
             "",

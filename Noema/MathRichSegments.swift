@@ -1,12 +1,3 @@
-// MathRichSegments.swift
-//  MathRichSegments.swift
-//  Noema
-//
-//  Platform-neutral segmentation of mixed text + LaTeX sources, shared by the
-//  SwiftUI renderer (iOS/visionOS) and the AppKit selectable renderer (macOS).
-//  Also hosts the copy transform that substitutes math attachments with their
-//  original LaTeX source when text is copied out of the macOS chat.
-
 import Foundation
 
 /// One inline run inside a paragraph.
@@ -117,6 +108,11 @@ enum MathRichSegmenter {
                         // a hanging-indent row instead of inline "• text"; a
                         // "#"-prefixed paragraph renders as a heading.
                         if currentInline.isEmpty, currentMarker == nil, currentHeadingLevel == nil {
+                            // The newline→space collapse above can leave a
+                            // leading space on a fresh paragraph (a grouped
+                            // block may start "\n### Heading"), which would
+                            // defeat the prefix checks below.
+                            inlinePara = String(inlinePara.drop(while: { $0 == " " }))
                             if let heading = headingPrefix(of: inlinePara) {
                                 currentHeadingLevel = heading.level
                                 inlinePara = heading.content

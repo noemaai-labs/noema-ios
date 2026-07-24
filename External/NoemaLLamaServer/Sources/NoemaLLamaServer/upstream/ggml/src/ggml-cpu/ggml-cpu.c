@@ -82,6 +82,9 @@ float ggml_table_f32_f16[1 << 16];
 // precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
 float ggml_table_f32_e8m0_half[1 << 8];
 
+// precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
+float ggml_table_f32_ue4m3[1 << 8];
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -224,6 +227,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q1_0] = {
         .from_float               = quantize_row_q1_0,
         .vec_dot                  = ggml_vec_dot_q1_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_0] = {
+        .from_float               = quantize_row_q2_0,
+        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -1555,6 +1564,7 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const bool skip_inactive = ggml_mul_mat_id_get_skip_inactive(dst);
 
     void * wdata_cur = params->wdata;
 
@@ -1611,6 +1621,12 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        if (skip_inactive) {
+            // Kernels below only visit active expert rows. Initialize the
+            // sparse holes deterministically so later activation/weighting
+            // cannot preserve stale or NaN scratch-buffer contents.
+            memset(dst->data, 0, ggml_nbytes(dst));
+        }
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1619,6 +1635,9 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                if (skip_inactive && i02 < 0) {
+                    continue;
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
@@ -1694,6 +1713,36 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+}
+
+static void ggml_compute_forward_noema_moe_weighted_reduce(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * experts = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t d = experts->ne[0];
+    const int64_t k = experts->ne[1];
+    const int64_t t = experts->ne[2];
+    const int64_t total = d * t;
+    for (int64_t linear = params->ith; linear < total; linear += params->nth) {
+        const int64_t id = linear % d;
+        const int64_t it = linear / d;
+        float sum = 0.0f;
+        for (int64_t ik = 0; ik < k; ++ik) {
+            const float v = *(const float *) ((const char *) experts->data +
+                id * experts->nb[0] + ik * experts->nb[1] + it * experts->nb[2]);
+            const float w = *(const float *) ((const char *) weights->data +
+                ik * weights->nb[1] + it * weights->nb[2]);
+            // Preserve the old graph's multiply rounding before its ordered
+            // add chain; volatile prevents an across-statement FMA here.
+            const volatile float weighted = v * w;
+            sum = ik == 0 ? weighted : sum + weighted;
+        }
+        *(float *) ((char *) dst->data + id * dst->nb[0] + it * dst->nb[1]) = sum;
     }
 }
 
@@ -1831,6 +1880,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_NOEMA_MOE_WEIGHTED_REDUCE:
+            {
+                ggml_compute_forward_noema_moe_weighted_reduce(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2051,6 +2104,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2231,6 +2288,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_NOEMA_MOE_WEIGHTED_REDUCE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2371,6 +2429,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2849,6 +2908,12 @@ struct ggml_cplan ggml_graph_plan(
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
+                case GGML_OP_SET_ROWS:
+                    {
+                        if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
+                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                        }
+                    } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
@@ -2956,6 +3021,12 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         GGML_ABORT("fatal error");
                     }
+                case GGML_OP_LIGHTNING_INDEXER:
+                    {
+                        // temp buffer for dequantizing lightning indexer keys
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        cur += sizeof(float)*ne10*n_tasks;
+                    } break;
                 default:
                     break;
             }
@@ -3796,6 +3867,11 @@ void ggml_cpu_init(void) {
             // initialize E8M0 half table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
+            }
+
+            // initialize UE4M3 table (256 entries)
+            for (int i = 0; i < (1 << 8); ++i) {
+                ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

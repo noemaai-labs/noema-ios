@@ -84,6 +84,7 @@ struct NoemaApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView().preferredColorScheme(colorScheme)
+                .calendarConfirmationHost()
 #if canImport(FBSDKCoreKit) && os(iOS)
                 .onAppear {
                     AppEvents.shared.activateApp()
@@ -150,6 +151,16 @@ private struct NoemaKeyboardCommands: Commands {
             }
             .keyboardShortcut("n", modifiers: [.command])
 
+            if chatVM.activeSessionDataset != nil {
+                Button {
+                    tabRouter.selection = .chat
+                    chatVM.startNewSession(carryingActiveDataset: false)
+                } label: {
+                    Text(verbatim: "\(String(localized: "New Chat")) · \(String(localized: "No Dataset"))")
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+            }
+
             Button(LocalizedStringKey("Stop")) {
                 chatVM.stop()
             }
@@ -214,6 +225,10 @@ struct NoemaMacApp: App {
         WindowGroup {
             ContentView()
                 .preferredColorScheme(colorScheme)
+                .calendarConfirmationHost()
+                .onAppear {
+                    ReviewPrompter.shared.trackSession()
+                }
                 .environmentObject(tabRouter)
                 .environmentObject(chatVM)
                 .environmentObject(modelManager)
@@ -231,17 +246,102 @@ struct NoemaMacApp: App {
                 }
         }
         .defaultSize(width: 1280, height: 820)
+        .commands {
+            NoemaMacKeyboardCommands(tabRouter: tabRouter, chatVM: chatVM)
+        }
+    }
+}
+
+private struct NoemaMacKeyboardCommands: Commands {
+    @ObservedObject var tabRouter: TabRouter
+    @ObservedObject var chatVM: ChatVM
+    @AppStorage("offGrid") private var offGrid = false
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button(LocalizedStringKey("Settings")) {
+                tabRouter.selection = .settings
+            }
+            .keyboardShortcut(",", modifiers: [.command])
+        }
+
+        CommandGroup(replacing: .newItem) {
+            Button(LocalizedStringKey("New Chat")) {
+                tabRouter.selection = .chat
+                chatVM.startNewSession()
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+
+            if chatVM.activeSessionDataset != nil {
+                Button {
+                    tabRouter.selection = .chat
+                    chatVM.startNewSession(carryingActiveDataset: false)
+                } label: {
+                    Text(verbatim: "\(String(localized: "New Chat")) · \(String(localized: "No Dataset"))")
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+            }
+        }
+
+        CommandMenu(LocalizedStringKey("Navigate")) {
+            Button(LocalizedStringKey("Chat")) {
+                tabRouter.selection = .chat
+            }
+            .keyboardShortcut("1", modifiers: [.command])
+
+            Button(LocalizedStringKey("Stored")) {
+                tabRouter.selection = .stored
+            }
+            .keyboardShortcut("2", modifiers: [.command])
+
+            Button(LocalizedStringKey("Explore")) {
+                tabRouter.selection = .explore
+            }
+            .keyboardShortcut("3", modifiers: [.command])
+            .disabled(offGrid)
+
+            Button(LocalizedStringKey("Mac Relay")) {
+                tabRouter.selection = .relay
+            }
+            .keyboardShortcut("4", modifiers: [.command])
+
+            Button(LocalizedStringKey("Tools")) {
+                tabRouter.selection = .tools
+            }
+            .keyboardShortcut("5", modifiers: [.command])
+
+            Button(LocalizedStringKey("Settings")) {
+                tabRouter.selection = .settings
+            }
+            .keyboardShortcut("6", modifiers: [.command])
+
+            Divider()
+
+            Button(LocalizedStringKey("Stop")) {
+                chatVM.stop()
+            }
+            .keyboardShortcut(".", modifiers: [.command])
+            .disabled(!chatVM.isStreaming)
+
+            Button(LocalizedStringKey("Stop After Paragraph")) {
+                chatVM.requestStopAfterParagraph()
+            }
+            .keyboardShortcut(".", modifiers: [.command, .shift])
+            .disabled(!chatVM.isStreaming)
+        }
     }
 }
 
 @MainActor
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
-    // Temporarily disable the menu bar status item / popover.
-    // Creating the singleton instantiates an NSStatusItem; omit for now.
-    // private var menuBarController = RelayMenuBarController.shared
     private let relayViewModel = RelayManagementViewModel.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Guard against a SwiftUI/AppKit reentrancy bug that throws an unhandled
+        // NSRangeException while tearing down an NSToolbar KVO observer during fullscreen
+        // resize. Installed before any window can enter fullscreen.
+        NoemaInstallToolbarObserverCrashGuard()
+
         NSApplication.shared.registerForRemoteNotifications()
         if #available(macOS 10.12, *) {
             NSWindow.allowsAutomaticWindowTabbing = false
@@ -277,20 +377,39 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
         // Skip system-managed helper windows (fullscreen overlays, mouse trackers, status/touch bar hosts)
         // and any lightweight panels/popovers so we don't accidentally re-style them.
         if isSystemHelperWindow(window) { return }
-        window.collectionBehavior.remove(.fullScreenNone)
-        window.collectionBehavior.insert([.fullScreenPrimary, .fullScreenAllowsTiling])
-        window.styleMask.remove([.borderless, .fullSizeContentView])
-        // Use standard titled resizable window with default chrome.
-        window.styleMask.insert([.titled, .closable, .miniaturizable, .resizable])
-        window.titleVisibility = .visible
-        window.titlebarAppearsTransparent = false
-        window.isMovableByWindowBackground = false
+        // Use standard titled resizable window with default chrome. Shared helper keeps the
+        // styleMask/toolbarStyle changes idempotent and inert during fullscreen so it never
+        // desyncs SwiftUI's toolbar KVO observers.
+        applyStandardWindowChrome(to: window)
         window.isReleasedWhenClosed = false
-        if #available(macOS 11.0, *) { window.toolbarStyle = .automatic }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // On macOS the SwiftUI scene phase is not reliably driven to `.background`
+        // on quit, so MainView's scenePhase flush may never run. Persist the
+        // pending chat state here so quitting never loses it.
+        if let chatVM = AppIntentDriver.shared.chatVM {
+            chatVM.flushPendingSessionSavesNow()
+            chatVM.persistRollingThoughtsNow()
+        }
+
+        // The `_exit(0)` below skips URLSession teardown. Durable background-session
+        // transfers remain owned by nsurlsessiond; any legacy foreground transfer gets
+        // resume data captured before the process exits.
+        BackgroundDownloadManager.shared.flushForTermination()
+
+        // Quitting (or force-quitting) while a model is loaded leaves the in-process
+        // inference threads and their GGML/Metal resources live. If we let AppKit run
+        // its normal exit() teardown, the C++ static destructors and Metal backend get
+        // torn down out from under those still-running threads and the process faults —
+        // which macOS reports as a crash ("Noema quit unexpectedly… send report to
+        // Apple"). Exit cleanly with status 0 instead: the kernel reaps the process
+        // without running that teardown and without invoking the crash reporter.
+        _exit(0)
     }
 
     func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String : Any]) {

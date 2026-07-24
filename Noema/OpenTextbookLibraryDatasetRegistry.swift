@@ -1,4 +1,3 @@
-// OpenTextbookLibraryDatasetRegistry.swift
 import Foundation
 
 /// Registry for searching the Open Textbook Library catalog.

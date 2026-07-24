@@ -1,8 +1,4 @@
-// DatasetRetriever.swift
 import Foundation
-#if canImport(PDFKit)
-import PDFKit
-#endif
 
 enum DatasetRetrievalMode: String, CaseIterable, Identifiable {
     case focused
@@ -297,6 +293,9 @@ actor DatasetRetriever {
             cache[dataset.datasetID] = nil
         }
 
+        var generatedExtractedText = false
+        var generatedCompactText = false
+        var preparationCompleted = false
         do {
             if !FileManager.default.fileExists(atPath: compactURL.path) {
                 Task { await logger.log("[RAG] extract.begin") }
@@ -311,11 +310,12 @@ actor DatasetRetriever {
                     )
                 }
                 let t0 = Date()
+                generatedExtractedText = true
                 let report = try await extractPlainText(from: dataset, writingTo: extractedURL) { frac in
-                    Task { @MainActor in
+                    if let progress {
                         let dt = Date().timeIntervalSince(t0)
                         let eta = frac > 0 ? dt * (1.0 / frac - 1.0) : nil
-                        progress?(
+                        await progress(
                             DatasetProcessingStatus(
                                 stage: .extracting,
                                 progress: frac,
@@ -340,6 +340,7 @@ actor DatasetRetriever {
                     )
                 }
                 let c0 = Date()
+                generatedCompactText = true
                 try compactText(from: extractedURL, writingTo: compactURL) { frac in
                     Task { @MainActor in
                         let dt = Date().timeIntervalSince(c0)
@@ -365,6 +366,8 @@ actor DatasetRetriever {
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty } ?? ""
             if preparedText.isEmpty {
+                if generatedExtractedText { try? FileManager.default.removeItem(at: extractedURL) }
+                if generatedCompactText { try? FileManager.default.removeItem(at: compactURL) }
                 let reason = String(localized: "No retrievable text found in imported files", locale: LocalizationManager.preferredLocale())
                 recordFailure(for: dataset, reason: reason)
                 if let progress {
@@ -372,6 +375,7 @@ actor DatasetRetriever {
                 }
                 return
             }
+            preparationCompleted = true
 
             // If caller asked to pause, emit an embedding gate status; otherwise continue to embeddings.
             if pauseBeforeEmbedding {
@@ -392,6 +396,10 @@ actor DatasetRetriever {
                 try await embedPrepared(dataset: dataset, progress: progress)
             }
         } catch {
+            if !preparationCompleted {
+                if generatedExtractedText { try? FileManager.default.removeItem(at: extractedURL) }
+                if generatedCompactText { try? FileManager.default.removeItem(at: compactURL) }
+            }
             Task { await logger.log("[RAG] ❌ prepare.failed error=\(error.localizedDescription)") }
             if !(error is CancellationError) {
                 recordFailure(for: dataset, reason: error.localizedDescription)
@@ -414,15 +422,10 @@ actor DatasetRetriever {
     }
 
     private func setIndexingDatasetIDPersisted(_ value: String) {
-        let key = indexingDatasetIDPersistedKey
-        if Thread.isMainThread {
-            UserDefaults.standard.set(value, forKey: key)
-            return
-        }
-
-        DispatchQueue.main.sync {
-            UserDefaults.standard.set(value, forKey: key)
-        }
+        // UserDefaults is thread-safe, so write directly. Previously this hopped to the main
+        // thread via DispatchQueue.main.sync, which blocks this actor (and risks a hang) while
+        // the main thread is busy — pointless for a plain defaults write.
+        UserDefaults.standard.set(value, forKey: indexingDatasetIDPersistedKey)
     }
 
     /// Performs the embedding step assuming extraction and compression have completed.
@@ -559,7 +562,7 @@ actor DatasetRetriever {
     private func extractPlainText(
         from dataset: LocalDataset,
         writingTo outputURL: URL,
-        onProgress: @escaping (Double) -> Void
+        onProgress: @escaping @Sendable (Double) async -> Void
     ) async throws -> DatasetIndexReport {
         let fm = FileManager.default
         let files = supportedFiles(in: dataset)
@@ -586,43 +589,39 @@ actor DatasetRetriever {
         let totalUnits = max(files.count, 1)
         var completedUnits = 0
 
-        func advanceProgress() {
-            completedUnits += 1
-            onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
-        }
-
         #if canImport(PDFKit)
         for file in pdfs {
             if Task.isCancelled { throw CancellationError() }
-            guard let doc = PDFKit.PDFDocument(url: file.url) else {
+            let progressBeforeFile = Double(completedUnits) / Double(totalUnits)
+            let progressForFile = 1.0 / Double(totalUnits)
+            guard let text = try await Self.extractPDFDocumentText(
+                from: file.url,
+                onPageProgress: { completedPages, pageCount in
+                    guard pageCount > 0 else { return }
+                    let pageFraction = Double(completedPages) / Double(pageCount)
+                    await onProgress(min(0.95, progressBeforeFile + progressForFile * pageFraction))
+                }
+            ) else {
                 report.skippedFiles.append(file.relativePath)
-                advanceProgress()
+                completedUnits += 1
+                await onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
                 continue
             }
-
-            var parts: [String] = []
-            for pageIndex in 0..<doc.pageCount {
-                if Task.isCancelled { throw CancellationError() }
-                if let page = doc.page(at: pageIndex),
-                   let text = page.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !text.isEmpty {
-                    parts.append(text)
-                }
-            }
-            let text = parts.joined(separator: "\n")
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 report.emptyFiles.append(file.relativePath)
             } else {
                 try writeProcessedFile(relativePath: file.relativePath, text: text)
                 report.processedFiles.append(file.relativePath)
             }
-            advanceProgress()
+            completedUnits += 1
+            await onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
         }
         #else
         for file in pdfs {
             if Task.isCancelled { throw CancellationError() }
             report.skippedFiles.append(file.relativePath)
-            advanceProgress()
+            completedUnits += 1
+            await onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
         }
         #endif
 
@@ -636,14 +635,16 @@ actor DatasetRetriever {
                 try writeProcessedFile(relativePath: file.relativePath, text: text)
                 report.processedFiles.append(file.relativePath)
             }
-            advanceProgress()
+            completedUnits += 1
+            await onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
         }
 
         for file in textFiles {
             if Task.isCancelled { throw CancellationError() }
             guard let raw = DatasetTextReader.readString(from: file.url) else {
                 report.skippedFiles.append(file.relativePath)
-                advanceProgress()
+                completedUnits += 1
+                await onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
                 continue
             }
             let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -653,13 +654,52 @@ actor DatasetRetriever {
                 try writeProcessedFile(relativePath: file.relativePath, text: raw)
                 report.processedFiles.append(file.relativePath)
             }
-            advanceProgress()
+            completedUnits += 1
+            await onProgress(min(0.95, Double(completedUnits) / Double(totalUnits)))
         }
 
         if Task.isCancelled { throw CancellationError() }
-        onProgress(1.0)
+        await onProgress(1.0)
         return report
     }
+
+    #if canImport(PDFKit)
+    /// Runs synchronous PDFKit/Vision work outside this actor. Cancellation of
+    /// indexing is forwarded to the worker and checked between PDF pages.
+    private nonisolated static func extractPDFDocumentText(
+        from url: URL,
+        onPageProgress: @escaping @Sendable (Int, Int) async -> Void = { _, _ in }
+    ) async throws -> String? {
+        let (updates, continuation) = AsyncStream<(Int, Int)>.makeStream()
+        let worker = Task.detached(priority: .utility) {
+            defer { continuation.finish() }
+            return try PDFTextExtractor.documentText(
+                from: url,
+                ocrEmptyPages: true,
+                onPageProgress: { completed, total in
+                    continuation.yield((completed, total))
+                }
+            )
+        }
+        return try await withTaskCancellationHandler {
+            for await (completed, total) in updates {
+                if Task.isCancelled { throw CancellationError() }
+                await onPageProgress(completed, total)
+            }
+            return try await worker.value
+        } onCancel: {
+            worker.cancel()
+            continuation.finish()
+        }
+    }
+    #endif
+
+    /// High-confidence prefixes that form genuine hyphenated compounds. When a
+    /// line-wrap hyphen follows one of these the hyphen is preserved rather than
+    /// removed, so "anti-inflammatory" doesn't collapse to "antiinflammatory".
+    private static let dehyphenationCompoundPrefixes: Set<String> = [
+        "self", "non", "anti", "multi", "semi"
+    ]
 
     private func compactText(from inputURL: URL, writingTo outputURL: URL, onProgress: (Double) -> Void) throws {
         let fm = FileManager.default
@@ -702,10 +742,21 @@ actor DatasetRetriever {
         var bytesRead: Int64 = 0
         var lastBlank = false
         var lastProgressBytes: Int64 = 0
+        // Holds the previous non-blank line so we can de-hyphenate a wrap
+        // ("infor-\nmation" → "information") before committing it.
+        var pendingLine: String? = nil
+
+        func flushPending() throws {
+            if let p = pendingLine {
+                try writeLine(p)
+                pendingLine = nil
+            }
+        }
 
         func handleLine(_ raw: String) throws {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
+                try flushPending()
                 if !lastBlank {
                     try writeLine("")
                     lastBlank = true
@@ -713,8 +764,29 @@ actor DatasetRetriever {
                 return
             }
             let normalized = normalizeInlineWhitespace(trimmed)
-            try writeLine(normalized)
             lastBlank = false
+            if let prev = pendingLine {
+                // Previous line ends with letter + hyphen and this line starts
+                // lowercase: either a wrapped word ("infor-\nmation") or a genuine
+                // hyphenated compound that happened to wrap ("anti-\ninflammatory").
+                if prev.count >= 2,
+                   prev.hasSuffix("-"),
+                   prev[prev.index(prev.endIndex, offsetBy: -2)].isLetter,
+                   let firstChar = normalized.first, firstChar.isLowercase {
+                    let stem = String(prev.dropLast())  // without the trailing hyphen
+                    let lastWord = (stem.split { $0 == " " || $0 == "\t" }.last).map { String($0).lowercased() } ?? ""
+                    if Self.dehyphenationCompoundPrefixes.contains(lastWord) {
+                        // Real compound — keep the hyphen ("anti-inflammatory").
+                        pendingLine = prev + normalized
+                    } else {
+                        // Line-wrap hyphenation — drop the hyphen ("information").
+                        pendingLine = stem + normalized
+                    }
+                    return
+                }
+                try writeLine(prev)
+            }
+            pendingLine = normalized
         }
 
         while true {
@@ -742,6 +814,7 @@ actor DatasetRetriever {
             let line = String(data: buffer, encoding: .utf8) ?? String(decoding: buffer, as: UTF8.self)
             try handleLine(line)
         }
+        try flushPending()
 
         onProgress(1.0)
     }
@@ -757,6 +830,9 @@ actor DatasetRetriever {
         var chunkSources: [String?] = []
         var chunkTitles: [String?] = []
         var buffer = ""
+        // Running token estimate for `buffer`, accumulated per line so we never
+        // re-tokenize the whole growing buffer (the old code was O(L^2) per file).
+        var bufferTokens = 0
         var currentSource: String? = nil
         // Stale extracted/compact text can still carry sections for files that
         // are now internal (e.g. the enterprise governance manifest); those
@@ -772,25 +848,6 @@ actor DatasetRetriever {
         let maxTokensPerChunk = DatasetChunkingPolicy.maxTokensPerChunk
         Task.detached { await logger.log("[RAG] Using maxTokensPerChunk=\(maxTokensPerChunk) for chunking") }
 
-        func splitLongText(_ s: String, maxChars: Int) -> [String] {
-            var out: [String] = []
-            var remaining = s
-            while !remaining.isEmpty {
-                if remaining.count <= maxChars { out.append(remaining); break }
-                // Try to split on the last sentence boundary or space before the limit
-                let idx = remaining.index(remaining.startIndex, offsetBy: maxChars)
-                var splitIndex = remaining[..<idx].lastIndex(of: "\n")
-                    ?? remaining[..<idx].lastIndex(of: ".")
-                    ?? remaining[..<idx].lastIndex(of: " ")
-                if splitIndex == nil { splitIndex = idx }
-                let part = String(remaining[..<splitIndex!]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !part.isEmpty { out.append(part) }
-                remaining = String(remaining[splitIndex!..<remaining.endIndex])
-                remaining = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            return out
-        }
-
         func flushBuffer() {
             let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
@@ -802,7 +859,7 @@ actor DatasetRetriever {
                     chunkSources.append(currentSource)
                     chunkTitles.append(chunkTitle)
                 } else {
-                    let parts = splitLongText(trimmed, maxChars: maxCharsPerChunk)
+                    let parts = Self.splitLongTextForEmbedding(trimmed, maxChars: maxCharsPerChunk)
                     for p in parts {
                         chunkTexts.append(p)
                         chunkSources.append(currentSource)
@@ -811,28 +868,44 @@ actor DatasetRetriever {
                 }
             }
             buffer = ""
+            bufferTokens = 0
         }
 
+        var consecutiveBlanks = 0
         for (idx, line) in lines.enumerated() {
             if Task.isCancelled { throw CancellationError() }
             let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if let marker = parseSourceMarker(t) {
                 flushBuffer()
+                consecutiveBlanks = 0
                 currentSource = marker
                 skippingInternalSource = DatasetStorage.isInternalRelativePath(marker)
                 continue
             }
             if skippingInternalSource { continue }
             if t.isEmpty {
-                flushBuffer()
+                // Only a strong boundary (a real paragraph/section break — two or
+                // more consecutive blank lines) forces a flush. A single blank
+                // line, which PDFKit emits constantly around visual line, column
+                // and figure seams, is a soft separator so passages stay whole
+                // instead of fragmenting into one-line chunks.
+                consecutiveBlanks += 1
+                if consecutiveBlanks >= 2 {
+                    flushBuffer()
+                }
             } else {
-                let prospective = buffer.isEmpty ? t : buffer + " " + t
-                let tok = await EmbeddingModel.shared.countTokens(prospective)
-                if tok > maxTokensPerChunk {
+                consecutiveBlanks = 0
+                // Tokenize only the new line and keep a running total, instead of
+                // re-tokenizing the whole buffer every line. The 8000-char cap in
+                // flushBuffer is the hard backstop if the running estimate drifts.
+                let lineTokens = await EmbeddingModel.shared.countTokens(t)
+                if !buffer.isEmpty && bufferTokens + lineTokens > maxTokensPerChunk {
                     flushBuffer()
                     buffer = t
+                    bufferTokens = lineTokens
                 } else {
-                    buffer = prospective
+                    buffer = buffer.isEmpty ? t : buffer + " " + t
+                    bufferTokens += lineTokens
                 }
             }
             if idx % 50 == 0 {
@@ -869,7 +942,7 @@ actor DatasetRetriever {
                 }
                 if best == 0 {
                     // Fallback to char-based split
-                    let parts = splitLongText(remaining, maxChars: 4000)
+                    let parts = Self.splitLongTextForEmbedding(remaining, maxChars: 4000)
                     if parts.isEmpty { break }
                     out.append(parts[0])
                     remaining = parts.dropFirst().joined(separator: " ")
@@ -1064,6 +1137,29 @@ actor DatasetRetriever {
         return batched
     }
 
+    nonisolated static func splitLongTextForEmbedding(_ text: String, maxChars: Int) -> [String] {
+        guard maxChars > 0 else { return [] }
+        var output: [String] = []
+        var remaining = text
+        while !remaining.isEmpty {
+            if remaining.count <= maxChars {
+                output.append(remaining)
+                break
+            }
+            let limit = remaining.index(remaining.startIndex, offsetBy: maxChars)
+            let candidate = remaining[..<limit].lastIndex(of: "\n")
+                ?? remaining[..<limit].lastIndex(of: ".")
+                ?? remaining[..<limit].lastIndex(of: " ")
+            // A delimiter at startIndex would emit an empty part and leave the
+            // remainder unchanged (notably for long strings beginning with a period).
+            let splitIndex = candidate == remaining.startIndex ? limit : (candidate ?? limit)
+            let part = String(remaining[..<splitIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !part.isEmpty { output.append(part) }
+            remaining = String(remaining[splitIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return output
+    }
+
     private func embeddingDatasetTitle(for dataset: LocalDataset) -> String? {
         if let stored = DatasetTextReader.readString(from: DatasetIndexIO.titleURL(for: dataset.url)),
            let normalized = DatasetRetriever.titleForEmbedding(source: nil, datasetTitle: stored) {
@@ -1129,18 +1225,43 @@ actor DatasetRetriever {
             }
         }
 
+        // No query term appears in this chunk — it is not a lexical match. Return
+        // 0 so the length bonus alone can never manufacture a spurious score. This
+        // matters for garbled corpora (e.g. char-spaced OCR), where every chunk
+        // tokenizes to single characters that match no multi-character query
+        // token: without this guard every long chunk scored exactly
+        // lengthBonus * 0.1 = 0.10 and the title page got injected as "relevant".
+        if hits == 0 { return 0 }
+
         let jaccard = Float(hits) / Float(max(seen.count + queryTokens.count - hits, 1))
         let lengthBonus = min(Float(text.count) / 500.0, 1.0)
         return jaccard * 0.9 + lengthBonus * 0.1
     }
 
     private func queryTokens(for query: String) -> Set<String> {
-        Set(
-            query.lowercased()
-                .split { !$0.isLetter && !$0.isNumber }
-                .map(String.init)
-                .filter { $0.count >= 3 }
-        )
+        var tokens = Set<String>()
+        // Keep runs of letters/digits together with internal "-" and "." so codes
+        // like "m8-1.25", "e-204" or "fm21-76" survive as one token instead of
+        // being shredded into sub-3-char fragments that the old filter dropped.
+        let pieces = query.lowercased().split { !$0.isLetter && !$0.isNumber && $0 != "-" && $0 != "." }
+        for piece in pieces {
+            let s = String(piece).trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+            guard !s.isEmpty else { continue }
+            let hasDigit = s.contains { $0.isNumber }
+            // Alphabetic words need >=3 chars; anything with a digit (part numbers,
+            // statutes, codes) is kept regardless of length.
+            if hasDigit || s.count >= 3 { tokens.insert(s) }
+            // Also index sub-parts of a compound code so "m8" matches "m8 bolt".
+            if hasDigit, s.contains("-") || s.contains(".") {
+                for sub in s.split(whereSeparator: { $0 == "-" || $0 == "." }) {
+                    let t = String(sub)
+                    if !t.isEmpty, t.contains(where: { $0.isNumber }) || t.count >= 3 {
+                        tokens.insert(t)
+                    }
+                }
+            }
+        }
+        return tokens
     }
 
     private func expandedQuery(_ query: String, mode: DatasetRetrievalMode) -> String {
@@ -1202,6 +1323,20 @@ actor DatasetRetriever {
         let embedReady = await EmbeddingModel.shared.isReady()
         var candidates: [DatasetRetrievalCandidate<Chunk>] = []
 
+        // Distinctive query terms used to nudge dense scores toward chunks that
+        // contain an exact term (part numbers, statutes, defined terms). Must
+        // contain a letter — pure-numeric tokens like "204" substring-match
+        // unrelated figures (e.g. "1204") and are dropped to avoid false hits.
+        let boostTokens = Array(
+            queryTokens(for: query)
+                .filter { $0.contains(where: { $0.isLetter }) && $0.count >= 3 }
+                .prefix(6)
+        )
+
+        // Best UN-BOOSTED cosine seen; the abstain decision keys off this so the
+        // keyword boost can re-order candidates but can never promote an
+        // off-topic chunk past the relevance floor.
+        var maxRawSimilarity: Float = -1
         if embedReady {
             let qVec = await EmbeddingModel.shared.embedQuery(trimmedQuery)
             if !qVec.isEmpty && qVec.allSatisfy({ $0.isFinite && !$0.isNaN }) {
@@ -1213,9 +1348,26 @@ actor DatasetRetriever {
                     }
                     let similarity = cosineSimilarity(chunk.vector, qVec)
                     if similarity.isFinite && !similarity.isNaN {
+                        maxRawSimilarity = max(maxRawSimilarity, similarity)
+                        var score = similarity
+                        if !boostTokens.isEmpty {
+                            // Tokenize the chunk the SAME way as the query (keeping
+                            // internal "-"/"." so codes like "e-204" / "m8-1.25" stay
+                            // a single token) and match on set membership: "204" can't
+                            // hit inside "1204", yet "e-204" still matches "e-204".
+                            let words = Set(
+                                chunk.text.lowercased()
+                                    .split { !$0.isLetter && !$0.isNumber && $0 != "-" && $0 != "." }
+                                    .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "-.")) }
+                            )
+                            let present = boostTokens.reduce(0) { $0 + (words.contains($1) ? 1 : 0) }
+                            if present > 0 {
+                                score += 0.08 * (Float(present) / Float(boostTokens.count))
+                            }
+                        }
                         candidates.append(
                             DatasetRetrievalCandidate(
-                                score: similarity,
+                                score: score,
                                 source: chunk.source,
                                 payload: chunk
                             )
@@ -1226,6 +1378,10 @@ actor DatasetRetriever {
                 Task { await logger.log("[RAG] ❌ Invalid query embedding, using lexical fallback") }
             }
         }
+
+        // True when the candidate pool came from dense (cosine) scoring, so the
+        // raw-cosine abstain below applies on the right scale.
+        let usedDense = !candidates.isEmpty
 
         if candidates.isEmpty {
             let tokens = queryTokens(for: trimmedQuery)
@@ -1238,8 +1394,22 @@ actor DatasetRetriever {
             }
         }
 
-        if candidates.isEmpty, let first = chunks.first {
-            return [DatasetRetrievalCandidate(score: 0, source: first.source, payload: first)]
+        if candidates.isEmpty {
+            // Nothing matched at all — abstain rather than forcing an irrelevant
+            // chunk into context, which invites grounded-looking hallucination.
+            return []
+        }
+
+        // Abstain ONLY when even the best raw (un-boosted) match is clearly
+        // off-topic. Above the floor we hand back the ranker's normal selection,
+        // preserving its graceful best-scoring fallback for weak-but-present matches.
+        if usedDense {
+            let floor = Self.abstainFloor()
+            if maxRawSimilarity < floor {
+                let best = maxRawSimilarity
+                Task { await logger.log(String(format: "[RAG] abstain — best cosine %.3f < floor %.3f", best, floor)) }
+                return []
+            }
         }
 
         let selected = DatasetRetrievalRanker.select(
@@ -1248,6 +1418,26 @@ actor DatasetRetriever {
             minScore: parameters.threshold
         )
         return Array(selected.prefix(maxChunks))
+    }
+
+    /// Raw-cosine relevance floor below which even the best match is treated as
+    /// off-topic and dense retrieval abstains. Deliberately conservative so it
+    /// only fires on genuine misses (it must not suppress legitimate weak matches
+    /// on lower-baseline models). Per-model overrides go here as real thresholds
+    /// are calibrated from abstain telemetry.
+    nonisolated static func abstainFloor() -> Float {
+        switch EmbeddingModelCatalog.activeRecord().id {
+        // Qwen3-Embedding is instruction-tuned: genuine matches sit well above
+        // ~0.3, while a degenerate corpus (e.g. garbled OCR whose chunks tokenize
+        // to near-identical vectors) collapses every cosine to ~0.10 — just over
+        // the old 0.08 default, so junk was injected instead of abstaining.
+        // Floor at 0.12 to reject the collapse while staying far below any real
+        // match. Conservative; tune up from abstain telemetry if needed.
+        case "Qwen/Qwen3-Embedding-0.6B-GGUF",
+             "Qwen/Qwen3-Embedding-4B-GGUF":
+            return 0.12
+        default: return 0.08
+        }
     }
 
     /// Estimates how many tokens the full dataset would occupy when inserted
@@ -1263,13 +1453,7 @@ actor DatasetRetriever {
             if Task.isCancelled { return total }
 #if canImport(PDFKit)
                 if file.ext == "pdf" {
-                    if let doc = PDFKit.PDFDocument(url: file.url) {
-                        var combined = ""
-                        for i in 0..<doc.pageCount {
-                            if let page = doc.page(at: i), let text = page.string {
-                                combined += text + "\n"
-                            }
-                        }
+                    if let combined = try? await Self.extractPDFDocumentText(from: file.url) {
                         total += await EmbeddingModel.shared.countTokens(combined)
                     }
                 } else if file.ext == "epub" {
@@ -1292,7 +1476,7 @@ actor DatasetRetriever {
 
     /// Reads and concatenates all eligible files within the dataset without
     /// performing any embedding or tokenization.
-    func fetchAllContent(for dataset: LocalDataset) -> String {
+    func fetchAllContent(for dataset: LocalDataset) async -> String {
         if let prepared = preparedText(for: dataset) {
             return prepared
         }
@@ -1302,13 +1486,7 @@ actor DatasetRetriever {
             if Task.isCancelled { break }
 #if canImport(PDFKit)
             if file.ext == "pdf" {
-                if let doc = PDFKit.PDFDocument(url: file.url) {
-                    var combined = ""
-                    for i in 0..<doc.pageCount {
-                        if let page = doc.page(at: i), let text = page.string {
-                            combined += text + "\n"
-                        }
-                    }
+                if let combined = try? await Self.extractPDFDocumentText(from: file.url) {
                     let trimmed = combined.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !trimmed.isEmpty {
                         parts.append("<<<FILE: \(file.relativePath)>>>\n\(combined)")

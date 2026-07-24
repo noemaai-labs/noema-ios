@@ -1,4 +1,3 @@
-// EmbeddingModel.swift
 import Foundation
 
 actor EmbeddingModel {
@@ -275,7 +274,7 @@ actor EmbeddingModel {
         }
         return []
 
-    } // end embedDocument
+    }
 
     func embedQuery(_ text: String) async -> [Float] {
         // Guard against invalid input

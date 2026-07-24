@@ -1,0 +1,40 @@
+# Add these in the nginx http context. The privacy format deliberately omits
+# request URIs with arguments, bodies, candidate URLs, and extracted text:
+# limit_req_zone $binary_remote_addr zone=noema_web_reader:10m rate=12r/m;
+# log_format privacy escape=json '{"time":"$time_iso8601","remote_addr":"$remote_addr","method":"$request_method",'
+#                                '"status":$status,"request_time":$request_time,"uri":"$uri"}';
+#
+# Give the existing /v1/search and legacy /search locations the same access log
+# plus a critical-only error log so Nginx warnings cannot copy GET arguments:
+# access_log /var/log/nginx/search-access.log privacy;
+# error_log /var/log/nginx/search-error.log crit;
+
+# Add inside the existing search.noemaai.com server block. Replace the
+# placeholder with the existing API-key check used by /v1/search.
+location = /v1/web/retrieve {
+    if ($request_method != POST) { return 405; }
+    client_max_body_size 64k;
+    limit_req zone=noema_web_reader burst=6 nodelay;
+
+    if ($http_x_noema_search_key != "__NOEMA_SEARCH_KEY__") { return 401; }
+
+    proxy_set_header X-Noema-Search-Key "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_connect_timeout 3s;
+    proxy_send_timeout 5s;
+    proxy_read_timeout 30s;
+    proxy_pass http://web-reader:8080/v1/web/retrieve;
+
+    add_header Cache-Control "no-store" always;
+    access_log /var/log/nginx/web-reader-access.log privacy;
+    error_log /var/log/nginx/web-reader-error.log crit;
+}
+
+location = /internal/web-reader-healthz {
+    allow 127.0.0.1;
+    allow 172.16.0.0/12;
+    deny all;
+    proxy_pass http://web-reader:8080/healthz;
+    access_log off;
+}

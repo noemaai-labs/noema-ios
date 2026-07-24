@@ -1,9 +1,69 @@
 #if os(iOS) || os(visionOS) || os(macOS)
-// StoredView.swift
 import SwiftUI
 import Foundation
 import UniformTypeIdentifiers
 import PDFKit
+import NoemaPackages
+#if os(macOS)
+import AppKit
+#endif
+
+/// Keeps high-frequency support-model progress inside the two-row section instead
+/// of invalidating the entire Stored screen.
+private struct SupportModelDownloadItems<Content: View>: View {
+    @EnvironmentObject private var downloadController: DownloadController
+    @ObservedObject private var presentationUpdates = DownloadPresentationUpdates.shared
+    @State private var availabilityRevision = 0
+    @State private var items: [SupportModelInventoryItem] = []
+    let content: ([SupportModelInventoryItem]) -> Content
+
+    init(@ViewBuilder content: @escaping ([SupportModelInventoryItem]) -> Content) {
+        self.content = content
+    }
+
+    var body: some View {
+        content(items)
+            .task(id: availabilityRevision) {
+                await refreshItems()
+            }
+            .onReceive(presentationUpdates.objectWillChange) { _ in
+                availabilityRevision &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .embeddingModelAvailabilityChanged)) { _ in
+                availabilityRevision &+= 1
+            }
+    }
+
+    private func refreshItems() async {
+        let whisperItems = downloadController.whisperItems
+        let embeddingItems = downloadController.embeddingItems
+#if canImport(TTSKit) && !arch(x86_64)
+        let voiceStore = VoiceModelDownloadStore.shared
+        let voiceIsDownloading = voiceStore.isDownloading
+        let voiceProgress = voiceStore.progress
+#endif
+
+        let refreshed = await Task.detached(priority: .utility) {
+            var values = [
+                SupportModelInventory.speechItem(whisperItems: whisperItems),
+                SupportModelInventory.embeddingItem(embeddingItems: embeddingItems)
+            ]
+#if canImport(TTSKit) && !arch(x86_64)
+            values.append(
+                SupportModelInventory.voiceItem(
+                    installState: VoiceModelCatalog.installState(),
+                    isDownloading: voiceIsDownloading,
+                    progress: voiceProgress
+                )
+            )
+#endif
+            return values
+        }.value
+
+        guard !Task.isCancelled else { return }
+        items = refreshed
+    }
+}
 
 struct ModelRow: View {
     let model: LocalModel
@@ -11,6 +71,9 @@ struct ModelRow: View {
     var isLoaded: Bool = false
     var settingsAction: (() -> Void)? = nil
     var deleteAction: (() -> Void)? = nil
+    /// Stored rows opt in; the iOS selector sheet already renders its own
+    /// paged chip below the row, so this defaults off to avoid doubling up.
+    var showsPagedFitStatus: Bool = false
     let loadAction: () -> Void
     @EnvironmentObject var vm: ChatVM
     @EnvironmentObject var modelManager: AppModelManager
@@ -81,10 +144,6 @@ struct ModelRow: View {
                         Text("·")
                         Text(QuantExtractor.shortLabel(from: model.quant, format: model.format))
                     }
-                    if let source = model.slmSourceFormatLabel {
-                        Text("·")
-                        Text(source)
-                    }
                     if model.format != .et && !hidesArchitectureAndMoEChips {
                         if !model.architectureFamily.isEmpty {
                             Text("·")
@@ -96,7 +155,7 @@ struct ModelRow: View {
                         }
                     }
                     if model.format == .et {
-                        let backend = modelManager.displaySettings(for: model).etBackend.displayName
+                        let backend = modelManager.displayETBackend(for: model).displayName
                         Text("·")
                         Text(backend)
                     }
@@ -104,6 +163,29 @@ struct ModelRow: View {
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(AppTheme.tertiaryText)
                 .padding(.top, 2)
+
+                // Paged verdict + canary lookup are memoized per URL, so list
+                // scrolling never stats the disk.
+                if showsPagedFitStatus, model.format == .gguf, OverfitPagedInstallCache.isPaged(model.url) {
+                    Group {
+                        if let classification = OverfitPagedFitCache.classification(forModelAt: model.url) {
+                            OverfitClassificationChip(classification: classification)
+                        } else {
+                            OverfitPagedChip()
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+
+                if AppleFoundationModelKind.resolve(modelID: model.modelID) == .privateCloudCompute {
+                    Text(ApplePrivateCloudComputeAvailability.status.message)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(
+                            ApplePrivateCloudComputeAvailability.status.isAvailableForRequests
+                                ? AppTheme.secondaryText
+                                : Color.orange
+                        )
+                }
             }
             Spacer()
             
@@ -127,17 +209,17 @@ struct ModelRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 } else if !isLoaded {
                     #if os(macOS)
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
                         if let settingsAction {
-                            Button(action: settingsAction) {
-                                Image(systemName: "gearshape")
-                                    .font(FontTheme.caption.weight(.semibold))
+                            IndustrialIconButton(
+                                systemImage: "gearshape",
+                                help: LocalizedStringKey("Model settings")
+                            ) {
+                                settingsAction()
                             }
-                            .buttonStyle(GlassButtonStyle())
-                            .help(LocalizedStringKey("Model settings"))
                             .disabled(isLoading || vm.loading)
                         }
-                        loadButton
+                        macLoadButton
                     }
                     #else
                     loadButton
@@ -193,14 +275,251 @@ struct ModelRow: View {
         .buttonStyle(GlassButtonStyle())
         .disabled(isLoading || vm.loading)
     }
+
+#if os(macOS)
+    @ViewBuilder
+    private var macLoadButton: some View {
+        Button(action: loadAction) {
+            if isLoading {
+                ProgressView()
+                    .scaleEffect(0.5)
+                    .frame(height: 14)
+            } else {
+                Text(LocalizedStringKey("Load"))
+            }
+        }
+        .buttonStyle(.industrial(.tinted))
+        .disabled(isLoading || vm.loading)
+    }
+#endif
+}
+
+private struct StoredOpenRouterModelItem: Identifiable {
+    let backend: RemoteBackend
+    let model: RemoteModel
+    let isInCatalog: Bool
+
+    var id: String {
+        "\(backend.id.uuidString)|\(model.id.lowercased())"
+    }
+}
+
+private struct StoredRemoteBackendDestination: Identifiable, Hashable {
+    let id: RemoteBackend.ID
+}
+
+private func storedModelsWithPCCBelowAFM(_ models: [LocalModel]) -> [LocalModel] {
+    guard let pccIndex = models.firstIndex(where: {
+        AppleFoundationModelKind.resolve(modelID: $0.modelID) == .privateCloudCompute
+    }) else {
+        return models
+    }
+
+    var ordered = models
+    let pcc = ordered.remove(at: pccIndex)
+    guard let afmIndex = ordered.firstIndex(where: {
+        AppleFoundationModelKind.resolve(modelID: $0.modelID) == .onDevice
+    }) else {
+        return models
+    }
+    ordered.insert(pcc, at: afmIndex + 1)
+    return ordered
+}
+
+@MainActor
+private func storedOpenRouterFavoriteModels(from modelManager: AppModelManager) -> [StoredOpenRouterModelItem] {
+    modelManager.remoteBackends
+        .filter(\.isOpenRouter)
+        .flatMap { backend in
+            modelManager.openRouterFavoriteModelIDs(for: backend.id).map { favoriteID in
+                let catalogModel = backend.cachedModels.first { model in
+                    model.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == favoriteID
+                }
+                return StoredOpenRouterModelItem(
+                    backend: backend,
+                    model: catalogModel ?? RemoteModel.makeCustom(id: favoriteID),
+                    isInCatalog: catalogModel != nil
+                )
+            }
+        }
+        .sorted { lhs, rhs in
+            let nameOrder = lhs.model.name.localizedCaseInsensitiveCompare(rhs.model.name)
+            if nameOrder != .orderedSame {
+                return nameOrder == .orderedAscending
+            }
+            return lhs.backend.name.localizedCaseInsensitiveCompare(rhs.backend.name) == .orderedAscending
+        }
+}
+
+private struct StoredOpenRouterModelRow: View {
+    let item: StoredOpenRouterModelItem
+    let isFetching: Bool
+    let isOffline: Bool
+    let isActivating: Bool
+    let isActive: Bool
+    let manageAction: () -> Void
+    let useAction: () -> Void
+
+    private enum ConnectionState {
+        case connected
+        case connecting
+        case unavailable
+        case offline
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .connected: return LocalizedStringKey("Connected")
+            case .connecting: return LocalizedStringKey("Connecting")
+            case .unavailable: return LocalizedStringKey("Unavailable")
+            case .offline: return LocalizedStringKey("Offline")
+            }
+        }
+
+        @MainActor
+        var color: Color {
+            switch self {
+            case .connected: return .green
+            case .connecting: return .orange
+            case .unavailable: return .red
+            case .offline: return AppTheme.secondaryText
+            }
+        }
+
+        var canUse: Bool {
+            if case .connected = self { return true }
+            return false
+        }
+    }
+
+    private var connectionState: ConnectionState {
+        if isOffline { return .offline }
+        if isFetching { return .connecting }
+        if !item.isInCatalog { return .unavailable }
+        if !EnterprisePolicyGate.remoteInferenceAllowed
+            || !EnterprisePolicyGate.allowsRemoteBackend(
+                id: item.backend.id,
+                endpointType: item.backend.endpointType
+            ) {
+            return .unavailable
+        }
+        if let error = item.backend.lastError?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty {
+            return .unavailable
+        }
+        if item.backend.lastConnectionSummary?.kind == .failure {
+            return .unavailable
+        }
+        return .connected
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.yellow)
+
+                    Text(item.model.name)
+                        .font(FontTheme.body)
+                        .fontWeight(.medium)
+                        .foregroundStyle(AppTheme.text)
+
+                    openRouterBadge
+                }
+
+                Text(item.model.id)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                HStack(spacing: 6) {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(connectionState.color)
+                            .frame(width: 6, height: 6)
+                        Text(connectionState.title)
+                    }
+                    .foregroundStyle(connectionState.color)
+
+                    Text("·")
+                    Text(item.backend.name)
+
+                    if let contextLength = item.model.maxContextLength, contextLength > 0 {
+                        Text("·")
+                        Text("\(contextLength.formatted()) ctx")
+                    }
+                }
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppTheme.tertiaryText)
+                .lineLimit(1)
+                .padding(.top, 2)
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 6) {
+                Button(action: manageAction) {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.industrial(.quiet))
+                .accessibilityLabel(LocalizedStringKey("Manage"))
+
+                if isActive && connectionState.canUse {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark")
+                        Text(LocalizedStringKey("Using"))
+                    }
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                } else {
+                    Button(action: useAction) {
+                        if isActivating {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text(LocalizedStringKey("Use"))
+                        }
+                    }
+                    .buttonStyle(.industrial(.tinted))
+                    .disabled(isActivating || !connectionState.canUse)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var openRouterBadge: some View {
+        Text(LocalizedStringKey("OpenRouter"))
+            .textCase(.uppercase)
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.orange)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.orange.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
 }
 
 struct SupportModelRow: View {
     let item: SupportModelInventoryItem
 
+    private var supportModelIcon: String {
+        switch item.kind {
+        case .speech: return "waveform"
+        case .voice: return "waveform.circle"
+        case .embedding: return "point.3.connected.trianglepath.dotted"
+        }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
-            Image(systemName: item.kind == .speech ? "waveform" : "point.3.connected.trianglepath.dotted")
+            Image(systemName: supportModelIcon)
                 .font(.system(size: 18, weight: .regular))
                 .foregroundStyle(.blue)
                 .frame(width: 24, height: 24)
@@ -231,8 +550,11 @@ struct SupportModelRow: View {
                 .padding(.top, 2)
 
                 if item.state == .downloading, let progress = item.progress {
-                    ProgressView(value: progress)
-                        .tint(.blue)
+#if os(macOS)
+                    IndustrialProgressBar(value: progress)
+#else
+                    DownloadCapsuleBar(value: progress)
+#endif
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -259,7 +581,7 @@ struct SupportModelRow: View {
         switch item.state {
         case .ready: return .green
         case .missing: return AppTheme.secondaryText
-        case .downloading: return .blue
+        case .downloading: return .accentColor
         case .paused: return .orange
         case .failed, .incomplete: return .red
         }
@@ -301,16 +623,30 @@ struct StoredView: View {
     @State private var importNotice: String?
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
+    @State private var showRAMSafetyWarning = false
+    @State private var pendingRAMSafetyLoad: (LocalModel, ModelSettings)?
     @AppStorage("hideGGUFOffloadWarning") private var hideGGUFOffloadWarning = false
     @State private var showRemoteBackendForm = false
+    @State private var selectedBackendDestination: StoredRemoteBackendDestination?
+    @State private var activatingOpenRouterModelID: String?
     @State private var modelPendingDeletion: LocalModel?
     @State private var datasetPendingDeletion: LocalDataset?
+    @State private var presentedSupportModelKind: SupportModelInventoryItem.Kind?
+    @State private var autopilotConfig = AutopilotConfigStore.load()
+    @State private var showAutopilotSetup = false
+    @State private var showAutopilotSettings = false
 
     var body: some View {
         NavigationStack {
             ZStack {
-                ScrollView {
-                    VStack(spacing: 24) {
+                // Use a List (not a ScrollView) so the large "Stored" title collapses into the
+                // inline header smoothly. A ScrollView + .navigationTitle re-lays-out the entire
+                // content frame on every frame of the collapse, which janks on device; List drives
+                // the collapse natively. Each section is rendered as one full-width, separator-less
+                // row so the existing visual layout is preserved.
+                List {
+                    Group {
+                        autopilotSection
                         modelsSection
                         supportModelsSection
                         if !modelManager.remoteBackends.isEmpty {
@@ -320,10 +656,21 @@ struct StoredView: View {
                             datasetsSection
                         }
                     }
-                    .padding(AppTheme.padding)
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 12, leading: AppTheme.padding, bottom: 12, trailing: AppTheme.padding))
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .background(AppTheme.windowBackground)
                 .guideHighlight(.storedList)
+                .navigationDestination(item: $presentedSupportModelKind) { kind in
+                    supportModelDestination(for: kind)
+                }
+                .navigationDestination(item: $selectedBackendDestination) { destination in
+                    RemoteBackendDetailView(backendID: destination.id)
+                        .environmentObject(modelManager)
+                }
                 .navigationTitle(LocalizedStringKey("Stored"))
                 .task {
                     await modelManager.refreshAsync()
@@ -385,6 +732,18 @@ struct StoredView: View {
                     try await modelManager.addRemoteBackend(from: draft)
                 }
             }
+            .sheet(isPresented: $showAutopilotSetup, onDismiss: {
+                autopilotConfig = AutopilotConfigStore.load()
+            }) {
+                AutopilotSetupView()
+                    .environmentObject(modelManager)
+            }
+            .sheet(isPresented: $showAutopilotSettings, onDismiss: {
+                autopilotConfig = AutopilotConfigStore.load()
+            }) {
+                AutopilotSettingsSheet()
+                    .environmentObject(modelManager)
+            }
             .alert(item: $datasetManager.embedAlert) { info in
                 Alert(title: Text(info.message))
             }
@@ -397,6 +756,24 @@ struct StoredView: View {
                 Button(LocalizedStringKey("OK"), role: .cancel) {}
             } message: {
                 Text(vm.loadError ?? "")
+            }
+            .alert(LocalizedStringKey("RAM Safety Checks"), isPresented: $showRAMSafetyWarning) {
+                Button(LocalizedStringKey("Continue"), role: .destructive) {
+                    if let (model, settings) = pendingRAMSafetyLoad {
+                        pendingRAMSafetyLoad = nil
+                        load(
+                            model,
+                            settings: settings,
+                            bypassWarning: true,
+                            bypassRAMCheck: true
+                        )
+                    }
+                }
+                Button(LocalizedStringKey("Cancel"), role: .cancel) {
+                    pendingRAMSafetyLoad = nil
+                }
+            } message: {
+                Text(LocalizedStringKey("Model likely exceeds memory budget. Lower context size or use a smaller quant/model."))
             }
             .alert(
                 datasetDeleteConfirmationTitle,
@@ -592,7 +969,116 @@ struct StoredView: View {
         .cornerRadius(AppTheme.cornerRadius)
     }
 
+    private var autopilotConfigured: Bool {
+        autopilotConfig.isReadyToArm
+    }
+
+    private var autopilotSubtitle: String {
+        guard EnterprisePolicyGate.remoteInferenceAllowed || !autopilotConfig.requiresCloudConsent else {
+            return String(localized: "Your organization's policy keeps answers on-device.")
+        }
+        guard autopilotConfigured, let escalation = autopilotConfig.escalationDisplayName else {
+            return String(localized: "Set up Autopilot")
+        }
+        guard vm.modelLoaded, let loaded = modelManager.loadedModel else {
+            return String(localized: "Engages when a model loads")
+        }
+        return "\(loaded.displayName) → \(escalation)"
+    }
+
+    private var autopilotToggleBinding: Binding<Bool> {
+        Binding(
+            get: { modelManager.autoRoutingArmed },
+            set: { newValue in
+                // Re-read the store at decision time: setup can complete on another
+                // surface (Settings, the other visionOS window) while this row's
+                // cached snapshot is stale.
+                let config = AutopilotConfigStore.load()
+                autopilotConfig = config
+                if newValue && !config.isReadyToArm {
+                    // Arming requires configuration + consent; route through the wizard,
+                    // which flips autoRoutingArmed itself once consent is granted.
+                    showAutopilotSetup = true
+                    return
+                }
+                #if canImport(UIKit) && !os(visionOS)
+                Haptics.impact(.light)
+                #endif
+                modelManager.autoRoutingArmed = newValue
+            }
+        )
+    }
+
+    @ViewBuilder private var autopilotSection: some View {
+        let enterpriseBlocked = !EnterprisePolicyGate.remoteInferenceAllowed
+            && autopilotConfig.requiresCloudConsent
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.cyan.opacity(modelManager.autoRoutingArmed ? 0.18 : 0.10))
+                .frame(width: 32, height: 32)
+                .overlay(
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(modelManager.autoRoutingArmed ? Color.cyan : AppTheme.secondaryText)
+                )
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(LocalizedStringKey("Autopilot"))
+                    .font(FontTheme.body)
+                    .fontWeight(.medium)
+                    .foregroundStyle(AppTheme.text)
+                Text(verbatim: autopilotSubtitle)
+                    .font(FontTheme.caption)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            .accessibilityElement(children: .combine)
+            Spacer(minLength: 12)
+            if enterpriseBlocked {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+            } else {
+                Toggle(LocalizedStringKey("Autopilot"), isOn: autopilotToggleBinding)
+                    .labelsHidden()
+                    .tint(.cyan)
+                    .accessibilityHint(Text(!autopilotConfigured
+                        ? LocalizedStringKey("Set up Autopilot")
+                        : (modelManager.autoRoutingArmed
+                            ? LocalizedStringKey("Turn off Autopilot")
+                            : LocalizedStringKey("Turn on Autopilot"))))
+            }
+        }
+        .padding(16)
+        .background(AppTheme.cardFill)
+        .cornerRadius(AppTheme.cornerRadius)
+        .overlay(
+            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
+                .stroke(Color.cyan.opacity(modelManager.autoRoutingArmed ? 0.35 : 0), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .visionHoverHighlight(cornerRadius: AppTheme.cornerRadius)
+        .onTapGesture {
+            // Tap reveals the same Autopilot settings as the Settings tab;
+            // the wizard is reached from there (or by flipping the toggle on
+            // while unconfigured).
+            if !enterpriseBlocked {
+                showAutopilotSettings = true
+            }
+        }
+        .opacity(enterpriseBlocked ? 0.6 : 1)
+        .animation(.easeInOut(duration: 0.2), value: modelManager.autoRoutingArmed)
+        .onAppear { autopilotConfig = AutopilotConfigStore.load() }
+        .onChangeCompat(of: modelManager.autoRoutingArmed) { _, _ in
+            autopilotConfig = AutopilotConfigStore.load()
+        }
+    }
+
     @ViewBuilder private var modelsSection: some View {
+        let favoriteOpenRouterModels = storedOpenRouterFavoriteModels(from: modelManager)
+        let storedModels = storedModelsWithPCCBelowAFM(modelManager.downloadedModels)
         VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .firstTextBaseline) {
                 Text(LocalizedStringKey("Models"))
@@ -616,7 +1102,7 @@ struct StoredView: View {
                 afmHiddenNotice
             }
 
-            if modelManager.downloadedModels.isEmpty {
+            if modelManager.downloadedModels.isEmpty && favoriteOpenRouterModels.isEmpty {
                 VStack(spacing: 16) {
                     Text(LocalizedStringKey("No models yet"))
                         .font(FontTheme.heading)
@@ -656,13 +1142,14 @@ struct StoredView: View {
                 .cornerRadius(AppTheme.cornerRadius)
             } else {
                 LazyVStack(spacing: 0) {
-                    ForEach(modelManager.downloadedModels, id: \.id) { model in
+                    ForEach(storedModels, id: \.id) { model in
                         VStack(spacing: 0) {
                             ModelRow(model: model,
                                     isLoading: loadingModelID == model.id,
-                                    isLoaded: modelManager.loadedModel?.id == model.id,
+                                    isLoaded: vm.modelLoaded && modelManager.loadedModel?.id == model.id,
                                     settingsAction: { selectedModel = model },
-                                    deleteAction: model.format == .afm ? nil : { modelPendingDeletion = model }) {
+                                    deleteAction: model.format == .afm ? nil : { modelPendingDeletion = model },
+                                    showsPagedFitStatus: true) {
                                 load(model)
                             }
                             .environmentObject(vm)
@@ -681,12 +1168,67 @@ struct StoredView: View {
                                     }
                                 }
                             }
-                            if model.id != modelManager.downloadedModels.last?.id {
+                            if model.id != storedModels.last?.id || !favoriteOpenRouterModels.isEmpty {
                                 Divider().padding(.leading, 8)
                             }
                         }
                     }
+
+                    ForEach(Array(favoriteOpenRouterModels.enumerated()), id: \.element.id) { index, item in
+                        StoredOpenRouterModelRow(
+                            item: item,
+                            isFetching: modelManager.remoteBackendsFetching.contains(item.backend.id),
+                            isOffline: offGrid,
+                            isActivating: activatingOpenRouterModelID == item.id,
+                            isActive: modelManager.activeRemoteSession?.backendID == item.backend.id
+                                && modelManager.activeRemoteSession?.modelID == item.model.id,
+                            manageAction: {
+                                selectedBackendDestination = StoredRemoteBackendDestination(id: item.backend.id)
+                            },
+                            useAction: { useOpenRouterFavorite(item) }
+                        )
+                        .padding(.horizontal, 8)
+                        .contextMenu {
+                            Button {
+                                selectedBackendDestination = StoredRemoteBackendDestination(id: item.backend.id)
+                            } label: {
+                                Label(LocalizedStringKey("Manage"), systemImage: "gearshape")
+                            }
+                            Button {
+                                modelManager.setOpenRouterFavorite(
+                                    false,
+                                    backendID: item.backend.id,
+                                    modelID: item.model.id
+                                )
+                            } label: {
+                                Label(LocalizedStringKey("Remove Favorite"), systemImage: "star.slash")
+                            }
+                        }
+
+                        if index < favoriteOpenRouterModels.count - 1 {
+                            Divider().padding(.leading, 8)
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    private func useOpenRouterFavorite(_ item: StoredOpenRouterModelItem) {
+        guard !offGrid, item.isInCatalog else { return }
+        activatingOpenRouterModelID = item.id
+        Task { @MainActor in
+            defer {
+                if activatingOpenRouterModelID == item.id {
+                    activatingOpenRouterModelID = nil
+                }
+            }
+            do {
+                let settings = modelManager.remoteSettings(for: item.backend.id, model: item.model)
+                try await vm.activateRemoteSession(backend: item.backend, model: item.model, settings: settings)
+                tabRouter.selection = .chat
+            } catch {
+                vm.loadError = (error as? RemoteBackendError)?.errorDescription ?? error.localizedDescription
             }
         }
     }
@@ -697,19 +1239,26 @@ struct StoredView: View {
                 .font(FontTheme.heading)
                 .foregroundStyle(AppTheme.text)
 
-            LazyVStack(spacing: 0) {
-                ForEach(supportModelItems) { item in
-                    VStack(spacing: 0) {
-                        NavigationLink {
-                            supportModelDestination(for: item)
-                        } label: {
-                            SupportModelRow(item: item)
-                                .padding(.horizontal, 8)
-                        }
-                        .buttonStyle(.plain)
-                        
-                        if item.id != supportModelItems.last?.id {
-                            Divider().padding(.leading, 38)
+            SupportModelDownloadItems { supportModelItems in
+                LazyVStack(spacing: 0) {
+                    ForEach(supportModelItems) { item in
+                        VStack(spacing: 0) {
+                            // This whole section renders as ONE List row, and List
+                            // fires every NavigationLink in a row on a single tap.
+                            // Borderless buttons get independent hit areas, and the
+                            // single optional destination can only push one page.
+                            Button {
+                                presentedSupportModelKind = item.kind
+                            } label: {
+                                SupportModelRow(item: item)
+                                    .padding(.horizontal, 8)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.borderless)
+
+                            if item.id != supportModelItems.last?.id {
+                                Divider().padding(.leading, 38)
+                            }
                         }
                     }
                 }
@@ -717,20 +1266,15 @@ struct StoredView: View {
         }
     }
 
-    private var supportModelItems: [SupportModelInventoryItem] {
-        [
-            SupportModelInventory.speechItem(whisperItems: downloadController.whisperItems),
-            SupportModelInventory.embeddingItem(embeddingItems: downloadController.embeddingItems)
-        ]
-    }
-
     @ViewBuilder
-    private func supportModelDestination(for item: SupportModelInventoryItem) -> some View {
-        switch item.kind {
+    private func supportModelDestination(for kind: SupportModelInventoryItem.Kind) -> some View {
+        switch kind {
         case .speech:
             WhisperModelsView(engineID: TranscriptionSettings.selectedEngineID.isLocalWhisper ? TranscriptionSettings.selectedEngineID : TranscriptionBackendFactory.preferredLocalWhisperEngineID())
         case .embedding:
             EmbeddingModelsView()
+        case .voice:
+            VoiceModelCatalogView()
         }
     }
 
@@ -857,7 +1401,12 @@ struct StoredView: View {
         }
     }
 
-    private func load(_ model: LocalModel, settings: ModelSettings? = nil, bypassWarning: Bool = false) {
+    private func load(
+        _ model: LocalModel,
+        settings: ModelSettings? = nil,
+        bypassWarning: Bool = false,
+        bypassRAMCheck: Bool = false
+    ) {
         let resolvedSettings = settings ?? modelManager.settings(for: model)
         if !bypassWarning {
             AppSoundPlayer.play(.loadPress)
@@ -875,7 +1424,7 @@ struct StoredView: View {
             try? await Task.sleep(nanoseconds: 200_000_000)
 
             // RAM safety gate unless bypassed
-            let bypass = UserDefaults.standard.bool(forKey: "bypassRAMCheck")
+            let bypass = bypassRAMCheck || UserDefaults.standard.bool(forKey: "bypassRAMCheck")
             if !bypass {
                 let sizeBytes = Int64(model.sizeGB * 1_073_741_824.0)
                 let ctx = Int(settings.contextLength)
@@ -887,11 +1436,13 @@ struct StoredView: View {
                     contextLength: ctx,
                     layerCount: layerHint,
                     moeInfo: model.moeInfo,
-                    kvCacheEstimate: kvCacheEstimate
+                    kvCacheEstimate: kvCacheEstimate,
+                    runtimeConfiguration: .resolved(from: settings, modelURL: model.url)
                 ) {
                     AppSoundPlayer.play(.error)
                     Haptics.error()
-                    vm.loadError = "Model likely exceeds memory budget. Lower context size or use a smaller quant/model."
+                    pendingRAMSafetyLoad = (model, settings)
+                    showRAMSafetyWarning = true
                     loadingModelID = nil
                     return
                 }
@@ -965,13 +1516,24 @@ struct StoredView: View {
                 loadURL = InstalledModelsStore.baseDir(for: .coreai, modelID: model.modelID)
                 try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
             }
-            let success = await vm.load(url: loadURL, settings: settings, format: model.format)
+            let success = await vm.load(
+                url: loadURL,
+                settings: settings,
+                format: model.format,
+                forceReload: false,
+                bypassRAMCheck: bypassRAMCheck
+            )
             if success {
                 modelManager.updateSettings(settings, for: model)
                 modelManager.markModelUsed(model)
                 tabRouter.selection = .chat
             } else {
                 modelManager.loadedModel = nil
+                if vm.lastLoadBlockedByRAMSafety {
+                    vm.loadError = nil
+                    pendingRAMSafetyLoad = (model, settings)
+                    showRAMSafetyWarning = true
+                }
             }
             // Clear pending flag if we survived the load attempt
             UserDefaults.standard.set(false, forKey: "bypassRAMLoadPending")
@@ -1036,6 +1598,7 @@ struct StoredView: View {
     @State private var selectedDataset: LocalDataset?
     @State private var importedDataset: LocalDataset?
     @State private var selectedBackendID: RemoteBackend.ID?
+    @State private var activatingOpenRouterModelID: String?
     @State private var showOffGridInfo = false
     @State private var showImporter = false
     @State private var pendingPickedURLs: [URL] = []
@@ -1047,9 +1610,18 @@ struct StoredView: View {
     @State private var showRemoteBackendForm = false
     @State private var showOffloadWarning = false
     @State private var pendingLoad: (LocalModel, ModelSettings)?
+    @State private var showRAMSafetyWarning = false
+    @State private var pendingRAMSafetyLoad: (LocalModel, ModelSettings)?
     @State private var activeDatasetModal: StoredDatasetModal?
     @State private var modelPendingDeletion: LocalModel?
     @State private var datasetPendingDeletion: LocalDataset?
+    @State private var presentedSupportModelKind: SupportModelInventoryItem.Kind?
+    @State private var pagedBuildModel: LocalModel?
+    @State private var pagedBuildPhase: PagedPackageBuildPhase = .preparing
+    @State private var pagedBuildError: String?
+    @State private var pagedBuildPackage: NoemaPagedPackage?
+    @State private var pagedBuildIsStored = false
+    @State private var pagedBuildTask: Task<Void, Never>?
 
     var body: some View {
         navigationContent
@@ -1065,6 +1637,24 @@ struct StoredView: View {
             Button(LocalizedStringKey("OK"), role: .cancel) {}
         } message: {
             Text(vm.loadError ?? "")
+        }
+        .alert(LocalizedStringKey("RAM Safety Checks"), isPresented: $showRAMSafetyWarning) {
+            Button(LocalizedStringKey("Continue"), role: .destructive) {
+                if let (model, settings) = pendingRAMSafetyLoad {
+                    pendingRAMSafetyLoad = nil
+                    load(
+                        model,
+                        settings: settings,
+                        bypassWarning: true,
+                        bypassRAMCheck: true
+                    )
+                }
+            }
+            Button(LocalizedStringKey("Cancel"), role: .cancel) {
+                pendingRAMSafetyLoad = nil
+            }
+        } message: {
+            Text(LocalizedStringKey("Model likely exceeds memory budget. Lower context size or use a smaller quant/model."))
         }
         .alert(
             datasetDeleteConfirmationTitle,
@@ -1253,6 +1843,27 @@ struct StoredView: View {
         .onChangeCompat(of: modelManager.downloadedDatasets) { _, _ in
             openPendingDatasetDetailIfNeeded()
         }
+        .sheet(item: $pagedBuildModel, onDismiss: {
+            pagedBuildTask?.cancel()
+            pagedBuildTask = nil
+            pagedBuildPackage = nil
+            pagedBuildIsStored = false
+        }) { model in
+            PagedPackageBuildSheet(
+                modelName: model.displayName,
+                phase: pagedBuildPhase,
+                error: pagedBuildError,
+                outputURL: pagedBuildPackage?.directoryURL,
+                isInStored: pagedBuildIsStored,
+                onAddToStored: addPagedPackageToStored
+            ) {
+                pagedBuildTask?.cancel()
+                pagedBuildTask = nil
+                pagedBuildPackage = nil
+                pagedBuildIsStored = false
+                pagedBuildModel = nil
+            }
+        }
     }
 
     private var navigationContent: some View {
@@ -1267,11 +1878,9 @@ struct StoredView: View {
                     storedList
                 }
                 .animation(.spring(response: 0.35, dampingFraction: 0.85), value: selectedModel != nil)
-                if offGrid {
-                    offGridBadge
-                        .transition(.scale.combined(with: .opacity))
-                        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: offGrid)
-                }
+            }
+            .navigationDestination(item: $presentedSupportModelKind) { kind in
+                supportModelDestination(for: kind)
             }
         }
     }
@@ -1326,22 +1935,13 @@ struct StoredView: View {
                 .help(LocalizedStringKey("Switch model"))
 
                 Text(model.format.displayName)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .industrialStat()
             }
             Spacer()
-            Button {
+            IndustrialIconButton(systemImage: "xmark", help: LocalizedStringKey("Close")) {
                 selectedModel = nil
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(8)
-                    .background(
-                        Circle()
-                            .fill(Color.primary.opacity(0.08))
-                    )
             }
-            .buttonStyle(.plain)
             .accessibilityLabel(Text(LocalizedStringKey("Close")))
         }
         .padding(.horizontal, 20)
@@ -1350,7 +1950,7 @@ struct StoredView: View {
 
     private var storedList: some View {
         ScrollView {
-            VStack(spacing: 32) {
+            LazyVStack(spacing: 32) {
                 modelsSection
                 supportModelsSection
                 remoteBackendsSection
@@ -1361,6 +1961,9 @@ struct StoredView: View {
         .background(AppTheme.windowBackground)
         .guideHighlight(.storedList)
         .task {
+            // Let the page-switch fade land before hitting the disk —
+            // refreshAsync/reloadFromDisk contend with the animation otherwise.
+            try? await Task.sleep(nanoseconds: 450_000_000)
             await modelManager.refreshAsync()
             modelManager.refreshRemoteBackends(offGrid: offGrid)
             datasetManager.reloadFromDisk()
@@ -1386,9 +1989,9 @@ struct StoredView: View {
     }
 
     private var afmHiddenNotice: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("Apple Foundation Model is hidden. You can re-enable it in Settings.")
-                .font(FontTheme.body)
+                .font(.system(size: 12.5))
                 .foregroundStyle(AppTheme.text)
             Button {
                 tabRouter.dismissAFMHiddenNotice()
@@ -1398,144 +2001,123 @@ struct StoredView: View {
             } label: {
                 Label("Open Settings", systemImage: "gearshape")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.industrial(.quiet))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(20)
-        .glassifyIfAvailable(in: RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-        .background(AppTheme.cardFill)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.035))
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                .stroke(AppTheme.cardStroke, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
     }
 
     private var offGridBadge: some View {
-        VStack {
-            Spacer()
-            HStack {
-                Spacer()
-                Button(action: { showOffGridInfo = true }) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "wifi.slash")
-                            .font(.system(size: 16, weight: .semibold))
-                        Text(LocalizedStringKey("Off-Grid"))
-                            .font(.system(size: 14, weight: .medium))
-                    }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(
-                        Capsule()
-                            .fill(Color.orange.gradient)
-                            .shadow(color: .black.opacity(0.2), radius: 8, x: 0, y: 4)
-                    )
-                }
-                .buttonStyle(.plain)
-                .padding(.trailing, 24)
-                .padding(.bottom, 24)
-            }
+        Button {
+            showOffGridInfo = true
+        } label: {
+            IndustrialBadge("Off-Grid", tint: .orange, dot: true)
         }
+        .buttonStyle(.plain)
+        .help(LocalizedStringKey("You're in Off-Grid mode. The Explore tab is hidden and all network features are disabled. You can only use downloaded models and datasets."))
+        .accessibilityLabel(Text(LocalizedStringKey("Off-Grid")))
     }
 
-    private func storedCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private func storedEmptyPanel<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         content()
-            .padding(UIConstants.defaultPadding)
-            .glassifyIfAvailable(in: RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-            .background(AppTheme.cardFill)
-            .clipShape(RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                    .stroke(AppTheme.cardStroke, lineWidth: 1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 24)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(0.035))
             )
-            // Removed shadow for better scroll performance on macOS
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            )
     }
 
     @ViewBuilder private var modelsSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(LocalizedStringKey("Models"))
-                    .font(FontTheme.heading)
-                    .foregroundStyle(AppTheme.text)
-                Spacer()
+        let favoriteOpenRouterModels = storedOpenRouterFavoriteModels(from: modelManager)
+        let storedModels = storedModelsWithPCCBelowAFM(modelManager.downloadedModels)
+        let modelCount = storedModels.count + favoriteOpenRouterModels.count
+        VStack(alignment: .leading, spacing: 12) {
+            IndustrialSectionHeader(
+                "Models",
+                detail: modelCount == 0 ? nil : "\(modelCount)"
+            ) {
+                if offGrid {
+                    offGridBadge
+                }
                 Button {
                     showRemoteBackendForm = true
                 } label: {
                     Text(LocalizedStringKey("Add remote endpoint"))
-                        .font(FontTheme.subheadline)
-                        .fontWeight(.medium)
                 }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
-                .foregroundStyle(Color.accentColor)
+                .buttonStyle(.industrial(.quiet))
                 .accessibilityLabel(LocalizedStringKey("Add remote endpoint"))
             }
 
             if tabRouter.isAFMHiddenNoticeVisible {
                 afmHiddenNotice
             }
-            
-            if modelManager.downloadedModels.isEmpty {
-                VStack(spacing: 16) {
-                    Text(LocalizedStringKey("No models yet"))
-                        .font(FontTheme.heading)
-                        .foregroundStyle(AppTheme.text)
-                    Text(LocalizedStringKey("Download a model from Explore or add a remote endpoint to get started."))
-                        .font(FontTheme.body)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .multilineTextAlignment(.center)
-                    Button {
-                        withAnimation(.easeInOut) {
-                            tabRouter.selection = .explore
+
+            if modelManager.downloadedModels.isEmpty && favoriteOpenRouterModels.isEmpty {
+                storedEmptyPanel {
+                    VStack(spacing: 12) {
+                        Text(LocalizedStringKey("No models yet"))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(AppTheme.text)
+                        Text(LocalizedStringKey("Download a model from Explore or add a remote endpoint to get started."))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .multilineTextAlignment(.center)
+                        HStack(spacing: 8) {
+                            Button {
+                                withAnimation(.easeInOut) {
+                                    tabRouter.selection = .explore
+                                }
+                            } label: {
+                                Label(LocalizedStringKey("Explore Models"), systemImage: "sparkles")
+                                    .symbolRenderingMode(.monochrome)
+                            }
+                            .buttonStyle(.industrial(.prominent))
+                            Button {
+                                showRemoteBackendForm = true
+                            } label: {
+                                Label(LocalizedStringKey("Add remote endpoint"), systemImage: "plus")
+                            }
+                            .buttonStyle(.industrial(.quiet))
+                            if modelManager.downloadedDatasets.isEmpty {
+                                Button {
+                                    showImporter = true
+                                } label: {
+                                    Label(LocalizedStringKey("Import Dataset"), systemImage: "square.and.arrow.down")
+                                }
+                                .buttonStyle(.industrial(.quiet))
+                            }
                         }
-                    } label: {
-                        Label(LocalizedStringKey("Explore Models"), systemImage: "sparkles")
-                            .symbolRenderingMode(.monochrome)
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Button {
-                        showRemoteBackendForm = true
-                    } label: {
-                        Label(LocalizedStringKey("Add remote endpoint"), systemImage: "plus")
-                    }
-                    .buttonStyle(.bordered)
-                    if modelManager.downloadedDatasets.isEmpty {
-                        Button {
-                            showImporter = true
-                        } label: {
-                            Label(LocalizedStringKey("Import Dataset"), systemImage: "square.and.arrow.down")
-                        }
-                        .buttonStyle(.bordered)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 32)
-                .glassifyIfAvailable(in: RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-                .background(AppTheme.cardFill)
-                .overlay(
-                    RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                        .stroke(AppTheme.cardStroke, lineWidth: 1)
-                )
             } else {
-                LazyVStack(spacing: 16) {
-                    ForEach(modelManager.downloadedModels, id: \.id) { model in
-                        storedCard {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(storedModels.enumerated()), id: \.element.id) { index, model in
+                        IndustrialHoverRow(selected: selectedModel?.id == model.id) {
                             ModelRow(
                                 model: model,
                                 isLoading: loadingModelID == model.id,
-                                isLoaded: modelManager.loadedModel?.id == model.id,
+                                isLoaded: vm.modelLoaded && modelManager.loadedModel?.id == model.id,
                                 settingsAction: { selectedModel = model },
-                                deleteAction: model.format == .afm ? nil : { modelPendingDeletion = model }
+                                deleteAction: model.format == .afm ? nil : { modelPendingDeletion = model },
+                                showsPagedFitStatus: true
                             ) {
                                 load(model)
                             }
+                            .environmentObject(vm)
                         }
-                        .environmentObject(vm)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                                .stroke(Color.accentColor.opacity(selectedModel?.id == model.id ? 0.7 : 0), lineWidth: 2)
-                        )
                         .contentShape(Rectangle())
                         .onTapGesture {
                             selectedModel = model
@@ -1544,89 +2126,151 @@ struct StoredView: View {
                             Button(LocalizedStringKey("Open Settings")) {
                                 selectedModel = model
                             }
+                            Button {
+                                NSWorkspace.shared.activateFileViewerSelecting([model.url])
+                            } label: {
+                                Label(LocalizedStringKey("Reveal in Finder"), systemImage: "folder")
+                            }
+                            if PagedPackageBuildService.canCreatePackage(for: model) {
+                                Button(LocalizedStringKey("Create Paged Package…")) {
+                                    startPagedPackageBuild(for: model)
+                                }
+                                .disabled(pagedBuildTask != nil)
+                            }
                             if model.format != .afm {
                                 Button(LocalizedStringKey("Delete"), role: .destructive) {
                                     modelPendingDeletion = model
                                 }
                             }
                         }
+
+                        if index < storedModels.count - 1 || !favoriteOpenRouterModels.isEmpty {
+                            IndustrialHairline().padding(.leading, 10)
+                        }
+                    }
+
+                    ForEach(Array(favoriteOpenRouterModels.enumerated()), id: \.element.id) { index, item in
+                        IndustrialHoverRow {
+                            StoredOpenRouterModelRow(
+                                item: item,
+                                isFetching: modelManager.remoteBackendsFetching.contains(item.backend.id),
+                                isOffline: offGrid,
+                                isActivating: activatingOpenRouterModelID == item.id,
+                                isActive: modelManager.activeRemoteSession?.backendID == item.backend.id
+                                    && modelManager.activeRemoteSession?.modelID == item.model.id,
+                                manageAction: { selectedBackendID = item.backend.id },
+                                useAction: { useOpenRouterFavorite(item) }
+                            )
+                        }
+                        .contextMenu {
+                            Button(LocalizedStringKey("Manage")) {
+                                selectedBackendID = item.backend.id
+                            }
+                            Button(LocalizedStringKey("Remove Favorite")) {
+                                modelManager.setOpenRouterFavorite(
+                                    false,
+                                    backendID: item.backend.id,
+                                    modelID: item.model.id
+                                )
+                            }
+                        }
+
+                        if index < favoriteOpenRouterModels.count - 1 {
+                            IndustrialHairline().padding(.leading, 10)
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    private func useOpenRouterFavorite(_ item: StoredOpenRouterModelItem) {
+        guard !offGrid, item.isInCatalog else { return }
+        activatingOpenRouterModelID = item.id
+        Task { @MainActor in
+            defer {
+                if activatingOpenRouterModelID == item.id {
+                    activatingOpenRouterModelID = nil
+                }
+            }
+            do {
+                let settings = modelManager.remoteSettings(for: item.backend.id, model: item.model)
+                try await vm.activateRemoteSession(backend: item.backend, model: item.model, settings: settings)
+                tabRouter.selection = .chat
+            } catch {
+                vm.loadError = (error as? RemoteBackendError)?.errorDescription ?? error.localizedDescription
             }
         }
     }
 
     @ViewBuilder private var supportModelsSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(LocalizedStringKey("Support Models"))
-                .font(FontTheme.heading)
-                .foregroundStyle(AppTheme.text)
+        VStack(alignment: .leading, spacing: 12) {
+            IndustrialSectionHeader("Support Models")
 
-            LazyVStack(spacing: 16) {
-                ForEach(supportModelItems) { item in
-                    NavigationLink {
-                        supportModelDestination(for: item)
-                    } label: {
-                        storedCard {
-                            SupportModelRow(item: item)
+            SupportModelDownloadItems { supportItems in
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(supportItems.enumerated()), id: \.element.id) { index, item in
+                        Button {
+                            withAnimation(AppMotion.submenu) {
+                                presentedSupportModelKind = item.kind
+                            }
+                        } label: {
+                            IndustrialHoverRow {
+                                SupportModelRow(item: item)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if index < supportItems.count - 1 {
+                            IndustrialHairline().padding(.leading, 10)
                         }
                     }
-                    .buttonStyle(.plain)
                 }
             }
         }
     }
 
-    private var supportModelItems: [SupportModelInventoryItem] {
-        [
-            SupportModelInventory.speechItem(whisperItems: downloadController.whisperItems),
-            SupportModelInventory.embeddingItem(embeddingItems: downloadController.embeddingItems)
-        ]
-    }
-
     @ViewBuilder
-    private func supportModelDestination(for item: SupportModelInventoryItem) -> some View {
-        switch item.kind {
+    private func supportModelDestination(for kind: SupportModelInventoryItem.Kind) -> some View {
+        switch kind {
         case .speech:
             WhisperModelsView(engineID: TranscriptionSettings.selectedEngineID.isLocalWhisper ? TranscriptionSettings.selectedEngineID : TranscriptionBackendFactory.preferredLocalWhisperEngineID())
         case .embedding:
             EmbeddingModelsView()
+        case .voice:
+            VoiceModelCatalogView()
         }
     }
 
     @ViewBuilder private var remoteBackendsSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(LocalizedStringKey("Remote Backends"))
-                .font(FontTheme.heading)
-                .foregroundStyle(AppTheme.text)
-            
+        VStack(alignment: .leading, spacing: 12) {
+            IndustrialSectionHeader(
+                "Remote Backends",
+                detail: modelManager.remoteBackends.isEmpty ? nil : "\(modelManager.remoteBackends.count)"
+            )
+
             if modelManager.remoteBackends.isEmpty {
-                VStack(spacing: 16) {
-                    Text(LocalizedStringKey("No remote endpoints configured."))
-                        .font(FontTheme.body)
-                        .foregroundStyle(AppTheme.secondaryText)
-                    Button {
-                        showRemoteBackendForm = true
-                    } label: {
-                        Label(LocalizedStringKey("Add Remote Endpoint"), systemImage: "plus")
+                storedEmptyPanel {
+                    VStack(spacing: 12) {
+                        Text(LocalizedStringKey("No remote endpoints configured."))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(AppTheme.secondaryText)
+                        Button {
+                            showRemoteBackendForm = true
+                        } label: {
+                            Label(LocalizedStringKey("Add Remote Endpoint"), systemImage: "plus")
+                        }
+                        .buttonStyle(.industrial(.quiet))
                     }
-                    .buttonStyle(.bordered)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 24)
-                .glassifyIfAvailable(in: RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-                .background(AppTheme.cardFill)
-                .overlay(
-                    RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                        .stroke(AppTheme.cardStroke, lineWidth: 1)
-                )
             } else {
-                LazyVStack(spacing: 16) {
-                    ForEach(modelManager.remoteBackends, id: \.id) { backend in
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(modelManager.remoteBackends.enumerated()), id: \.element.id) { index, backend in
                         Button {
                             selectedBackendID = backend.id
                         } label: {
-                            storedCard {
+                            IndustrialHoverRow {
                                 RemoteBackendRow(
                                     backend: backend,
                                     isFetching: modelManager.remoteBackendsFetching.contains(backend.id),
@@ -1634,12 +2278,17 @@ struct StoredView: View {
                                     activeSession: modelManager.activeRemoteSession
                                 )
                             }
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
                             Button(LocalizedStringKey("Delete"), role: .destructive) {
                                 modelManager.deleteRemoteBackend(id: backend.id)
                             }
+                        }
+
+                        if index < modelManager.remoteBackends.count - 1 {
+                            IndustrialHairline().padding(.leading, 10)
                         }
                     }
                 }
@@ -1648,51 +2297,41 @@ struct StoredView: View {
     }
 
     @ViewBuilder private var datasetsSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack {
-                Text(LocalizedStringKey("Datasets"))
-                    .font(FontTheme.heading)
-                    .foregroundStyle(AppTheme.text)
-                Spacer()
+        VStack(alignment: .leading, spacing: 12) {
+            IndustrialSectionHeader(
+                "Datasets",
+                detail: modelManager.downloadedDatasets.isEmpty ? nil : "\(modelManager.downloadedDatasets.count)"
+            ) {
                 Button {
                     showImporter = true
                 } label: {
                     Text(LocalizedStringKey("Import Dataset"))
-                        .font(FontTheme.subheadline)
-                        .fontWeight(.medium)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(Color.accentColor)
+                .buttonStyle(.industrial(.quiet))
             }
-            
+
             if modelManager.downloadedDatasets.isEmpty {
-                VStack(spacing: 16) {
-                    Text(LocalizedStringKey("No datasets yet"))
-                        .font(FontTheme.heading)
-                        .foregroundStyle(AppTheme.text)
-                    Text(LocalizedStringKey("Import PDFs, EPUBs, or text files to build local knowledge bases."))
-                        .font(FontTheme.body)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .multilineTextAlignment(.center)
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Label(LocalizedStringKey("Import Dataset"), systemImage: "square.and.arrow.down")
+                storedEmptyPanel {
+                    VStack(spacing: 12) {
+                        Text(LocalizedStringKey("No datasets yet"))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(AppTheme.text)
+                        Text(LocalizedStringKey("Import PDFs, EPUBs, or text files to build local knowledge bases."))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .multilineTextAlignment(.center)
+                        Button {
+                            showImporter = true
+                        } label: {
+                            Label(LocalizedStringKey("Import Dataset"), systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.industrial(.quiet))
                     }
-                    .buttonStyle(.bordered)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 32)
-                .glassifyIfAvailable(in: RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous))
-                .background(AppTheme.cardFill)
-                .overlay(
-                    RoundedRectangle(cornerRadius: AppTheme.cornerRadius, style: .continuous)
-                        .stroke(AppTheme.cardStroke, lineWidth: 1)
-                )
             } else {
-                LazyVStack(spacing: 16) {
-                    ForEach(modelManager.downloadedDatasets) { ds in
-                        storedCard {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(modelManager.downloadedDatasets.enumerated()), id: \.element.id) { index, ds in
+                        IndustrialHoverRow {
                             DatasetRow(
                                 dataset: ds,
                                 indexing: datasetManager.indexingDatasetID == ds.datasetID,
@@ -1706,6 +2345,10 @@ struct StoredView: View {
                                 datasetPendingDeletion = ds
                             }
                         }
+
+                        if index < modelManager.downloadedDatasets.count - 1 {
+                            IndustrialHairline().padding(.leading, 10)
+                        }
                     }
                 }
             }
@@ -1713,7 +2356,12 @@ struct StoredView: View {
         .guideHighlight(.storedDatasets)
     }
 
-    private func load(_ model: LocalModel, settings: ModelSettings? = nil, bypassWarning: Bool = false) {
+    private func load(
+        _ model: LocalModel,
+        settings: ModelSettings? = nil,
+        bypassWarning: Bool = false,
+        bypassRAMCheck: Bool = false
+    ) {
         let resolvedSettings = settings ?? modelManager.settings(for: model)
         if !bypassWarning {
             AppSoundPlayer.play(.loadPress)
@@ -1729,7 +2377,7 @@ struct StoredView: View {
             await vm.unload()
             try? await Task.sleep(nanoseconds: 200_000_000)
 
-            let bypass = UserDefaults.standard.bool(forKey: "bypassRAMCheck")
+            let bypass = bypassRAMCheck || UserDefaults.standard.bool(forKey: "bypassRAMCheck")
             if !bypass {
                 let sizeBytes = Int64(model.sizeGB * 1_073_741_824.0)
                 let ctx = Int(settings.contextLength)
@@ -1741,11 +2389,13 @@ struct StoredView: View {
                     contextLength: ctx,
                     layerCount: layerHint,
                     moeInfo: model.moeInfo,
-                    kvCacheEstimate: kvCacheEstimate
+                    kvCacheEstimate: kvCacheEstimate,
+                    runtimeConfiguration: .resolved(from: settings, modelURL: model.url)
                 ) {
                     AppSoundPlayer.play(.error)
                     Haptics.error()
-                    vm.loadError = String(localized: "Model likely exceeds memory budget. Lower context size or use a smaller quant/model.")
+                    pendingRAMSafetyLoad = (model, settings)
+                    showRAMSafetyWarning = true
                     loadingModelID = nil
                     return
                 }
@@ -1820,12 +2470,23 @@ struct StoredView: View {
                 try? FileManager.default.createDirectory(at: loadURL, withIntermediateDirectories: true)
             }
 
-            let success = await vm.load(url: loadURL, settings: settings, format: model.format)
+            let success = await vm.load(
+                url: loadURL,
+                settings: settings,
+                format: model.format,
+                forceReload: false,
+                bypassRAMCheck: bypassRAMCheck
+            )
             if success {
                 modelManager.markModelUsed(model)
                 tabRouter.selection = .chat
             } else {
                 modelManager.loadedModel = nil
+                if vm.lastLoadBlockedByRAMSafety {
+                    vm.loadError = nil
+                    pendingRAMSafetyLoad = (model, settings)
+                    showRAMSafetyWarning = true
+                }
             }
             UserDefaults.standard.set(false, forKey: "bypassRAMLoadPending")
             loadingModelID = nil
@@ -1865,7 +2526,7 @@ struct StoredView: View {
         macModalPresenter.present(
             title: dataset.name,
             subtitle: dataset.source.isEmpty ? nil : dataset.source,
-            showCloseButton: false,
+            showCloseButton: true,
             dimensions: MacModalDimensions(
                 minWidth: 600,
                 idealWidth: 660,
@@ -1916,15 +2577,18 @@ struct StoredView: View {
         ) {
             VStack(alignment: .leading, spacing: 16) {
                 Text(LocalizedStringKey("Name your dataset"))
-                    .font(.headline)
+                    .font(.system(size: 13, weight: .semibold))
                 TextField(LocalizedStringKey("Dataset name"), text: $datasetName)
-                    .textFieldStyle(.roundedBorder)
+                    .industrialField()
+                    .font(.system(size: 12, design: .monospaced))
                 Spacer()
                 HStack {
                     Button(LocalizedStringKey("Cancel")) { showNameSheet = false }
+                        .buttonStyle(.industrial(.quiet))
                     Spacer()
                     Button(LocalizedStringKey("Import")) { Task { await performImport() } }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.industrial(.prominent))
+                        .keyboardShortcut(.defaultAction)
                         .disabled(datasetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
@@ -1985,6 +2649,238 @@ struct StoredView: View {
         }
     }
 
+    private func startPagedPackageBuild(for model: LocalModel) {
+        guard pagedBuildTask == nil else { return }
+        pagedBuildPhase = .preparing
+        pagedBuildError = nil
+        pagedBuildPackage = nil
+        pagedBuildIsStored = false
+        pagedBuildModel = model
+        let source = model.url
+        pagedBuildTask = Task { @MainActor in
+            do {
+                let package = try await PagedPackageBuildService.build(sourceGGUF: source) { phase in
+                    Task { @MainActor in
+                        pagedBuildPhase = phase
+                    }
+                }
+                pagedBuildPackage = package
+                pagedBuildPhase = .finished
+            } catch is CancellationError {
+                pagedBuildModel = nil
+            } catch {
+                pagedBuildError = error.localizedDescription
+            }
+            pagedBuildTask = nil
+        }
+    }
+
+    private func addPagedPackageToStored() {
+        guard !pagedBuildIsStored,
+              let package = pagedBuildPackage,
+              let sourceModel = pagedBuildModel else {
+            return
+        }
+        let installed = PagedPackageBuildService.installedModel(
+            for: package,
+            sourceModel: sourceModel
+        )
+        modelManager.installOrUpdate(installed)
+        pagedBuildIsStored = true
+    }
+
+}
+
+/// Progress sheet for "Create Paged Package…". Same Stored-dialect anatomy as
+/// OverfitCanaryProgressSheet (mono-caps header, 6pt dot, hairlines, step
+/// rows, industrial action row); kept local so OverfitStatusViews stays
+/// untouched.
+private struct PagedPackageBuildSheet: View {
+    let modelName: String
+    let phase: PagedPackageBuildPhase
+    var error: String? = nil
+    var outputURL: URL? = nil
+    var isInStored = false
+    let onAddToStored: () -> Void
+    let onDismiss: () -> Void
+
+    private enum StepState {
+        case pending
+        case active
+        case done
+        case failed
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(error == nil ? Color.accentColor : Color.red)
+                    .frame(width: 6, height: 6)
+                Text(headerTitle)
+                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(error == nil ? Color.primary.opacity(0.6) : Color.red)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+            }
+            .padding(.vertical, 7)
+            IndustrialHairline()
+
+            HStack(spacing: 8) {
+                Text(verbatim: modelName)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.5))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 7)
+            IndustrialHairline()
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(PagedPackageBuildPhase.allCases, id: \.rawValue) { step in
+                    stepRow(step)
+                }
+            }
+            .padding(.vertical, 4)
+
+            if let error {
+                IndustrialHairline()
+                Text(verbatim: error)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Color.primary.opacity(0.7))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 10)
+            } else if phase == .finished, let outputURL {
+                IndustrialHairline()
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "folder.fill")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 16, height: 16)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(
+                            String.localizedStringWithFormat(
+                                String(localized: "Saved to %@"),
+                                outputURL.lastPathComponent
+                            )
+                        )
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                        Text(verbatim: outputURL.deletingLastPathComponent().path)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(Color.primary.opacity(0.5))
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .help(outputURL.path)
+                    }
+                }
+                .padding(.vertical, 10)
+            }
+
+            IndustrialHairline()
+            HStack(spacing: 8) {
+                Spacer()
+                if error == nil, phase == .finished, let outputURL {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+                    } label: {
+                        Label(LocalizedStringKey("Reveal in Finder"), systemImage: "folder")
+                    }
+                    .buttonStyle(.industrial(.tinted))
+
+                    Button(action: onAddToStored) {
+                        Label(
+                            LocalizedStringKey(isInStored ? "In Stored" : "Add to Stored"),
+                            systemImage: isInStored ? "checkmark" : "plus"
+                        )
+                    }
+                    .buttonStyle(.industrial(isInStored ? .quiet : .prominent))
+                    .disabled(isInStored)
+                }
+                Button(LocalizedStringKey("Done"), action: onDismiss)
+                    .buttonStyle(.industrial(.quiet))
+            }
+            .padding(.top, 12)
+        }
+        .padding(20)
+        .frame(width: 400)
+    }
+
+    private var headerTitle: LocalizedStringKey {
+        if error != nil { return "Package build failed" }
+        if phase == .finished, outputURL != nil { return "Complete" }
+        return "Create Paged Package…"
+    }
+
+    private func titleKey(for step: PagedPackageBuildPhase) -> LocalizedStringKey {
+        switch step {
+        case .preparing: return "Preparing…"
+        case .extracting: return "Extracting experts…"
+        case .verifying: return "Verifying…"
+        case .finishing: return "Finishing…"
+        case .finished: return "Complete"
+        }
+    }
+
+    private func stepRow(_ step: PagedPackageBuildPhase) -> some View {
+        let state = state(for: step)
+        return HStack(spacing: 10) {
+            Group {
+                switch state {
+                case .pending:
+                    Circle()
+                        .fill(Color.primary.opacity(0.15))
+                        .frame(width: 5, height: 5)
+                case .active:
+                    ProgressView()
+                        .controlSize(.small)
+                case .done:
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.green)
+                case .failed:
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.red)
+                }
+            }
+            .frame(width: 16, height: 16)
+            Text(titleKey(for: step))
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(textColor(for: state))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func state(for step: PagedPackageBuildPhase) -> StepState {
+        if error != nil {
+            if step.rawValue < phase.rawValue { return .done }
+            if step == phase { return .failed }
+            return .pending
+        }
+        if phase == .finished { return .done }
+        if step.rawValue < phase.rawValue { return .done }
+        if step == phase { return .active }
+        return .pending
+    }
+
+    private func textColor(for state: StepState) -> Color {
+        switch state {
+        case .pending: return Color.primary.opacity(0.35)
+        case .active: return Color.primary.opacity(0.8)
+        case .done: return Color.primary.opacity(0.6)
+        case .failed: return .red
+        }
+    }
 }
 
 #endif

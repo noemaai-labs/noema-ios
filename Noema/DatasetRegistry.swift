@@ -1,4 +1,3 @@
-// DatasetRegistry.swift
 import Foundation
 
 /// Registry APIs for dataset listings.

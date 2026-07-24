@@ -88,7 +88,32 @@ enum WhisperModelCatalog {
         return url.appendingPathComponent(artifact.resourcePath, isDirectory: true)
     }
 
+    private final class InstallStateCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var map: [String: (state: WhisperModelInstallState, time: Date)] = [:]
+        func get(_ k: String) -> WhisperModelInstallState? {
+            lock.lock(); defer { lock.unlock() }
+            if let e = map[k], Date().timeIntervalSince(e.time) < 1.5 { return e.state }
+            return nil
+        }
+        func set(_ k: String, _ v: WhisperModelInstallState) {
+            lock.lock(); defer { lock.unlock() }
+            map[k] = (v, Date())
+        }
+    }
+    private static let installStateCache = InstallStateCache()
+
+    /// Throttled cache (~1.5s). The underlying check walks the WhisperKit package directory
+    /// recursively and is read from StoredView.body on every render (~5Hz while a download is
+    /// active), which stalled the main thread. The brief staleness is fine for an install badge.
     static func installationState(for record: WhisperModelRecord, runtime: WhisperRuntimeFormat) -> WhisperModelInstallState {
+        let key = "\(record.id)|\(runtime)"
+        if let cached = installStateCache.get(key) { return cached }
+        let result = computeInstallationState(for: record, runtime: runtime)
+        installStateCache.set(key, result)
+        return result
+    }
+    private static func computeInstallationState(for record: WhisperModelRecord, runtime: WhisperRuntimeFormat) -> WhisperModelInstallState {
         guard record.artifact(for: runtime) != nil,
               let installedURL = record.installedURL(runtime: runtime) else {
             return .missing

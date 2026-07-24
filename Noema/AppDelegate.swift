@@ -32,6 +32,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         BackgroundDownloadManager.shared.handleEvents(for: identifier, completionHandler: completionHandler)
     }
 
+    func applicationWillTerminate(_ application: UIApplication) {
+        // Background-session transfers outlive the process via nsurlsessiond, so the
+        // flush leaves them running and only captures foreground-session tasks.
+        BackgroundDownloadManager.shared.flushForTermination()
+    }
+
 #if canImport(FBSDKCoreKit) && os(iOS)
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
         let handled = ApplicationDelegate.shared.application(app, open: url, options: options)

@@ -1,10 +1,3 @@
-// NoemaAppShortcuts.swift
-//
-// App Shortcuts surface the most useful intents in Siri, Spotlight and the
-// Action button with zero setup. The system allows at most ten; the rest of
-// the intents stay available in the Shortcuts app and to the Siri AI through
-// their App Intents metadata.
-
 import AppIntents
 
 struct NoemaShortcuts: AppShortcutsProvider {

@@ -20,7 +20,7 @@
 ### Multi-backend model support
 Noema runs several on-device model formats so you can pick the right balance of speed, memory, and quality. These are represented in the app's `ModelFormat` enum:
 
-- **GGUF** – quantized weights run by llama.cpp, both in-process (via `llama.xcframework`) and through a loopback HTTP server.
+- **GGUF** – quantized weights run by the single bundled llama.cpp runtime, exposed through the local loopback server for chat and through its public C API for in-process helpers such as embeddings.
 - **MLX** – Apple's Metal-accelerated format for running models natively on Apple Silicon (integrated via Swift Package Manager).
 - **ExecuTorch (ET)** – PyTorch ExecuTorch models, with XNNPACK / CoreML / MPS backends.
 - **CoreML / ANE (CML)** – CoreML model bundles that run on the Apple Neural Engine.
@@ -30,7 +30,7 @@ Noema runs several on-device model formats so you can pick the right balance of 
 The RAM advisor heuristics estimate the working-set footprint for each format and compute whether a model fits the device's memory budget. Functions such as `fitsInRAM()` and `maxContextUnderBudget()` report whether a given model/context will run comfortably on your device.
 
 ### In-process and loopback inference
-For GGUF, Noema ships two llama.cpp builds: `llama.xcframework` for fast in-process execution, and `NoemaLLamaServer`, a dynamic library that runs a loopback HTTP server (`cpp-httplib`) for an OpenAI-compatible local API. The app talks to it over `127.0.0.1`, so chats, tokenization, and tool calls never leave the device.
+For GGUF, Noema ships one llama.cpp build through `NoemaLLamaServer`. This dynamic library provides both llama.cpp's public C API for in-process helpers and the embedded loopback HTTP server (`cpp-httplib`) used for the OpenAI-compatible local API. The app talks to the server over `127.0.0.1`, so chats, tokenization, and tool calls never leave the device.
 
 ### RAM check & model size helper
 A built-in RAM adviser uses device-specific limits to estimate available memory. It multiplies the quantized weight size by a format-specific factor and adds an estimate for the key-value cache to determine whether a model of a given size and context length fits. It can also compute the maximum context length that fits under budget and surfaces this in the UI so you can pick an appropriate model and prompt length.

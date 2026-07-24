@@ -10,6 +10,9 @@ struct ChatView: View {
     @EnvironmentObject private var modelManager: AppModelManager
     @EnvironmentObject private var datasetManager: DatasetManager
     @AppStorage("isAdvancedMode") private var isAdvancedMode = false
+    // Shared with iOS/macOS: render assistant replies as verbatim, unformatted
+    // text. Global @AppStorage keeps it consistent across devices; defaults off.
+    @AppStorage("showRawAssistantOutput") private var showRawAssistantOutput = false
 
     @State private var scrollProxy: ScrollViewProxy?
     @State private var showSessionTray = false
@@ -17,6 +20,7 @@ struct ChatView: View {
     @State private var suggestionsSessionID: UUID?
     @State private var showModelRequiredAlert = false
     @State private var measuredHeight: CGFloat = 0
+    @State private var showVoiceMode = false
 
     private struct InputHeightPreferenceKey: PreferenceKey {
         static var defaultValue: CGFloat { 0 }
@@ -153,6 +157,33 @@ struct ChatView: View {
             }
 
             Spacer()
+
+            Menu {
+                Toggle(isOn: $showRawAssistantOutput) {
+                    Label(LocalizedStringKey("Show Raw Output"), systemImage: "chevron.left.forwardslash.chevron.right")
+                }
+                if vm.activeSessionDataset != nil {
+                    Button {
+                        vm.startNewSession(carryingActiveDataset: false)
+                    } label: {
+                        Label {
+                            Text(verbatim: "\(String(localized: "New Chat")) · \(String(localized: "No Dataset"))")
+                        } icon: {
+                            Image(systemName: "circle.slash")
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 22, weight: .semibold))
+                    .padding(10)
+                    .background(
+                        Circle()
+                            .fill(Color(.secondarySystemBackground))
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("More options"))
 
             Button {
                 vm.startNewSession()
@@ -324,6 +355,33 @@ struct ChatView: View {
                         }
                     }
 
+#if canImport(Speech)
+                Button {
+                    Task { await vm.toggleLiveDictation() }
+                } label: {
+                    Image(systemName: "mic.fill")
+                        .symbolVariant(vm.isDictating ? .fill : .none)
+                }
+                .buttonStyle(.bordered)
+                .tint(vm.isDictating ? .red : .secondary)
+                .disabled(vm.isRecordingAudio || vm.loading || vm.stillLoading)
+                .accessibilityLabel(Text(LocalizedStringKey(vm.isDictating ? "Stop Dictation" : "Start Dictation")))
+                .accessibilityHint(Text(LocalizedStringKey("Dictates speech into the message field.")))
+
+                Button {
+                    showVoiceMode = true
+                } label: {
+                    Image(systemName: "waveform")
+                }
+                .buttonStyle(.bordered)
+                .disabled(vm.isRecordingAudio || vm.isDictating || vm.isStreaming || vm.loading || vm.stillLoading || !hasActiveChatModel)
+                .fullScreenCover(isPresented: $showVoiceMode) {
+                    VoiceModeView(chatVM: vm)
+                }
+                .accessibilityLabel(Text(LocalizedStringKey("Voice Mode")))
+                .accessibilityHint(Text(LocalizedStringKey("Start a spoken conversation.")))
+#endif
+
                 Button {
                     if vm.isStreaming {
                         vm.stop()
@@ -334,7 +392,12 @@ struct ChatView: View {
                         }
                         let text = vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !text.isEmpty else { return }
-                        Task { await vm.send() }
+                        Task {
+                            if vm.isDictating {
+                                await vm.stopLiveDictation()
+                            }
+                            await vm.send()
+                        }
                     }
                 } label: {
                     Label(vm.isStreaming ? LocalizedStringKey("Stop") : LocalizedStringKey("Send"), systemImage: vm.isStreaming ? "stop.fill" : "paperplane.fill")
@@ -443,7 +506,7 @@ private struct ChatAdvancedOrnament: View {
 
             if let remote = modelManager.activeRemoteSession {
                 remoteSessionRow(for: remote)
-            } else if let loaded = modelManager.loadedModel {
+            } else if (vm.modelLoaded || vm.loading || vm.stillLoading), let loaded = modelManager.loadedModel {
                 ModelRow(
                     model: loaded,
                     isLoading: false,

@@ -122,6 +122,7 @@ extension EnvironmentValues {
 
 struct MacModalHost: View {
     @EnvironmentObject private var presenter: MacModalPresenter
+    @FocusState private var cardFocused: Bool
 
     var body: some View {
         Group {
@@ -139,8 +140,6 @@ struct MacModalHost: View {
                                 removal: .opacity
                             )
                         )
-                        .compositingGroup()
-                        .shadow(color: Color.black.opacity(0.14), radius: 24, x: 0, y: 18)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .zIndex(10)
@@ -151,7 +150,7 @@ struct MacModalHost: View {
 
     @ViewBuilder
     private func modalCard(for presentation: MacModalPresentation) -> some View {
-        let cornerRadius: CGFloat = 26
+        let cornerRadius: CGFloat = 14
 
         VStack(spacing: 0) {
             if presentation.title != nil || presentation.showCloseButton {
@@ -165,12 +164,17 @@ struct MacModalHost: View {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(Color(nsColor: .textBackgroundColor))
         )
+        // Clip content to the rounded silhouette. Modal bodies fill the card
+        // edge-to-edge and paint their own opaque backgrounds; without this they
+        // square off the card's rounded corners. Placed before the stroke overlay
+        // so the 1px border stays crisp on the outer edge.
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .stroke(Color.primary.opacity(0.05), lineWidth: 1)
+                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
         )
         .compositingGroup()
-        .shadow(color: Color.black.opacity(0.12), radius: 22, x: 0, y: 18)
+        .shadow(color: Color.black.opacity(0.12), radius: 22, x: 0, y: 12)
         .frame(
             minWidth: presentation.dimensions.minWidth,
             idealWidth: presentation.dimensions.idealWidth,
@@ -180,6 +184,14 @@ struct MacModalHost: View {
             maxHeight: presentation.dimensions.maxHeight,
             alignment: .topLeading
         )
+        // Escape → dismiss. The card claims focus on present so cancelOperation
+        // reaches it even when the hosting window had nothing focused; embedded
+        // fields still see Escape first and unhandled presses bubble up here.
+        .focusable()
+        .focusEffectDisabled()
+        .focused($cardFocused)
+        .onExitCommand { presenter.dismiss() }
+        .onAppear { cardFocused = true }
     }
 
     @ViewBuilder
@@ -192,31 +204,22 @@ struct MacModalHost: View {
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     if let title = presentation.title {
                         Text(title)
-                            .font(.system(size: 18, weight: .semibold))
+                            .font(.system(size: 16, weight: .semibold))
                     }
                     if let subtitle = presentation.subtitle, !subtitle.isEmpty {
                         Text(subtitle)
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
+                            .industrialStat()
+                            .lineLimit(1)
                     }
                 }
                 Spacer()
                 if presentation.showCloseButton {
-                    Button {
+                    IndustrialIconButton(systemImage: "xmark") {
                         presenter.dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .semibold))
-                            .padding(8)
-                            .background(
-                                Circle()
-                                    .fill(Color.primary.opacity(0.08))
-                            )
                     }
-                    .buttonStyle(.plain)
                     .accessibilityLabel("Close")
                 }
             }

@@ -124,6 +124,10 @@ actor RemoteChatService {
             struct Delta: Decodable {
                 let role: String?
                 let content: String?
+                // OpenRouter streams chain-of-thought as `reasoning`;
+                // DeepSeek-style providers use `reasoning_content`.
+                let reasoning: String?
+                let reasoningContent: String?
                 let toolCalls: [ToolCallChunk]?
                 let functionCall: FunctionCallChunk?
             }
@@ -131,6 +135,8 @@ actor RemoteChatService {
             struct Message: Decodable {
                 let role: String?
                 let content: String?
+                let reasoning: String?
+                let reasoningContent: String?
                 let toolCalls: [ToolCallChunk]?
                 let functionCall: FunctionCallChunk?
             }
@@ -164,7 +170,7 @@ actor RemoteChatService {
     private var modelID: String
     private var toolSpecs: [ToolSpec]
     private var options = RequestOptions()
-    private var cancellationHandler: (() -> Void)?
+    private var cancellationHandler: (id: UUID, cancel: @Sendable () -> Void)?
     private let decoder: JSONDecoder
     private var bufferedToolTokens: [String] = []
 #if os(iOS) || os(visionOS)
@@ -277,29 +283,36 @@ actor RemoteChatService {
     }
 
     func cancelActiveStream() {
-        cancellationHandler?()
+        let handler = cancellationHandler
         cancellationHandler = nil
+        handler?.cancel()
     }
 
     func stream(for input: LLMInput) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
+        let streamID = UUID()
+        let taskBox = LockIsolated<Task<Void, Never>?>(nil)
+        let stream = AsyncThrowingStream<String, Error> { continuation in
             let task = Task {
                 await self.performStream(for: input, continuation: continuation)
-                await self.clearCancellationHandler()
+                await self.clearCancellationHandler(streamID: streamID)
             }
-            Task { await self.setCancellationHandler { task.cancel() } }
+            taskBox.withMutableValue { $0 = task }
             continuation.onTermination = { _ in
-                task.cancel()
-                Task { await self.clearCancellationHandler() }
+                taskBox.withValue { $0?.cancel() }
+                Task { await self.clearCancellationHandler(streamID: streamID) }
             }
         }
+        // This actor remains occupied until `stream(for:)` returns, so the child task
+        // cannot finish and clear its handler before registration completes.
+        cancellationHandler = (
+            id: streamID,
+            cancel: { taskBox.withValue { $0?.cancel() } }
+        )
+        return stream
     }
 
-    private func setCancellationHandler(_ handler: @escaping () -> Void) {
-        cancellationHandler = handler
-    }
-
-    private func clearCancellationHandler() {
+    private func clearCancellationHandler(streamID: UUID) {
+        guard cancellationHandler?.id == streamID else { return }
         cancellationHandler = nil
     }
 
@@ -502,6 +515,9 @@ actor RemoteChatService {
         await logger.log("[RemoteChat] [Cloud] Performing Cloud Relay request for '\(backend.name)' model '\(modelID)'")
         await notifyTransport(.cloudRelay, streaming: false)
         do {
+            guard !NetworkKillSwitch.isEnabled else {
+                throw URLError(.notConnectedToInternet)
+            }
             guard let containerID = relayContainerID, !containerID.isEmpty else {
                 throw InferenceError.notConfigured
             }
@@ -543,9 +559,15 @@ actor RemoteChatService {
             sanitizedEntries = messages.map { ($0.role, $0.content) }
         case .plain(let text):
             sanitizedEntries = [(role: "user", text: text)]
-        case .multimodal(let text, _):
+        case .multimodal(let text, let paths):
+            if !paths.isEmpty {
+                Task { await logger.log("[RemoteChat] [Images] Cloud Relay transport can't carry images; sending text only.") }
+            }
             sanitizedEntries = [(role: "user", text: text)]
-        case .multimodalMessages(let messages, _):
+        case .multimodalMessages(let messages, let paths):
+            if !paths.isEmpty {
+                Task { await logger.log("[RemoteChat] [Images] Cloud Relay transport can't carry images; sending text only.") }
+            }
             sanitizedEntries = messages.map { ($0.role, $0.content) }
         }
 #if os(iOS) || os(visionOS)
@@ -633,9 +655,11 @@ actor RemoteChatService {
             cfg.timeoutIntervalForResource = 3
             cfg.waitsForConnectivity = false
             let session = URLSession(configuration: cfg)
+            NetworkKillSwitch.track(session: session)
             defer { session.invalidateAndCancel() }
             await logger.log("[RemoteChat] [LAN] Health probe → \(healthURL.absoluteString) for '\(backend.name)'")
             do {
+                guard !NetworkKillSwitch.shouldBlock(request: req) else { return false }
                 let (_, resp) = try await session.data(for: req)
                 if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
                     return true
@@ -656,10 +680,12 @@ actor RemoteChatService {
         configuration.timeoutIntervalForResource = 4
         configuration.waitsForConnectivity = false
         let session = URLSession(configuration: configuration)
+        NetworkKillSwitch.track(session: session)
         defer { session.invalidateAndCancel() }
         let hostDescription = url.absoluteString
         await logger.log("[RemoteChat] [LAN] HEAD probe → \(hostDescription) for '\(backend.name)'")
         do {
+            guard !NetworkKillSwitch.shouldBlock(request: request) else { return false }
             let (_, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse {
                 switch http.statusCode {
@@ -699,10 +725,13 @@ actor RemoteChatService {
 #if os(iOS) || os(visionOS)
         var usedLANTransport = false
         var lanTransportSSID: String?
+        var receivedLANPayload = false
 #endif
 
         do {
             let prompt = input.prompt
+            let imagePaths = Self.imagePaths(from: input)
+            let structuredMessages = Self.structuredMessages(from: input)
             guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 continuation.finish()
                 return
@@ -732,7 +761,7 @@ actor RemoteChatService {
 #endif
             if backend.endpointType == .ollama {
                 await notifyTransport(.direct, streaming: true)
-                try await performOllamaStream(prompt: prompt, continuation: continuation)
+                try await performOllamaStream(prompt: prompt, imagePaths: imagePaths, continuation: continuation)
                 return
             }
 
@@ -748,7 +777,7 @@ actor RemoteChatService {
                     let ssidLabel = matchedSSID.isEmpty ? "<unknown>" : matchedSSID
                     await logger.log("[RemoteChat] [LAN] Switching transport from Cloud Relay to direct LAN for '\(backend.name)' (SSID \(ssidLabel))")
                 }
-                request = try buildRelayLANRequest(prompt: prompt, matchedSSID: matchedSSID)
+                request = try buildRelayLANRequest(prompt: prompt, matchedSSID: matchedSSID, imagePaths: imagePaths)
                 usedLANTransport = true
                 await notifyTransport(.lan(ssid: matchedSSID), streaming: true)
                 Task {
@@ -756,16 +785,30 @@ actor RemoteChatService {
                 }
             } else {
                 kind = currentEndpointKind()
-                request = try buildRequest(prompt: prompt, kind: kind)
+                request = try buildRequest(
+                    prompt: prompt,
+                    kind: kind,
+                    imagePaths: imagePaths,
+                    structuredMessages: structuredMessages
+                )
                 await notifyTransport(.direct, streaming: true)
             }
 #else
             let kind = currentEndpointKind()
-            let request = try buildRequest(prompt: prompt, kind: kind)
+            let request = try buildRequest(
+                prompt: prompt,
+                kind: kind,
+                imagePaths: imagePaths,
+                structuredMessages: structuredMessages
+            )
             await notifyTransport(.direct, streaming: true)
 #endif
             let isLMStudioNativeV1Stream = backend.endpointType == .lmStudio
                 && (request.url?.path.lowercased().contains("/api/v1/chat") ?? false)
+            guard !NetworkKillSwitch.shouldBlock(request: request) else {
+                throw URLError(.notConnectedToInternet)
+            }
+            NetworkKillSwitch.track(session: URLSession.shared)
             let (bytes, response) = try await URLSession.shared.bytes(for: request)
             try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse else {
@@ -793,6 +836,13 @@ actor RemoteChatService {
             var streamedLMStudioMessageDelta = false
             var streamedLMStudioReasoningDelta = false
             var lmStudioReasoningOpen = false
+            var sawValidPayload = false
+
+            func closeReasoningStreamIfNeeded() {
+                guard lmStudioReasoningOpen else { return }
+                lmStudioReasoningOpen = false
+                continuation.yield("</think>")
+            }
 
             func registerItemID(_ id: String?, key: String) {
                 guard let id, !id.isEmpty else { return }
@@ -815,6 +865,10 @@ actor RemoteChatService {
                 if !force, lastEmittedToolJSON[key] == jsonString { return }
                 lastEmittedToolJSON[key] = jsonString
                 logToolCallPayload(jsonString)
+                // Native tool calls are outside the reasoning channel. Close it
+                // before ChatVM cancels this stream for tool execution, otherwise
+                // the next continuation's <think> nests inside the prior block.
+                closeReasoningStreamIfNeeded()
                 let token = "TOOL_CALL: \(jsonString)"
                 let result = continuation.yield(token)
                 switch result {
@@ -913,6 +967,7 @@ actor RemoteChatService {
                     if let deltaValue = event["delta"],
                        let text = stringFromDeltaValue(deltaValue),
                        !text.isEmpty {
+                        closeReasoningStreamIfNeeded()
                         continuation.yield(text)
                     }
                 case "response.output_item.added":
@@ -1043,6 +1098,7 @@ actor RemoteChatService {
                     if let content = (event["content"] as? String) ?? (event["delta"] as? String),
                        !content.isEmpty {
                         streamedLMStudioMessageDelta = true
+                        closeReasoningStreamIfNeeded()
                         continuation.yield(content)
                     }
                 case "tool_call.start":
@@ -1127,6 +1183,7 @@ actor RemoteChatService {
                                 if !streamedLMStudioMessageDelta,
                                    let content = item["content"] as? String,
                                    !content.isEmpty {
+                                    closeReasoningStreamIfNeeded()
                                     continuation.yield(content)
                                 }
                             } else if itemType == "reasoning" {
@@ -1176,6 +1233,10 @@ actor RemoteChatService {
                 if let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let type = jsonObject["type"] as? String,
                    type.hasPrefix("response.") {
+                    sawValidPayload = true
+#if os(iOS) || os(visionOS)
+                    if usedLANTransport { receivedLANPayload = true }
+#endif
                     if let error = handleResponseEvent(jsonObject) {
                         throw error
                     }
@@ -1189,6 +1250,10 @@ actor RemoteChatService {
                         "reasoning.", "tool_call.", "message.", "error"
                     ]
                     if lmStudioPrefixes.contains(where: { type.hasPrefix($0) }) {
+                        sawValidPayload = true
+#if os(iOS) || os(visionOS)
+                        if usedLANTransport { receivedLANPayload = true }
+#endif
                         if let error = handleLMStudioStreamEvent(jsonObject) {
                             throw error
                         }
@@ -1199,12 +1264,35 @@ actor RemoteChatService {
                 do {
                     chunk = try decoder.decode(ChatChunk.self, from: data)
                 } catch {
+                    // A chunk that doesn't match our schema is skipped (providers send
+                    // keep-alives, role-only deltas, and vendor-specific events), but log
+                    // it so genuinely malformed/truncated streams are diagnosable instead
+                    // of silently disappearing.
+                    let preview = String(data: data.prefix(200), encoding: .utf8) ?? "<non-utf8>"
+                    await logger.log("[RemoteChatService] skipped undecodable stream chunk: \(error.localizedDescription) — \(preview)")
                     continue
                 }
+                sawValidPayload = true
+#if os(iOS) || os(visionOS)
+                if usedLANTransport { receivedLANPayload = true }
+#endif
 
                 for choice in chunk.choices {
                     if let delta = choice.delta {
+                        // Bridge streamed chain-of-thought into the same
+                        // <think> stream local models use, reusing the shared
+                        // open/close state (closed at content start and at
+                        // stream end below).
+                        let reasoningDelta = (delta.reasoning ?? "") + (delta.reasoningContent ?? "")
+                        if isChat, !reasoningDelta.isEmpty {
+                            if !lmStudioReasoningOpen {
+                                lmStudioReasoningOpen = true
+                                continuation.yield("<think>")
+                            }
+                            continuation.yield(reasoningDelta)
+                        }
                         if let content = delta.content, !content.isEmpty {
+                            closeReasoningStreamIfNeeded()
                             continuation.yield(content)
                         }
                         if isChat, let toolCalls = delta.toolCalls, !toolCalls.isEmpty {
@@ -1246,10 +1334,11 @@ actor RemoteChatService {
                 }
             }
 
-            if lmStudioReasoningOpen {
-                lmStudioReasoningOpen = false
-                continuation.yield("</think>")
+            guard sawValidPayload else {
+                throw RemoteChatError.invalidResponse
             }
+
+            closeReasoningStreamIfNeeded()
 
             if isChat && (sawToolCallFinish || !accumulators.isEmpty) {
                 for (key, _) in accumulators.sorted(by: { $0.key < $1.key }) {
@@ -1262,7 +1351,7 @@ actor RemoteChatService {
             continuation.finish()
         } catch {
 #if os(iOS) || os(visionOS)
-            if usedLANTransport {
+            if usedLANTransport && !receivedLANPayload {
                 let ssidDescription = lanTransportSSID ?? "unknown SSID"
                 Task {
                     await logger.log("[RemoteChat] ⚠️ LAN transport failed for \(backend.name) on \(ssidDescription): \(error.localizedDescription). Falling back to Cloud Relay.")
@@ -1277,10 +1366,14 @@ actor RemoteChatService {
         }
     }
 
-    private func performOllamaStream(prompt: String, continuation: AsyncThrowingStream<String, Error>.Continuation) async throws {
+    private func performOllamaStream(prompt: String, imagePaths: [String] = [], continuation: AsyncThrowingStream<String, Error>.Continuation) async throws {
         bufferedToolTokens.removeAll(keepingCapacity: false)
 
-        let request = try buildOllamaRequest(prompt: prompt)
+        let request = try buildOllamaRequest(prompt: prompt, imagePaths: imagePaths)
+        guard !NetworkKillSwitch.shouldBlock(request: request) else {
+            throw URLError(.notConnectedToInternet)
+        }
+        NetworkKillSwitch.track(session: URLSession.shared)
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse else {
@@ -1299,6 +1392,7 @@ actor RemoteChatService {
 
         var accumulators: [Int: ToolCallAccumulator] = [:]
         var lastEmittedToolJSON: [Int: String] = [:]
+        var sawValidPayload = false
 
         func emitToolCallUpdate(
             for index: Int,
@@ -1359,6 +1453,7 @@ actor RemoteChatService {
             } catch {
                 continue
             }
+            sawValidPayload = true
 
             if let content = chunk.message?.content, !content.isEmpty {
                 continuation.yield(content)
@@ -1375,6 +1470,10 @@ actor RemoteChatService {
             }
         }
 
+        guard sawValidPayload else {
+            throw RemoteChatError.invalidResponse
+        }
+
         if !accumulators.isEmpty {
             for (index, _) in accumulators.sorted(by: { $0.key < $1.key }) {
                 emitToolCallUpdate(for: index, force: true, requestStatus: "ready")
@@ -1385,7 +1484,7 @@ actor RemoteChatService {
     }
 
 #if os(iOS) || os(visionOS)
-    private func buildRelayLANRequest(prompt: String, matchedSSID: String) throws -> URLRequest {
+    private func buildRelayLANRequest(prompt: String, matchedSSID: String, imagePaths: [String] = []) throws -> URLRequest {
         guard let url = backend.relayLANChatEndpointURL else {
             throw RemoteChatError.invalidEndpoint
         }
@@ -1400,6 +1499,12 @@ actor RemoteChatService {
             throw RemoteChatError.missingModelIdentifier
         }
 
+        // The relay host's own HTTP server rejects image content parts with
+        // 400 ("Images are not supported by Noema Relay endpoints"), which
+        // would silently degrade the turn to CloudKit relay — text only here.
+        if !imagePaths.isEmpty {
+            Task { await logger.log("[RemoteChat] [Images] Noema Relay LAN endpoint can't accept image parts; sending text only.") }
+        }
         var body: [String: Any] = [
             "model": modelValue,
             "stream": true,
@@ -1455,7 +1560,12 @@ actor RemoteChatService {
         await observer(transport, streaming)
     }
 
-    private func buildRequest(prompt: String, kind: EndpointKind) throws -> URLRequest {
+    private func buildRequest(
+        prompt: String,
+        kind: EndpointKind,
+        imagePaths: [String] = [],
+        structuredMessages: [ChatMessage]? = nil
+    ) throws -> URLRequest {
         let trimmedModel = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         let modelValue: String = {
             if !trimmedModel.isEmpty { return trimmedModel }
@@ -1467,14 +1577,17 @@ actor RemoteChatService {
         }
 
         let wantsTools = options.includeTools && !toolSpecs.isEmpty
-        let lmStudioToolsFallback = backend.endpointType == .lmStudio && wantsTools
+        let wantsImages = !imagePaths.isEmpty
+        // Both tools and image content parts need the OpenAI chat shape; LM
+        // Studio's native /api/v1/chat takes a flat "input" string only.
+        let lmStudioOpenAIFallback = backend.endpointType == .lmStudio && (wantsTools || wantsImages)
         let url: URL
-        if lmStudioToolsFallback {
+        if lmStudioOpenAIFallback {
             guard let fallbackURL = backend.absoluteURL(for: "/v1/chat/completions") else {
                 throw RemoteChatError.invalidEndpoint
             }
             Task {
-                await logger.log("[RemoteChat] [LMStudio] Tools enabled; routing request through OpenAI-compatible /v1/chat/completions fallback.")
+                await logger.log("[RemoteChat] [LMStudio] Tools or images present; routing request through OpenAI-compatible /v1/chat/completions fallback.")
             }
             url = fallbackURL
         } else {
@@ -1483,7 +1596,7 @@ actor RemoteChatService {
             }
             url = endpointURL
         }
-        let requestKind: EndpointKind = lmStudioToolsFallback ? .chat : kind
+        let requestKind: EndpointKind = lmStudioOpenAIFallback ? .chat : kind
         let openRouterSupportedParameters = backend.isOpenRouter
             ? supportedOpenRouterParameters(for: modelValue)
             : nil
@@ -1498,22 +1611,32 @@ actor RemoteChatService {
             "stream": true
         ]
 
-        if backend.endpointType == .lmStudio && !lmStudioToolsFallback {
+        if backend.endpointType == .lmStudio && !lmStudioOpenAIFallback {
             body["input"] = prompt
         } else {
             switch requestKind {
             case .chat:
-                body["messages"] = [["role": "user", "content": prompt]]
+                if let structuredMessages, !structuredMessages.isEmpty {
+                    body["messages"] = Self.chatMessagePayloads(
+                        structuredMessages,
+                        imagePaths: imagePaths
+                    )
+                } else {
+                    body["messages"] = [["role": "user", "content": Self.userContentValue(prompt: prompt, imagePaths: imagePaths)]]
+                }
                 if allowTools {
                     body["tools"] = try toolsPayload(from: toolSpecs)
                     body["tool_choice"] = "auto"
                 }
             case .completion:
+                if wantsImages {
+                    Task { await logger.log("[RemoteChat] [Images] completion-style endpoint can't carry image parts; sending text only.") }
+                }
                 body["prompt"] = prompt
             }
         }
         if !options.stops.isEmpty &&
-            !(backend.endpointType == .lmStudio && !lmStudioToolsFallback) &&
+            !(backend.endpointType == .lmStudio && !lmStudioOpenAIFallback) &&
             openRouterAllowsParameter("stop",
                                       supportedParameters: openRouterSupportedParameters,
                                       defaultWhenUnknown: false) {
@@ -1525,7 +1648,10 @@ actor RemoteChatService {
                                      defaultWhenUnknown: true) {
             body["temperature"] = temperature
         }
-        if backend.endpointType == .lmStudio && !lmStudioToolsFallback {
+        if backend.endpointType == .lmStudio {
+            // Same LM Studio server whether native /api/v1/chat or the
+            // OpenAI-compat fallback (tools/images) — saved sampling settings
+            // apply to both; without this the fallback silently dropped them.
             // Context length is applied at LM Studio model load time to avoid spawning
             // a second loaded instance when chat-time context differs from load config.
             if let temperature = options.temperature {
@@ -1567,6 +1693,15 @@ actor RemoteChatService {
                                          supportedParameters: openRouterSupportedParameters,
                                          defaultWhenUnknown: false) {
                 body["repetition_penalty"] = repeatPenalty
+            }
+            // Ask OpenRouter to include the model's chain-of-thought in the
+            // stream so the think box renders for cloud answers too. Only
+            // sent when the catalog advertises the parameter — it never
+            // forces reasoning on, it just stops it being stripped.
+            if openRouterAllowsParameter("include_reasoning",
+                                         supportedParameters: openRouterSupportedParameters,
+                                         defaultWhenUnknown: false) {
+                body["include_reasoning"] = true
             }
         }
 
@@ -1637,7 +1772,7 @@ actor RemoteChatService {
         return .httpError(code, resolvedMessage)
     }
 
-    private func buildOllamaRequest(prompt: String) throws -> URLRequest {
+    private func buildOllamaRequest(prompt: String, imagePaths: [String] = []) throws -> URLRequest {
         guard let url = backend.chatEndpointURL else {
             throw RemoteChatError.invalidEndpoint
         }
@@ -1647,15 +1782,21 @@ actor RemoteChatService {
             throw RemoteChatError.missingModelIdentifier
         }
 
+        // Ollama's chat API takes bare base64 strings on the message, not
+        // OpenAI content parts.
+        var userMessage: [String: Any] = [
+            "role": "user",
+            "content": prompt
+        ]
+        let encodedImages = imagePaths.compactMap { RemoteImageEncoding.base64Payload(forPath: $0) }
+        if !encodedImages.isEmpty {
+            userMessage["images"] = encodedImages
+        }
+
         var body: [String: Any] = [
             "model": trimmedModel,
             "stream": true,
-            "messages": [
-                [
-                    "role": "user",
-                    "content": prompt
-                ]
-            ],
+            "messages": [userMessage],
             "keep_alive": "5m"
         ]
 
@@ -1700,6 +1841,15 @@ actor RemoteChatService {
         try buildRequest(prompt: prompt, kind: .chat)
     }
 
+    func buildChatRequestForTesting(input: LLMInput) throws -> URLRequest {
+        try buildRequest(
+            prompt: input.prompt,
+            kind: .chat,
+            imagePaths: Self.imagePaths(from: input),
+            structuredMessages: Self.structuredMessages(from: input)
+        )
+    }
+
     private func logToolCallPayload(_ jsonString: String) {
         let backendName = backend.name
         let trimmedModel = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1723,6 +1873,76 @@ actor RemoteChatService {
             return []
         }
         return json
+    }
+
+    /// Preserve role-tagged input for chat endpoints. `LLMInput.prompt` remains
+    /// the fallback for completion-style endpoints and legacy adapters only.
+    static func structuredMessages(from input: LLMInput) -> [ChatMessage]? {
+        switch input.content {
+        case .messages(let messages), .multimodalMessages(let messages, _):
+            return messages
+        case .plain, .multimodal:
+            return nil
+        }
+    }
+
+    /// OpenAI-compatible message payload that retains assistant tool calls and
+    /// the matching tool_call_id on role:"tool" results. Images attach only to
+    /// the final user turn without flattening the rest of the transcript.
+    static func chatMessagePayloads(
+        _ messages: [ChatMessage],
+        imagePaths: [String] = []
+    ) -> [[String: Any]] {
+        let finalUserIndex = messages.lastIndex { $0.role.lowercased() == "user" }
+        return messages.enumerated().map { index, message in
+            var payload: [String: Any] = ["role": message.role]
+            if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                payload["tool_calls"] = toolCalls.map { toolCall in
+                    [
+                        "id": toolCall.id,
+                        "type": toolCall.type,
+                        "function": [
+                            "name": toolCall.function.name,
+                            "arguments": toolCall.function.arguments
+                        ]
+                    ]
+                }
+                let trimmedContent = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                payload["content"] = trimmedContent.isEmpty ? NSNull() : message.content
+            } else if index == finalUserIndex, !imagePaths.isEmpty {
+                payload["content"] = userContentValue(prompt: message.content, imagePaths: imagePaths)
+            } else {
+                payload["content"] = message.content
+            }
+            if let toolCallID = message.toolCallId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !toolCallID.isEmpty {
+                payload["tool_call_id"] = toolCallID
+            }
+            return payload
+        }
+    }
+
+    /// `LLMInput.prompt` flattens multimodal content to text; image paths must
+    /// be pulled from the content enum directly.
+    static func imagePaths(from input: LLMInput) -> [String] {
+        switch input.content {
+        case .plain, .messages:
+            return []
+        case .multimodal(_, let paths), .multimodalMessages(_, let paths):
+            return paths
+        }
+    }
+
+    /// Chat-completions user-message content: a plain string normally, an
+    /// OpenAI content-parts array when images ride along. Unencodable images
+    /// are skipped rather than failing the send.
+    static func userContentValue(prompt: String, imagePaths: [String]) -> Any {
+        guard !imagePaths.isEmpty else { return prompt }
+        let imageObjects = imagePaths.compactMap { RemoteImageEncoding.imageContentObject(forPath: $0) }
+        guard !imageObjects.isEmpty else { return prompt }
+        var parts: [[String: Any]] = [["type": "text", "text": prompt]]
+        parts.append(contentsOf: imageObjects)
+        return parts
     }
 
     private func makeToolCallJSON(

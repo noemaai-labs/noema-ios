@@ -1,11 +1,3 @@
-// NoemaAppIntents.swift
-//
-// App Intents verbs exposed to Siri, Shortcuts, Spotlight and the Action
-// button. Fast, predictable actions run headless; anything that needs UI or
-// the GPU opens the app. On iOS 27 the heavy intents adopt LongRunningIntent
-// so the new Siri AI keeps them alive past the usual timeout and shows
-// progress while a model loads.
-
 import AppIntents
 import Foundation
 

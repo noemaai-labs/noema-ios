@@ -1,8 +1,3 @@
-// HFEndpoint.swift
-// Routes Hugging Face traffic through a user-selected mirror (e.g. hf-mirror.com)
-// or a custom endpoint so model downloads work in regions where huggingface.co
-// is blocked. URLs are rewritten at the network boundary; catalog data and
-// repo-ID parsing keep canonical huggingface.co URLs.
 import Foundation
 
 enum HFEndpoint {

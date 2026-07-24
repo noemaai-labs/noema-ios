@@ -148,6 +148,10 @@ public struct RelayModelRecord: Sendable {
     public var health: RelayModelHealth
     public var lastChecked: Date?
     public var version: Int
+    /// Overfit (paged GGUF) advertisement. Optional and defaulted so records
+    /// written by builds without these fields keep decoding unchanged.
+    public var overfitClassification: String?
+    public var overfitMeasuredGenerationRate: Double?
 
     public init(recordID: CKRecord.ID,
                 modelID: String,
@@ -163,7 +167,9 @@ public struct RelayModelRecord: Sendable {
                 exposed: Bool,
                 health: RelayModelHealth,
                 lastChecked: Date?,
-                version: Int) {
+                version: Int,
+                overfitClassification: String? = nil,
+                overfitMeasuredGenerationRate: Double? = nil) {
         self.recordID = recordID
         self.modelID = modelID
         self.hostDeviceID = hostDeviceID
@@ -179,6 +185,8 @@ public struct RelayModelRecord: Sendable {
         self.health = health
         self.lastChecked = lastChecked
         self.version = version
+        self.overfitClassification = overfitClassification
+        self.overfitMeasuredGenerationRate = overfitMeasuredGenerationRate
     }
 
     public init?(record: CKRecord) {
@@ -213,6 +221,12 @@ public struct RelayModelRecord: Sendable {
         self.health = health
         self.lastChecked = record["lastChecked"] as? Date
         self.version = version
+        self.overfitClassification = record["overfitClassification"] as? String
+        if let rate = record["overfitMeasuredGenerationRate"] as? NSNumber {
+            self.overfitMeasuredGenerationRate = rate.doubleValue
+        } else {
+            self.overfitMeasuredGenerationRate = nil
+        }
     }
 
     public func apply(to record: CKRecord) {
@@ -250,6 +264,16 @@ public struct RelayModelRecord: Sendable {
         record["health"] = health.rawValue as CKRecordValue
         record["lastChecked"] = lastChecked
         record["version"] = version as CKRecordValue
+        if let overfitClassification {
+            record["overfitClassification"] = overfitClassification as CKRecordValue
+        } else {
+            record["overfitClassification"] = nil
+        }
+        if let overfitMeasuredGenerationRate {
+            record["overfitMeasuredGenerationRate"] = NSNumber(value: overfitMeasuredGenerationRate)
+        } else {
+            record["overfitMeasuredGenerationRate"] = nil
+        }
     }
 }
 

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>ai.noema.NoemaMCPHost</string>
+    <key>CFBundleName</key><string>NoemaMCPHost</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright © Noema</string>
+    <key>XPCService</key><dict><key>ServiceType</key><string>Application</string></dict>
+</dict>
+</plist>

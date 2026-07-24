@@ -3,6 +3,7 @@ import SwiftUI
 struct EmbeddingModelsView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var downloadController: DownloadController
+    @ObservedObject private var presentationUpdates = DownloadPresentationUpdates.shared
     @EnvironmentObject private var datasetManager: DatasetManager
     @State private var pendingSelection: EmbeddingModelRecord?
     @State private var showSelectionConfirmation = false
@@ -14,8 +15,17 @@ struct EmbeddingModelsView: View {
     @State private var showDeleteError = false
     @State private var refreshToken = UUID()
     @State private var searchText = ""
+    // Installed-state is `FileManager.fileExists` (synchronous main-thread disk I/O).
+    // Calling it per row on every body eval pegged the main thread at the controller's
+    // 5 Hz download cadence — on a disk already busy writing the download, those stat()
+    // calls block and the app/VoiceOver freezes and overheats. Snapshot once at init and
+    // refresh only when availability actually changes (download completes / model deleted).
+    @State private var installedRecordIDs: Set<String> = Set(
+        EmbeddingModelCatalog.records.filter(\.isInstalled).map(\.id)
+    )
 #if os(macOS)
     @State private var selectedDetailRecord: EmbeddingModelRecord?
+    @State private var macContentAppeared = false
 #endif
 
     private var activeRecord: EmbeddingModelRecord {
@@ -24,7 +34,7 @@ struct EmbeddingModelsView: View {
     }
 
     private var activeRecordIsInstalled: Bool {
-        activeRecord.isInstalled
+        installedRecordIDs.contains(activeRecord.id)
     }
 
     private var filteredRecords: [EmbeddingModelRecord] {
@@ -32,15 +42,21 @@ struct EmbeddingModelsView: View {
     }
 
     private var installedRecords: [EmbeddingModelRecord] {
-        filteredRecords.filter(\.isInstalled)
+        filteredRecords.filter { installedRecordIDs.contains($0.id) }
     }
 
     private var availableRecords: [EmbeddingModelRecord] {
-        filteredRecords.filter { $0.isInstallable && !$0.isInstalled }
+        filteredRecords.filter { $0.isInstallable && !installedRecordIDs.contains($0.id) }
     }
 
     private var unavailableRecords: [EmbeddingModelRecord] {
         filteredRecords.filter { !$0.isInstallable }
+    }
+
+    /// Re-snapshots installed-state from disk. Called only when availability changes
+    /// (download completes / model deleted), never per render.
+    private func refreshInstalledRecordIDs() {
+        installedRecordIDs = Set(EmbeddingModelCatalog.records.filter(\.isInstalled).map(\.id))
     }
 
     private var hasVisibleRows: Bool {
@@ -59,6 +75,29 @@ struct EmbeddingModelsView: View {
                 macSearchField
 #endif
 
+#if os(macOS)
+                // Mount the card list one tick after the push so the submenu
+                // animation stays clean, then fade it in.
+                if macContentAppeared {
+                    Group {
+                        if !activeRecordIsInstalled {
+                            activeMissingBanner
+                        }
+
+                        if hasVisibleRows {
+                            modelSection(title: "Downloaded", records: installedRecords)
+                            if !installedRecords.isEmpty {
+                                indexRebuildNotice
+                            }
+                            modelSection(title: "Available", records: availableRecords)
+                            modelSection(title: "Unavailable", records: unavailableRecords)
+                        } else if !trimmedSearchText.isEmpty {
+                            emptySearchResults
+                        }
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.99, anchor: .top)))
+                }
+#else
                 if !activeRecordIsInstalled {
                     activeMissingBanner
                 }
@@ -73,6 +112,7 @@ struct EmbeddingModelsView: View {
                 } else if !trimmedSearchText.isEmpty {
                     emptySearchResults
                 }
+#endif
             }
             .padding(.horizontal, 20)
             .padding(.top, 18)
@@ -81,6 +121,11 @@ struct EmbeddingModelsView: View {
         .background(AppTheme.windowBackground.ignoresSafeArea())
 #if os(macOS)
         .frame(minWidth: 560, minHeight: 520)
+        .task {
+            guard !macContentAppeared else { return }
+            await Task.yield()
+            withAnimation(AppMotion.submenu) { macContentAppeared = true }
+        }
         .sheet(item: $selectedDetailRecord) { record in
             EmbeddingModelDetailView(recordID: record.id)
                 .environmentObject(downloadController)
@@ -91,8 +136,10 @@ struct EmbeddingModelsView: View {
         .navigationBarTitleDisplayMode(.large)
         .searchable(text: $searchText, prompt: Text(LocalizedStringKey("Search embedding models")))
 #endif
+        .onAppear { refreshInstalledRecordIDs() }
         .onReceive(NotificationCenter.default.publisher(for: .embeddingModelAvailabilityChanged)) { _ in
             refreshToken = UUID()
+            refreshInstalledRecordIDs()
             datasetManager.reloadFromDisk()
         }
         .confirmationDialog(
@@ -160,22 +207,16 @@ struct EmbeddingModelsView: View {
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(LocalizedStringKey("Embedding Models"))
-                    .font(.system(size: 24, weight: .semibold))
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(AppTheme.text)
                 Text(LocalizedStringKey("Dataset search quality and indexing"))
-                    .font(.system(size: 14))
-                    .foregroundStyle(AppTheme.secondaryText)
+                    .industrialStat()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button {
+            IndustrialIconButton(systemImage: "xmark", help: LocalizedStringKey("Close")) {
                 dismiss()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 28, height: 28)
             }
-            .buttonStyle(.bordered)
             .accessibilityLabel(LocalizedStringKey("Close"))
         }
     }
@@ -184,7 +225,7 @@ struct EmbeddingModelsView: View {
     private var macSearchField: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 15, weight: .medium))
+                .font(.system(size: catalogSearchIconSize, weight: .medium))
                 .foregroundStyle(AppTheme.secondaryText)
                 .frame(width: 18)
 
@@ -203,13 +244,13 @@ struct EmbeddingModelsView: View {
                 .accessibilityLabel(LocalizedStringKey("Clear"))
             }
         }
-        .padding(.horizontal, 13)
+        .padding(.horizontal, catalogSearchFieldHorizontalPadding)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(cardBackground, in: RoundedRectangle(cornerRadius: catalogSearchFieldCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.04), lineWidth: 1)
+            RoundedRectangle(cornerRadius: catalogSearchFieldCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(catalogCardStrokeOpacity), lineWidth: 1)
         )
     }
 #endif
@@ -238,7 +279,7 @@ struct EmbeddingModelsView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous))
     }
 
     @ViewBuilder
@@ -274,17 +315,21 @@ struct EmbeddingModelsView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous))
     }
 
     @ViewBuilder
     private func modelSection(title: String, records: [EmbeddingModelRecord]) -> some View {
         if !records.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
+#if os(macOS)
+                IndustrialSectionHeader(LocalizedStringKey(title), detail: "\(records.count)")
+#else
                 Text(LocalizedStringKey(title))
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(AppTheme.secondaryText)
                     .padding(.horizontal, 4)
+#endif
 
                 ForEach(records) { record in
                     modelCard(for: record)
@@ -297,7 +342,7 @@ struct EmbeddingModelsView: View {
 
     @ViewBuilder
     private func modelCard(for record: EmbeddingModelRecord) -> some View {
-        let installed = record.isInstalled
+        let installed = installedRecordIDs.contains(record.id)
         let isActive = record.id == activeRecord.id
         let item = downloadController.embeddingItems.first { $0.id == record.id }
         let state = rowState(record: record, installed: installed, isActive: isActive, item: item)
@@ -318,6 +363,9 @@ struct EmbeddingModelsView: View {
 #endif
         }
         .buttonStyle(.plain)
+        // Express selection on exactly the active+installed model. Not-downloaded
+        // models can never be active, so they never read as "Selected."
+        .accessibilityAddTraits(installed && isActive ? .isSelected : [])
         .contextMenu {
             contextActions(record: record, installed: installed, isActive: isActive, item: item)
         }
@@ -357,7 +405,7 @@ struct EmbeddingModelsView: View {
                     .padding(.leading, 42)
 
                 if let item, item.status != .completed {
-                    downloadProgressView(item: item)
+                    EmbeddingDownloadProgressRow(item: item)
                         .padding(.leading, 42)
                 }
 
@@ -370,20 +418,27 @@ struct EmbeddingModelsView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
+#if os(macOS)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.primary.opacity(0.3))
+                .padding(.top, 8)
+#else
             Image(systemName: "chevron.right")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(Color.primary.opacity(0.22))
                 .padding(.top, 32)
+#endif
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background(cardBackground, in: RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(Color.primary.opacity(0.04), lineWidth: 1)
+            RoundedRectangle(cornerRadius: catalogCardCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(catalogCardStrokeOpacity), lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(0.035), radius: 12, x: 0, y: 5)
+        .shadow(color: Color.black.opacity(catalogCardShadowOpacity), radius: 12, x: 0, y: 5)
     }
 
     @ViewBuilder
@@ -420,38 +475,39 @@ struct EmbeddingModelsView: View {
                 Image(systemName: "checkmark")
                     .font(.system(size: 15, weight: .bold))
                     .foregroundStyle(.white)
+                    .accessibilityHidden(true)
             case .installed:
                 Image(systemName: "checkmark.circle")
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(.blue)
             case .downloading:
                 Image(systemName: "arrow.down.circle")
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(.blue)
             case .paused:
                 Image(systemName: "pause.circle")
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(.orange)
             case .notDownloaded:
                 Image(systemName: "arrow.down.circle")
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(AppTheme.secondaryText)
             case .gated:
                 Image(systemName: "lock.circle")
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(.orange)
             case .unsupported:
                 Image(systemName: "exclamationmark.circle")
-                    .font(.system(size: 27, weight: .medium))
+                    .font(.system(size: catalogStatusIconSize, weight: .medium))
                     .foregroundStyle(.orange)
             }
         }
-        .frame(width: 28, height: 28)
+        .frame(width: catalogStatusIconFrame, height: catalogStatusIconFrame)
     }
 
     private var cardBackground: Color {
 #if os(macOS)
-        Color(nsColor: .controlBackgroundColor)
+        Color.primary.opacity(0.035)
 #else
         Color(uiColor: .secondarySystemGroupedBackground)
 #endif
@@ -494,26 +550,6 @@ struct EmbeddingModelsView: View {
             }
         }
         .lineLimit(1)
-    }
-
-    @ViewBuilder
-    private func downloadProgressView(item: DownloadController.EmbeddingItem) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ProgressView(value: item.progress)
-            HStack(spacing: 8) {
-                Text(LocalizedStringKey(item.status.statusLabelKey))
-                    .font(FontTheme.caption)
-                    .foregroundStyle(AppTheme.secondaryText)
-                Text("\(Int(item.progress * 100))%")
-                    .font(FontTheme.caption)
-                    .foregroundStyle(AppTheme.secondaryText)
-                if item.speed > 0 {
-                    Text(formatSpeed(item.speed))
-                        .font(FontTheme.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
-            }
-        }
     }
 
     @ViewBuilder
@@ -628,6 +664,9 @@ struct EmbeddingModelsView: View {
 
     @ViewBuilder
     private func badge(_ text: String, color: Color) -> some View {
+#if os(macOS)
+        IndustrialBadge(verbatim: text, tint: color)
+#else
         Text(text)
             .font(FontTheme.caption)
             .fontWeight(.medium)
@@ -636,10 +675,24 @@ struct EmbeddingModelsView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(color.opacity(0.12), in: Capsule())
+#endif
     }
 
     @ViewBuilder
     private func detailChip(label: String) -> some View {
+#if os(macOS)
+        Text(label)
+            .textCase(.uppercase)
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.primary.opacity(0.5))
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.primary.opacity(0.05))
+            )
+#else
         Text(label)
             .font(FontTheme.caption)
             .foregroundStyle(AppTheme.secondaryText)
@@ -647,6 +700,7 @@ struct EmbeddingModelsView: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(Color.primary.opacity(0.06), in: Capsule())
+#endif
     }
 
     // MARK: - Actions
@@ -794,18 +848,11 @@ struct EmbeddingModelsView: View {
         formatter.allowedUnits = bytes >= 1_000_000_000 ? [.useGB] : [.useMB]
         return formatter.string(fromByteCount: bytes)
     }
-
-    private func formatSpeed(_ bytesPerSec: Double) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowedUnits = bytesPerSec >= 1_000_000 ? [.useMB] : [.useKB]
-        let bytesString = formatter.string(fromByteCount: Int64(bytesPerSec))
-        return String.localizedStringWithFormat(String(localized: "%@/s"), bytesString)
-    }
 }
 
 private struct EmbeddingModelDetailView: View {
     @EnvironmentObject private var downloadController: DownloadController
+    @ObservedObject private var presentationUpdates = DownloadPresentationUpdates.shared
     @EnvironmentObject private var datasetManager: DatasetManager
     @Environment(\.dismiss) private var dismiss
     let recordID: String
@@ -900,22 +947,7 @@ private struct EmbeddingModelDetailView: View {
 
             if let item, item.status != .completed {
                 Section {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ProgressView(value: item.progress)
-                        HStack(spacing: 8) {
-                            Text(LocalizedStringKey(item.status.statusLabelKey))
-                                .font(FontTheme.caption)
-                                .foregroundStyle(AppTheme.secondaryText)
-                            Text("\(Int(item.progress * 100))%")
-                                .font(FontTheme.caption)
-                                .foregroundStyle(AppTheme.secondaryText)
-                            if item.speed > 0 {
-                                Text(formatSpeed(item.speed))
-                                    .font(FontTheme.caption)
-                                    .foregroundStyle(AppTheme.secondaryText)
-                            }
-                        }
-                    }
+                    EmbeddingDownloadProgressRow(item: item)
                 }
             }
 
@@ -1006,14 +1038,9 @@ private struct EmbeddingModelDetailView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button {
+            IndustrialIconButton(systemImage: "xmark", help: LocalizedStringKey("Close")) {
                 dismiss()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 28, height: 28)
             }
-            .buttonStyle(.bordered)
             .accessibilityLabel(LocalizedStringKey("Close"))
         }
     }
@@ -1042,7 +1069,11 @@ private struct EmbeddingModelDetailView: View {
                     } label: {
                         Label(LocalizedStringKey("Use Model"), systemImage: "checkmark.circle")
                     }
+#if os(macOS)
+                    .buttonStyle(.industrial(.tinted))
+#else
                     .buttonStyle(GlassButtonStyle())
+#endif
                 }
 
                 Button(role: .destructive) {
@@ -1051,36 +1082,56 @@ private struct EmbeddingModelDetailView: View {
                 } label: {
                     Label(LocalizedStringKey("Delete"), systemImage: "trash")
                 }
+#if os(macOS)
+                .buttonStyle(.industrial(.destructive))
+#else
                 .buttonStyle(.borderless)
                 .tint(.red)
+#endif
             } else if let item, item.canResume {
                 Button {
                     downloadController.resume(itemID: item.id)
                 } label: {
                     Label(LocalizedStringKey("Resume"), systemImage: "play.fill")
                 }
+#if os(macOS)
+                .buttonStyle(.industrial(.tinted))
+#else
                 .buttonStyle(GlassButtonStyle())
+#endif
 
                 Button(role: .cancel) {
                     downloadController.cancel(itemID: record.id)
                 } label: {
                     Label(LocalizedStringKey("Cancel"), systemImage: "xmark.circle")
                 }
+#if os(macOS)
+                .buttonStyle(.industrial(.quiet))
+#else
                 .buttonStyle(.borderless)
+#endif
             } else if item != nil {
                 Button(role: .cancel) {
                     downloadController.cancel(itemID: record.id)
                 } label: {
                     Label(LocalizedStringKey("Cancel Download"), systemImage: "xmark.circle")
                 }
+#if os(macOS)
+                .buttonStyle(.industrial(.quiet))
+#else
                 .buttonStyle(.borderless)
+#endif
             } else if record.isInstallable {
                 Button {
                     requestDownload(record)
                 } label: {
                     Label(LocalizedStringKey("Download"), systemImage: "arrow.down.circle.fill")
                 }
+#if os(macOS)
+                .buttonStyle(.industrial(.prominent))
+#else
                 .buttonStyle(GlassButtonStyle())
+#endif
             } else {
                 Text(LocalizedStringKey("Not available in this build"))
                     .font(FontTheme.caption)
@@ -1271,13 +1322,17 @@ private struct EmbeddingModelDetailView: View {
         formatter.allowedUnits = bytes >= 1_000_000_000 ? [.useGB] : [.useMB]
         return formatter.string(fromByteCount: bytes)
     }
+}
 
-    private func formatSpeed(_ bytesPerSec: Double) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowedUnits = bytesPerSec >= 1_000_000 ? [.useMB] : [.useKB]
-        let bytesString = formatter.string(fromByteCount: Int64(bytesPerSec))
-        return String.localizedStringWithFormat(String(localized: "%@/s"), bytesString)
+private struct EmbeddingDownloadProgressRow: View {
+    let item: DownloadController.EmbeddingItem
+
+    var body: some View {
+        DownloadProgressCluster(
+            progress: item.progress,
+            speed: item.speed,
+            statusKey: item.status == .downloading ? nil : LocalizedStringKey(item.status.statusLabelKey)
+        )
     }
 }
 
@@ -1341,3 +1396,23 @@ private struct FlowMetadata: View {
         }
     }
 }
+
+#if os(macOS)
+private let catalogCardCornerRadius: CGFloat = 8
+private let catalogCardStrokeOpacity: Double = 0.08
+private let catalogCardShadowOpacity: Double = 0
+private let catalogStatusIconSize: CGFloat = 16
+private let catalogStatusIconFrame: CGFloat = 20
+private let catalogSearchFieldCornerRadius: CGFloat = 6
+private let catalogSearchIconSize: CGFloat = 12
+private let catalogSearchFieldHorizontalPadding: CGFloat = 10
+#else
+private let catalogCardCornerRadius: CGFloat = 22
+private let catalogCardStrokeOpacity: Double = 0.04
+private let catalogCardShadowOpacity: Double = 0.035
+private let catalogStatusIconSize: CGFloat = 27
+private let catalogStatusIconFrame: CGFloat = 28
+private let catalogSearchFieldCornerRadius: CGFloat = 14
+private let catalogSearchIconSize: CGFloat = 15
+private let catalogSearchFieldHorizontalPadding: CGFloat = 13
+#endif

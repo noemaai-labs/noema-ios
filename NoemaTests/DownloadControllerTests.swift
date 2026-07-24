@@ -32,6 +32,82 @@ final class DownloadControllerTests: XCTestCase {
         )
     }
 
+    func testRelaunchProgressUsesOnlyDurableBytes() {
+        XCTAssertEqual(
+            DownloadController.recoveredArtifactByteCount(
+                state: .downloading,
+                persistedBytes: 970,
+                stagingBytes: nil,
+                hasFinalFile: false,
+                hasLiveTask: false,
+                hasResumeData: false
+            ),
+            0
+        )
+        XCTAssertEqual(
+            DownloadController.recoveredArtifactByteCount(
+                state: .downloading,
+                persistedBytes: 970,
+                stagingBytes: 640,
+                hasFinalFile: false,
+                hasLiveTask: false,
+                hasResumeData: false
+            ),
+            640
+        )
+        XCTAssertNil(
+            DownloadController.recoveredArtifactByteCount(
+                state: .downloading,
+                persistedBytes: 970,
+                stagingBytes: nil,
+                hasFinalFile: false,
+                hasLiveTask: true,
+                hasResumeData: false
+            )
+        )
+        XCTAssertNil(
+            DownloadController.recoveredArtifactByteCount(
+                state: .downloading,
+                persistedBytes: 970,
+                stagingBytes: nil,
+                hasFinalFile: false,
+                hasLiveTask: false,
+                hasResumeData: true
+            )
+        )
+        XCTAssertNil(
+            DownloadController.recoveredArtifactByteCount(
+                state: .completed,
+                persistedBytes: 1_000,
+                stagingBytes: nil,
+                hasFinalFile: true,
+                hasLiveTask: false,
+                hasResumeData: false
+            )
+        )
+    }
+
+    func testOrphanedModelCompletionResumesCanonicalFinalizer() {
+        XCTAssertTrue(
+            DownloadController.requiresCanonicalModelFinalization(
+                state: .finalizing,
+                allArtifactsCompleted: true
+            )
+        )
+        XCTAssertTrue(
+            DownloadController.requiresCanonicalModelFinalization(
+                state: .verifying,
+                allArtifactsCompleted: false
+            )
+        )
+        XCTAssertFalse(
+            DownloadController.requiresCanonicalModelFinalization(
+                state: .completed,
+                allArtifactsCompleted: true
+            )
+        )
+    }
+
     func testAggregateModelProgressUsesInMemoryArtifactBytes() {
         let progress = DownloadController.aggregateModelProgress(
             mainWritten: 4_000,
@@ -79,6 +155,8 @@ final class DownloadControllerTests: XCTestCase {
 
         XCTAssertTrue(job.canResume)
         XCTAssertFalse(job.canPause)
+        XCTAssertTrue(DownloadJobState.queued.autoResumeEligible)
+        XCTAssertTrue(DownloadJobState.preparing.autoResumeEligible)
         XCTAssertFalse(DownloadJobState.scheduled.autoResumeEligible)
         XCTAssertEqual(DownloadJobState.scheduled.statusLabelKey, "Download Status Scheduled")
     }
@@ -362,6 +440,86 @@ final class DownloadControllerTests: XCTestCase {
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: stagingURL.path))
         XCTAssertEqual(result.removedOrphanFiles, 0)
+        await DownloadEngine.shared.removeJob(externalID: externalID)
+    }
+
+    @MainActor
+    func testDownloadMaintenancePreservesFinalizingJobForRelaunchRecovery() async throws {
+        try await removeAllDownloadJobs()
+        let controller = DownloadController()
+        let externalID = "noema-tests-finalizing-\(UUID().uuidString)"
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NoemaFinalizingRecoveryTests-\(UUID().uuidString)", isDirectory: true)
+        let finalURL = root.appendingPathComponent("model.bin")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            Task { await DownloadEngine.shared.removeJob(externalID: externalID) }
+            _ = controller
+        }
+
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(repeating: 0x2A, count: 10).write(to: finalURL)
+        _ = await DownloadEngine.shared.upsertJob(
+            owner: .embedding(EmbeddingDownloadOwner(repoID: externalID)),
+            artifacts: [makeDownloadArtifact(id: "main", finalURL: finalURL, state: .completed)],
+            state: .finalizing
+        )
+
+        let result = await controller.runDownloadMaintenance(manual: true, force: true)
+        let recoveredJob = await DownloadEngine.shared.job(forExternalID: externalID)
+
+        XCTAssertNotNil(recoveredJob)
+        XCTAssertEqual(recoveredJob?.state, .finalizing)
+        XCTAssertEqual(result.removedJobs, 0)
+        await DownloadEngine.shared.removeJob(externalID: externalID)
+    }
+
+    @MainActor
+    func testDownloadMaintenanceRoutesRecoveredModelThroughCanonicalFinalizer() async throws {
+        try await removeAllDownloadJobs()
+        let controller = DownloadController()
+        let modelID = "noema/tests/recovered-final-\(UUID().uuidString)"
+        let externalID = "\(modelID)-Q4_K_M"
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NoemaRecoveredModelTests-\(UUID().uuidString)", isDirectory: true)
+        let finalURL = root.appendingPathComponent("model.gguf")
+        let quant = QuantInfo(
+            label: "Q4_K_M",
+            format: .gguf,
+            sizeBytes: 10,
+            downloadURL: URL(string: "https://example.com/model.gguf")!,
+            sha256: nil,
+            configURL: nil
+        )
+        let detail = ModelDetails(
+            id: modelID,
+            summary: "Recovered model finalization test",
+            quants: [quant],
+            promptTemplate: nil
+        )
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            Task { await DownloadEngine.shared.removeJob(externalID: externalID) }
+            _ = controller
+        }
+
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(repeating: 0x2A, count: 10).write(to: finalURL)
+        _ = await DownloadEngine.shared.upsertJob(
+            owner: .model(ModelDownloadOwner(detail: detail, quant: quant)),
+            artifacts: [makeDownloadArtifact(id: "main", finalURL: finalURL, state: .downloading)],
+            state: .downloading
+        )
+
+        let result = await controller.runDownloadMaintenance(manual: true, force: true)
+        let maybeRecoveredJob = await DownloadEngine.shared.job(forExternalID: externalID)
+        let recoveredJob = try XCTUnwrap(maybeRecoveredJob)
+
+        XCTAssertEqual(recoveredJob.state, .finalizing)
+        XCTAssertTrue(recoveredJob.artifacts.allSatisfy { $0.state == .completed })
+        XCTAssertEqual(result.repairedArtifacts, 1)
+        XCTAssertEqual(result.repairedCompletions, 0)
+        XCTAssertEqual(result.removedJobs, 0)
         await DownloadEngine.shared.removeJob(externalID: externalID)
     }
 

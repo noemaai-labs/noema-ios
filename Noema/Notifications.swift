@@ -1,4 +1,3 @@
-// Notifications.swift
 import Foundation
 
 extension Notification.Name {

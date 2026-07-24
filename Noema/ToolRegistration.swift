@@ -1,4 +1,3 @@
-// ToolRegistration.swift
 import Foundation
 
 // MARK: - Tool Registration and Initialization
@@ -18,19 +17,34 @@ public final class ToolRegistrar {
         
         await logger.log("[ToolRegistrar] Initializing tools...")
         
-        // Register web search tool
         await registerWebSearchTool()
 
-        // Register Python code execution tool
         await registerPythonTool()
 
-        // Register persistent memory tool
         await registerMemoryTool()
 
         // Register deterministic local tools
         await registerCalculatorTool()
         await registerUnitConverterTool()
-        
+
+        // Register on-device dataset (RAG) search
+        await registerDatasetSearchTool()
+
+        // PDF navigation is local and shared by every app target.
+        await registerPDFReadTool()
+
+        #if os(macOS)
+        ToolRegistry.shared.register(MCPFindTool())
+        ToolRegistry.shared.register(MCPCallTool())
+        #endif
+
+        // Register calendar (read + confirm-to-create)
+        await registerCalendarTools()
+
+        await registerChartTool()
+
+        await registerPhoneAFriendTool()
+
         isInitialized = true
         await logger.log("[ToolRegistrar] Tool initialization complete. Registered tools: \(ToolRegistry.shared.registeredToolNames)")
     }
@@ -63,6 +77,34 @@ public final class ToolRegistrar {
         let unitConverterTool = UnitConverterTool()
         ToolRegistry.shared.register(unitConverterTool)
         await logger.log("[ToolRegistrar] Registered UnitConverterTool")
+    }
+
+    private func registerDatasetSearchTool() async {
+        let datasetSearchTool = DatasetSearchTool()
+        ToolRegistry.shared.register(datasetSearchTool)
+        await logger.log("[ToolRegistrar] Registered DatasetSearchTool (noema.rag.search)")
+    }
+
+    private func registerPDFReadTool() async {
+        let pdfReadTool = PDFReadTool()
+        ToolRegistry.shared.register(pdfReadTool)
+        await logger.log("[ToolRegistrar] Registered PDFReadTool (noema.pdf.read)")
+    }
+
+    private func registerCalendarTools() async {
+        ToolRegistry.shared.register(CalendarEventsTool())
+        ToolRegistry.shared.register(CalendarAddEventTool())
+        await logger.log("[ToolRegistrar] Registered Calendar tools (events, addEvent)")
+    }
+
+    private func registerChartTool() async {
+        ToolRegistry.shared.register(ChartRenderTool())
+        await logger.log("[ToolRegistrar] Registered ChartRenderTool (noema.chart.render)")
+    }
+
+    private func registerPhoneAFriendTool() async {
+        ToolRegistry.shared.register(PhoneAFriendTool())
+        await logger.log("[ToolRegistrar] Registered PhoneAFriendTool (noema.assist.handoff)")
     }
 }
 
@@ -97,6 +139,10 @@ public struct ToolConfiguration {
     public let webSearchEnabled: Bool
     public let pythonEnabled: Bool
     public let memoryEnabled: Bool
+    public let datasetSearchEnabled: Bool
+    public let chartEnabled: Bool
+    public let pdfReadEnabled: Bool
+    public let calendarEnabled: Bool
     public let offlineMode: Bool
     public let maxToolTurns: Int
     public let toolTimeout: TimeInterval
@@ -105,6 +151,10 @@ public struct ToolConfiguration {
         webSearchEnabled: Bool = true,
         pythonEnabled: Bool = true,
         memoryEnabled: Bool = true,
+        datasetSearchEnabled: Bool = true,
+        chartEnabled: Bool = true,
+        pdfReadEnabled: Bool = true,
+        calendarEnabled: Bool = true,
         offlineMode: Bool = false,
         maxToolTurns: Int = 4,
         toolTimeout: TimeInterval = 30.0
@@ -112,6 +162,10 @@ public struct ToolConfiguration {
         self.webSearchEnabled = webSearchEnabled
         self.pythonEnabled = pythonEnabled
         self.memoryEnabled = memoryEnabled
+        self.datasetSearchEnabled = datasetSearchEnabled
+        self.chartEnabled = chartEnabled
+        self.pdfReadEnabled = pdfReadEnabled
+        self.calendarEnabled = calendarEnabled
         self.offlineMode = offlineMode
         self.maxToolTurns = maxToolTurns
         self.toolTimeout = toolTimeout
@@ -127,6 +181,14 @@ public struct ToolConfiguration {
         let webSearchEnabled = defaults.object(forKey: "webSearchEnabled") as? Bool ?? true
         let pythonEnabled = defaults.object(forKey: "pythonEnabled") as? Bool ?? true
         let memoryEnabled = defaults.object(forKey: "memoryEnabled") as? Bool ?? true
+        let datasetSearchEnabled = defaults.object(forKey: "datasetSearchToolEnabled") as? Bool ?? true
+        let chartEnabled = defaults.object(forKey: "chartToolEnabled") as? Bool ?? true
+        // Automatic on every app target: executable only while the active chat
+        // dataset contains a PDF, gated by the optional master toggle. There is
+        // no context-bar chip.
+        let pdfReadEnabled = (defaults.object(forKey: "pdfToolEnabled") as? Bool ?? true)
+            && (defaults.object(forKey: "pdfToolPresent") as? Bool ?? false)
+        let calendarEnabled = defaults.object(forKey: "calendarToolEnabled") as? Bool ?? true
         let offlineMode = defaults.object(forKey: "offGrid") as? Bool ?? false
         let maxToolTurns = defaults.object(forKey: "maxToolTurns") as? Int ?? 4
         let toolTimeout = defaults.object(forKey: "toolTimeout") as? TimeInterval ?? 30.0
@@ -135,6 +197,10 @@ public struct ToolConfiguration {
             webSearchEnabled: webSearchEnabled,
             pythonEnabled: pythonEnabled,
             memoryEnabled: memoryEnabled,
+            datasetSearchEnabled: datasetSearchEnabled,
+            chartEnabled: chartEnabled,
+            pdfReadEnabled: pdfReadEnabled,
+            calendarEnabled: calendarEnabled,
             offlineMode: offlineMode,
             maxToolTurns: maxToolTurns,
             toolTimeout: toolTimeout
@@ -204,6 +270,29 @@ public final class ToolManager {
         case "noema.math.calculate", "noema.units.convert":
             let registry = await ToolRegistry.shared
             return registry.tool(named: toolName) != nil
+        case PhoneAFriendTool.toolName:
+            // Autopilot phone-a-friend: gated on the Autopilot config, not the
+            // tool toggles. A local escalation target works offline, so this
+            // deliberately skips the offlineMode check for that case.
+            guard PhoneAFriendGate.isAvailable() else { return false }
+            let registry = await ToolRegistry.shared
+            return registry.tool(named: toolName) != nil
+        case "noema.rag.search", "noema.pdf.read", "noema.calendar.events", "noema.calendar.addEvent", "noema.chart.render":
+            // On-device retrieval / PDF reading / calendar / charts — fully local, so they
+            // stay available in offline mode. Each honors its master toggle; calendar access
+            // is additionally gated by the OS permission prompt, and the create tool requires
+            // explicit user confirmation.
+            let enabled: Bool
+            switch toolName {
+            case "noema.rag.search": enabled = configuration.datasetSearchEnabled
+            case "noema.pdf.read": enabled = configuration.pdfReadEnabled
+            case "noema.chart.render": enabled = configuration.chartEnabled
+            case "noema.calendar.events", "noema.calendar.addEvent": enabled = configuration.calendarEnabled
+            default: enabled = true
+            }
+            guard enabled else { return false }
+            let registry = await ToolRegistry.shared
+            return registry.tool(named: toolName) != nil
         default:
             guard !configuration.offlineMode else { return false }
             let registry = await ToolRegistry.shared
@@ -238,21 +327,6 @@ extension ChatVM {
         }
     }
 
-    func runToolEnabledGeneration(prompt: String) async throws -> String {
-        // This would integrate with the existing ChatVM to use tools
-        var messages = [
-            ToolChatMessage.system("You are a helpful assistant with access to tools."),
-            ToolChatMessage.user(prompt)
-        ]
-
-        // Get the current backend and create a tool-capable version
-        // This would need to be integrated with the existing backend system
-
-        await logger.log("[ChatVM] Running tool-enabled generation for: \(prompt.prefix(100))...")
-
-        // For now, return a placeholder
-        return "Tool-enabled generation not yet integrated with ChatVM"
-    }
 }
 #elseif os(macOS)
 extension ChatVM {

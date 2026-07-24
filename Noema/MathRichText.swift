@@ -1,11 +1,3 @@
-// MathRichText.swift
-//  MathRichText.swift
-//  Noema
-//
-//  Renders mixed text with inline and block LaTeX using MathTokenizer and
-//  SwiftMath-backed views. Keeps baseline alignment for inline math and flows
-//  across lines.
-
 import SwiftUI
 import Foundation
 
@@ -48,6 +40,20 @@ extension EnvironmentValues {
         set { self[MessageHoverCopySuppressionKey.self] = newValue }
     }
 }
+
+private struct StreamTokenFadeInKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    /// Armed only inside the live streaming bubble (ActiveStreamingMessageView),
+    /// so newly appended tokens fade in while finished rows keep rendering
+    /// statically at zero extra cost.
+    var streamTokenFadeIn: Bool {
+        get { self[StreamTokenFadeInKey.self] }
+        set { self[StreamTokenFadeInKey.self] = newValue }
+    }
+}
 #if os(macOS)
 import AppKit
 #endif
@@ -65,6 +71,7 @@ struct MathRichText: View {
 #if os(macOS)
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.messageHoverCopySuppression) private var messageHoverCopySuppression
+    @Environment(\.streamTokenFadeIn) private var streamTokenFadeIn
 #endif
 
     init(source: String, bodyFont: Font = .body, bodyPointSize: CGFloat? = nil,
@@ -97,7 +104,9 @@ struct MathRichText: View {
             bodyWeight: macFontWeight(from: bodyWeight),
             blockMathFontSize: blockMathStyle.fontSize,
             isDark: colorScheme == .dark,
-            messageHoverCopySuppression: messageHoverCopySuppression
+            messageHoverCopySuppression: messageHoverCopySuppression,
+            fadeAppendedText: streamTokenFadeIn
+                && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         )
         .equatable()
 #else
@@ -209,10 +218,7 @@ private struct InlineLine: View {
 
     var body: some View {
         // Wrap inline runs naturally across lines using Text + inline images/views
-        // We compose as HStack with text wrapping via flexible Text segments
-        // and InlineMathView kept small enough to fit within line height.
         // SwiftUI doesn't allow inline baseline directly in Text; we approximate with alignment guides.
-        // We split consecutive text tokens to reduce view count.
         let runs = mergeText(tokens)
         WrappedInline(runs: runs, font: bodyFont, fontSize: inlineSize)
     }
@@ -426,17 +432,38 @@ private struct WrappedInline: View {
                     }
                 }
                 // Streaming polish: appended fragments are *inserted* views
-                // (stable offsets for the prefix), so they fade in whenever the
-                // update runs inside an animated transaction — which only the
-                // live streaming bubble provides (see ActiveStreamingMessageView).
-                // Static messages render without a transaction: zero cost.
+                // (stable offsets for the prefix). Inside the live streaming
+                // bubble each new fragment fades itself in (StreamFragmentFadeIn)
+                // while the ~30 Hz flush transaction stays non-animated, so the
+                // bubble's layout never animates per flush (a proven jank source
+                // — see ActiveStreamingMessageView). Static messages never arm
+                // the environment flag: zero cost.
                 // Removal is identity so re-splits never leave fading ghosts.
+                .modifier(StreamFragmentFadeIn())
                 .transition(.asymmetric(insertion: .opacity, removal: .identity))
             }
         }
         // Apply base font to the container so inline Markdown keeps its
         // styles but inherits the body size/weight.
         .font(font)
+    }
+}
+
+/// One-shot fade for a newly inserted streaming fragment. Self-contained per
+/// leaf: only the new view animates its own composited opacity (no layout
+/// pass), so the per-flush cost is O(appended fragments), not O(bubble).
+private struct StreamFragmentFadeIn: ViewModifier {
+    @Environment(\.streamTokenFadeIn) private var fadeEnabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var revealed = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(fadeEnabled && !reduceMotion && !revealed ? 0 : 1)
+            .onAppear {
+                guard fadeEnabled, !reduceMotion, !revealed else { return }
+                withAnimation(.easeOut(duration: 0.35)) { revealed = true }
+            }
     }
 }
 

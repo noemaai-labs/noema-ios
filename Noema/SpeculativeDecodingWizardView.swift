@@ -51,9 +51,14 @@ struct SpeculativeDecodingWizardSummaryContent: View {
     }
 
     private var helperReadyCount: Int {
-        ggufModels.filter { model in
+#if os(macOS)
+        // Helper draft models aren't supported by the macOS runtime.
+        return 0
+#else
+        return ggufModels.filter { model in
             !SpeculativeRecommendationEngine.helperCandidates(for: model, among: ggufModels).isEmpty
         }.count
+#endif
     }
 
     private var summaryLine: String {
@@ -93,6 +98,31 @@ struct SpeculativeDecodingWizardView: View {
     }
 
     var body: some View {
+        platformContent
+            .onAppear(perform: ensureSelection)
+            .onReceive(modelManager.$downloadedModels) { _ in ensureSelection() }
+            .onChange(of: selectedModelPath) { _, _ in
+                applyMessage = nil
+                exportError = nil
+                exportURL = nil
+                selectedHelperID = ""
+            }
+    }
+
+    private var platformContent: some View {
+#if os(macOS)
+        // The iOS Form renders badly inside the Mac settings sheet (clipped
+        // labels, wrong insets, stock buttons), and the sheet already supplies
+        // the title + close, so macOS gets the industrial card layout with no
+        // navigationTitle.
+        macBody
+#else
+        formBody
+            .navigationTitle(LocalizedStringKey("Speculative Wizard"))
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             if ggufModels.isEmpty {
                 Section {
@@ -124,16 +154,110 @@ struct SpeculativeDecodingWizardView: View {
                 }
             }
         }
-        .navigationTitle(LocalizedStringKey("Speculative Wizard"))
-        .onAppear(perform: ensureSelection)
-        .onReceive(modelManager.$downloadedModels) { _ in ensureSelection() }
-        .onChange(of: selectedModelPath) { _, _ in
-            applyMessage = nil
-            exportError = nil
-            exportURL = nil
-            selectedHelperID = ""
+    }
+
+#if os(macOS)
+    // MARK: - macOS industrial layout
+
+    private var macBody: some View {
+        MacSettingsPage {
+            if ggufModels.isEmpty {
+                MacSettingsCard(LocalizedStringKey("No GGUF models installed")) {
+                    MacSettingsNoteRow(LocalizedStringKey("Speculative decoding speeds up GGUF models. Install one to choose between a built-in draft head, a smaller helper model, or leaving it off."), divider: false)
+                }
+            } else {
+                MacSettingsCard(LocalizedStringKey("Model")) {
+                    MacSettingsControlRow(LocalizedStringKey("Model"), divider: false) {
+                        Picker(LocalizedStringKey("Model"), selection: selectedPathBinding) {
+                            ForEach(ggufModels, id: \.id) { model in
+                                Text(verbatim: modelLabel(model)).tag(model.url.path)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    MacSettingsNoteRow(LocalizedStringKey("Speculative decoding drafts several tokens with a fast source, then verifies them with this model — keeping quality while improving speed."))
+                }
+
+                if let plan = selectedPlan {
+                    macRecommendationCard(plan)
+                    macDraftSourceCard(plan)
+                    macAdvancedCard(plan)
+                }
+            }
         }
     }
+
+    @ViewBuilder
+    private func macRecommendationCard(_ plan: SpeculativeRecommendationPlan) -> some View {
+        MacSettingsCard(LocalizedStringKey("Recommendation")) {
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Recommended"),
+                value: plan.recommendationTitle,
+                systemImage: plan.recommendationIcon,
+                tint: plan.tint,
+                divider: false
+            )
+            SpecMacNoteRow(text: plan.reason)
+            MacSettingsActionRow {
+                Button {
+                    apply(plan)
+                } label: {
+                    Label(LocalizedStringKey("Apply Recommendation"), systemImage: "checkmark.circle.fill")
+                }
+                .buttonStyle(.industrial(.prominent))
+                .disabled(!plan.canApply)
+            }
+            if let applyMessage {
+                SpecMacNoteRow(text: applyMessage, tint: .green)
+            }
+        }
+    }
+
+    // Helper draft models aren't applied by the macOS runtime, so only the
+    // built-in MTP row is offered here (mirrors the `#if !os(macOS)` gate in
+    // draftSourceSection).
+    private func macDraftSourceCard(_ plan: SpeculativeRecommendationPlan) -> some View {
+        MacSettingsCard(LocalizedStringKey("Draft Source")) {
+            MacSettingsStatusRow(
+                title: LocalizedStringKey("Built-in draft (MTP)"),
+                value: plan.mtpAvailable ? plan.mtpSource : String(localized: "Not available for this model"),
+                systemImage: plan.mtpAvailable ? "bolt.fill" : "bolt.slash",
+                tint: plan.mtpAvailable ? .green : .secondary,
+                divider: false
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func macAdvancedCard(_ plan: SpeculativeRecommendationPlan) -> some View {
+        MacSettingsCard(LocalizedStringKey("Advanced")) {
+            let settings = modelManager.displaySettings(for: plan.target)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Speculative Mode"), value: settings.speculativeDecoding.selection.title, divider: false)
+            MacSettingsKeyValueRow(title: LocalizedStringKey("Helper Model"), value: currentHelperName(settings))
+            MacSettingsKeyValueRow(title: LocalizedStringKey("MTP Draft Tokens"), value: "\(settings.speculativeDecoding.resolvedMTPDraftNMax)")
+            MacSettingsKeyValueRow(title: LocalizedStringKey("MTP Min Draft Tokens"), value: "\(settings.speculativeDecoding.resolvedMTPDraftNMin)")
+            MacSettingsKeyValueRow(title: LocalizedStringKey("MTP Draft P-Min"), value: String(format: "%.2f", settings.speculativeDecoding.resolvedMTPDraftPMin))
+            MacSettingsActionRow {
+                Button {
+                    generateExport(plan)
+                } label: {
+                    Label(LocalizedStringKey("Generate Speculative JSON"), systemImage: "doc.badge.gearshape")
+                }
+                .buttonStyle(.industrial(.tinted))
+
+                if let exportURL {
+                    ShareLink(item: exportURL) {
+                        Label(LocalizedStringKey("Share Speculative JSON"), systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.industrial(.quiet))
+                }
+            }
+            if let exportError {
+                SpecMacNoteRow(text: exportError, tint: .orange)
+            }
+        }
+    }
+#endif
 
     private var selectedPathBinding: Binding<String> {
         Binding(
@@ -221,6 +345,9 @@ struct SpeculativeDecodingWizardView: View {
                 tint: plan.mtpAvailable ? .green : .secondary
             )
 
+            // Helper draft models aren't applied by the macOS runtime, so only MTP is
+            // offered there.
+#if !os(macOS)
             if plan.helperCandidates.isEmpty {
                 SpecCandidateRow(
                     title: LocalizedStringKey("Helper model"),
@@ -248,6 +375,7 @@ struct SpeculativeDecodingWizardView: View {
                     Label(LocalizedStringKey("Use This Helper"), systemImage: "link")
                 }
             }
+#endif
         }
     }
 
@@ -299,6 +427,7 @@ struct SpeculativeDecodingWizardView: View {
         case .mtp:
             settings.speculativeDecoding.selection = .mtp
             settings.speculativeDecoding.helperModelID = nil
+            settings.speculativeDecoding.mtpAutoTune = true
             settings.speculativeDecoding.mtpDraftNMax = 2
             settings.speculativeDecoding.mtpDraftNMin = 0
             settings.speculativeDecoding.mtpDraftPMin = 0.1
@@ -436,6 +565,28 @@ private struct SpecValueRow: View {
     }
 }
 
+#if os(macOS)
+/// Muted mono note in the Mac card dialect for already-localized runtime
+/// strings (recommendation reason, apply/export status). The shared
+/// MacSettingsNoteRow only accepts a LocalizedStringKey, so it can't render
+/// these verbatim values.
+private struct SpecMacNoteRow: View {
+    let text: String
+    var tint: Color = Color.primary.opacity(0.45)
+    var divider: Bool = true
+
+    var body: some View {
+        MacSettingsRowContainer(divider: divider) {
+            Text(verbatim: text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(tint)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+#endif
+
 private struct SpeculativeHelperCandidate: Identifiable {
     let id: String
     let model: LocalModel
@@ -503,7 +654,14 @@ private struct SpeculativeRecommendationPlan {
 
 private enum SpeculativeRecommendationEngine {
     static func plan(for target: LocalModel, among models: [LocalModel]) -> SpeculativeRecommendationPlan {
+#if os(macOS)
+        // Helper draft models aren't applied by the macOS runtime (see the speculative
+        // env setup in Noema.swift), so never recommend or offer one — it would be
+        // persisted and then silently discarded at load time.
+        let helpers: [SpeculativeHelperCandidate] = []
+#else
         let helpers = helperCandidates(for: target, among: models)
+#endif
         let mtp = hasMTP(target)
         let mtpSource = mtpSource(for: target)
 
@@ -561,7 +719,9 @@ private enum SpeculativeRecommendationEngine {
                 candidate.id != target.id &&
                 candidate.format == .gguf &&
                 sizeBytes(candidate) < sizeBytes(target) &&
-                sameFamily(target, candidate)
+                sameFamily(target, candidate) &&
+                // A paged install cannot load resident as the draft.
+                !OverfitPagedInstallCache.isPaged(candidate.url)
             }
             .sorted {
                 let lhsSize = sizeBytes($0)

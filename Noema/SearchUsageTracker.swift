@@ -1,4 +1,3 @@
-// SearchUsageTracker.swift
 import Foundation
 
 @MainActor
@@ -45,7 +44,6 @@ final class SearchUsageTracker: ObservableObject {
         let calendar = Calendar.current
         let now = Date()
         
-        // Check if we need to reset (24 hours have passed)
         if calendar.dateComponents([.day], from: lastResetDate, to: now).day ?? 0 >= 1 {
             resetUsage()
         }
@@ -68,7 +66,6 @@ final class SearchUsageTracker: ObservableObject {
         
         currentUsage = usage.count
         lastResetDate = usage.lastResetDate
-        // Check if we need to reset
         checkAndResetIfNeeded()
         limitReached = currentUsage >= dailyLimit
     }

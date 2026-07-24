@@ -5,9 +5,12 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
+#include "noema_paged_hooks.h"
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -17,6 +20,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <string>
 #include <unordered_set>
 
 // dedup helpers
@@ -60,26 +64,6 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
-
-static ggml_tensor * ggml_mul_mat_aux(
-        ggml_context * ctx,
-        ggml_tensor * cur,
-        ggml_tensor * rot) {
-    const auto n = rot->ne[0];
-
-    ggml_tensor * res;
-
-    if (!ggml_is_contiguous(cur)) {
-        res = ggml_cont_2d   (ctx, cur, n, ggml_nelements(cur)/n);
-    } else {
-        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
-    }
-    res = ggml_mul_mat   (ctx, rot, res);
-    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
-    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-
-    return res;
-}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -486,13 +470,17 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when the graph only stores K/V without attending
+    // (e.g. DFlash's KV-injection pass)
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
-    if (self_k_rot) {
+    if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
 
-    if (self_v_rot) {
+    if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
 }
@@ -564,7 +552,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+        if (self_v_idxs) {
+            mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+        }
     }
 
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
@@ -575,26 +565,28 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+        if (self_v_idxs_swa) {
+            mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+        }
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (self_k_rot) {
+    if (self_k_rot && self_k_rot->buffer) {
         mctx->get_base()->set_input_k_rot(self_k_rot);
     }
 
-    if (self_v_rot) {
+    if (self_v_rot && self_v_rot->buffer) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
     }
 
-    if (self_k_rot_swa) {
+    if (self_k_rot_swa && self_k_rot_swa->buffer) {
         mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
     }
 
-    if (self_v_rot_swa) {
+    if (self_v_rot_swa && self_v_rot_swa->buffer) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
 }
@@ -625,6 +617,305 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
+
+    return res;
+}
+
+static void dsv4_set_i64(ggml_tensor * dst, const std::vector<int64_t> & src) {
+    if (!dst || !dst->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
+    ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
+}
+
+static void dsv4_set_i32(ggml_tensor * dst, const std::vector<int32_t> & src) {
+    if (!dst || !dst->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
+    ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
+}
+
+static void dsv4_set_kq_mask(
+        ggml_tensor * dst,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    if (!dst || !dst->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(n_tokens%n_stream == 0);
+    GGML_ASSERT(dst->ne[0] == plan.n_kv);
+    GGML_ASSERT(dst->ne[1] == (int64_t) n_tokens/n_stream);
+    GGML_ASSERT(dst->ne[2] == 1);
+    GGML_ASSERT(dst->ne[3] == n_stream);
+    GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    if (dst->type == GGML_TYPE_F32) {
+        float * data = (float *) dst->data;
+
+        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+            const int32_t n_visible = plan.n_visible[i];
+
+            for (int64_t j = 0; j < dst->ne[0]; ++j) {
+                data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
+            }
+        }
+    } else if (dst->type == GGML_TYPE_F16) {
+        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+        const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+        const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
+
+        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+            const int32_t n_visible = plan.n_visible[i];
+
+            for (int64_t j = 0; j < dst->ne[0]; ++j) {
+                data[i*dst->ne[0] + j] = j < n_visible ? fp16_zero : fp16_ninf;
+            }
+        }
+    }
+}
+
+static ggml_tensor * dsv4_build_raw_kq_mask(
+        ggml_context * ctx,
+        const llama_kv_cache_dsv4_raw_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams,
+        int64_t n_stream) {
+    const auto n_kv     = mctx->get_n_kv();
+    const auto n_tokens = ubatch.n_tokens;
+
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(n_tokens%n_stream == 0);
+
+    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kq_mask");
+
+    return res;
+}
+
+static bool dsv4_can_reuse_raw_kq_mask(
+        ggml_tensor * kq_mask,
+        const llama_kv_cache_dsv4_raw_context * mctx,
+        const llama_ubatch & ubatch,
+        int64_t n_stream) {
+    const auto n_kv     = mctx->get_n_kv();
+    const auto n_tokens = ubatch.n_tokens;
+
+    GGML_ASSERT(n_stream > 0);
+
+    bool res = true;
+
+    res &= (kq_mask->ne[0] == n_kv);
+    res &= (kq_mask->ne[1] == n_tokens/n_stream);
+    res &= (kq_mask->ne[2] == 1);
+    res &= (kq_mask->ne[3] == n_stream);
+
+    return res;
+}
+
+static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
+    std::ostringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            ss << ", ";
+        }
+        ss << values[i];
+    }
+    ss << "]";
+    return ss.str();
+}
+
+static bool dsv4_compress_debug() {
+    static const bool debug = []() {
+        const char * env = getenv("LLAMA_DSV4_COMPRESS_DEBUG");
+        return env && atoi(env) > 0;
+    }();
+
+    return debug;
+}
+
+static void dsv4_set_comp_inputs(
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        const char * name,
+        bool debug,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    dsv4_set_i32(inp.state_pos, plan.state_pos);
+    dsv4_set_i32(inp.state_persist_src_idxs, plan.state_persist_src_idxs);
+    dsv4_set_i32(inp.state_persist_dst_idxs, plan.state_persist_dst_idxs);
+    dsv4_set_i32(inp.state_read_idxs, plan.state_read_idxs);
+    dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
+    dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
+    dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+
+    if (debug || dsv4_compress_debug()) {
+        LLAMA_LOG_INFO("%s: %s n_tokens=%u, n_stream=%d, state_persist_dst=%s, state_write_pos=%s\n",
+                __func__, name, n_tokens, (int) n_stream,
+                dsv4_plan_positions(plan.state_persist_dst_idxs).c_str(),
+                dsv4_plan_positions(plan.state_write_pos).c_str());
+    }
+}
+
+static bool dsv4_can_reuse_tensor_1d(ggml_tensor * t, int64_t ne0) {
+    return (t == nullptr && ne0 == 0) || (t != nullptr && t->ne[0] == ne0);
+}
+
+static bool dsv4_can_reuse_kq_mask(
+        ggml_tensor * t,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    if (plan.n_kv == 0) {
+        return t == nullptr;
+    }
+
+    GGML_ASSERT(n_stream > 0);
+
+    return t != nullptr &&
+           t->ne[0] == plan.n_kv &&
+           t->ne[1] == (int64_t) n_tokens/n_stream &&
+           t->ne[2] == 1 &&
+           t->ne[3] == n_stream;
+}
+
+static bool dsv4_can_reuse_comp_input(
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    bool res = true;
+    res &= dsv4_can_reuse_tensor_1d(inp.state_pos, plan.state_pos.size());
+    res &= dsv4_can_reuse_tensor_1d(inp.state_persist_src_idxs, plan.state_persist_src_idxs.size());
+    res &= dsv4_can_reuse_tensor_1d(inp.state_persist_dst_idxs, plan.state_persist_dst_idxs.size());
+    res &= dsv4_can_reuse_tensor_1d(inp.state_read_idxs, plan.state_read_idxs.size());
+    res &= dsv4_can_reuse_tensor_1d(inp.state_write_idxs, plan.state_write_idxs.size());
+    res &= dsv4_can_reuse_tensor_1d(inp.state_write_pos, plan.state_write_pos.size());
+    res &= dsv4_can_reuse_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+
+    return res;
+}
+
+static ggml_tensor * dsv4_build_input_1d(
+        ggml_context * ctx,
+        ggml_type type,
+        int64_t ne0,
+        const std::string & name) {
+    if (ne0 == 0) {
+        return nullptr;
+    }
+
+    ggml_tensor * res = ggml_new_tensor_1d(ctx, type, ne0);
+    ggml_set_input(res);
+    ggml_set_name(res, name.c_str());
+
+    return res;
+}
+
+static void dsv4_build_comp_inputs(
+        ggml_context * ctx,
+        llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        const char * name,
+        const llama_cparams & cparams,
+        int64_t n_stream) {
+    inp.state_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_pos.size(), std::string("dsv4_") + name + "_state_pos");
+    inp.state_persist_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_src_idxs.size(), std::string("dsv4_") + name + "_state_persist_src_idxs");
+    inp.state_persist_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_dst_idxs.size(), std::string("dsv4_") + name + "_state_persist_dst_idxs");
+    inp.state_read_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_read_idxs.size(), std::string("dsv4_") + name + "_state_read_idxs");
+    inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + "_state_write_idxs");
+    inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + "_state_write_pos");
+
+    if (plan.n_kv > 0) {
+        const int64_t n_tokens = (int64_t) plan.n_visible.size();
+
+        GGML_ASSERT(n_stream > 0);
+        GGML_ASSERT(n_tokens%n_stream == 0);
+
+        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+        ggml_set_input(inp.kq_mask);
+        ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+    }
+}
+
+void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs);
+    }
+
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_k_rot) {
+        mctx->set_input_k_rot(self_k_rot);
+    }
+}
+
+void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+    const auto & plan_csa = mctx->get_csa_plan(*ubatch);
+    const auto & plan_hca = mctx->get_hca_plan(*ubatch);
+    const auto & plan_lid = mctx->get_lid_plan(*ubatch);
+    const int64_t n_stream = plan_csa.n_stream;
+
+    inp_raw->mctx = mctx->get_raw();
+    inp_raw->set_input(ubatch);
+
+    dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
+    dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
+    dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+
+    if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
+        mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
+    }
+
+    if (inp_hca.k_rot && inp_hca.k_rot->buffer) {
+        mctx->get_hca()->set_input_k_rot(inp_hca.k_rot);
+    }
+
+    if (inp_lid.k_rot && inp_lid.k_rot->buffer) {
+        mctx->get_lid()->set_input_k_rot(inp_lid.k_rot);
+    }
+}
+
+bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
+
+    this->mctx = mctx;
+    inp_raw->mctx = mctx->get_raw();
+
+    bool res = true;
+
+    const auto & plan_csa = mctx->get_csa_plan(params.ubatch);
+    const auto & plan_hca = mctx->get_hca_plan(params.ubatch);
+    const auto & plan_lid = mctx->get_lid_plan(params.ubatch);
+    const int64_t n_stream = plan_csa.n_stream;
+
+    const auto * raw_ctx = mctx->get_raw();
+    inp_raw->mctx = raw_ctx;
+
+    if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
+        res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
+    }
+    if (inp_raw->self_kq_mask && inp_raw->self_kq_mask->buffer) {
+        res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask, raw_ctx, params.ubatch, n_stream);
+    }
+
+    res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
+    res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
+    res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
 
     return res;
 }
@@ -904,6 +1195,11 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_nextn     = nullptr;
+
+    t_layer_inp.resize(LLAMA_MAX_LAYERS);
+    std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -912,6 +1208,7 @@ void llm_graph_result::reset() {
     params = {};
 
     inputs.clear();
+    fused_nodes.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -932,7 +1229,7 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_result::set_outputs() {
+void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
@@ -944,6 +1241,15 @@ void llm_graph_result::set_outputs() {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    {
+        const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
+        for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
+            if (embeddings_layer_inp[il]) {
+                GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
+                ggml_set_output(t_layer_inp[il]);
+            }
+        }
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -1002,6 +1308,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
+}
+
+void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
+    fused_nodes.push_back(result);
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1063,6 +1373,8 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+
+
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
@@ -1074,6 +1386,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+
+    if (w_s) {
+        res = ggml_mul(ctx0, res, w_s);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -1093,18 +1409,30 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_add(ctx0, res, ab_cur);
     }
 
-    if (w_s) {
-        res = ggml_mul(ctx0, res, w_s);
-    }
-
     return res;
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
-          ggml_tensor * ids) const {
+          ggml_tensor * ids,
+          ggml_tensor * w_s,
+          ggml_tensor * scale_ids,
+                   bool skip_inactive) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_mul_mat_id_set_skip_inactive(res, skip_inactive);
+
+    if (w_s) {
+        const int64_t n_expert = w_s->ne[0];
+        const int64_t n_tokens = cur->ne[2];
+        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        // Noema Overfit rewrites `ids` from logical expert ids to bank-slot
+        // ids. Per-expert QAT scale vectors remain resident, so gather them
+        // with the original logical ids supplied by the MoE graph.
+        s = ggml_get_rows(ctx0, s, scale_ids ? scale_ids : ids);
+        res = ggml_mul(ctx0, res, s);
+    }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -1115,11 +1443,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * ab_cur = ggml_mul_mat_id(
-                ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
-                ids
-                );
+        ggml_tensor * a_cur = ggml_mul_mat_id(ctx0, lw->a, cur, ids);
+        ggml_mul_mat_id_set_skip_inactive(a_cur, skip_inactive);
+        ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, a_cur, ids);
+        ggml_mul_mat_id_set_skip_inactive(ab_cur, skip_inactive);
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
@@ -1256,6 +1583,29 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+    // NVFP4 support is currently restricted to
+    // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
+    // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
+    // TODO: disambiguate LLM-architectural scales (which use *_s) from NVFP4 scale_2 (which also uses *_s currently)
+    auto has_lora = [this](ggml_tensor * w) {
+        if (!w) {
+            return false;
+        }
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(w) != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    GGML_ASSERT(!up_s   || !up_b   || !up   || up->type   != GGML_TYPE_NVFP4);
+    GGML_ASSERT(!gate_s || !gate_b || !gate || gate->type != GGML_TYPE_NVFP4);
+    GGML_ASSERT(!down_s || !down_b || !down || down->type != GGML_TYPE_NVFP4);
+    GGML_ASSERT(!up_s   || !up   || up->type   != GGML_TYPE_NVFP4 || !has_lora(up));
+    GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
+    GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 
@@ -1300,20 +1650,24 @@ ggml_tensor * llm_graph_context::build_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate && type_gate == LLM_FFN_PAR) {
-                // Step35: HF clamps gate (after SiLU) and up before multiplication
-                if (arch == LLM_ARCH_STEP35 && il >= 0) {
+                if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                        cb(gate_act, "ffn_silu", il);
-                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                        cb(gate_act, "ffn_silu_clamped", il);
-
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
                         cb(tmp, "ffn_up_clamped", il);
 
-                        cur = ggml_mul(ctx0, gate_act, tmp);
+                        if (arch == LLM_ARCH_DEEPSEEK4) {
+                            cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                            cb(cur, "ffn_gate_clamped", il);
+                            cur = ggml_swiglu_split(ctx0, cur, tmp);
+                        } else {
+                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                            cb(gate_act, "ffn_silu", il);
+                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                            cb(gate_act, "ffn_silu_clamped", il);
+                            cur = ggml_mul(ctx0, gate_act, tmp);
+                        }
                         cb(cur, "ffn_swiglu_limited", il);
                         type_gate = LLM_FFN_SEQ;
                         break;
@@ -1423,7 +1777,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1443,7 +1798,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        selected_experts_in
     );
 }
 
@@ -1470,7 +1826,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1479,6 +1836,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+            ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+        }
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;
@@ -1502,6 +1862,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
+            } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+            {
+                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
             } break;
         default:
             GGML_ABORT("fatal error");
@@ -1553,8 +1917,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
-    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-    cb(selected_experts->src[0], "ffn_moe_argsort", il);
+    ggml_tensor * selected_experts = selected_experts_in;
+    if (selected_experts == nullptr) {
+        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+    }
     cb(selected_experts, "ffn_moe_topk", il);
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
@@ -1564,6 +1931,45 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    }
+
+    // Noema Overfit: the indexed matmuls consume slot ids rewritten by a CPU
+    // custom node; weight gathering and add_id biases keep real expert ids.
+    // When paging is off this is `selected_experts` and no node is inserted.
+    // `down_exps` identifies the bank by tensor identity so a second resident
+    // MoE model (the helper-draft of streamed speculation) is never rewritten.
+    //
+    // Wave-split prefill (streamed mode 2): multi-token graphs may
+    // split this layer's routed computation into n_moe_waves expert-group
+    // branches instead, in which case the whole-union single-call route node
+    // must NOT be built (its residency demand is exactly what waves avoid).
+    // Bias-free, weight-after-ffn layers are eligible. Per-expert QAT scales
+    // stay resident and are gathered with the original logical expert ids
+    // (build_lora_mm_id's scale_ids), so they are safe under bank-slot rewrite
+    // and the wave mask. add_id biases or pre-FFN weighting would still leak
+    // masked rows past the routed-weights mask and remain fail-closed.
+    int32_t n_moe_waves = 0;
+    if (noema_paged_route_active() && n_tokens > 1) {
+        const bool has_exps_bias = gate_up_exps_b != nullptr || up_exps_b != nullptr ||
+                                   gate_exps_b != nullptr || down_exps_b != nullptr;
+        if (!weight_before_ffn && !has_exps_bias) {
+            n_moe_waves = noema_paged_prefill_waves(down_exps, il, n_tokens, n_expert);
+        } else {
+            // Telemetry only: record which tensor-shape condition blocked the
+            // wave gate so stats_json can explain a waves-on run that never
+            // engaged (stream.wavesRejectedReason).
+            noema_paged_note_wave_ineligible(down_exps,
+                                             weight_before_ffn ? "weightBeforeFFN"
+                                             : "biases");
+        }
+    }
+
+    ggml_tensor * mmid_ids = selected_experts;
+    if (n_moe_waves == 0 && noema_paged_route_active()) {
+        mmid_ids = noema_paged_build_route_rewrite(ctx0, selected_experts, down_exps, il);
+        if (mmid_ids != selected_experts) {
+            cb(mmid_ids, "ffn_moe_slot_ids", il);
+        }
     }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
@@ -1609,166 +2015,204 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
-    ggml_tensor * up = nullptr;
-    ggml_tensor * experts = nullptr;
-
-    if (gate_up_exps) {
-        // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
-        cb(gate_up, "ffn_moe_gate_up", il);
-
-        if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
-            cb(gate_up, "ffn_moe_gate_up_biased", il);
-        }
-
-        // apply per-expert scale2 to merged gate_up (use up_exps_s since gate and up are fused)
-        if (up_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-            gate_up = ggml_mul(ctx0, gate_up, s);
-            cb(gate_up, "ffn_moe_gate_up_scaled", il);
-        }
-
-        const int64_t n_ff = gate_up->ne[0] / 2;
-        cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-        cb(cur, "ffn_moe_gate", il);
-        up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
-        cb(up, "ffn_moe_up", il);
-    } else {
-        // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
-
-        if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
-            cb(up, "ffn_moe_up_biased", il);
-        }
-
-        // apply per-expert scale2 to up
-        if (up_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-            up = ggml_mul(ctx0, up, s);
-            cb(up, "ffn_moe_up_scaled", il);
-        }
-
-        if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
-        } else {
-            cur = up;
-        }
-
-        if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
-            cb(cur, "ffn_moe_gate_biased", il);
-        }
-
-        // apply per-expert scale2 to gate
-        if (gate_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-            cur = ggml_mul(ctx0, cur, s);
-            cb(cur, "ffn_moe_gate_scaled", il);
-        }
-    }
-
     const bool has_gate = gate_exps || gate_up_exps;
+    const bool expert_major = n_moe_waves > 0 &&
+        noema_paged_expert_major_active(down_exps, il);
+    const bool fused_reduce = !weight_before_ffn &&
+        noema_paged_fused_reduce_active(down_exps, il);
 
-    switch (type_op) {
-        case LLM_FFN_SILU:
-            if (gate_exps) {
-                // Step35: per-layer clamp for routed experts
-                if (arch == LLM_ARCH_STEP35 && il >= 0) {
-                    const float limit = hparams.swiglu_clamp_exp[il];
-                    constexpr float eps = 1e-6f;
-                    if (limit > eps) {
-                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                        cb(gate_act, "ffn_moe_silu", il);
-                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                        cb(gate_act, "ffn_moe_silu_clamped", il);
+    // One routed FFN pass over `ids`, weighted by `w`. The single-call path
+    // runs it once with (mmid_ids, weights) — the exact node sequence this
+    // code always built. Wave-split prefill runs it once per expert-group
+    // branch with that branch's rewritten ids and masked weights.
+    const auto build_moe_branch = [&](ggml_tensor * ids, ggml_tensor * w,
+                                      bool skip_inactive) -> ggml_tensor * {
+        ggml_tensor * bcur = cur;
+        ggml_tensor * bup  = nullptr;
 
-                        up = ggml_clamp(ctx0, up, -limit, limit);
-                        cb(up, "ffn_moe_up_clamped", il);
+        if (gate_up_exps) {
+            // merged gate_up path: one mul_mat_id, then split into gate and up views
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, bcur, ids, up_exps_s, selected_experts, skip_inactive); // [n_ff*2, n_expert_used, n_tokens]
+            cb(gate_up, "ffn_moe_gate_up", il);
 
-                        cur = ggml_mul(ctx0, gate_act, up);
-                        cb(cur, "ffn_moe_swiglu_limited", il);
-                        break;
-                    }
-                }
+            if (up_exps_s) {
+                cb(gate_up, "ffn_moe_gate_up_scaled", il);
             }
 
-            if (has_gate) {
-                cur = ggml_swiglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_swiglu", il);
-            } else {
-                cur = ggml_silu(ctx0, cur);
-                cb(cur, "ffn_moe_silu", il);
-            } break;
-        case LLM_FFN_GELU:
-            if (has_gate) {
-                cur = ggml_geglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_geglu", il);
-            } else {
-                cur = ggml_gelu(ctx0, cur);
-                cb(cur, "ffn_moe_gelu", il);
-            } break;
-        case LLM_FFN_SWIGLU_OAI_MOE:
-            {
-                // TODO: move to hparams?
-                constexpr float alpha = 1.702f;
-                constexpr float limit = 7.0f;
-                cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
-                cb(cur, "ffn_moe_swiglu_oai", il);
-            } break;
-        case LLM_FFN_RELU:
-            if (has_gate) {
-                cur = ggml_reglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_reglu", il);
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cb(cur, "ffn_moe_relu", il);
-            } break;
-        case LLM_FFN_RELU_SQR:
-            if (has_gate) {
-                // TODO: add support for gated squared relu
-                GGML_ABORT("fatal error: gated squared relu not implemented");
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cur = ggml_sqr(ctx0, cur);
-                cb(cur, "ffn_moe_relu_sqr", il);
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
+            if (gate_up_exps_b) {
+                gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+                cb(gate_up, "ffn_moe_gate_up_biased", il);
+            }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
-    cb(experts, "ffn_moe_down", il);
+            const int64_t n_ff = gate_up->ne[0] / 2;
+            bcur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            cb(bcur, "ffn_moe_gate", il);
+            bup  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+            cb(bup, "ffn_moe_up", il);
+        } else {
+            // separate gate and up path
+            bup = build_lora_mm_id(up_exps, bcur, ids, up_exps_s, selected_experts, skip_inactive); // [n_ff, n_expert_used, n_tokens]
+            cb(bup, "ffn_moe_up", il);
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
-    }
+            if (up_exps_s) {
+                cb(bup, "ffn_moe_up_scaled", il);
+            }
 
-    // apply per-expert scale2 to down
-    if (down_exps_s) {
-        ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-        experts = ggml_mul(ctx0, experts, s);
-        cb(experts, "ffn_moe_down_scaled", il);
-    }
+            if (up_exps_b) {
+                bup = ggml_add_id(ctx0, bup, up_exps_b, selected_experts);
+                cb(bup, "ffn_moe_up_biased", il);
+            }
 
-    if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
+            if (gate_exps) {
+                bcur = build_lora_mm_id(gate_exps, bcur, ids, gate_exps_s, selected_experts, skip_inactive); // [n_ff, n_expert_used, n_tokens]
+                cb(bcur, "ffn_moe_gate", il);
+            } else {
+                bcur = bup;
+            }
+
+            if (gate_exps_s) {
+                cb(bcur, "ffn_moe_gate_scaled", il);
+            }
+
+            if (gate_exps_b) {
+                bcur = ggml_add_id(ctx0, bcur, gate_exps_b, selected_experts);
+                cb(bcur, "ffn_moe_gate_biased", il);
+            }
+        }
+
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_exps) {
+                    if (il >= 0) {
+                        const float limit = hparams.swiglu_clamp_exp[il];
+                        constexpr float eps = 1e-6f;
+                        if (limit > eps) {
+                            bup = ggml_clamp(ctx0, bup, -limit, limit);
+                            cb(bup, "ffn_moe_up_clamped", il);
+
+                            if (arch == LLM_ARCH_DEEPSEEK4) {
+                                bcur = ggml_clamp(ctx0, bcur, -INFINITY, limit);
+                                cb(bcur, "ffn_moe_gate_clamped", il);
+                                bcur = ggml_swiglu_split(ctx0, bcur, bup);
+                            } else {
+                                ggml_tensor * gate_act = ggml_silu(ctx0, bcur);
+                                cb(gate_act, "ffn_moe_silu", il);
+                                gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                                cb(gate_act, "ffn_moe_silu_clamped", il);
+                                bcur = ggml_mul(ctx0, gate_act, bup);
+                            }
+                            cb(bcur, "ffn_moe_swiglu_limited", il);
+                            break;
+                        }
+                    }
+                }
+
+                if (has_gate) {
+                    bcur = ggml_swiglu_split(ctx0, bcur, bup);
+                    cb(bcur, "ffn_moe_swiglu", il);
+                } else {
+                    bcur = ggml_silu(ctx0, bcur);
+                    cb(bcur, "ffn_moe_silu", il);
+                } break;
+            case LLM_FFN_GELU:
+                if (has_gate) {
+                    bcur = ggml_geglu_split(ctx0, bcur, bup);
+                    cb(bcur, "ffn_moe_geglu", il);
+                } else {
+                    bcur = ggml_gelu(ctx0, bcur);
+                    cb(bcur, "ffn_moe_gelu", il);
+                } break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                {
+                    // TODO: move to hparams?
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    bcur = ggml_swiglu_oai(ctx0, bcur, bup, alpha, limit);
+                    cb(bcur, "ffn_moe_swiglu_oai", il);
+                } break;
+            case LLM_FFN_RELU:
+                if (has_gate) {
+                    bcur = ggml_reglu_split(ctx0, bcur, bup);
+                    cb(bcur, "ffn_moe_reglu", il);
+                } else {
+                    bcur = ggml_relu(ctx0, bcur);
+                    cb(bcur, "ffn_moe_relu", il);
+                } break;
+            case LLM_FFN_RELU_SQR:
+                if (has_gate) {
+                    // TODO: add support for gated squared relu
+                    GGML_ABORT("fatal error: gated squared relu not implemented");
+                } else {
+                    bcur = ggml_relu(ctx0, bcur);
+                    bcur = ggml_sqr(ctx0, bcur);
+                    cb(bcur, "ffn_moe_relu_sqr", il);
+                } break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+
+        ggml_tensor * bexperts = build_lora_mm_id(down_exps, bcur, ids, down_exps_s, selected_experts, skip_inactive); // [n_embd, n_expert_used, n_tokens]
+        cb(bexperts, "ffn_moe_down", il);
+
+        if (down_exps_s) {
+            cb(bexperts, "ffn_moe_down_scaled", il);
+        }
+
+        if (down_exps_b) {
+            bexperts = ggml_add_id(ctx0, bexperts, down_exps_b, selected_experts);
+            cb(bexperts, "ffn_moe_down_biased", il);
+        }
+
+        if (fused_reduce) {
+            bexperts = ggml_noema_moe_weighted_reduce(ctx0, bexperts, w);
+            cb(bexperts, "ffn_moe_fused_weighted_reduce", il);
+        } else if (!weight_before_ffn) {
+            bexperts = ggml_mul(ctx0, bexperts, w);
+            cb(bexperts, "ffn_moe_weighted", il);
+        }
+        return bexperts;
+    };
+
+    ggml_tensor * experts = nullptr;
+
+    if (n_moe_waves == 0) {
+        experts = build_moe_branch(mmid_ids, weights, false);
+    } else {
+        // Wave-split prefill: branch g only needs its expert-id range resident.
+        // Expert-major mode writes -1 for every other assignment and the
+        // indexed matmuls skip those rows. The legacy path retains distinct
+        // placeholder slots plus a weight mask for parity/rollback testing.
+        // Branch g's route node depends on branch g-1's output: the CPU route
+        // callback swaps bank slots, and that must never overlap the previous
+        // branch's pending GPU reads of those slots.
+        for (int32_t wg = 0; wg < n_moe_waves; ++wg) {
+            ggml_tensor * ids_g = noema_paged_build_route_rewrite_wave(
+                ctx0, selected_experts, down_exps, il, wg, n_moe_waves, experts);
+            cb(ids_g, "ffn_moe_slot_ids_wave", il);
+            ggml_tensor * w_g = weights;
+            if (!expert_major) {
+                ggml_tensor * mask_g = noema_paged_build_wave_mask(
+                    ctx0, selected_experts, il, wg, n_moe_waves);
+                cb(mask_g, "ffn_moe_wave_mask", il);
+                w_g = ggml_mul(ctx0, weights, mask_g);
+                cb(w_g, "ffn_moe_wave_weights", il);
+            }
+
+            ggml_tensor * branch = build_moe_branch(ids_g, w_g, expert_major);
+            experts = wg == 0 ? branch : ggml_add(ctx0, experts, branch);
+        }
+        cb(experts, "ffn_moe_waves_sum", il);
     }
 
     ggml_build_forward_expand(gf, experts);
+
+    // The specialized reduction already returns [n_embd, n_tokens]. It uses
+    // fixed top-k accumulation order on CPU and Metal, so no view/add tail is
+    // needed and wave branches can be summed directly in expert-major form.
+    if (fused_reduce) {
+        cb(experts, "ffn_moe_out", il);
+        return experts;
+    }
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
@@ -2079,7 +2523,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
@@ -2298,12 +2742,12 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
-        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
     if (inp->self_v_rot) {
-        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2334,7 +2778,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
     if (wo) {
@@ -2539,14 +2983,14 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
     if (k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
-            k_cur = ggml_mul_mat_aux(ctx0, k_cur, k_rot);
+            k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
         }
     }
     if (v_rot) {
         if (v_cur) {
-            v_cur = ggml_mul_mat_aux(ctx0, v_cur, v_rot);
+            v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
         }
     }
 
@@ -2589,7 +3033,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
@@ -2681,9 +3125,9 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     {
         inp->self_k_idxs_lid = mctx_cur->get_lid()->build_input_k_idxs(ctx0, ubatch);
 
-        // ensure F32 mask
+        // ensure that mask type matches fused lightning indexer use (requires f16 mask)
         auto cparams_copy = cparams;
-        cparams_copy.flash_attn = false;
+        cparams_copy.flash_attn = cparams.fused_lid;
 
         inp->self_kq_mask_lid = build_attn_inp_kq_mask(ctx0, mctx_cur->get_lid(), ubatch, cparams_copy);
         inp->self_kq_mask_lid_cnv = inp->self_kq_mask_lid;
@@ -2727,6 +3171,33 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+    const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+    const auto * raw_ctx  = mctx_cur->get_raw();
+
+    auto inp_raw = std::make_unique<llm_graph_input_dsv4_raw>(cparams, raw_ctx);
+
+    const int64_t n_stream = mctx_cur->get_csa_plan(ubatch).n_stream;
+
+    GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
+
+    inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
+    inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
+    inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
+
+    inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+    auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
+
+    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
+    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
+    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
+    inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
+    inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
+    inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+
+    return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
 }
 
 ggml_tensor * llm_graph_context::build_rs(

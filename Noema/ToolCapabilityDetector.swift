@@ -1,4 +1,3 @@
-// ToolCapabilityDetector.swift
 import Foundation
 
 enum ToolCapabilityDetector {
@@ -91,7 +90,10 @@ enum ToolCapabilityDetector {
             if !FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) || !isDir.boolValue {
                 dir = dir.deletingLastPathComponent()
             }
-            let candidates = ["config.json", "tokenizer_config.json", "tokenizer.json", "added_tokens.json"]
+            // Include chat_template.jinja: modern conversions (e.g. Qwen 3.x MLX) ship the
+            // tool-supporting chat template as a standalone .jinja file, not embedded in
+            // tokenizer_config.json — without scanning it, tool-capable models read as incapable.
+            let candidates = ["config.json", "tokenizer_config.json", "tokenizer.json", "added_tokens.json", "chat_template.jinja"]
                 .map { dir.appendingPathComponent($0) }
             for file in candidates where FileManager.default.fileExists(atPath: file.path) {
                 if let data = try? Data(contentsOf: file), let s = String(data: data, encoding: .utf8) {
@@ -104,7 +106,7 @@ enum ToolCapabilityDetector {
             }
             return false
         case .et:
-            return true // Allow Leap/ET to use tools by design
+            return true // Allow ET models to use tools by design
         case .ane:
             var root = InstalledModelsStore.canonicalURL(for: url, format: .ane)
             var isDir: ObjCBool = false

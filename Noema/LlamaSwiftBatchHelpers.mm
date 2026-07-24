@@ -1,4 +1,3 @@
-// LlamaSwiftBatchHelpers.mm
 #import "LlamaSwiftBatchHelpers.h"
 
 void noema_batch_clear_logits(struct llama_batch *batch, int n) {

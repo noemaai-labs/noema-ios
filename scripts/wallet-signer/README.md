@@ -32,10 +32,10 @@ The `.cer` alone cannot sign passes. It must be paired with the private key crea
 
 ```sh
 export NOEMA_WALLET_SIGNER_TOKEN="choose-a-long-random-token"
-export NOEMA_PASS_P12="/Users/arminstamate/Documents/Armin Noema Wallet Pass.p12"
-export NOEMA_PASS_CERT="/Users/arminstamate/Downloads/pass.cer"
+export NOEMA_PASS_P12="$HOME/Documents/Noema Wallet Pass.p12"
+export NOEMA_PASS_CERT="$HOME/Documents/pass.cer"
 export NOEMA_PASS_P12_PASSWORD="p12-password"
-export NOEMA_WWDR_CERT="/Users/arminstamate/Documents/AppleWWDRCAG4.cer"
+export NOEMA_WWDR_CERT="$HOME/Documents/AppleWWDRCAG4.cer"
 export NOEMA_APP_ATTEST_ROOT_CERT="/secure/path/Apple_App_Attestation_Root_CA.pem"
 export NOEMA_APP_ATTEST_APP_ID="XX3Z6V9TU9.arminproducts.Noema"
 export NOEMA_WALLET_SIGNER_HOST="127.0.0.1"

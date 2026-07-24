@@ -1,4 +1,3 @@
-// CombinedDatasetRegistry.swift
 import Foundation
 
 /// Combines results from multiple registries for datasets.

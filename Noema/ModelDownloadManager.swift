@@ -1,6 +1,6 @@
-// ModelDownloadManager.swift
 import Foundation
 import CryptoKit
+import NoemaPackages
 
 enum DownloadEvent {
     case started(Int64?)
@@ -32,33 +32,7 @@ func isGitLFSPointer(at url: URL) -> Bool {
 /// Safetensors format: first 8 bytes are header length (u64 little endian), followed by JSON header.
 /// Returns true if valid, false if corrupted/incomplete.
 func isValidSafetensorsFile(at url: URL) -> Bool {
-    guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-    defer { try? handle.close() }
-
-    // Read first 8 bytes for header length
-    guard let headerLengthData = try? handle.read(upToCount: 8), headerLengthData.count == 8 else {
-        return false
-    }
-
-    // Parse as little-endian u64
-    let headerLength = headerLengthData.withUnsafeBytes { $0.load(as: UInt64.self) }
-
-    // Sanity check: header should be reasonable size (< 100MB)
-    if headerLength > 100_000_000 {
-        return false
-    }
-
-    // Try to read and parse the JSON header
-    guard let headerData = try? handle.read(upToCount: Int(headerLength)) else {
-        return false
-    }
-
-    // Verify it's valid JSON
-    guard let _ = try? JSONSerialization.jsonObject(with: headerData) else {
-        return false
-    }
-
-    return true
+    SafetensorsFileValidator.isValidFile(at: url)
 }
 
 /// Returns the file size in bytes, or nil if file doesn't exist
@@ -71,53 +45,85 @@ func fileSize(at url: URL) -> Int64? {
 }
 
 private actor MultipartDownloadProgressTracker {
-    private let totalExpected: Int64
+    /// Floor for the denominator. Per-artifact expected sizes discovered at transfer
+    /// time (Content-Length, final on-disk bytes) can only raise it — needed for
+    /// artifact sets whose sizes are unknown up front (MLX safetensors backfill).
+    private let baseExpected: Int64
     private let minSampleInterval: TimeInterval = 0.4
+    /// Progress events arrive via independent Tasks with no ordering guarantee, so
+    /// a regression alone can be reordering. A genuine HTTP-200 restart (rejected/
+    /// ignored resume) resets the counter near zero: require both a large absolute
+    /// drop and a halving before re-baselining; anything else stays clamped.
+    private let restartDropThreshold: Int64 = 8 << 20
     private var bytesByArtifact: [String: Int64] = [:]
-    private var speedByArtifact: [String: Double] = [:]
-    private var lastSampleTimeByArtifact: [String: Date] = [:]
-    private var lastSampleBytesByArtifact: [String: Int64] = [:]
+    private var expectedByArtifact: [String: Int64] = [:]
+    // Speed derives from the tracker-wide byte total, not summed per-part windows:
+    // a part finishing (its window speed cliffing to zero) or spinning up (empty
+    // first window) then can't distort the aggregate rate.
+    private var lastTotalBytes: Int64 = 0
+    private var lastTotalSampleTime: Date? = nil
+    private var totalSpeed: Double = 0
 
     init(totalExpected: Int64) {
-        self.totalExpected = totalExpected
+        self.baseExpected = totalExpected
     }
 
-    func updateBytes(_ written: Int64, for artifactID: String) -> (Double, Int64, Int64, Double) {
-        let clampedWritten = max(bytesByArtifact[artifactID] ?? 0, written)
-        bytesByArtifact[artifactID] = clampedWritten
-
-        let now = Date()
-        if let t0 = lastSampleTimeByArtifact[artifactID],
-           let b0 = lastSampleBytesByArtifact[artifactID] {
-            let dt = now.timeIntervalSince(t0)
-            if dt >= minSampleInterval {
-                let delta = max(0, clampedWritten - b0)
-                speedByArtifact[artifactID] = dt > 0 ? Double(delta) / dt : 0
-                lastSampleTimeByArtifact[artifactID] = now
-                lastSampleBytesByArtifact[artifactID] = clampedWritten
-            }
-        } else {
-            lastSampleTimeByArtifact[artifactID] = now
-            lastSampleBytesByArtifact[artifactID] = clampedWritten
-            speedByArtifact[artifactID] = 0
+    func updateBytes(_ written: Int64, expected: Int64? = nil, for artifactID: String) -> (Double, Int64, Int64, Double) {
+        if let expected, expected > 0 {
+            expectedByArtifact[artifactID] = max(expectedByArtifact[artifactID] ?? 0, expected)
         }
-
+        let previous = bytesByArtifact[artifactID] ?? 0
+        if written < previous - restartDropThreshold, written < previous / 2 {
+            bytesByArtifact[artifactID] = max(0, written)
+            lastTotalBytes = currentTotalBytes()
+            lastTotalSampleTime = Date()
+        } else {
+            bytesByArtifact[artifactID] = max(previous, written)
+        }
+        sampleSpeedIfDue()
         return snapshot()
     }
 
     func markCompleted(_ bytes: Int64, for artifactID: String) -> (Double, Int64, Int64, Double) {
-        let clampedBytes = max(bytesByArtifact[artifactID] ?? 0, bytes)
+        let previous = bytesByArtifact[artifactID] ?? 0
+        let clampedBytes = max(previous, bytes)
         bytesByArtifact[artifactID] = clampedBytes
-        speedByArtifact[artifactID] = 0
-        lastSampleTimeByArtifact[artifactID] = Date()
-        lastSampleBytesByArtifact[artifactID] = clampedBytes
+        expectedByArtifact[artifactID] = max(expectedByArtifact[artifactID] ?? 0, clampedBytes)
+        // Advance the speed baseline by the same jump: bytes seeded here (shards
+        // already on disk, slow sha256 verification) were not transferred in this
+        // window and would otherwise read as multi-GB/s throughput.
+        lastTotalBytes += clampedBytes - previous
+        sampleSpeedIfDue()
         return snapshot()
     }
 
+    private func currentTotalBytes() -> Int64 {
+        max(0, bytesByArtifact.values.reduce(0, +))
+    }
+
+    private func sampleSpeedIfDue() {
+        let now = Date()
+        let total = currentTotalBytes()
+        guard let t0 = lastTotalSampleTime else {
+            lastTotalSampleTime = now
+            lastTotalBytes = total
+            return
+        }
+        let dt = now.timeIntervalSince(t0)
+        guard dt >= minSampleInterval else { return }
+        totalSpeed = max(0, Double(total - lastTotalBytes) / dt)
+        lastTotalSampleTime = now
+        lastTotalBytes = total
+    }
+
     private func snapshot() -> (Double, Int64, Int64, Double) {
-        let totalWritten = max(0, bytesByArtifact.values.reduce(0, +))
+        let totalWritten = currentTotalBytes()
+        let artifactIDs = Set(bytesByArtifact.keys).union(expectedByArtifact.keys)
+        let discoveredExpected = artifactIDs.reduce(into: Int64(0)) { sum, id in
+            sum += max(expectedByArtifact[id] ?? 0, bytesByArtifact[id] ?? 0)
+        }
+        let totalExpected = max(baseExpected, discoveredExpected)
         let fraction = min(max(Double(totalWritten) / Double(max(totalExpected, 1)), 0), 1)
-        let totalSpeed = speedByArtifact.values.reduce(0, +)
         return (fraction, totalWritten, totalExpected, totalSpeed)
     }
 }
@@ -174,9 +180,13 @@ actor ModelDownloadManager {
                 }
             }
 
-            return results.enumerated().map { offset, element in
+            return try results.enumerated().map { offset, element in
                 guard let element else {
-                    fatalError("Missing bounded concurrency result at index \(offset)")
+                    throw NSError(
+                        domain: "ModelDownloadManager.BoundedConcurrency",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Missing bounded concurrency result at index \(offset)"]
+                    )
                 }
                 return element
             }
@@ -198,6 +208,10 @@ actor ModelDownloadManager {
         } else {
             tmpByKey[key] = destinations
         }
+    }
+
+    private func addTempDestination(_ destination: URL, for key: String) {
+        tmpByKey[key, default: []].insert(destination)
     }
 
     private func clearTempDestinations(for key: String) {
@@ -257,6 +271,22 @@ actor ModelDownloadManager {
         return computed.lowercased() == expected.lowercased()
     }
 
+    /// Size of an already-valid primary weights file, or nil when it must be (re)downloaded.
+    /// Mirrors the multipart per-part skip policy so resuming after the main transfer
+    /// completed (pause/failure during verification or sidecar backfill) doesn't restart
+    /// the primary file from byte zero.
+    nonisolated private func validExistingPrimaryFileSize(quant: QuantInfo, dir: URL) -> Int64? {
+        let finalURL = dir.appendingPathComponent(quant.primaryDownloadRelativePath)
+        guard FileManager.default.fileExists(atPath: finalURL.path) else { return nil }
+        if quant.format == .gguf, !isValidGGUFMagic(at: finalURL) { return nil }
+        if finalURL.pathExtension.lowercased() == "safetensors",
+           isGitLFSPointer(at: finalURL) || !isValidSafetensorsFile(at: finalURL) {
+            return nil
+        }
+        guard sha256Matches(fileURL: finalURL, expected: quant.sha256) else { return nil }
+        return fileSize(at: finalURL)
+    }
+
     nonisolated private func updateWeightsArtifacts(in dir: URL, weights: String, weightShards: [String]? = nil) {
         do {
             let artifactsURL = dir.appendingPathComponent("artifacts.json")
@@ -273,7 +303,8 @@ actor ModelDownloadManager {
             }
             if obj["mmproj"] == nil { obj["mmproj"] = NSNull() }
             let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
-            try? out.write(to: artifactsURL)
+            try out.write(to: artifactsURL)
+            MtpLocator.invalidateCache()
         } catch {}
     }
 
@@ -283,6 +314,18 @@ actor ModelDownloadManager {
 
     nonisolated private func primaryRelativePath(for quant: QuantInfo) -> String {
         quant.primaryDownloadRelativePath
+    }
+
+    /// Relative `.noema-paged` package directory a quant installs into, or nil
+    /// for plain quants. Every member part lives under the package directory,
+    /// so the primary part path is a stable marker.
+    nonisolated private func pagedPackageRelativeDirectory(for quant: QuantInfo) -> String? {
+        let components = quant.primaryDownloadRelativePath.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count > 1 else { return nil }
+        for idx in components.indices.dropLast() where components[idx].lowercased().hasSuffix(".noema-paged") {
+            return components[components.startIndex...idx].joined(separator: "/")
+        }
+        return nil
     }
 
     nonisolated private func shardArtifactID(for relativePath: String) -> String {
@@ -424,9 +467,18 @@ actor ModelDownloadManager {
         } catch {
             let destinations = tempDestinations(for: key)
             if !destinations.isEmpty {
-                Task { @MainActor in
+                if error is CancellationError {
+                    Task { @MainActor in
+                        for destination in destinations {
+                            BackgroundDownloadManager.shared.cancel(destination: destination)
+                        }
+                    }
+                } else {
+                    // One part failing (or a user pause) must not destroy the siblings'
+                    // partial transfers: pause captures resume data, whereas a plain
+                    // cancel discards it and the retry restarts those parts from zero.
                     for destination in destinations {
-                        BackgroundDownloadManager.shared.cancel(destination: destination)
+                        await BackgroundDownloadManager.shared.pause(destination: destination)
                     }
                 }
             }
@@ -550,9 +602,18 @@ actor ModelDownloadManager {
         } catch {
             let destinations = tempDestinations(for: key)
             if !destinations.isEmpty {
-                Task { @MainActor in
+                if error is CancellationError {
+                    Task { @MainActor in
+                        for destination in destinations {
+                            BackgroundDownloadManager.shared.cancel(destination: destination)
+                        }
+                    }
+                } else {
+                    // One part failing (or a user pause) must not destroy the siblings'
+                    // partial transfers: pause captures resume data, whereas a plain
+                    // cancel discards it and the retry restarts those parts from zero.
                     for destination in destinations {
-                        BackgroundDownloadManager.shared.cancel(destination: destination)
+                        await BackgroundDownloadManager.shared.pause(destination: destination)
                     }
                 }
             }
@@ -607,6 +668,123 @@ actor ModelDownloadManager {
         return url.path.split(separator: "/").filter { !$0.isEmpty }.count <= 2
     }
 
+    private enum MLXWeightFetchOutcome {
+        case installed(Int64)
+        case notFound
+        case invalidContent
+        case failed(Error)
+    }
+
+    /// Fetches one MLX safetensors weight file through BackgroundDownloadManager so the
+    /// transfer survives suspension, resumes from partial data, and reports progress into
+    /// the engine — this phase used to be an invisible `URLSession.shared` download.
+    /// Only pause/stop cancellations propagate as thrown errors; everything else is an outcome.
+    private func fetchMLXWeightFile(named name: String,
+                                    repoID: String,
+                                    dir: URL,
+                                    key: String,
+                                    jobID: String?,
+                                    token: String?,
+                                    progressTracker: MultipartDownloadProgressTracker,
+                                    continuation: AsyncStream<DownloadEvent>.Continuation) async throws -> MLXWeightFetchOutcome {
+        let escaped = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+        guard let remote = URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(escaped)?download=1") else {
+            return .notFound
+        }
+        let artifactID = "mlx:\(name)"
+        let finalURL = dir.appendingPathComponent(name)
+        let tmpURL = dir.appendingPathComponent(name + ".download")
+        ensureParentDirectory(for: finalURL)
+        addTempDestination(tmpURL, for: key)
+
+        var req = URLRequest(url: remote)
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        req.setValue("Noema/1.0 (+https://noema.app)", forHTTPHeaderField: "User-Agent")
+        if let token, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        await DownloadEngine.shared.upsertArtifacts(externalID: key, artifacts: [
+            DownloadArtifact(
+                id: artifactID,
+                role: .weightShard,
+                remoteURL: remote,
+                stagingURL: tmpURL,
+                finalURL: finalURL,
+                expectedBytes: nil,
+                downloadedBytes: 0,
+                checksum: nil,
+                state: .downloading,
+                retryCount: 0,
+                nextRetryAt: nil,
+                lastErrorDescription: nil,
+                manualPause: false
+            )
+        ])
+
+        do {
+            _ = try await BackgroundDownloadManager.shared.download(
+                request: req,
+                to: tmpURL,
+                jobID: jobID,
+                artifactID: artifactID,
+                expectedSize: nil,
+                progress: nil,
+                progressBytes: { written, expected in
+                    Task {
+                        await DownloadEngine.shared.updateArtifactProgressLive(
+                            externalID: key,
+                            artifactID: artifactID,
+                            written: written,
+                            expected: expected > 0 ? expected : nil
+                        )
+                        let snap = await progressTracker.updateBytes(written, expected: expected > 0 ? expected : nil, for: artifactID)
+                        continuation.yield(.progress(snap.0, snap.1, snap.2, snap.3))
+                    }
+                }
+            )
+        } catch {
+            let ns = error as NSError
+            if error is CancellationError || (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled) {
+                throw error
+            }
+            if BackgroundDownloadManager.httpRejectionStatus(from: error) == 404 {
+                await DownloadEngine.shared.updateArtifactState(externalID: key, artifactID: artifactID, state: .cancelled)
+                return .notFound
+            }
+            await DownloadEngine.shared.updateArtifactState(
+                externalID: key,
+                artifactID: artifactID,
+                state: isNetworkError(error) ? .retrying : .failed,
+                errorMessage: error.localizedDescription
+            )
+            return .failed(error)
+        }
+
+        if isGitLFSPointer(at: tmpURL) || !isValidSafetensorsFile(at: tmpURL) {
+            try? FileManager.default.removeItem(at: tmpURL)
+            await DownloadEngine.shared.updateArtifactState(
+                externalID: key,
+                artifactID: artifactID,
+                state: .failed,
+                errorMessage: "Invalid safetensors payload"
+            )
+            return .invalidContent
+        }
+
+        try? FileManager.default.removeItem(at: finalURL)
+        do {
+            try FileManager.default.moveItem(at: tmpURL, to: finalURL)
+        } catch {
+            return .failed(error)
+        }
+        let size = fileSize(at: finalURL) ?? 0
+        await DownloadEngine.shared.markArtifactCompleted(externalID: key, artifactID: artifactID, finalBytes: size)
+        let snap = await progressTracker.markCompleted(size, for: artifactID)
+        continuation.yield(.progress(snap.0, snap.1, snap.2, snap.3))
+        return .installed(size)
+    }
+
     func download(_ quant: QuantInfo, for modelID: String, jobID: String? = nil) -> AsyncStream<DownloadEvent> {
         AsyncStream { continuation in
             let key = "\(modelID)-\(quant.label)"
@@ -652,12 +830,25 @@ actor ModelDownloadManager {
                     private var lastSpeedSampleTime: Date? = nil
                     private var lastSpeedSampleBytes: Int64? = nil
                     private let minSampleInterval: TimeInterval = 0.5
+                    // Progress events arrive via independent Tasks with no ordering
+                    // guarantee, so a regression alone can be reordering. A genuine
+                    // HTTP-200 restart (rejected/ignored resume) resets the counter near
+                    // zero: require both a large absolute drop and a halving before
+                    // re-baselining; anything else must not produce negative deltas.
+                    private let restartDropThreshold: Int64 = 8 << 20
 
                     init(expected: Int64) { self.expected = expected }
 
                     // Update with the absolute total bytes written so far.
                     // Returns the latest throttled instantaneous speed (bytes/sec).
                     func updateBytes(_ written: Int64) -> Double {
+                        if written < lastBytes - restartDropThreshold, written < lastBytes / 2 {
+                            lastBytes = written
+                            lastSpeedSampleTime = Date()
+                            lastSpeedSampleBytes = written
+                            return latestSpeed
+                        }
+                        guard written >= lastBytes else { return latestSpeed }
                         lastBytes = written
                         let now = Date()
                         guard let t0 = lastSpeedSampleTime, let b0 = lastSpeedSampleBytes else {
@@ -709,6 +900,8 @@ actor ModelDownloadManager {
                 let transferState = TransferState()
                 var final = dir.appendingPathComponent(primaryRelativePath)
                 var installedSizeBytes = quant.sizeBytes
+                let pagedPackageDir = pagedPackageRelativeDirectory(for: quant)
+                var pagedPackageFingerprint: String? = nil
                 var currentArtifactID: String? = quant.isMultipart ? nil : "main"
                 do {
                     // A CoreML or Core AI quant still pointing at a bare repo root could
@@ -728,7 +921,11 @@ actor ModelDownloadManager {
                     if quant.isMultipart {
                         if verbose { print("DOWNLOAD_START \(Date().timeIntervalSince1970)") }
                         let multipart: (final: URL, installedSizeBytes: Int64)
-                        if quant.format == .gguf {
+                        // Paged packages carry non-GGUF members (manifest.json,
+                        // expert banks), so they take the format-agnostic asset
+                        // path; integrity comes from package validation below,
+                        // not per-part GGUF magic checks.
+                        if quant.format == .gguf, pagedPackageDir == nil {
                             multipart = try await self.downloadMultipartGGUF(
                                 quant: quant,
                                 key: key,
@@ -748,6 +945,47 @@ actor ModelDownloadManager {
                         if verbose { print("DOWNLOAD_END \(Date().timeIntervalSince1970)") }
                         final = multipart.final
                         installedSizeBytes = multipart.installedSizeBytes
+
+                        if let pagedPackageDir {
+                            let packageDir = dir.appendingPathComponent(pagedPackageDir, isDirectory: true)
+                            do {
+                                let pkg = try NoemaPagedPackage.load(at: packageDir)
+                                try pkg.validate(level: .structural)
+                                PagedPackageLocator.excludeFromBackupIfNeeded(packageDir)
+                                final = pkg.residentGGUFURL
+                                installedSizeBytes = Int64(clamping: pkg.totalSizeBytes)
+                                pagedPackageFingerprint = pkg.manifest.fingerprint
+                                // The loadable weights are the resident GGUF, not
+                                // the manifest the multipart writer recorded as
+                                // primary.
+                                updateWeightsArtifacts(
+                                    in: dir,
+                                    weights: pagedPackageDir + "/" + pkg.manifest.resident.path,
+                                    weightShards: quant.allRelativeDownloadPaths
+                                )
+                            } catch {
+                                // A package that fails validation is unusable as a
+                                // unit; drop the partial directory so a retry
+                                // redownloads it from scratch.
+                                try? FileManager.default.removeItem(at: packageDir)
+                                throw error
+                            }
+                        }
+                    } else if let existingSize = validExistingPrimaryFileSize(quant: quant, dir: dir) {
+                        // A prior run already produced the main weights (e.g. the download was
+                        // paused or failed during verification or the sidecar backfill below);
+                        // don't restart the primary transfer from byte zero.
+                        final = dir.appendingPathComponent(primaryRelativePath)
+                        installedSizeBytes = existingSize
+                        await DownloadEngine.shared.markArtifactCompleted(
+                            externalID: key,
+                            artifactID: "main",
+                            finalBytes: existingSize
+                        )
+                        continuation.yield(.progress(1, existingSize, existingSize, 0))
+                        await DownloadEngine.shared.updateJobState(externalID: key, state: .verifying, manualPause: false)
+                        continuation.yield(.verifying)
+                        updateWeightsArtifacts(in: dir, weights: primaryRelativePath)
                     } else {
                     var req = URLRequest(url: quant.downloadURL)
                     req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
@@ -783,13 +1021,15 @@ actor ModelDownloadManager {
                             }
                             Task { await transferState.update(w: written, e: reportedExpected) }
                             Task {
+                                // Sample first: the engine-actor hop has variable latency
+                                // that would otherwise skew the sample timestamp.
+                                _ = await progressState.updateBytes(written)
                                 await DownloadEngine.shared.updateArtifactProgressLive(
                                     externalID: key,
                                     artifactID: "main",
                                     written: written,
                                     expected: reportedExpected > 0 ? reportedExpected : expected
                                 )
-                                _ = await progressState.updateBytes(written)
                             }
                         })
                     if verbose { print("DOWNLOAD_END \(Date().timeIntervalSince1970)") }
@@ -803,7 +1043,6 @@ actor ModelDownloadManager {
                     if quant.format == .gguf {
                         do {
                             // If the server served HTML (e.g., rate limit page), bail out
-                            // Basic sniff: ensure file begins with GGUF magic
                             let readHandle = try FileHandle(forReadingFrom: tmp)
                             defer { try? readHandle.close() }
                             let magic = try readHandle.read(upToCount: 4) ?? Data()
@@ -844,6 +1083,9 @@ actor ModelDownloadManager {
                     updateWeightsArtifacts(in: dir, weights: primaryRelativePath)
                     }
                     await DownloadEngine.shared.updateJobState(externalID: key, state: .finalizing, manualPause: false)
+                    // Main weights are complete; a late pause/failure surfacing from the
+                    // sidecar backfill below must not flip the completed artifact's state.
+                    currentArtifactID = nil
                     // Fetch and cache hub metadata (pipeline_tag, gguf.chat_template, etc.)
                     if let meta = await HuggingFaceMetadataCache.fetchAndCache(repoId: modelID, token: UserDefaults.standard.string(forKey: "huggingFaceToken")) {
                         HuggingFaceMetadataCache.saveToModelDir(meta: meta, modelID: modelID, format: quant.format)
@@ -1093,6 +1335,17 @@ actor ModelDownloadManager {
                         // Strategy: Try single model.safetensors first, then fall back to sharded files
                         let singleSafetensorsDest = dir.appendingPathComponent("model.safetensors")
                         var needsShardedDownload = true
+                        var singleWeightsError: Error? = nil
+                        var singleWeightsInvalid = false
+                        // The job was already flagged "finalizing"; weight fetches flip it back to
+                        // downloading (and to finalizing afterwards) so the UI doesn't sit on
+                        // "Finalizing" while gigabytes transfer. Lazy so the common
+                        // nothing-to-backfill case never flickers.
+                        var markedWeightsDownloading = false
+                        let mlxTracker = MultipartDownloadProgressTracker(totalExpected: max(quant.sizeBytes, 1))
+                        if let primaryBytes = fileSize(at: final), primaryBytes > 0 {
+                            _ = await mlxTracker.markCompleted(primaryBytes, for: "mlx:primary")
+                        }
 
                         // First, try downloading the single model.safetensors file
                         if !FileManager.default.fileExists(atPath: singleSafetensorsDest.path) ||
@@ -1100,44 +1353,30 @@ actor ModelDownloadManager {
                            !isValidSafetensorsFile(at: singleSafetensorsDest) {
 
                             print("[ModelDownloadManager] Attempting to download single model.safetensors...")
-                            do {
-                                let singleURL = URL(string: "https://huggingface.co/\(repoID)/resolve/main/model.safetensors?download=1")!
-                                var sreq = URLRequest(url: singleURL)
-                                sreq.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
-                                if let token = UserDefaults.standard.string(forKey: "huggingFaceToken"), !token.isEmpty {
-                                    sreq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-                                }
-
-                                if NetworkKillSwitch.isEnabled { throw URLError(.notConnectedToInternet) }
-                                NetworkKillSwitch.track(session: URLSession.shared)
-
-                                let (tmpFile, resp) = try await URLSession.shared.download(for: HFEndpoint.rewrite(sreq))
-
-                                if let httpResp = resp as? HTTPURLResponse, (200..<300).contains(httpResp.statusCode) {
-                                    // Validate before moving
-                                    if isGitLFSPointer(at: tmpFile) {
-                                        print("[ModelDownloadManager] Downloaded model.safetensors is LFS pointer - will try sharded")
-                                        try? FileManager.default.removeItem(at: tmpFile)
-                                    } else if !isValidSafetensorsFile(at: tmpFile) {
-                                        let size = fileSize(at: tmpFile) ?? 0
-                                        print("[ModelDownloadManager] Downloaded model.safetensors has invalid header (size: \(size)) - will try sharded")
-                                        try? FileManager.default.removeItem(at: tmpFile)
-                                    } else {
-                                        // Valid single file - move to destination
-                                        try? FileManager.default.removeItem(at: singleSafetensorsDest) // Remove any invalid existing file
-                                        try FileManager.default.moveItem(at: tmpFile, to: singleSafetensorsDest)
-                                        let finalSize = fileSize(at: singleSafetensorsDest) ?? 0
-                                        print("[ModelDownloadManager] Successfully downloaded model.safetensors (\(finalSize / 1_000_000) MB)")
-                                        needsShardedDownload = false
-                                    }
-                                } else if let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 404 {
-                                    print("[ModelDownloadManager] model.safetensors not found (404) - will try sharded files")
-                                    try? FileManager.default.removeItem(at: tmpFile)
-                                } else {
-                                    print("[ModelDownloadManager] Failed to download model.safetensors - will try sharded")
-                                    try? FileManager.default.removeItem(at: tmpFile)
-                                }
-                            } catch {
+                            if !markedWeightsDownloading {
+                                markedWeightsDownloading = true
+                                await DownloadEngine.shared.updateJobState(externalID: key, state: .downloading, manualPause: false)
+                            }
+                            switch try await self.fetchMLXWeightFile(
+                                named: "model.safetensors",
+                                repoID: repoID,
+                                dir: dir,
+                                key: key,
+                                jobID: jobID,
+                                token: authToken,
+                                progressTracker: mlxTracker,
+                                continuation: continuation
+                            ) {
+                            case .installed(let size):
+                                print("[ModelDownloadManager] Successfully downloaded model.safetensors (\(size / 1_000_000) MB)")
+                                needsShardedDownload = false
+                            case .notFound:
+                                print("[ModelDownloadManager] model.safetensors not found (404) - will try sharded files")
+                            case .invalidContent:
+                                singleWeightsInvalid = true
+                                print("[ModelDownloadManager] Downloaded model.safetensors is not valid safetensors data - will try sharded")
+                            case .failed(let error):
+                                singleWeightsError = error
                                 print("[ModelDownloadManager] Error downloading model.safetensors: \(error) - will try sharded")
                             }
                         } else {
@@ -1146,12 +1385,15 @@ actor ModelDownloadManager {
                         }
 
                         // If single file download failed/not available, try sharded download via index
+                        var shardIndexFound = false
+                        var shardFetchError: Error? = nil
+                        var shardContentInvalid = false
                         if needsShardedDownload {
                             do {
                                 let indexURL = URL(string: "https://huggingface.co/\(repoID)/raw/main/model.safetensors.index.json")!
                                 var req = URLRequest(url: indexURL)
                                 req.setValue("application/json", forHTTPHeaderField: "Accept")
-                                if let token = UserDefaults.standard.string(forKey: "huggingFaceToken"), !token.isEmpty {
+                                if let token = authToken, !token.isEmpty {
                                     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                                 }
                                 if NetworkKillSwitch.isEnabled { throw URLError(.notConnectedToInternet) }
@@ -1165,14 +1407,13 @@ actor ModelDownloadManager {
                                     // Parse shard list from weight_map values
                                     if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                                        let weightMap = obj["weight_map"] as? [String: String] {
+                                        shardIndexFound = true
                                         let shardNames = Array(Set(weightMap.values)).sorted()
                                         print("[ModelDownloadManager] Found \(shardNames.count) safetensors shards in index")
 
-                                        var anyShardFailed = false
                                         for name in shardNames {
                                             let shardDest = dir.appendingPathComponent(name)
 
-                                            // Check if file exists and is valid
                                             if FileManager.default.fileExists(atPath: shardDest.path) {
                                                 if isGitLFSPointer(at: shardDest) {
                                                     print("[ModelDownloadManager] \(name) is LFS pointer - re-downloading")
@@ -1183,70 +1424,68 @@ actor ModelDownloadManager {
                                                     try? FileManager.default.removeItem(at: shardDest)
                                                 } else {
                                                     print("[ModelDownloadManager] \(name) already valid - skipping")
+                                                    _ = await mlxTracker.markCompleted(fileSize(at: shardDest) ?? 0, for: "mlx:\(name)")
                                                     continue
                                                 }
                                             }
 
-                                            // Download the shard
                                             print("[ModelDownloadManager] Downloading shard: \(name)")
-                                            do {
-                                                let shardURL = URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(name)?download=1")!
-                                                var sreq = URLRequest(url: shardURL)
-                                                sreq.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
-                                                if let token = UserDefaults.standard.string(forKey: "huggingFaceToken"), !token.isEmpty {
-                                                    sreq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-                                                }
-
-                                                if NetworkKillSwitch.isEnabled { throw URLError(.notConnectedToInternet) }
-                                                NetworkKillSwitch.track(session: URLSession.shared)
-
-                                                let (tmpShard, shardResp) = try await URLSession.shared.download(for: HFEndpoint.rewrite(sreq))
-
-                                                if let httpResp = shardResp as? HTTPURLResponse {
-                                                    guard (200..<300).contains(httpResp.statusCode) else {
-                                                        print("[ModelDownloadManager] Shard \(name): HTTP \(httpResp.statusCode)")
-                                                        anyShardFailed = true
-                                                        try? FileManager.default.removeItem(at: tmpShard)
-                                                        continue
-                                                    }
-                                                }
-
-                                                // Validate downloaded file
-                                                if isGitLFSPointer(at: tmpShard) {
-                                                    print("[ModelDownloadManager] ERROR: \(name) is LFS pointer")
-                                                    try? FileManager.default.removeItem(at: tmpShard)
-                                                    anyShardFailed = true
-                                                    continue
-                                                }
-
-                                                if !isValidSafetensorsFile(at: tmpShard) {
-                                                    let size = fileSize(at: tmpShard) ?? 0
-                                                    print("[ModelDownloadManager] ERROR: \(name) invalid header (size: \(size))")
-                                                    try? FileManager.default.removeItem(at: tmpShard)
-                                                    anyShardFailed = true
-                                                    continue
-                                                }
-
-                                                try FileManager.default.moveItem(at: tmpShard, to: shardDest)
-                                                let finalSize = fileSize(at: shardDest) ?? 0
-                                                print("[ModelDownloadManager] Downloaded \(name) (\(finalSize / 1_000_000) MB)")
-
-                                            } catch {
-                                                print("[ModelDownloadManager] Failed shard \(name): \(error)")
-                                                anyShardFailed = true
+                                            if !markedWeightsDownloading {
+                                                markedWeightsDownloading = true
+                                                await DownloadEngine.shared.updateJobState(externalID: key, state: .downloading, manualPause: false)
                                             }
-                                        }
-
-                                        // If any shards failed to download, the index might be stale
-                                        // Try the single file as final fallback
-                                        if anyShardFailed && !FileManager.default.fileExists(atPath: singleSafetensorsDest.path) {
-                                            print("[ModelDownloadManager] Some shards failed - index may be outdated. Model weights may be incomplete.")
+                                            switch try await self.fetchMLXWeightFile(
+                                                named: name,
+                                                repoID: repoID,
+                                                dir: dir,
+                                                key: key,
+                                                jobID: jobID,
+                                                token: authToken,
+                                                progressTracker: mlxTracker,
+                                                continuation: continuation
+                                            ) {
+                                            case .installed(let size):
+                                                print("[ModelDownloadManager] Downloaded \(name) (\(size / 1_000_000) MB)")
+                                            case .notFound:
+                                                print("[ModelDownloadManager] Shard \(name): HTTP 404")
+                                                shardContentInvalid = true
+                                            case .invalidContent:
+                                                print("[ModelDownloadManager] ERROR: \(name) is not valid safetensors data")
+                                                shardContentInvalid = true
+                                            case .failed(let error):
+                                                print("[ModelDownloadManager] Failed shard \(name): \(error)")
+                                                shardFetchError = error
+                                            }
                                         }
                                     }
                                 }
                             } catch {
+                                let ns = error as NSError
+                                if error is CancellationError ||
+                                    (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled) {
+                                    throw error
+                                }
                                 print("[ModelDownloadManager] No safetensors index or failed to fetch: \(error)")
                             }
+                        }
+
+                        // Installing with weights known to be missing or invalid only defers the
+                        // failure to load time with a far more confusing error. Surface it now:
+                        // transport errors categorize as retryable downstream, and already-valid
+                        // shards are skipped on the retry. A repo with neither a single file nor
+                        // an index and no transport error simply publishes no safetensors weights
+                        // (e.g. npz-based MLX) — that stays installable.
+                        if needsShardedDownload {
+                            if shardIndexFound {
+                                if let shardFetchError { throw shardFetchError }
+                                if shardContentInvalid { throw URLError(.cannotParseResponse) }
+                            } else if !FileManager.default.fileExists(atPath: singleSafetensorsDest.path) {
+                                if let singleWeightsError { throw singleWeightsError }
+                                if singleWeightsInvalid { throw URLError(.cannotParseResponse) }
+                            }
+                        }
+                        if markedWeightsDownloading {
+                            await DownloadEngine.shared.updateJobState(externalID: key, state: .finalizing, manualPause: false)
                         }
 
                         // Also fetch the index file if we downloaded a single file (for compatibility)
@@ -1356,9 +1595,9 @@ actor ModelDownloadManager {
                     case .mlx:
                         isVision = MLXBridge.isVLMModel(at: canonical)
                     case .et:
-                        // Use Leap heuristics: prefer quantization slug check; fall back to bundle scan
+                        // Prefer repository/name signals, then inspect the installed ET artifacts.
                         let slug = final.deletingPathExtension().lastPathComponent
-                        isVision = LeapCatalogService.isVisionQuantizationSlug(slug) || LeapCatalogService.bundleLikelyVision(at: canonical)
+                        isVision = ETModelResolver.isVisionIdentifier(slug) || ETModelResolver.isLikelyVisionModel(at: canonical)
                     case .ane:
                         isVision = false
                     case .afm:
@@ -1411,7 +1650,9 @@ actor ModelDownloadManager {
                                                            userSelected: nil,
                                                            detected: ETBackendDetector.detect(tags: [], modelName: "\(modelID) \(quant.label)")
                                                        )
-                                                       : nil)
+                                                       : nil,
+                                                   pagedPackageFingerprint: pagedPackageFingerprint,
+                                                   pagedPackageBytes: pagedPackageFingerprint != nil ? installedSizeBytes : nil)
                     self.clearTempDestinations(for: key)
                     continuation.yield(.finished(installed))
                 } catch is CancellationError {

@@ -92,6 +92,19 @@ extension AppModelManager {
         clearOpenRouterFavorites(for: id)
         remoteBackendsFetching.remove(id)
         StartupPreferencesStore.removeRemoteSelections(for: id)
+        var autopilotConfig = AutopilotConfigStore.load()
+        var autopilotConfigChanged = false
+        if autopilotConfig.routerSelection?.backendID == id {
+            autopilotConfig.routerSelection = nil
+            autopilotConfigChanged = true
+        }
+        if autopilotConfig.escalationSelection?.backendID == id {
+            autopilotConfig.escalationSelection = nil
+            autopilotConfigChanged = true
+        }
+        if autopilotConfigChanged {
+            AutopilotConfigStore.save(autopilotConfig)
+        }
         if activeRemoteSession?.backendID == id {
             activeRemoteSession = nil
         }
@@ -320,9 +333,11 @@ extension AppModelManager {
             cfg.timeoutIntervalForResource = 3
             cfg.waitsForConnectivity = false
             let session = URLSession(configuration: cfg)
+            NetworkKillSwitch.track(session: session)
             defer { session.invalidateAndCancel() }
             await logger.log("[RemoteChat] [LAN] Health probe → \(healthURL.absoluteString) for '\(backend.name)'")
             do {
+                guard !NetworkKillSwitch.shouldBlock(request: req) else { return }
                 let (_, resp) = try await session.data(for: req)
                 if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
                     // If the host is on Ethernet (no SSID) but we're on the same subnet,
@@ -348,9 +363,11 @@ extension AppModelManager {
         configuration.timeoutIntervalForResource = 4
         configuration.waitsForConnectivity = false
         let session = URLSession(configuration: configuration)
+        NetworkKillSwitch.track(session: session)
         defer { session.invalidateAndCancel() }
         await logger.log("[RemoteChat] [LAN] HEAD probe → \(url.absoluteString) for '\(backend.name)'")
         do {
+            guard !NetworkKillSwitch.shouldBlock(request: request) else { return }
             let (_, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse {
                 switch http.statusCode {

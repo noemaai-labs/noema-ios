@@ -36,6 +36,7 @@ struct SupportModelInventoryItem: Identifiable, Equatable, Sendable {
     enum Kind: String, Sendable {
         case speech
         case embedding
+        case voice
     }
 
     let id: String
@@ -79,6 +80,46 @@ enum SupportModelInventory {
             state: state,
             progress: progress,
             sizeBytes: sizeBytes
+        )
+    }
+
+    @MainActor
+    static func voiceItem() -> SupportModelInventoryItem {
+        let installState = VoiceModelCatalog.installState()
+        let store = VoiceModelDownloadStore.shared
+        return voiceItem(
+            installState: installState,
+            isDownloading: store.isDownloading,
+            progress: store.progress
+        )
+    }
+
+    /// Builds the row from a MainActor snapshot while allowing the expensive
+    /// install-state and size scans to be performed by an off-main caller.
+    static func voiceItem(
+        installState: VoiceModelInstallState,
+        isDownloading: Bool,
+        progress: Double
+    ) -> SupportModelInventoryItem {
+        let state: SupportModelState = {
+            if isDownloading { return .downloading }
+            switch installState {
+            case .ready: return .ready
+            case .incomplete: return .incomplete
+            case .missing: return .missing
+            }
+        }()
+        return SupportModelInventoryItem(
+            id: "support:voice",
+            kind: .voice,
+            titleKey: "Voice / TTS",
+            displayName: VoiceModelCatalog.displayName,
+            detail: "Neural Engine",
+            state: state,
+            progress: isDownloading ? progress : nil,
+            sizeBytes: installState == .ready
+                ? VoiceModelCatalog.installedSizeBytes
+                : VoiceModelCatalog.approximateSizeBytes
         )
     }
 

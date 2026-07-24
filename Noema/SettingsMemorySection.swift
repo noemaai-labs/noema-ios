@@ -559,6 +559,30 @@ private struct MemoryEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+#if os(macOS)
+        // Presented as a plain sheet (no macSettingsSheet), so macOS keeps its own
+        // title header + Save/Cancel action row instead of the raw iOS Form.
+        macBody
+#else
+        formBody
+            .navigationTitle(draft.isNew ? "Add Memory" : "Edit Memory")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        onSave()
+                    }
+                }
+            }
+#endif
+    }
+
+    private var formBody: some View {
         Form {
             Section {
                 TextField("Memory Title", text: $draft.title)
@@ -589,21 +613,102 @@ private struct MemoryEditorSheet: View {
                 }
             }
         }
-        .navigationTitle(draft.isNew ? "Add Memory" : "Edit Memory")
-        #if !os(macOS)
-        .navigationBarTitleDisplayMode(.inline)
-        #endif
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") {
-                    dismiss()
+    }
+
+#if os(macOS)
+    private var macBody: some View {
+        MacSettingsPage {
+            HStack {
+                Text(draft.isNew ? LocalizedStringKey("Add Memory") : LocalizedStringKey("Edit Memory"))
+                    .font(.system(size: 16, weight: .semibold))
+                Spacer(minLength: 8)
+            }
+
+            MacSettingsCard(draft.isNew ? LocalizedStringKey("New Memory") : LocalizedStringKey("Edit Memory")) {
+                MacSettingsControlRow("Memory Title", divider: false) {
+                    TextField("Memory Title", text: $draft.title)
+                        .labelsHidden()
+                        .industrialField(width: 240)
+                }
+
+                MemoryContentEditorRow(text: $draft.content)
+
+                MacSettingsControlRow("Memory Scope") {
+                    Picker("Memory Scope", selection: $draft.scope) {
+                        ForEach(MemoryScope.allCases, id: \.self) { scope in
+                            Text(scope.localizedTitle).tag(scope)
+                        }
+                    }
+                    .labelsHidden()
+                }
+
+                MacSettingsControlRow("Expires") {
+                    Toggle("Expires", isOn: $draft.hasExpiry)
+                        .toggleStyle(IndustrialToggleStyle())
+                        .labelsHidden()
+                }
+
+                if draft.hasExpiry {
+                    MacSettingsControlRow("Expiry Date") {
+                        DatePicker(
+                            "Expiry Date",
+                            selection: $draft.expiresAt,
+                            in: Date()...,
+                            displayedComponents: [.date]
+                        )
+                        .labelsHidden()
+                    }
+                }
+
+                if let errorMessage, !errorMessage.isEmpty {
+                    MacSettingsRowContainer {
+                        Text(errorMessage)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else {
+                    MacSettingsNoteRow("Use memory for durable facts that should remain available in future conversations.")
                 }
             }
-            ToolbarItem(placement: .confirmationAction) {
+
+            MacSettingsActionRow(divider: false) {
                 Button("Save") {
                     onSave()
                 }
+                .buttonStyle(.industrial(.prominent))
+                Button("Cancel") {
+                    dismiss()
+                }
+                .buttonStyle(.industrial(.quiet))
+            }
+        }
+        .frame(minWidth: 460, minHeight: 560)
+    }
+
+    /// The multi-line content editor doesn't fit the single-line control-row
+    /// mould, so it gets a full-width field of its own inside the card.
+    private struct MemoryContentEditorRow: View {
+        @Binding var text: String
+
+        var body: some View {
+            MacSettingsRowContainer {
+                TextEditor(text: $text)
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(minHeight: 200)
+                    .frame(maxWidth: .infinity)
+                    .padding(6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    )
             }
         }
     }
+#endif
 }

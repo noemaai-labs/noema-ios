@@ -1,4 +1,3 @@
-// DatasetDocumentSupport.swift
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers

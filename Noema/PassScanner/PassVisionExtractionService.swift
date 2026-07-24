@@ -267,7 +267,7 @@ final class PassVisionExtractionService {
     }
 
     private static func stringProperties(_ names: [String]) -> [String: [String: String]] {
-        Dictionary(uniqueKeysWithValues: names.map { ($0, ["type": "string"]) })
+        Dictionary(names.map { ($0, ["type": "string"]) }, uniquingKeysWith: { _, latest in latest })
     }
 
     private static var systemPrompt: String {

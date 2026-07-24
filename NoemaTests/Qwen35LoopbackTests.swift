@@ -87,18 +87,216 @@ final class Qwen35LoopbackTests: XCTestCase {
         XCTAssertEqual(messages.last?.content, "hello")
     }
 
+    @MainActor
+    func testStructuredLoopbackInputKeepsFrozenFullDocumentSystemPrefix() throws {
+        let vm = ChatVM()
+        vm.setLoadedStateForTesting(
+            modelLoaded: true,
+            loadedURL: URL(fileURLWithPath: "/tmp/Qwen3.5-4B-Q4_K_M.gguf"),
+            loadedFormat: .gguf
+        )
+        let history: [ChatVM.Msg] = [
+            .init(role: "user", text: "What does this method do?", timestamp: Date())
+        ]
+
+        let input = try XCTUnwrap(vm.structuredLoopbackInput(
+            for: history,
+            retrievedContext: "FULL DOCUMENT SENTINEL",
+            fullDocumentPlacement: true,
+            systemPromptOverride: "FROZEN SYSTEM SENTINEL"
+        ))
+        guard case .messages(let messages) = input.content else {
+            return XCTFail("Expected structured loopback messages")
+        }
+        let system = try XCTUnwrap(messages.first(where: { $0.role == "system" }))
+
+        XCTAssertTrue(system.content.contains("FULL DOCUMENT SENTINEL"))
+        XCTAssertTrue(system.content.contains("FROZEN SYSTEM SENTINEL"))
+        let documentIndex = try XCTUnwrap(system.content.range(of: "FULL DOCUMENT SENTINEL")?.lowerBound)
+        let systemIndex = try XCTUnwrap(system.content.range(of: "FROZEN SYSTEM SENTINEL")?.lowerBound)
+        XCTAssertLessThan(documentIndex, systemIndex)
+    }
+
+    @MainActor
+    func testPlainToolContinuationPromptRetainsFullDocumentAndFrozenSystemPrompt() {
+        let vm = ChatVM()
+        let history: [ChatVM.Msg] = [
+            .init(role: "user", text: "Question", timestamp: Date()),
+            .init(role: "assistant", text: "", timestamp: Date()),
+            .init(role: "tool", text: #"{"result":"value"}"#, timestamp: Date())
+        ]
+
+        let prompt = vm.plainToolContinuationPrompt(
+            history: history,
+            retrievedContext: "FULL DOCUMENT SENTINEL",
+            fullDocumentPlacement: true,
+            systemPromptOverride: "FROZEN SYSTEM SENTINEL"
+        )
+
+        XCTAssertTrue(prompt.contains("FULL DOCUMENT SENTINEL"))
+        XCTAssertTrue(prompt.contains("FROZEN SYSTEM SENTINEL"))
+        XCTAssertTrue(prompt.contains(#"{"result":"value"}"#))
+    }
+
+    @MainActor
+    func testPlainToolContinuationPromptRetainsQuerySpecificRAGContext() {
+        let vm = ChatVM()
+        let history: [ChatVM.Msg] = [
+            .init(role: "user", text: "Question", timestamp: Date()),
+            .init(role: "tool", text: "Tool output", timestamp: Date())
+        ]
+
+        let prompt = vm.plainToolContinuationPrompt(
+            history: history,
+            retrievedContext: "RAG CONTEXT SENTINEL",
+            fullDocumentPlacement: false,
+            systemPromptOverride: "FROZEN SYSTEM SENTINEL"
+        )
+
+        XCTAssertTrue(prompt.contains("RAG CONTEXT SENTINEL"))
+        XCTAssertTrue(prompt.contains("FROZEN SYSTEM SENTINEL"))
+    }
+
+    @MainActor
+    func testToolContinuationHistoryCopiesLiveAssistantToolMetadata() throws {
+        let vm = ChatVM()
+        let toolCall = ChatVM.Msg.ToolCall(
+            toolName: "dataset.grep",
+            displayName: "Read",
+            iconName: "doc.text.magnifyingglass",
+            requestParams: ["query": AnyCodable("method")],
+            phase: .completed,
+            externalToolCallID: "call-dataset-1",
+            result: #"{"matches":[]}"#
+        )
+        let history: [ChatVM.Msg] = [
+            .init(role: "user", text: "Question", timestamp: Date()),
+            .init(role: "assistant", text: "", timestamp: Date(), streaming: true)
+        ]
+
+        let continuation = vm.historyForToolContinuation(
+            from: history,
+            assistantIndex: 1,
+            assistantText: "Calling the document tool",
+            assistantToolCalls: [toolCall],
+            toolResult: #"{"matches":[]}"#
+        )
+
+        XCTAssertEqual(continuation[1].text, "Calling the document tool")
+        XCTAssertEqual(continuation[1].toolCalls?.first?.externalToolCallID, "call-dataset-1")
+        XCTAssertEqual(continuation.last?.role, "tool")
+        XCTAssertEqual(continuation.last?.text, #"{"matches":[]}"#)
+    }
+
+    @MainActor
+    func testEscalationMessagesPreserveNativeToolCallAndResultRoles() throws {
+        let vm = ChatVM()
+        let toolCall = ChatVM.Msg.ToolCall(
+            toolName: "noema.pdf.read",
+            displayName: "Read",
+            iconName: "doc.text.magnifyingglass",
+            requestParams: [
+                "action": AnyCodable("grep"),
+                "query": AnyCodable("hardware")
+            ],
+            phase: .completed,
+            externalToolCallID: "pdf-call-1",
+            result: #"{"matches":[{"page":6}]}"#
+        )
+        var assistant = ChatVM.Msg(
+            role: "assistant",
+            text: "<think>Search the PDF.</think>\(noemaToolAnchorToken)",
+            timestamp: Date()
+        )
+        assistant.toolCalls = [toolCall]
+        let history: [ChatVM.Msg] = [
+            .init(role: "user", text: "Find the training hardware", timestamp: Date()),
+            assistant,
+            .init(role: "tool", text: #"{"matches":[{"page":6}]}"#, timestamp: Date())
+        ]
+
+        let messages = vm.escalationChatMessages(
+            history: history,
+            systemPrompt: "System"
+        )
+
+        XCTAssertEqual(messages.map(\.role), ["system", "user", "assistant", "tool"])
+        XCTAssertFalse(messages[2].content.contains(noemaToolAnchorToken))
+        XCTAssertEqual(messages[2].toolCalls?.first?.id, "pdf-call-1")
+        XCTAssertEqual(messages[2].toolCalls?.first?.function.name, "noema.pdf.read")
+        XCTAssertEqual(messages[3].toolCallId, "pdf-call-1")
+        XCTAssertFalse(messages.contains { $0.content.contains("Give the final answer now") })
+    }
+
+    @MainActor
+    func testStreamingContinuationDoesNotStopAfterTwoToolResults() async {
+        let probe = SequencedToolContinuationProbe(
+            outputs: [
+                [#"TOOL_RESULT: {"step":1}"#],
+                [#"TOOL_RESULT: {"step":2}"#],
+                [#"TOOL_RESULT: {"step":3}"#],
+                ["Final answer after three tool results."]
+            ]
+        )
+        let client = AnyLLMClient(textStream: { input in
+            let chunks = await probe.nextOutput(for: input)
+            return AsyncThrowingStream<String, Error> { continuation in
+                for chunk in chunks { continuation.yield(chunk) }
+                continuation.finish()
+            }
+        })
+        let vm = ChatVM()
+        vm.msgs = [.init(role: "system", text: "test")]
+        vm.setClientForTesting(
+            client,
+            modelLoaded: true,
+            loadedURL: URL(fileURLWithPath: "/tmp/unlimited-tool-continuation.gguf"),
+            loadedFormat: .gguf
+        )
+
+        await vm.sendMessage("Research this with as many tool calls as needed")
+        for _ in 0..<2_000 {
+            if await probe.invocationCount() >= 4,
+               vm.msgs.last?.streaming == false {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        let invocationCount = await probe.invocationCount()
+        XCTAssertEqual(invocationCount, 4)
+        XCTAssertTrue(vm.msgs.last?.text.contains("Final answer after three tool results.") == true)
+        XCTAssertFalse(vm.msgs.last?.streaming ?? true)
+    }
+
     func testTemplateDrivenLoopbackRequestPlanAddsGenerationPrompt() {
         let client = NoemaLlamaClient(url: URL(fileURLWithPath: "/tmp/Qwen3.5-4B-Q4_K_M.gguf"))
-        let input = LLMInput(.messages([ChatMessage(role: "user", content: "hello")]))
+        let input = LLMInput(
+            .messages([ChatMessage(role: "user", content: "hello")]),
+            generationOptions: LLMGenerationOptions(promptCache: true)
+        )
 
         let plan = client.buildLoopbackRequestPlan(for: input, forceNonStreaming: false)
 
         XCTAssertEqual(plan.endpoint, "/v1/chat/completions")
         XCTAssertEqual(plan.requestMode, "chat_completions")
         XCTAssertEqual(plan.body["add_generation_prompt"] as? Bool, true)
+        XCTAssertEqual(plan.body["cache_prompt"] as? Bool, true)
         XCTAssertEqual(plan.body["reasoning_format"] as? String, "deepseek")
         let kwargs = plan.body["chat_template_kwargs"] as? [String: Bool]
         XCTAssertEqual(kwargs?["enable_thinking"], true)
+    }
+
+    func testPlainLoopbackRequestPlanHonorsRequestPromptCache() {
+        let client = NoemaLlamaClient(url: URL(fileURLWithPath: "/tmp/model.gguf"))
+
+        let plan = client.buildLoopbackRequestPlan(
+            for: LLMInput(.plain("hello"), generationOptions: LLMGenerationOptions(promptCache: true)),
+            forceNonStreaming: false
+        )
+
+        XCTAssertEqual(plan.endpoint, "/completion")
+        XCTAssertEqual(plan.body["cache_prompt"] as? Bool, true)
     }
 
     func testAliasModelUsesMetadataBackedQwen35Profile() throws {
@@ -184,6 +382,7 @@ final class Qwen35LoopbackTests: XCTestCase {
         let imagePayload = try XCTUnwrap(content.last?["image_url"] as? [String: String])
 
         XCTAssertEqual(plan.body["add_generation_prompt"] as? Bool, true)
+        XCTAssertEqual(plan.body["speculative"] as? Bool, false)
         XCTAssertEqual(plan.body["reasoning_format"] as? String, "deepseek")
         XCTAssertEqual((plan.body["chat_template_kwargs"] as? [String: Bool])?["enable_thinking"], true)
         XCTAssertEqual(messages.first?["role"] as? String, "system")
@@ -232,6 +431,7 @@ final class Qwen35LoopbackTests: XCTestCase {
         let schema = try XCTUnwrap(jsonSchema["schema"] as? [String: Any])
 
         XCTAssertEqual(plan.body["add_generation_prompt"] as? Bool, true)
+        XCTAssertEqual(plan.body["speculative"] as? Bool, false)
         XCTAssertNil(plan.body["reasoning_format"])
         XCTAssertEqual((plan.body["chat_template_kwargs"] as? [String: Bool])?["enable_thinking"], false)
         XCTAssertEqual(plan.body["n_predict"] as? Int, 1024)
@@ -612,5 +812,24 @@ private actor AsyncUnloadProbe {
     func resume() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private actor SequencedToolContinuationProbe {
+    private let outputs: [[String]]
+    private var inputs: [LLMInput] = []
+
+    init(outputs: [[String]]) {
+        self.outputs = outputs
+    }
+
+    func nextOutput(for input: LLMInput) -> [String] {
+        inputs.append(input)
+        let index = inputs.count - 1
+        return outputs.indices.contains(index) ? outputs[index] : []
+    }
+
+    func invocationCount() -> Int {
+        inputs.count
     }
 }

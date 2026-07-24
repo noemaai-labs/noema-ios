@@ -1,5 +1,4 @@
 #if os(iOS) || os(visionOS) || os(macOS)
-// WebSearchButton.swift
 import SwiftUI
 
 struct WebSearchButton: View {
@@ -168,7 +167,6 @@ struct WebSearchButton: View {
     }
 
     private var hasRecentWebSearch: Bool {
-        // Check if the current or recent message has a web search
         if let lastMsg = vm.msgs.last(where: { $0.role == "🤖" || $0.role.lowercased() == "assistant" }) {
             return lastMsg.usedWebSearch == true || lastMsg.webHits != nil
         }
@@ -190,7 +188,9 @@ struct WebSearchButton: View {
     }
 
     private var webSearchBlockedByModelFormat: Bool {
-        isMLXModel || isAFMModel
+        // PCC-backed AFM runs the native FoundationModels web tool, so only the
+        // on-device AFM variant stays blocked.
+        isMLXModel || (isAFMModel && vm.afmChatToolsUnavailable)
     }
 
     private var functionCallingSupport: Bool? {
@@ -222,7 +222,7 @@ struct WebSearchButton: View {
         if isMLXModel {
             return String(localized: "Web Search is currently unreliable with MLX models due to MLX limitations.")
         }
-        if isAFMModel {
+        if isAFMModel && vm.afmChatToolsUnavailable {
             return String(localized: "Web search is disabled for Apple Foundation Models because their context budget cannot reliably accommodate tool input.")
         }
         if supported == false {

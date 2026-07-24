@@ -122,6 +122,45 @@ enum ETModelResolver {
         pteURL(for: url) != nil
     }
 
+    static func displayName(for modelID: String) -> String? {
+        let repo = modelID.split(separator: "/").last.map(String.init) ?? modelID
+        let cleaned = repo
+            .replacingOccurrences(of: "[-_]", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    static func isVisionIdentifier(_ value: String) -> Bool {
+        let lower = value.lowercased()
+        let tokens = [
+            "vision", "vlm", "llava", "qwen-vl", "qwen2-vl", "qwen3-vl",
+            "multimodal", "image", "pixtral", "minicpm-v", "gemma-vision"
+        ]
+        return tokens.contains { lower.contains($0) }
+    }
+
+    static func isLikelyVisionModel(at url: URL) -> Bool {
+        if isVisionIdentifier(url.path) {
+            return true
+        }
+
+        let directory = modelDirectory(for: url)
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return false
+        }
+
+        for file in files {
+            let name = file.lastPathComponent.lowercased()
+            if isVisionIdentifier(name) { return true }
+            if name.contains("projector") || name.contains("mmproj") || name.contains("image") { return true }
+            if name == "preprocessor_config.json" { return true }
+        }
+        return false
+    }
+
     static func modelDirectory(for url: URL) -> URL {
         let fixed = url.resolvingSymlinksInPath().standardizedFileURL
         var isDir: ObjCBool = false

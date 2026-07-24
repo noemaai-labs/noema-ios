@@ -1,6 +1,3 @@
-// ChatSuggestions.swift
-// Centralized list of starter prompts and simple rotation logic.
-
 import Foundation
 
 struct ChatSuggestions {
