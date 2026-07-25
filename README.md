@@ -96,7 +96,6 @@ The project uses the `NoemaLLamaServer` SwiftPM package build for llama.cpp, so 
 ### Configuration
 - **Web search** – built in; it uses the hosted SearXNG endpoint by default and requires no per-user key. The endpoint and engine are configurable in Settings.
 - **Hugging Face endpoint** – optionally point downloads at a mirror (e.g. `hf-mirror.com`) via Settings or the `HF_ENDPOINT` environment variable. Your Hugging Face token is only ever sent to official Hugging Face hosts.
-- **RevenueCat** – supply your key via the `REVENUECAT_API_KEY` environment variable or `RevenueCatAPIKey` in Info.plist if you enable subscriptions.
 
 ---
 
