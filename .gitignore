@@ -62,3 +62,7 @@ AuthKey_*.p8
 /Noema/UsageLimiterDemo.swift
 /Noema/ToolIntegration.swift
 /Noema/ReadmeMobileFormatterTests.swift
+
+# Runtime secrets read by AppSecrets.swift. Never track this file — it holds
+# the live SearXNG key. Copy Secrets.example.plist and fill it in.
+Secrets.plist
