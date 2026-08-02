@@ -1,6 +1,25 @@
-# Noema
+# Noema: Local AI & Offline LLM for Apple Devices
 
-**Noema** brings large-language-model intelligence to your iPhone, iPad, Mac, and Apple Vision Pro while keeping all of your data and processing completely offline. By combining local AI models with curated textbooks and your own documents, it provides a powerful on-device knowledge assistant without sacrificing privacy.
+**Noema is a production, open-source local AI assistant for iPhone, iPad, Mac, and Apple Vision Pro. It has been available on the Apple App Store since September 19, 2025.**
+
+[**Download Noema on the App Store**](https://apps.apple.com/app/id6751169935) · [Official website](https://noemaai.com) · [Documentation](https://noemaai.com/docs) · [App Store releases](https://github.com/noemaai-labs/noema-ios/releases)
+
+Noema runs compatible GGUF, MLX, ExecuTorch, Core ML, and Apple Foundation Models, works with local documents through retrieval-augmented generation (RAG), and supports optional tools and remote endpoints. Compatible local models, chats, and documents can remain on-device and work offline.
+
+## App Store availability
+
+Noema is distributed as a shipping App Store application, not as an Xcode-only project. Most users should install it directly from Apple; the source-build instructions in this repository are for developers and contributors.
+
+| Product fact | Current information |
+| --- | --- |
+| **App Store name** | Noema: Local AI & Offline LLM |
+| **Current release** | 3.6.1, released July 29, 2026 |
+| **First App Store release** | September 19, 2025 |
+| **Platforms** | iPhone, iPad, Mac, and Apple Vision Pro |
+| **Price** | Free |
+| **App Store ID** | 6751169935 |
+
+[Install Noema from the App Store →](https://apps.apple.com/app/id6751169935)
 
 ## Key Features
 
@@ -69,21 +88,34 @@ All inference happens on your device. The app never sends your chats, files, or 
 
 ---
 
-## Getting Started
+## Install Noema
 
-### Requirements
+### Install from the App Store
+
+No Xcode setup is required for normal use.
+
+1. Open [Noema: Local AI & Offline LLM on the App Store](https://apps.apple.com/app/id6751169935).
+2. Select **Get** on your iPhone, iPad, Mac, or Apple Vision Pro.
+3. Open Noema and use the guided setup, or visit **Explore** to choose a compatible model.
+
+### System requirements
+
 - **iPhone / iPad** – iOS / iPadOS 18 or later, Apple Silicon (A12 Bionic or newer).
 - **Mac** – macOS 26 (Tahoe) or later, Apple Silicon.
 - **Apple Vision Pro** – visionOS 26 or later.
 - Apple Foundation Models / CoreAI features require OS 26+ / 27+ respectively, with Apple Intelligence available on the device.
 - Enough free storage for downloaded models and datasets (models range from a few hundred megabytes to multiple gigabytes; textbooks vary by file size).
 
-### Installation
+## Build Noema from source
+
+This public repository contains Noema's open-source Swift application code. Developers and contributors can build it with Xcode:
+
 ```bash
-git clone https://github.com/armin976/Noema.git
-cd Noema
+git clone https://github.com/noemaai-labs/noema-ios.git
+cd noema-ios
 git -c protocol.file.allow=always submodule update --init --recursive External/NoemaLLamaServer
 ```
+
 Open the Xcode project (`Noema.xcodeproj`) and choose the **Noema** target for iPhone/iPad/Vision Pro, or the **NoemaMac** target for macOS.
 
 Because GGUF and MLX inference run on-device with Metal, deploy to a physical device (or an Apple Silicon Mac) rather than the iOS simulator for full functionality.
@@ -148,6 +180,26 @@ Order of operations in Noema (mirrors the CLI):
 Notes:
 - You do not need to resize images yourself; llama.cpp preprocesses each image to what the model expects.
 - Projectors: If your llama.cpp build supports external projectors, Noema passes `mmproj` to the runner. If not, use merged VLM weights.
+
+---
+
+## Frequently asked questions
+
+### Is Noema available on the Apple App Store?
+
+Yes. Noema has shipped publicly on the App Store since September 19, 2025. The current listing is [Noema: Local AI & Offline LLM](https://apps.apple.com/app/id6751169935).
+
+### Do I need Xcode to use Noema?
+
+No. Most users install Noema directly from the App Store. Xcode is required only when building the open-source application from this GitHub repository.
+
+### Does Noema work offline?
+
+Yes. Compatible local models, chats, and documents can stay on-device and work without an internet connection. Web search, remote endpoints, and other connected features are optional and user-controlled.
+
+### Which model formats and runtimes does Noema support?
+
+Noema supports GGUF through llama.cpp, MLX, ExecuTorch, Core ML, and Apple's on-device Foundation Models, alongside local document RAG, tool calling, and an OpenAI-compatible loopback server.
 
 ---
 
